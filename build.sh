@@ -43,6 +43,10 @@ fi
 # cross-built libfdk-aac, so the eld-codec C shim needs the zig toolchain + FDK_AAC_PREFIX.
 # Env per docs/ops/04_OPEN_ITEMS.md; skipped (non-fatal) where the fdk prefix is absent.
 FDK="${FDK_AAC_PREFIX:-$PWD/scratchpad/fdk/install}"
+# Cross-build libfdk-aac from vendored source when the prefix is absent (tools/build_fdk.sh).
+if [ ! -f "$FDK/lib/libfdk-aac.a" ] && [ -d "$PWD/scratchpad/fdk/src/libAACenc" ]; then
+  FDK_AAC_PREFIX="$FDK" sh tools/build_fdk.sh
+fi
 if [ -d "$FDK" ]; then
   FDK_AAC_PREFIX="$FDK" \
   CC="zig cc -target arm-linux-musleabihf -mcpu=cortex_a7 -fno-sanitize=all" \
@@ -81,3 +85,11 @@ $BOX_CARGO zigbuild $BOX_STD --target armv7-unknown-linux-musleabihf --release -
 echo "built  target/armv7-unknown-linux-musleabihf/release/mfid  ($(wc -c < target/armv7-unknown-linux-musleabihf/release/mfid) bytes, armv7 static, bring-up only)"
 cargo build --release -p mfi-probe
 echo "built  target/release/mfi-probe  ($(wc -c < target/release/mfi-probe) bytes, host)"
+
+# Stage the non-cargo artifacts the installer needs next to the cargo output, so a build-farm
+# collector that only knows target/<triple>/release/ and dist/ still ships a complete set
+# (tools/ocbm_install.sh wants accessory_init/iap_role_switch.armv7; ocbm-host is the bench client).
+mkdir -p dist
+[ -f accessory_init/iap_role_switch.armv7 ] && cp -f accessory_init/iap_role_switch.armv7 dist/
+cp -f target/release/ocbm-host dist/
+echo "staged dist/: $(ls dist | tr '\n' ' ')"
