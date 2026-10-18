@@ -1,0 +1,29 @@
+name: Rust
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  iap2-core:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates/vendor/iap2-core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/vendor/iap2-core
+      - run: cargo fmt --check
+      - run: cargo test --locked
+      - run: cargo clippy --locked -- -D warnings
+
+  workspace-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --locked -p iap2d -p ocbm-host
