@@ -341,6 +341,15 @@ pub const MGMT_RESTART_WIRELESS: u8 = 0x05; // [MGMT_RESTART_WIRELESS] -> bounce
 /// OCBM). Sticky by design: whoever asked for NCM works on the box over ssh and returns it with
 /// `rm /script/ncm_only; reboot` — exactly what `tools/ocbm_install.sh revert` typed over the console.
 pub const MGMT_ENTER_NCM: u8 = 0x06;
+/// [MGMT_SET_POLICY][utf8 JSON `{"autoConnect":bool,"order":["AA:BB:CC:DD:EE:FF",..]}`] -> the box
+/// relays it to btd's control port as `{"cmd":"policy",..}`: the order btd pages bonded phones in
+/// when it reconnects, and whether it reconnects at all. btd validates and persists it
+/// (`projection_policy.json` beside the link keys). MGMT_ACK status 0 = btd answered ok.
+pub const MGMT_SET_POLICY: u8 = 0x07;
+/// [MGMT_CONNECT_DEVICE][ascii MAC "AA:BB:.." or empty] -> btd `{"cmd":"connect"}`: page that bonded
+/// phone now (empty = first-to-connect). Never preempts a running session (btd refuses to page
+/// while one is live).
+pub const MGMT_CONNECT_DEVICE: u8 = 0x08;
                                             //   Box->host:
 pub const MGMT_INFO: u8 = 0x81; // [MGMT_INFO][utf8 JSON] — identity + health + bonded-device snapshot
 pub const MGMT_ACK: u8 = 0x82; // [MGMT_ACK][verb u8][status u8] — 0 ok / 1 error, echoing the request verb
@@ -356,6 +365,7 @@ pub const CAP_MFI: u32 = 0x0000_0004;
 pub const CAP_IP: u32 = 0x0000_0008;
 pub const CAP_FILE: u32 = 0x0000_0010;
 pub const CAP_ETH: u32 = 0x0000_0020; // box can bridge a raw-ethernet netdev (ncm0) over CH_ETH
+pub const CAP_PHONE_POLICY: u32 = 0x0000_0040; // box takes MGMT_SET_POLICY / MGMT_CONNECT_DEVICE
 
 // OCBM_CH_IP stream-mux sub-frame types. Payload = [type u8][conn_id u16 LE][data].
 // AAOS has no NCM, so L3 is done in userspace over this channel (no kernel TUN needed).

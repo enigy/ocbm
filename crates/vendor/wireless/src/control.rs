@@ -307,11 +307,21 @@ impl Control {
         self.policy.read().map(|p| p.clone()).unwrap_or_default()
     }
 
+    /// Replace the policy; writes `projection_policy.json` only when it actually changed. A CCPA
+    /// keeps it on flash, and the projection app re-sends its policy every session (it is the
+    /// durable copy), so an unconditional write would cost a flash write per connect.
     pub fn set_policy(&self, p: Policy) {
-        if let Ok(mut w) = self.policy.write() {
-            *w = p.clone();
+        let changed = match self.policy.write() {
+            Ok(mut w) => {
+                let changed = *w != p;
+                *w = p.clone();
+                changed
+            }
+            Err(_) => true,
+        };
+        if changed {
+            save_policy(&p);
         }
-        save_policy(&p);
     }
 
     /// Take any pending connect request. Called by the reconnect loop each round.

@@ -919,6 +919,71 @@ fn pair_answer_request(accept: bool) -> String {
     format!("{{\"cmd\":\"pair_answer\",\"accept\":{accept}}}\n")
 }
 
+/// Longest MGMT_SET_POLICY body relayed. A policy is a flag plus a handful of 17-char addresses;
+/// anything near this is not a policy, and btd reads one line into memory.
+const POLICY_BODY_MAX: usize = 4096;
+
+/// `MGMT_SET_POLICY` body (`{"autoConnect":..,"order":[..]}`) -> btd's `{"cmd":"policy",..}` line.
+/// None when the body is not one JSON object on one line: btd validates the fields (fail-closed),
+/// this only guarantees the framing — a newline inside would split it into two requests.
+fn policy_request(body: &str) -> Option<String> {
+    let body = body.trim();
+    if body.len() > POLICY_BODY_MAX || !body.starts_with('{') || !body.ends_with('}') || body.contains(['\n', '\r']) {
+        return None;
+    }
+    let rest = body[1..].trim_start();
+    Some(if rest.starts_with('}') {
+        "{\"cmd\":\"policy\"}\n".to_string()
+    } else {
+        format!("{{\"cmd\":\"policy\",{rest}\n")
+    })
+}
+
+/// `MGMT_CONNECT_DEVICE` body (a MAC, or empty) -> btd's `{"cmd":"connect"..}` line. None for anything
+/// that is not `AA:BB:CC:DD:EE:FF` hex, so nothing but an address reaches the JSON.
+fn connect_request(mac: &str) -> Option<String> {
+    let mac = mac.trim();
+    if mac.is_empty() {
+        return Some("{\"cmd\":\"connect\"}\n".to_string());
+    }
+    let ok = mac.len() == 17
+        && mac.split(':').count() == 6
+        && mac.split(':').all(|o| o.len() == 2 && o.bytes().all(|b| b.is_ascii_hexdigit()));
+    ok.then(|| format!("{{\"cmd\":\"connect\",\"address\":\"{mac}\"}}\n"))
+}
+
+/// One request/response round trip with btd's control port, bounded at every step (connect, write
+/// and read are each capped at 250 ms) because this runs on the dispatch thread that also carries the
+/// host heartbeats. True when btd answered `"ok":true`.
+fn btd_round_trip(line: &str) -> bool {
+    let Some(mut s) = connect_seam(WIRELESS_CONTROL_ADDR, Duration::from_millis(250)) else {
+        eprintln!("[ocbmd] device policy: btd control port {WIRELESS_CONTROL_ADDR} unreachable");
+        return false;
+    };
+    let _ = s.set_nonblocking(false);
+    let _ = s.set_write_timeout(Some(Duration::from_millis(250)));
+    let _ = s.set_read_timeout(Some(Duration::from_millis(250)));
+    if let Err(e) = s.write_all(line.as_bytes()) {
+        eprintln!("[ocbmd] device policy: write to btd failed: {e}");
+        return false;
+    }
+    let mut buf = [0u8; 512];
+    let mut got = Vec::new();
+    while !got.contains(&b'\n') && got.len() < buf.len() {
+        match s.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => got.extend_from_slice(&buf[..n]),
+            Err(e) => {
+                eprintln!("[ocbmd] device policy: no answer from btd: {e}");
+                return false;
+            }
+        }
+    }
+    let reply = String::from_utf8_lossy(&got);
+    eprintln!("[ocbmd] device policy: btd -> {}", reply.trim());
+    reply.contains("\"ok\":true")
+}
+
 /// The cross-process host-presence flag carplayd read to gate the session (docs/carplay/02_SESSION_LIFECYCLE.md).
 ///
 /// The `cfg(test)` alias is not cosmetic: the presence/teardown tests really write and delete these
@@ -3442,6 +3507,28 @@ impl Daemon {
                 request_wireless_restart();
                 self.mgmt_ack(verb, 0);
             }
+            p::MGMT_SET_POLICY => {
+                let body = std::str::from_utf8(&pl[1..]).unwrap_or("");
+                let ok = match policy_request(body) {
+                    Some(line) => btd_round_trip(&line),
+                    None => {
+                        eprintln!("[ocbmd] device policy: refused a malformed MGMT_SET_POLICY body ({} B)", body.len());
+                        false
+                    }
+                };
+                self.mgmt_ack(verb, u8::from(!ok));
+            }
+            p::MGMT_CONNECT_DEVICE => {
+                let mac = std::str::from_utf8(&pl[1..]).unwrap_or("");
+                let ok = match connect_request(mac) {
+                    Some(line) => btd_round_trip(&line),
+                    None => {
+                        eprintln!("[ocbmd] device policy: refused MGMT_CONNECT_DEVICE for {mac:?} (not a MAC)");
+                        false
+                    }
+                };
+                self.mgmt_ack(verb, u8::from(!ok));
+            }
             _ => {}
         }
     }
@@ -3607,7 +3694,7 @@ impl Daemon {
                         self.hello_cleared_conns = true;
                     }
                     let mut caps =
-                        p::CAP_CONSOLE | p::CAP_ECHO | p::CAP_IP | p::CAP_FILE | p::CAP_ETH;
+                        p::CAP_CONSOLE | p::CAP_ECHO | p::CAP_IP | p::CAP_FILE | p::CAP_ETH | p::CAP_PHONE_POLICY;
                     if self.mfi.is_some() {
                         caps |= p::CAP_MFI;
                     }
@@ -4632,6 +4719,35 @@ fn main() {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn policy_request_wraps_the_host_body_for_btd() {
+        assert_eq!(
+            policy_request(r#"{"autoConnect":true,"order":["AA:BB:CC:DD:EE:01"]}"#).as_deref(),
+            Some("{\"cmd\":\"policy\",\"autoConnect\":true,\"order\":[\"AA:BB:CC:DD:EE:01\"]}\n")
+        );
+        assert_eq!(policy_request("{}").as_deref(), Some("{\"cmd\":\"policy\"}\n"));
+    }
+
+    #[test]
+    fn policy_request_refuses_anything_but_one_object_on_one_line() {
+        assert!(policy_request("").is_none());
+        assert!(policy_request("[1,2]").is_none());
+        assert!(policy_request("{\"autoConnect\":true}\n{\"cmd\":\"forget\"}").is_none());
+        assert!(policy_request(&format!("{{\"order\":\"{}\"}}", "x".repeat(POLICY_BODY_MAX))).is_none());
+    }
+
+    #[test]
+    fn connect_request_accepts_only_a_mac_or_nothing() {
+        assert_eq!(connect_request("").as_deref(), Some("{\"cmd\":\"connect\"}\n"));
+        assert_eq!(
+            connect_request(" aa:BB:cc:DD:ee:01 ").as_deref(),
+            Some("{\"cmd\":\"connect\",\"address\":\"aa:BB:cc:DD:ee:01\"}\n")
+        );
+        assert!(connect_request("AA:BB:CC:DD:EE").is_none());
+        assert!(connect_request("AA:BB:CC:DD:EE:0G").is_none());
+        assert!(connect_request("\",\"cmd\":\"forget").is_none());
+    }
 
     // -----------------------------------------------------------------------------------------
     // Harness for the SESSION/CTRL/MFI paths.
