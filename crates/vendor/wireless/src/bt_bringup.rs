@@ -166,6 +166,11 @@ fn restore_sco_setup() {
             // The seam logs its own detail to stdout; carry the one-line verdict so a box.log
             // reader does not have to correlate two files.
             let detail = String::from_utf8_lossy(&out.stdout);
+            // Every line, not just the verdict (2026-10-20): radio_hal stamps each with uptime, and
+            // the lock wait and readback inside `sco_on` are part of the bring-up time being measured.
+            for line in detail.lines().filter(|l| !l.trim().is_empty()) {
+                eprintln!("[bt-bringup] {}", line.trim());
+            }
             let last = detail.lines().last().unwrap_or("").trim();
             match code {
                 0 => eprintln!("[bt-bringup] SCO setup restored after the down/up cycle ({last})"),
@@ -183,9 +188,27 @@ fn restore_sco_setup() {
     }
 }
 
+/// One timed step of [`bring_up`]: an `@<unix_ms> ` write-time stamp (docs/carplay/01_OCBM_PROTOCOL.md
+/// CH_LOG, so the host's drive log keeps the real time) plus the time since bring-up began.
+///
+/// Added 2026-10-20: a GM truck drive log showed 11.7 s from btd starting to "discoverable" on a
+/// warm reconnect (radio_hal had just reported hci0 converged), the largest single cost between the
+/// host's SUBSCRIBE and the first video frame. Nothing inside bring-up was timed, so which step
+/// spends it (the DOWN->UP controller reset, `hciconfig` calls, or the `radio_hal.sh sco_on`
+/// restore behind its `bt` lock) could not be told apart.
+fn stamp(t0: std::time::Instant, what: &str) {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    eprintln!("@{now_ms} [bt-bringup] {what} (+{} ms)", t0.elapsed().as_millis());
+}
+
 /// Bring the controller up as a discoverable/connectable CarPlay-style accessory: set class, name,
 /// EIR, then enable page+inquiry scan (discoverable + connectable, no timeout).
 pub fn bring_up(hci_dev: &str, name: &str) -> std::io::Result<()> {
+    let t0 = std::time::Instant::now();
+    stamp(t0, "start");
     // Name the real fault at its source rather than letting it surface as an unexplained EINVAL.
     // Deliberately a LOG, not an early return: this is diagnostic, the controller may already be
     // attached by some path we do not model, and refusing to proceed on a heuristic would be worse
@@ -199,6 +222,7 @@ pub fn bring_up(hci_dev: &str, name: &str) -> std::io::Result<()> {
         );
     }
     stop_conflicting_daemons(); // box: free L2CAP PSM 1 (SDP) from the stock hcid before we bind it
+    stamp(t0, "conflicting daemons stopped");
 
     // docs/wireless/01_BT_AND_RADIO.md: force a DOWN->UP cycle, not a bare `up`. The kernel sends its Set_Event_Mask (which is
     // what enables the SSP events IO_Capability_Request 0x31 / User_Confirmation_Request 0x33 /
@@ -241,30 +265,39 @@ pub fn bring_up(hci_dev: &str, name: &str) -> std::io::Result<()> {
     if crate::hci::native_selected() {
         let dev = crate::hci::dev_id(hci_dev)?;
         let _ = crate::hci::dev_down(dev); // best-effort: already-down returns EALREADY
+        stamp(t0, "down");
         crate::hci::dev_up(dev)?;
+        stamp(t0, "up");
         let _ = crate::hci::write_ssp_mode(dev, true); // non-fatal, as with `hciconfig sspmode`
         crate::hci::write_class_of_device(dev, CLASS_OF_DEVICE)?;
         crate::hci::write_local_name(dev, name)?;
         crate::hci::write_eir(dev, &eir_bytes(name))?;
         crate::hci::set_scan(dev, crate::hci::SCAN_PAGE_AND_INQUIRY)?;
+        stamp(t0, "class, name, EIR, scan set");
         restore_sco_setup();
+        stamp(t0, "SCO setup restored");
         eprintln!("[btd] HCI bring-up OK dev={hci_dev} name={name}");
         return Ok(());
     }
 
     let _ = run(&[hci_dev, "down"]);
+    stamp(t0, "down");
     run(&[hci_dev, "up"])?;
+    stamp(t0, "up");
     // Force Simple Pairing mode ON at the HCI level (HCI Write_Simple_Pairing_Mode). The NXP IW416
     // firmware defaults SSP OFF and the mgmt SET_SSP path can be rejected silently, leaving "Simple
     // Pairing mode: Disabled" → pairing degrades to legacy PIN → iOS refuses the iAP2/CarPlay handshake
     // (SDP loops, RFCOMM never opens). This deterministically flips the readback; SSP is required for
     // BOTH Just-Works and Numeric Comparison. Non-fatal if the build's hciconfig lacks `sspmode`.
     let _ = run(&[hci_dev, "sspmode", "1"]);
+    stamp(t0, "sspmode");
     run(&[hci_dev, "class", &format!("0x{CLASS_OF_DEVICE:06x}")])?;
     run(&[hci_dev, "name", name])?;
     run(&[hci_dev, "inqdata", &eir_hex(name)])?;
     run(&[hci_dev, "piscan"])?;
+    stamp(t0, "class, name, EIR, piscan set");
     restore_sco_setup();
+    stamp(t0, "SCO setup restored");
     eprintln!("[btd] HCI bring-up OK dev={hci_dev} name={name}");
     Ok(())
 }

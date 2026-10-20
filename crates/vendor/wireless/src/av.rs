@@ -262,7 +262,23 @@ fn wait_visible(path: &str) -> bool {
 }
 
 /// Ensure the wireless A/V receiver layer is running. Idempotent; call after answering 0x5703.
+///
+/// Timed (2026-10-20): spawning carplayd at the 0x5703 reply costs the session its start-up time
+/// before the phone's control connection can be accepted (~0.5 s on a GM truck drive log). Starting
+/// it earlier would also move the `/tmp/carplay_transport` claim ahead of the Wi-Fi handoff, which
+/// suppresses the wired supervisor for a phone that has not agreed to Wi-Fi yet — so this measures
+/// the cost first instead of moving the spawn.
 pub fn ensure_av_layer() {
+    let t0 = std::time::Instant::now();
+    ensure_av_layer_timed();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    println!("@{now_ms} [av] ensure_av_layer done in {} ms", t0.elapsed().as_millis());
+}
+
+fn ensure_av_layer_timed() {
     // Serialize (see AV_LOCK): two rapid 0x5703s must not both spawn the daemons.
     let _guard = AV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 

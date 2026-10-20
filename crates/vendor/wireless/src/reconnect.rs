@@ -52,7 +52,23 @@ const BACKOFF_START_SECS: u64 = 10;
 const BACKOFF_MAX_SECS: u64 = 60;
 /// Let bring-up/SSP/SDP settle and give the phone a moment to connect IN on its own before we start
 /// paging it ourselves.
-const INITIAL_SETTLE_SECS: u64 = 5;
+///
+/// Was 5 s. A GM truck drive log (Carlink3, 2026-10-20) showed it as 5.0 of the 27.5 s from the
+/// host's SUBSCRIBE to the first video frame, with the bonded phone answering the page 0.75 s after
+/// it ended. Bring-up has already returned when this starts (SSP agent and SDP are serving), and a
+/// phone that connects IN meanwhile is still safe: `attempt()`'s compare_exchange on
+/// `session_active` refuses to page over it. 1 s keeps a moment for that inbound connect.
+/// Override: `BT_RECONNECT_SETTLE_SECS` or `/tmp/reconnect_settle_secs` (whole seconds, `0` allowed).
+const INITIAL_SETTLE_DEFAULT_SECS: u64 = 1;
+
+/// Same bench-lever convention as [`acl_hold_secs`]: env first, then the tmpfs file.
+fn initial_settle_secs() -> u64 {
+    let parse = |v: &str| v.trim().parse::<u64>().ok();
+    box_common::lever("BT_RECONNECT_SETTLE_SECS", "CARPLAY_RECONNECT_SETTLE_SECS")
+        .and_then(|v| parse(&v))
+        .or_else(|| std::fs::read_to_string("/tmp/reconnect_settle_secs").ok().and_then(|v| parse(&v)))
+        .unwrap_or(INITIAL_SETTLE_DEFAULT_SECS)
+}
 
 /// `@<unix_ms> ` write-time stamp (docs/carplay/01_OCBM_PROTOCOL.md CH_LOG): the box.log tailer
 /// parses this prefix and uses it instead of the millisecond it happened to READ the line at.
@@ -771,7 +787,9 @@ pub fn run(
     ctrl: &Arc<Control>,
 ) {
     // Settle before the first probe (bring-up/SSP/SDP, and give the phone a chance to connect IN first).
-    if !interruptible_sleep(INITIAL_SETTLE_SECS, shutdown) {
+    let settle = initial_settle_secs();
+    log(&format!("settling {settle}s before paging bonded phones"));
+    if !interruptible_sleep(settle, shutdown) {
         return;
     }
 

@@ -60,7 +60,11 @@ WLAN_STATE=/tmp/.radio_wlan_state
 BT_STATE=/tmp/.radio_bt_state
 LOGP="[radio_hal]"
 
-log() { echo "$LOGP $*"; }
+# Uptime (seconds since boot, /proc/uptime) on every line: the box clock is bogus until the host's
+# CT_SETTIME, so cold-boot radio bring-up (firmware preload, hciattach, convergence) is otherwise
+# untimeable in a drive log (Carlink3, 2026-10-20). Plain text after the prefix, so `grep` on the
+# message words still matches.
+log() { echo "$LOGP [up $(cut -d' ' -f1 /proc/uptime 2>/dev/null)] $*"; }
 
 # Single-flight per subsystem. mkdir is the portable atomic test-and-set on busybox (no flock
 # dependency). A concurrent second bring-up must not run - the supervisor can manufacture
@@ -739,6 +743,7 @@ case "$VERB" in
   bt_off)      lock_take bt   || exit 1; do_bt_off;      _r=$?; lock_drop bt;   exit $_r ;;
   # Best-effort and idempotent: the daemon calls it after every bring-up DOWN->UP, and a unit
   # whose branch carries no SCO mapping must report that (3) rather than fail the caller.
-  sco_on)      lock_take bt   || exit 1; do_sco_on;      _r=$?; lock_drop bt;   exit $_r ;;
+  sco_on)      log "sco_on: taking the bt lock"; lock_take bt || exit 1; log "sco_on: bt lock taken"
+               do_sco_on;      _r=$?; lock_drop bt;   exit $_r ;;
   *) echo "$LOGP usage: radio_hal.sh probe|status|wifi_ap_on|wifi_ap_off|bt_on|bt_off|sco_on" >&2; exit 64 ;;
 esac
