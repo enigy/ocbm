@@ -156,8 +156,10 @@ pub fn connect_to(peer: [u8; 6], channel: u8, connect_timeout_secs: i64) -> std:
 }
 
 /// Block until one RFCOMM client connects on `channel`, or `shutdown` is set. Returns `Ok(None)` on
-/// shutdown, `Ok(Some(file))` on an accepted connection ready for iAP2 traffic.
-pub fn accept_one(channel: u8, shutdown: &AtomicBool) -> std::io::Result<Option<std::fs::File>> {
+/// shutdown, `Ok(Some((file, peer)))` on an accepted connection ready for iAP2 traffic. `peer` is the
+/// phone's bdaddr in mgmt little-endian order, the order the link-key store uses, so callers can
+/// ask whether it is bonded (security plan 2026-10-21 H1: Wi-Fi details only for bonded phones).
+pub fn accept_one(channel: u8, shutdown: &AtomicBool) -> std::io::Result<Option<(std::fs::File, [u8; 6])>> {
     let listener = open_listener(channel)?;
     let listen_fd = listener.as_raw_fd();
     while !shutdown.load(Ordering::Relaxed) {
@@ -188,7 +190,7 @@ pub fn accept_one(channel: u8, shutdown: &AtomicBool) -> std::io::Result<Option<
             return Err(e);
         }
         // SAFETY: cfd is a freshly accepted, exclusively-owned connected socket descriptor.
-        return Ok(Some(unsafe { std::fs::File::from_raw_fd(cfd) }));
+        return Ok(Some((unsafe { std::fs::File::from_raw_fd(cfd) }, ra.rc_bdaddr)));
     }
     Ok(None)
 }

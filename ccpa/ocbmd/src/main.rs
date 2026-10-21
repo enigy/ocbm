@@ -919,6 +919,17 @@ fn pair_answer_request(accept: bool) -> String {
     format!("{{\"cmd\":\"pair_answer\",\"accept\":{accept}}}\n")
 }
 
+/// `MGMT_PAIR_WINDOW` payload (`[seconds u16 LE]`) -> btd's `{"cmd":"pair_window",..}` line. None when the
+/// payload is not exactly two bytes. btd clamps to 1..300 s (0 closes); clamped here as well, so the
+/// line never carries a number btd would have to argue with.
+fn pair_window_request(arg: &[u8]) -> Option<String> {
+    let [lo, hi] = arg else {
+        return None;
+    };
+    let secs = u16::from_le_bytes([*lo, *hi]).min(300);
+    Some(format!("{{\"cmd\":\"pair_window\",\"seconds\":{secs}}}\n"))
+}
+
 /// Longest MGMT_SET_POLICY body relayed. A policy is a flag plus a handful of 17-char addresses;
 /// anything near this is not a policy, and btd reads one line into memory.
 const POLICY_BODY_MAX: usize = 4096;
@@ -1006,6 +1017,8 @@ const PAIRING_CODE_FILE: &str = "/tmp/pairing_code";
 const WIRELESS_CONTROL_ADDR: &str = "127.0.0.1:9115";
 #[cfg(test)]
 const WIRELESS_CONTROL_ADDR: &str = "127.0.0.1:19115";
+/// Present while btd's pairing window is open (`ssp_agent::PAIR_WINDOW_FLAG`); mirrored as `BH_PAIR_WINDOW`.
+const PAIR_WINDOW_FILE: &str = "/tmp/bt_pair_window";
 /// Written by `wireless::bt_driver::publish_bt_phase` on every iAP2 handshake transition.
 const BT_PHASE_FILE: &str = "/tmp/bt_phase";
 
@@ -2237,6 +2250,9 @@ impl Daemon {
         }
         if free_kb >= floor_kb {
             f |= p::BH_ROOTFS_OK;
+        }
+        if std::path::Path::new(PAIR_WINDOW_FILE).exists() {
+            f |= p::BH_PAIR_WINDOW;
         }
 
         if Some(f) != self.box_health {
@@ -3518,6 +3534,17 @@ impl Daemon {
                 };
                 self.mgmt_ack(verb, u8::from(!ok));
             }
+            // "Add phone" (security plan H1): relayed to btd, whose SSP agent applies it.
+            p::MGMT_PAIR_WINDOW => {
+                let ok = match pair_window_request(&pl[1..]) {
+                    Some(line) => btd_round_trip(&line),
+                    None => {
+                        eprintln!("[ocbmd] pairing window: refused a MGMT_PAIR_WINDOW of {} B (want 2)", pl.len() - 1);
+                        false
+                    }
+                };
+                self.mgmt_ack(verb, u8::from(!ok));
+            }
             p::MGMT_CONNECT_DEVICE => {
                 let mac = std::str::from_utf8(&pl[1..]).unwrap_or("");
                 let ok = match connect_request(mac) {
@@ -3694,7 +3721,7 @@ impl Daemon {
                         self.hello_cleared_conns = true;
                     }
                     let mut caps =
-                        p::CAP_CONSOLE | p::CAP_ECHO | p::CAP_IP | p::CAP_FILE | p::CAP_ETH | p::CAP_PHONE_POLICY;
+                        p::CAP_CONSOLE | p::CAP_ECHO | p::CAP_IP | p::CAP_FILE | p::CAP_ETH | p::CAP_PHONE_POLICY | p::CAP_PAIR_WINDOW;
                     if self.mfi.is_some() {
                         caps |= p::CAP_MFI;
                     }
@@ -5771,10 +5798,19 @@ mod tests {
     }
 
     #[test]
+    fn pair_window_payload_becomes_one_btd_line() {
+        assert_eq!(pair_window_request(&120u16.to_le_bytes()).unwrap(), "{\"cmd\":\"pair_window\",\"seconds\":120}\n");
+        assert_eq!(pair_window_request(&0u16.to_le_bytes()).unwrap(), "{\"cmd\":\"pair_window\",\"seconds\":0}\n");
+        assert_eq!(pair_window_request(&u16::MAX.to_le_bytes()).unwrap(), "{\"cmd\":\"pair_window\",\"seconds\":300}\n");
+        assert!(pair_window_request(&[]).is_none());
+        assert!(pair_window_request(&[1, 2, 3]).is_none());
+    }
+
+    #[test]
     fn box_health_bits_do_not_collide() {
         let all = [
             p::BH_HCI_PRESENT, p::BH_SSP, p::BH_IAP2D, p::BH_AIRPLAYD,
-            p::BH_CARPLAY_WIRELESS, p::BH_WLAN_AP, p::BH_ROOTFS_OK,
+            p::BH_CARPLAY_WIRELESS, p::BH_WLAN_AP, p::BH_ROOTFS_OK, p::BH_PAIR_WINDOW,
         ];
         let mut seen = 0u8;
         for b in all {

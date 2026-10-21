@@ -16,7 +16,7 @@
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::FromRawFd;
-use std::sync::atomic::{AtomicBool, AtomicI8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI8, AtomicU64, Ordering};
 
 const AF_BLUETOOTH: libc::sa_family_t = 31;
 const BTPROTO_HCI: libc::c_int = 1;
@@ -505,6 +505,116 @@ impl ConfirmTracker {
     }
 }
 
+// ---- Pairing window (security plan 2026-10-21 H1) ----------------------------------------------
+
+/// Longest window the app can open; `MGMT_PAIR_WINDOW` asks are clamped to 1..=this.
+pub const PAIR_WINDOW_MAX_SECS: u64 = 300;
+
+/// Once a new phone has bonded inside the window, the window closes this soon after: one phone per
+/// tap of "Add phone", with a little slack for the phone's own follow-up connects.
+pub const PAIR_WINDOW_CLOSE_AFTER_BOND_MS: u64 = 10_000;
+
+/// Present while the box is discoverable and taking new bonds; ocbmd reports it to the app as
+/// `BH_PAIR_WINDOW`. tmpfs, so a reboot never leaves a stale "open".
+pub const PAIR_WINDOW_FLAG: &str = "/tmp/bt_pair_window";
+
+/// When the pairing window closes, set from the app (`{"cmd":"pair_window"}` on btd's control port)
+/// and read by [`run`]'s mgmt loop, which applies it to the controller.
+///
+/// Outside the window the controller is connectable but neither discoverable nor bondable, so a
+/// bonded phone still reconnects by page while nobody new can find the box or pair with it. Before
+/// this the box was discoverable and bondable for the whole session with Just Works pairing, so any
+/// device in range could bond and then be handed the AP credentials (security review H1).
+///
+/// One deadline (wall-clock ms; 0 = closed), latest-writer-wins, like [`PairAnswer`].
+#[derive(Default)]
+pub struct PairWindow(AtomicU64);
+
+impl PairWindow {
+    pub const fn new() -> Self {
+        Self(AtomicU64::new(0))
+    }
+
+    /// Open the window for `secs` (clamped to 1..=[`PAIR_WINDOW_MAX_SECS`]) from `now_ms`; 0 closes it.
+    /// Returns the seconds actually granted.
+    pub fn set(&self, secs: u64, now_ms: u64) -> u64 {
+        if secs == 0 {
+            self.0.store(0, Ordering::Release);
+            return 0;
+        }
+        let secs = secs.min(PAIR_WINDOW_MAX_SECS);
+        self.0.store(now_ms + secs * 1000, Ordering::Release);
+        secs
+    }
+
+    /// A phone just bonded: close [`PAIR_WINDOW_CLOSE_AFTER_BOND_MS`] from now, never later than planned.
+    pub fn bonded(&self, now_ms: u64) {
+        let soon = now_ms + PAIR_WINDOW_CLOSE_AFTER_BOND_MS;
+        // fetch_min: a closed window (0) stays closed, and a deadline is only ever pulled earlier.
+        self.0.fetch_min(soon, Ordering::AcqRel);
+    }
+
+    pub fn is_open(&self, now_ms: u64) -> bool {
+        now_ms < self.0.load(Ordering::Acquire)
+    }
+
+    /// Whole seconds left, 0 when closed.
+    pub fn remaining_secs(&self, now_ms: u64) -> u64 {
+        self.0.load(Ordering::Acquire).saturating_sub(now_ms).div_ceil(1000)
+    }
+}
+
+/// Whether the controller should be discoverable and take new bonds right now: inside the window, or
+/// while no phone is bonded at all, so a fresh box (or an app with no "Add phone" button) can still
+/// pair its first phone.
+fn pairing_allowed(window_open: bool, bonds: usize) -> bool {
+    window_open || bonds == 0
+}
+
+/// Apply the pairing state to the controller. Each mgmt setting is read back (see [`apply_setting`]).
+///
+/// The scan mode is ALSO written directly. On the CCPA's 3.14 kernel `SET_DISCOVERABLE` is a no-op when
+/// the mgmt flag already holds the asked-for value, and `bt_bringup` turns inquiry scan on with a raw
+/// Write_Scan_Enable that never sets that flag, so "SET_DISCOVERABLE=0" alone could leave the box
+/// visible. The native (modern-kernel) backend uses the ioctl instead, which keeps the mgmt flags in
+/// step (`hci::set_scan`).
+fn apply_pairing_state(sock: &mut File, index: u16, open: bool, why: &str) {
+    if open {
+        apply_setting(sock, OP_SET_BONDABLE, index, &[1], "SET_BONDABLE=1");
+        apply_setting(sock, OP_SET_DISCOVERABLE, index, &[1, 0, 0], "SET_DISCOVERABLE=general");
+    } else {
+        apply_setting(sock, OP_SET_DISCOVERABLE, index, &[0, 0, 0], "SET_DISCOVERABLE=0");
+        apply_setting(sock, OP_SET_BONDABLE, index, &[0], "SET_BONDABLE=0");
+    }
+    let scan = if open { crate::hci::SCAN_PAGE_AND_INQUIRY } else { crate::hci::SCAN_PAGE };
+    let wrote = if crate::hci::native_selected() {
+        crate::hci::set_scan(index, scan)
+    } else {
+        crate::hci::write_scan_enable(index, scan)
+    };
+    if let Err(e) = wrote {
+        log(&format!("pairing window: scan mode write failed (non-fatal): {e}"));
+    }
+    if open {
+        let _ = std::fs::write(PAIR_WINDOW_FLAG, b"1");
+        log(&format!("pairing window OPEN ({why}): discoverable, new phones may pair"));
+    } else {
+        let _ = std::fs::remove_file(PAIR_WINDOW_FLAG);
+        log(&format!("pairing window CLOSED ({why}): not discoverable, new pairings refused; bonded phones still reconnect"));
+    }
+}
+
+/// Why the window is in the state [`pairing_allowed`] chose, for the log line.
+fn pairing_reason(window: &PairWindow, now: u64, bonds: usize) -> String {
+    if window.is_open(now) {
+        format!("{} s left", window.remaining_secs(now))
+    } else if bonds == 0 {
+        "no phone bonded yet".to_string()
+    } else {
+        format!("{bonds} phone(s) bonded, window not open")
+    }
+}
+
 // ---- Numeric Comparison: the head unit's half of the yes/no ----------------------------------
 
 /// The head unit's answer to a Numeric-Comparison prompt, handed to the mgmt loop from another
@@ -684,11 +794,15 @@ fn refuse_pairing(bdaddr: &[u8; 6]) {
 /// `pair_answer` is the head unit's yes/no for Numeric Comparison (see [`PairAnswer`]). With it,
 /// numeric mode WAITS for a real answer instead of auto-accepting. `None` — or the
 /// `BT_SSP_INTERACTIVE=1` lever — wait for the head unit's yes/no instead of confirming at once.
+///
+/// `pair_window` gates discoverability and new bonds (see [`PairWindow`]); `None` keeps the old
+/// always-discoverable, always-bondable behaviour for callers that have no app to open a window.
 pub fn run(
     controller_index: u16,
     shutdown: &AtomicBool,
     on_pair_rejected: Option<&dyn Fn()>,
     pair_answer: Option<&PairAnswer>,
+    pair_window: Option<&PairWindow>,
 ) -> std::io::Result<()> {
     let mut sock = open_mgmt_socket()?;
 
@@ -737,7 +851,6 @@ pub fn run(
     // load-bearing one — if the controller rejects it, pairing degrades to legacy PIN and iOS refuses
     // CarPlay. bt_bringup also forces `hciconfig sspmode 1` so SSP is on even if this mgmt path is quirky.
     apply_setting(&mut sock, OP_SET_POWERED, controller_index, &[1], "SET_POWERED=1");
-    apply_setting(&mut sock, OP_SET_BONDABLE, controller_index, &[1], "SET_BONDABLE=1");
     apply_setting(&mut sock, OP_SET_CONNECTABLE, controller_index, &[1], "SET_CONNECTABLE=1");
     // General discoverable, no timeout (device-proven 2026-09-03). bt_bringup's `hciconfig piscan`
     // enables inquiry scan at the HCI level, but the kernel's mgmt layer rewrites Scan_Enable from
@@ -748,7 +861,23 @@ pub fn run(
     // the user taps the head unit in Settings ▸ Bluetooth, iOS initiates and shows its code, the
     // head unit confirms. That requires being discoverable. The stock CCPA is visible as
     // "CarLink-xxxx" permanently too.
-    apply_setting(&mut sock, OP_SET_DISCOVERABLE, controller_index, &[1, 0, 0], "SET_DISCOVERABLE=general");
+    //
+    // Since the 2026-10-21 security plan (H1) that is true only inside the pairing window, or while
+    // no phone is bonded: the window opens from the app's "Add phone". Without a window (`None`),
+    // discoverable and bondable as before.
+    let mut pairing_open = match pair_window {
+        Some(w) => {
+            let bonds = bonded_addrs().len();
+            let open = pairing_allowed(w.is_open(now_ms()), bonds);
+            apply_pairing_state(&mut sock, controller_index, open, &pairing_reason(w, now_ms(), bonds));
+            open
+        }
+        None => {
+            apply_setting(&mut sock, OP_SET_BONDABLE, controller_index, &[1], "SET_BONDABLE=1");
+            apply_setting(&mut sock, OP_SET_DISCOVERABLE, controller_index, &[1, 0, 0], "SET_DISCOVERABLE=general");
+            true
+        }
+    };
     apply_setting(&mut sock, OP_SET_SSP, controller_index, &[1], "SET_SSP=1");
     apply_setting(&mut sock, OP_SET_IO_CAPABILITY, controller_index, &[io_cap], "SET_IO_CAPABILITY");
 
@@ -780,10 +909,12 @@ pub fn run(
     log("pairing agent running");
     let mut confirm_tracker = ConfirmTracker::new();
     let mut confirms = PendingConfirmState::new();
+    let mut last_window_check = 0u64;
     let mut buf = [0u8; 512];
     loop {
         if shutdown.load(Ordering::Relaxed) {
             clear_pairing_code(); // don't leave a stale code showing after teardown
+            let _ = std::fs::remove_file(PAIR_WINDOW_FLAG); // the app must not see "open" with no agent
             // A confirm we are about to stop servicing gets a definite NO rather than a stall: the
             // phone shows "Pairing Unsuccessful" now instead of spinning until its own timeout.
             if confirms.is_pending() {
@@ -827,6 +958,18 @@ pub fn run(
                     "pair answer ({}) with no confirm pending — ignored",
                     if accept { "pair" } else { "cancel" }
                 )),
+            }
+        }
+        // The pairing window, checked once a loop (the read below is bounded at 1 s): an "Add phone"
+        // from the app opens it here, and it closes again at its deadline or once a phone has bonded.
+        if let Some(w) = pair_window.filter(|_| now_ms() >= last_window_check + 1000) {
+            let now = now_ms();
+            last_window_check = now;
+            let bonds = bonded_addrs().len();
+            let want = pairing_allowed(w.is_open(now), bonds);
+            if want != pairing_open {
+                apply_pairing_state(&mut sock, controller_index, want, &pairing_reason(w, now, bonds));
+                pairing_open = want;
             }
         }
         if let Some(p) = confirms.expired(now_ms()) {
@@ -890,6 +1033,10 @@ pub fn run(
                         let mut record = [0u8; LINK_KEY_RECORD_LEN];
                         record.copy_from_slice(record_bytes);
                         persist_link_key(&record);
+                    }
+                    // One phone per window: it closes shortly after this bond (H1).
+                    if let Some(w) = pair_window {
+                        w.bonded(now_ms());
                     }
                     // A real bond just formed for this device — its stored key is fresh, so any prior
                     // rejection streak no longer applies, and any confirm still pending for it is
@@ -1082,6 +1229,43 @@ pub fn run(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn pair_window_opens_clamps_and_closes() {
+        let w = PairWindow::new();
+        assert!(!w.is_open(1_000), "closed until the app opens it");
+        assert_eq!(w.set(120, 1_000), 120);
+        assert!(w.is_open(1_000) && w.is_open(120_999));
+        assert!(!w.is_open(121_000), "closed at its deadline");
+        assert_eq!(w.remaining_secs(61_000), 60);
+        assert_eq!(w.set(100_000, 0), PAIR_WINDOW_MAX_SECS, "asks are clamped");
+        assert_eq!(w.set(0, 5_000), 0);
+        assert!(!w.is_open(5_000), "0 closes it at once");
+    }
+
+    #[test]
+    fn a_new_bond_closes_the_window_soon_but_never_reopens_or_extends_it() {
+        let w = PairWindow::new();
+        w.set(120, 0);
+        w.bonded(5_000);
+        assert!(w.is_open(5_000 + PAIR_WINDOW_CLOSE_AFTER_BOND_MS - 1));
+        assert!(!w.is_open(5_000 + PAIR_WINDOW_CLOSE_AFTER_BOND_MS));
+        let closed = PairWindow::new();
+        closed.bonded(5_000);
+        assert!(!closed.is_open(5_001), "a bond outside the window must not open it");
+        let ending = PairWindow::new();
+        ending.set(3, 0);
+        ending.bonded(1_000);
+        assert!(!ending.is_open(3_000), "a bond never pushes the deadline later");
+    }
+
+    #[test]
+    fn pairing_is_open_inside_the_window_or_before_the_first_bond() {
+        assert!(pairing_allowed(true, 2));
+        assert!(pairing_allowed(false, 0), "a fresh box must be able to pair its first phone");
+        assert!(!pairing_allowed(false, 1));
+    }
+
     use super::*;
 
     #[test]

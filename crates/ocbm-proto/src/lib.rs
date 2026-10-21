@@ -228,6 +228,8 @@ pub const BH_CARPLAY_WIRELESS: u8 = 0x10; // btd running (BT + AP bring-up super
 pub const BH_WLAN_AP: u8 = 0x20; // hostapd running — the box is raising its OWN AP (NOT the GM bridge role)
 pub const BH_ROOTFS_OK: u8 = 0x40; // rootfs has headroom; clear means the box is close to full and may
                                    // fail to write logs, configs or the ephemeral session YAML
+pub const BH_PAIR_WINDOW: u8 = 0x80; // the Bluetooth pairing window is open (MGMT_PAIR_WINDOW): the box is
+                                     // discoverable and takes new bonds. Security plan 2026-10-21 §3.
 
 pub const CT_LOG_CTL: u8 = 0x1B; // host->box [CT_LOG_CTL][enabled u8][cap_kb u16 LE] -> arm/disarm the
                                  // box->host CH_LOG stream. `cap_kb` 0 means the built-in default
@@ -350,6 +352,11 @@ pub const MGMT_SET_POLICY: u8 = 0x07;
 /// phone now (empty = first-to-connect). Never preempts a running session (btd refuses to page
 /// while one is live).
 pub const MGMT_CONNECT_DEVICE: u8 = 0x08;
+/// [MGMT_PAIR_WINDOW][seconds u16 LE] -> open the Bluetooth pairing window for that long (the box
+/// clamps to 1..300); 0 closes it. Outside the window the box is not discoverable, refuses new bonds,
+/// and hands Wi-Fi configuration (iAP2 0x5703) only to bonded phones. MGMT_ACK status 0 = done.
+/// Security plan 2026-10-21 §3 (enigy/ocbm docs/ops/SECURITY_PLAN_2026-10-21.md).
+pub const MGMT_PAIR_WINDOW: u8 = 0x09;
                                             //   Box->host:
 pub const MGMT_INFO: u8 = 0x81; // [MGMT_INFO][utf8 JSON] — identity + health + bonded-device snapshot
 pub const MGMT_ACK: u8 = 0x82; // [MGMT_ACK][verb u8][status u8] — 0 ok / 1 error, echoing the request verb
@@ -366,6 +373,7 @@ pub const CAP_IP: u32 = 0x0000_0008;
 pub const CAP_FILE: u32 = 0x0000_0010;
 pub const CAP_ETH: u32 = 0x0000_0020; // box can bridge a raw-ethernet netdev (ncm0) over CH_ETH
 pub const CAP_PHONE_POLICY: u32 = 0x0000_0040; // box takes MGMT_SET_POLICY / MGMT_CONNECT_DEVICE
+pub const CAP_PAIR_WINDOW: u32 = 0x0000_0080; // box takes MGMT_PAIR_WINDOW and gates pairing behind it
 
 // OCBM_CH_IP stream-mux sub-frame types. Payload = [type u8][conn_id u16 LE][data].
 // AAOS has no NCM, so L3 is done in userspace over this channel (no kernel TUN needed).

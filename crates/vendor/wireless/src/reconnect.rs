@@ -256,7 +256,7 @@ fn attempt(
         log("session already active — standing down (dropping outbound connect)");
         return Attempt::Failed;
     };
-    bt_driver::run(sock, name, shutdown);
+    bt_driver::run(sock, name, shutdown, Some(peer));
     log("reconnect session ended");
     Attempt::Ran
 }

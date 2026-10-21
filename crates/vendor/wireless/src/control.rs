@@ -38,6 +38,9 @@
 //!   {"cmd":"forget","address":"AA:BB:.."}  -> {"ok":true}
 //!   {"cmd":"pair_answer","accept":true}    -> {"ok":true}    // the head unit's yes/no for the
 //!                                                            // Numeric-Comparison code on screen
+//!   {"cmd":"pair_window","seconds":120}    -> {"ok":true,"seconds":120}  // open the pairing window
+//!                                                            // (1..300 s; 0 closes it). Security
+//!                                                            // plan 2026-10-21 H1, ssp_agent::PairWindow
 //! ```
 //!
 //! ## Address byte order — the thing that will bite
@@ -168,6 +171,20 @@ fn json_bool(src: &str, key: &str) -> Option<bool> {
     }
 }
 
+/// Extract a non-negative integer for `"key"`; None when absent or not a plain number.
+fn json_u64(src: &str, key: &str) -> Option<u64> {
+    let pat = format!("\"{key}\"");
+    let i = src.find(&pat)? + pat.len();
+    let rest = &src[i..];
+    let colon = rest.find(':')?;
+    let after = rest[colon + 1..].trim_start();
+    let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() || digits.len() > 9 {
+        return None;
+    }
+    digits.parse().ok()
+}
+
 /// Extract an array of strings for `"key"`.
 fn json_str_array(src: &str, key: &str) -> Option<Vec<String>> {
     let pat = format!("\"{key}\"");
@@ -280,6 +297,9 @@ pub struct Control {
     /// thread — pairing happens on the accept path, before any session exists, so a per-session
     /// answer slot would be created after the prompt it is meant to answer.
     pair_answer: Arc<ssp_agent::PairAnswer>,
+    /// The pairing window (security plan H1), PROCESS-lifetime for the same reason as
+    /// `pair_answer`: "Add phone" arrives before the phone does. Read by the SSP agent's mgmt loop.
+    pair_window: Arc<ssp_agent::PairWindow>,
 }
 
 impl Control {
@@ -296,6 +316,11 @@ impl Control {
     /// thread; `handle_request`'s `pair_answer` verb writes it.
     pub fn pair_answer(&self) -> Arc<ssp_agent::PairAnswer> {
         self.pair_answer.clone()
+    }
+
+    /// The slot the SSP agent polls for the pairing window; `handle_request`'s `pair_window` writes it.
+    pub fn pair_window(&self) -> Arc<ssp_agent::PairWindow> {
+        self.pair_window.clone()
     }
 
     /// True while a session is live on EITHER path, named peer or not.
@@ -575,6 +600,19 @@ pub fn handle_request(ctrl: &Control, line: &str) -> String {
             }
             None => r#"{"ok":false,"error":"pair_answer: accept must be true or false"}"#.to_string(),
         },
+        // "Add phone" (app -> MGMT_PAIR_WINDOW -> ocbmd -> here). The agent applies it within a
+        // second. FAIL CLOSED: an absent or malformed `seconds` opens nothing.
+        "pair_window" => match json_u64(line, "seconds") {
+            Some(secs) => {
+                let granted = ctrl.pair_window.set(secs, now_ms());
+                log(&format!(
+                    "pairing window {}",
+                    if granted == 0 { "closed by the app".to_string() } else { format!("opened by the app for {granted} s") }
+                ));
+                format!(r#"{{"ok":true,"seconds":{granted}}}"#)
+            }
+            None => r#"{"ok":false,"error":"pair_window: seconds must be a whole number"}"#.to_string(),
+        },
         "forget" => match json_str(line, "address").as_deref().and_then(parse_addr) {
             Some(a) => {
                 if ssp_agent::forget_bond(&a) {
@@ -719,6 +757,20 @@ mod tests {
         assert!(c.has_request(), "peeking must not consume");
         assert_eq!(c.take_request(), Some(Some([1, 2, 3, 4, 5, 6])));
         assert!(!c.has_request());
+    }
+
+    #[test]
+    fn pair_window_opens_closes_and_fails_closed() {
+        let ctrl = Control::new(Arc::new(AtomicBool::new(false)));
+        assert_eq!(handle_request(&ctrl, r#"{"cmd":"pair_window","seconds":120}"#), r#"{"ok":true,"seconds":120}"#);
+        assert!(ctrl.pair_window().is_open(now_ms()));
+        assert_eq!(handle_request(&ctrl, r#"{"cmd":"pair_window","seconds":9000}"#), r#"{"ok":true,"seconds":300}"#);
+        assert_eq!(handle_request(&ctrl, r#"{"cmd":"pair_window","seconds":0}"#), r#"{"ok":true,"seconds":0}"#);
+        assert!(!ctrl.pair_window().is_open(now_ms()));
+        for bad in [r#"{"cmd":"pair_window"}"#, r#"{"cmd":"pair_window","seconds":"120"}"#, r#"{"cmd":"pair_window","seconds":-5}"#] {
+            assert!(handle_request(&ctrl, bad).contains(r#""ok":false"#), "{bad}");
+        }
+        assert!(!ctrl.pair_window().is_open(now_ms()), "a refused request opens nothing");
     }
 
     #[test]

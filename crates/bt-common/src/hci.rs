@@ -58,6 +58,8 @@ const HCISETSCAN: u32 = 0x400448DD;
 
 /// Scan modes for [`set_scan`]: inquiry scan = discoverable, page scan = connectable.
 pub const SCAN_PAGE_AND_INQUIRY: u32 = 0x03;
+/// Connectable but not discoverable: bonded phones can still page us, nobody new can find us.
+pub const SCAN_PAGE: u32 = 0x02;
 pub const SCAN_NONE: u32 = 0x00;
 
 /// `struct hci_dev_req` — `{ __u16 dev_id; __u32 dev_opt; }`.

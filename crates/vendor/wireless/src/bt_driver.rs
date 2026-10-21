@@ -33,6 +33,23 @@ use std::time::{Duration, Instant};
 /// is self-correcting, and a write failure can never affect the handshake it is reporting on.
 const BT_PHASE_FILE: &str = "/tmp/bt_phase";
 
+/// The phone this iAP2-over-Bluetooth session is talking to (mgmt little-endian), set by [`run`]. One
+/// session runs at a time (`control::SessionClaim`), so one slot is enough.
+static SESSION_PEER: std::sync::Mutex<Option<[u8; 6]>> = std::sync::Mutex::new(None);
+
+/// Whether `peer` may be told the AP's SSID and passphrase: only a phone this box is bonded with
+/// (security plan 2026-10-21 H1). New bonds happen only inside the pairing window the app opens, so
+/// "bonded" is the allowlist. iAP2 authenticates the accessory to the phone, never the phone to us,
+/// so before this any device that reached 0x5702 got the credentials. An unknown peer is refused.
+pub(crate) fn wifi_config_allowed(peer: Option<[u8; 6]>) -> bool {
+    peer.is_some_and(|p| crate::ssp_agent::bonded_addrs().contains(&p))
+}
+
+/// Last two octets of a mgmt little-endian bdaddr, for log lines (never the whole address).
+fn peer_tail(peer: Option<[u8; 6]>) -> String {
+    peer.map_or_else(|| "unknown".to_string(), |p| format!("..{:02X}:{:02X}", p[1], p[0]))
+}
+
 /// Best-effort: reporting must never perturb what it reports.
 ///
 /// Temp-then-`rename` (ocbmd's `write_flag_atomic` idiom), not a bare `fs::write`: the file is
@@ -134,8 +151,13 @@ const MAX_REASSEMBLY: usize = 8192;
 ///
 /// A thin wrapper over [`session`] purely so the phase mirror is un-latched on EVERY exit, including
 /// the three early returns that never enter the loop. See the `publish_bt_phase` call below.
-pub fn run(sock: File, name: &str, shutdown: &AtomicBool) {
+///
+/// `peer` is the phone's bdaddr (mgmt little-endian) when the caller knows it — both the accept path
+/// and reconnect do — and decides whether the Wi-Fi details may be handed over ([`wifi_config_allowed`]).
+pub fn run(sock: File, name: &str, shutdown: &AtomicBool, peer: Option<[u8; 6]>) {
+    *SESSION_PEER.lock().unwrap_or_else(|e| e.into_inner()) = peer;
     session(sock, name, shutdown);
+    *SESSION_PEER.lock().unwrap_or_else(|e| e.into_inner()) = None;
     // Un-latch the phase mirror (audit 3.3). `/tmp/bt_phase` is last-write-wins with no unlink, so
     // without this the deepest phase reached since boot stays readable forever and `ocbmd` re-emits
     // it to every fresh subscriber -- the host sees a phantom "phone detected" long after the phone
@@ -408,6 +430,17 @@ fn process_one(
     // phone can join wlan0. Intercepted here (not in iap2-core::state) to keep the shared wired state
     // machine untouched. Sent on the control session (1), like identify.
     if msg_id == spec::MSG_REQUEST_ACCESSORY_WI_FI_CONFIGURATION_INFORMATION {
+        // Checked when the request arrives, not when the session started: a phone pairing for the
+        // first time bonds moments before it asks, and the link key is persisted on NEW_LINK_KEY.
+        let peer = *SESSION_PEER.lock().unwrap_or_else(|e| e.into_inner());
+        if !wifi_config_allowed(peer) {
+            log(&format!(
+                "RX 0x5702 RequestAccessoryWiFiConfig from {} -- not bonded with this box; not replying \
+                 (pair it through the app's Add phone first)",
+                peer_tail(peer)
+            ));
+            return false;
+        }
         // No readable AP config means we cannot answer truthfully. Say nothing: the phone retries
         // 0x5702 on its own (three times per handoff, av.rs), which is the path that recovers if
         // hostapd comes up late. Replying with an invented SSID would send the phone off Bluetooth
@@ -765,7 +798,7 @@ mod tests {
         });
 
         std::thread::scope(|sc| {
-            sc.spawn(|| run(acc, "test-accessory", &shutdown));
+            sc.spawn(|| run(acc, "test-accessory", &shutdown, None));
             std::thread::sleep(Duration::from_secs(13));
             shutdown.store(true, Ordering::Relaxed);
         });
@@ -796,7 +829,7 @@ mod tests {
         drop(peer);
         publish_bt_phase(ocbm_proto::BTP_IDENTIFIED); // pretend a previous session got deep
         let shutdown = AtomicBool::new(false);
-        run(acc, "test-accessory", &shutdown);
+        run(acc, "test-accessory", &shutdown, None);
         assert_eq!(
             std::fs::read_to_string(BT_PHASE_FILE).unwrap().trim(),
             ocbm_proto::BTP_IDLE.to_string(),
@@ -807,7 +840,7 @@ mod tests {
         let (acc2, peer2) = pair();
         publish_bt_phase(ocbm_proto::BTP_IDENTIFIED);
         std::thread::scope(|sc| {
-            let h = sc.spawn(|| run(acc2, "test-accessory", &shutdown));
+            let h = sc.spawn(|| run(acc2, "test-accessory", &shutdown, None));
             drop(peer2);
             h.join().unwrap();
         });

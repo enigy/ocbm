@@ -129,10 +129,11 @@ fn rfcomm_connect(
     }
 }
 
+/// One accepted RFCOMM connection and the phone's bdaddr (mgmt little-endian), or None on shutdown.
 fn rfcomm_accept(
     channel: u8,
     shutdown: &AtomicBool,
-) -> std::io::Result<Option<std::fs::File>> {
+) -> std::io::Result<Option<(std::fs::File, [u8; 6])>> {
     if rfcomm_uspace::selected() {
         rfcomm_uspace::accept_one(channel, shutdown)
     } else {
@@ -315,7 +316,7 @@ fn run_active_session(
         return;
     }
     log(&format!(
-        "discoverable as \"{accessory_name}\" -- waiting for pairing or preempt"
+        "Bluetooth up as \"{accessory_name}\" -- waiting for a phone or preempt (discoverable only while pairing is open)"
     ));
 
     let ssp_shutdown = Arc::new(AtomicBool::new(false));
@@ -323,6 +324,8 @@ fn run_active_session(
     // The head unit's Numeric-Comparison yes/no. Owned by the PROCESS-lifetime `Control` (the
     // control port is bound before the claim loop), cloned into each session's agent thread.
     let pair_answer = ctrl.pair_answer();
+    // The pairing window ("Add phone" in the app), also process-lifetime (security plan H1).
+    let pair_window = ctrl.pair_window();
     let ssp_handle = thread::spawn(move || {
         // Restart on error, like both accept loops below. `run` returns `Ok(())` on the shutdown
         // flag, so an `Err` is always a transient failure (the mgmt socket right after bring_up's
@@ -330,7 +333,7 @@ fn run_active_session(
         // that exits leaves the box discoverable but unable to pair for the rest of the session.
         while !t.load(Ordering::Relaxed) {
             let on_pair_rejected = || bt_driver::publish_bt_phase(ocbm_proto::BTP_PAIR_REJECTED);
-            match ssp_agent::run(CONTROLLER_INDEX, &t, Some(&on_pair_rejected), Some(&pair_answer)) {
+            match ssp_agent::run(CONTROLLER_INDEX, &t, Some(&on_pair_rejected), Some(&pair_answer), Some(&pair_window)) {
                 Ok(()) => break,
                 Err(e) => {
                     log(&format!("SSP agent exited: {e} -- restarting"));
@@ -404,7 +407,7 @@ fn run_active_session(
             break;
         }
         match rfcomm_accept(RFCOMM_CHANNEL, &t) {
-            Ok(Some(sock)) => {
+            Ok(Some((sock, peer))) => {
                 log("RFCOMM client connected -- starting iAP2 handshake");
                 // Claim the single-session slot ATOMICALLY (compare_exchange, not a plain store) so the
                 // accept path and the Model-B reconnect path can never run two concurrent bt_driver::run
@@ -417,16 +420,15 @@ fn run_active_session(
                 // NB `_claim`, not `_`: `let _ = ...` drops the guard IMMEDIATELY and would release
                 // the claim before the driver even starts.
                 let Some(_claim) =
-                    control::SessionClaim::try_claim(&accept_active, &accept_ctrl, None)
+                    control::SessionClaim::try_claim(&accept_active, &accept_ctrl, Some(peer))
                 else {
                     log("session already active (reconnect in progress) -- dropping inbound connect");
                     continue;
                 };
-                // The peer bdaddr is not published here: the accept path is handed an already-open
-                // socket. `status.active` is true regardless, which is what the app gates on — and
-                // getting THAT wrong is what made the device screen offer Forget for the phone that
-                // was actively projecting.
-                bt_driver::run(sock, &rfcomm_name, &t);
+                // The peer comes from the accept itself now (security plan H1 needs it to decide
+                // who may have the Wi-Fi details), so the device screen can mark this phone's row
+                // connected too. `status.active` stays what the app gates on.
+                bt_driver::run(sock, &rfcomm_name, &t, Some(peer));
                 log("RFCOMM session ended");
             }
             Ok(None) => break, // shutdown
@@ -473,9 +475,18 @@ fn run_active_session(
                 break;
             }
             match rfcomm_accept(AA_RFCOMM_CHANNEL, &t) {
-                Ok(Some(mut sock)) => {
+                Ok(Some((mut sock, peer))) => {
+                    // The Android Auto bootstrap hands the phone the AP credentials too
+                    // (WifiInfoResponse), so the same rule as CarPlay's 0x5703: bonded phones only.
+                    if !bt_driver::wifi_config_allowed(Some(peer)) {
+                        log(&format!(
+                            "AA: RFCOMM client ..{:02X}:{:02X} is not bonded with this box -- dropping it (pair it through the app's Add phone first)",
+                            peer[1], peer[0]
+                        ));
+                        continue;
+                    }
                     let Some(_claim) =
-                        control::SessionClaim::try_claim(&aa_active, &aa_ctrl, None)
+                        control::SessionClaim::try_claim(&aa_active, &aa_ctrl, Some(peer))
                     else {
                         log("AA: session already active -- dropping inbound connect");
                         continue;
@@ -555,7 +566,7 @@ fn run_active_session(
                     break;
                 }
                 match rfcomm_accept(channel, &t) {
-                    Ok(Some(mut sock)) => {
+                    Ok(Some((mut sock, _peer))) => {
                         log(&format!(
                             "{}: the phone connected to our headset channel {channel}",
                             path.as_str()
