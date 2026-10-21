@@ -830,6 +830,11 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
   writes one when the existing key is absent or under 8 chars, so an existing `12345678` is never
   replaced. **This is a deliberate development posture** (telnetd is the documented rollback channel)
   and therefore an owner decision, not a defect — recorded so it is a decision and not an oversight.
+  **Partly closed 2026-10-21 (branch `security-fixes`):** `ocbm_boot.sh` stops telnetd and dropbear
+  in OCBM mode (the NCM modes keep them as the rescue channel), and `radio_ap_up.sh` treats
+  `12345678` and the old MAC-derived fallback as missing and writes a random passphrase once (the
+  phone gets it in the 0x5703 handoff). Still open: `ncm_wifi` runs the AP alongside unbound
+  telnetd/dropbear, and the stock dropbear host keys are shared across units.
   Source: `docs/ops/05_AUDITS.md` §7 ("Outside the review's scope, for the owner"). Verified open 2026-08-16:
   `grep -n "wpa_passphrase" ccpa/rootfs/script/radio_ap_up.sh` → the guard is `[ "${#PSK}" -lt 8 ]`;
   `cat ccpa/rootfs/etc/init.d/rcS` → `busybox telnetd -l /bin/sh -p 23 &`;

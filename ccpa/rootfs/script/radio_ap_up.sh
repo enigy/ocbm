@@ -108,16 +108,23 @@ echo "$NAME" > /etc/wifi_name
 # ---- passphrase: set only if MISSING, never blanked ------------------------------------------
 # The vendor bug this guards against is unconditional rewriting from a config oracle that no
 # longer exists. We only ever fill in an absent or too-short key, and never overwrite a good one.
+# A well-known default counts as missing (security review C1, 2026-10-21): Carlinkit ships
+# 12345678, and the old fallback below was derived from the AP's own MAC, which the AP broadcasts.
+# The replacement is random and persisted once; the phone is handed it in the iAP2 0x5703 handoff
+# at every connect, so nobody ever types it.
+_known_psk() { case "$1" in 12345678|"carplay$SUF") return 0 ;; esac; return 1; }
 PSK=$(sed -n 's/^wpa_passphrase=//p' /etc/hostapd.conf | head -1)
+_known_psk "$PSK" && PSK=""
 if [ "${#PSK}" -lt 8 ]; then
   PSK=$(cat /etc/wifi_password 2>/dev/null | tr -cd '[:print:]' | head -c 63)
-  [ "${#PSK}" -lt 8 ] && PSK="carplay$SUF"
+  _known_psk "$PSK" && PSK=""
+  [ "${#PSK}" -lt 8 ] && PSK=$(head -c 64 /dev/urandom | md5sum | cut -c1-20)
   if grep -q '^wpa_passphrase=' /etc/hostapd.conf; then
     sed -i "s/^wpa_passphrase=.*/wpa_passphrase=$PSK/" /etc/hostapd.conf
   else
     echo "wpa_passphrase=$PSK" >> /etc/hostapd.conf
   fi
-  echo "$L wpa_passphrase was absent/too short - set a device-derived one"
+  echo "$L wpa_passphrase was absent, too short or a known default - set a random one"
 fi
 
 # ---- channel + band ---------------------------------------------------------------------------

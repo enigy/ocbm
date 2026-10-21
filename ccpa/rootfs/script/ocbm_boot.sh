@@ -68,6 +68,15 @@ touch /tmp/UDiskPassThroughMode
     setsid sh /script/radio_hal.sh preload >> /tmp/box.log 2>&1 </dev/null &
   fi
 
+  # No remote login in OCBM mode (security review C1, 2026-10-21). The box's rcS starts dropbear
+  # and a passwordless telnetd on every boot, bound to no interface, so in this mode they would
+  # also answer on the Wi-Fi AP raised for every session. OCBM mode is managed over the OCBM
+  # console and the UART; the NCM modes never run this script, so ncm_only / ncm_wifi (and the
+  # failover into them) keep both as the rescue channel. Bracketed patterns: no self-match.
+  pkill -f "[b]usybox telnetd" 2>/dev/null
+  pkill -x dropbear 2>/dev/null
+  echo "[ocbm-boot] remote login off in OCBM mode (telnetd/dropbear stopped)" >> /tmp/box.log
+
   # ---- FIRST-BOOT DEAD-MAN (armed by ocbm_install.sh finalize: /script/ocbm_trial) --------
   # The installer tells the operator: "if this host does not confirm over the OCBM link within
   # 240s, the box restores ncm_only and reboots itself back to NCM." That promise was made by
