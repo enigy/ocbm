@@ -98,7 +98,8 @@ die()  { printf '[ocbm] ABORT: %s\n' "$*" >&2; exit 1; }
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR
           -o ConnectTimeout=8 -o ServerAliveInterval=5 -o ServerAliveCountMax=3)
 SSHP=()
-command -v sshpass >/dev/null 2>&1 && SSHP=(sshpass -p "${BOX_PW:-}")
+# `sshpass -e` reads the password from SSHPASS, not argv: `-p PW` shows it to every local user in `ps`.
+command -v sshpass >/dev/null 2>&1 && { export SSHPASS="${BOX_PW:-}"; SSHP=(sshpass -e); }
 VIA=""
 
 detect_transport() {

@@ -107,7 +107,9 @@
 #   --host IP        adapter address (default 192.168.50.2 — NOT .100, that is your Mac's
 #                    DHCP lease from the adapter's udhcpd)
 #   --pass PW        root password; implies ssh. Omit for the shipped blank-password unit —
-#                    `install` prompts for an IP/password only if the default endpoint is dead
+#                    `install` prompts for an IP/password only if the default endpoint is dead.
+#                    Prefer BOX_PW=... in the environment (or the prompt): an argv password
+#                    is visible to every local user in `ps` while the install runs
 #   --via ssh|telnet transport (default ssh, changed 2026-09-05). TELNET IS THE RESCUE PATH:
 #                    it exists so a unit whose dropbear/authorized_keys is broken can be repaired,
 #                    and it moves files as 2 KB base64 chunks through a line-oriented shell. Do not
@@ -131,7 +133,7 @@ OVERLAY="$REPO/ccpa/rootfs"
 BOXSH="$REPO/tools/boxsh.py"
 
 BOX="192.168.50.2"
-BOX_PW=""
+BOX_PW="${BOX_PW:-}"   # from the environment keeps it out of `ps`, unlike --pass
 VIA="ssh"
 HOST_IF=""
 HOST_IP="192.168.50.1"
@@ -194,7 +196,8 @@ SSH_OPTS=(${SSH_KEY_OPTS[@]+"${SSH_KEY_OPTS[@]}"}
 box() {   # run a shell command on the box; stdout passthrough, exit status preserved
   if [ "$VIA" = telnet ]; then python3 "$BOXSH" --host "$BOX" --timeout "${BOX_TIMEOUT:-45}" run "$1"
   elif [ -n "$BOX_PW" ] && command -v sshpass >/dev/null 2>&1; then
-    sshpass -p "$BOX_PW" ssh "${SSH_OPTS[@]}" "root@$BOX" "$1"
+    # -e reads SSHPASS from the environment; `-p PW` would show the password to every local user in `ps`.
+    SSHPASS="$BOX_PW" sshpass -e ssh "${SSH_OPTS[@]}" "root@$BOX" "$1"
   else ssh "${SSH_OPTS[@]}" "root@$BOX" "$1"; fi
 }
 box_slow() { BOX_TIMEOUT=600 box "$1"; }   # 528 MHz ARM: whole-rootfs scans need real time

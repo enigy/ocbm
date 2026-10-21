@@ -4,6 +4,10 @@ on:
     branches: ["**"]
   pull_request:
 
+# Build and test only: the token needs nothing beyond reading the repo.
+permissions:
+  contents: read
+
 jobs:
   iap2-core:
     runs-on: ubuntu-latest
