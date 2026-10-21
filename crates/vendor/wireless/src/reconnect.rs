@@ -50,6 +50,12 @@ use crate::{bt_driver, control, hfp_hf, sco_audio, sdp_client};
 const CONNECT_TIMEOUT_SECS: i64 = 8;
 const BACKOFF_START_SECS: u64 = 10;
 const BACKOFF_MAX_SECS: u64 = 60;
+/// One short retry when the FIRST round after start-up fails, instead of the full
+/// `BACKOFF_START_SECS`. Reset cycle on a CCPA, 2026-10-20: in 3 of 8 reconnects the first page
+/// failed ~5 s in (`SDP query failed: Connection reset by peer` twice, `Host is down` once) and the
+/// very next attempt succeeded - but only after the 10 s floor, so each cost ~15 s. Once per daemon
+/// start, so it cannot spin: every later round still gets the floor and the doubling.
+const FIRST_RETRY_SECS: u64 = 2;
 /// Let bring-up/SSP/SDP settle and give the phone a moment to connect IN on its own before we start
 /// paging it ourselves.
 ///
@@ -794,6 +800,7 @@ pub fn run(
     }
 
     let mut backoff = BACKOFF_START_SECS;
+    let mut first_round = true;
     // Log only on a change in the bonded/idle state, so the per-round re-read below doesn't spam the log.
     // `None` = nothing logged yet; `Some(true)` = had bonds; `Some(false)` = idle.
     let mut last_state: Option<bool> = None;
@@ -893,13 +900,19 @@ pub fn run(
         // DLC then drops, or fails auth fast) makes each attempt return in well under a second. Without this
         // floor the old `continue` spun the loop back-to-back — pinning the single i.MX6UL core and paging
         // the phone continuously. A genuine session that just ended still retries within BACKOFF_START_SECS.
-        if !sleep_or_request(backoff, shutdown, ctrl) {
+        // The single exception is FIRST_RETRY_SECS, once, after a first round that failed outright.
+        let quick = first_round && !ran && !rejected;
+        first_round = false;
+        if quick {
+            log(&format!("first page round failed -- one quick retry in {FIRST_RETRY_SECS}s"));
+        }
+        if !sleep_or_request(if quick { FIRST_RETRY_SECS } else { backoff }, shutdown, ctrl) {
             break;
         }
         if rejected {
             // The hold-off is over: drop the flag so the next attempt is judged on its own.
             let _ = std::fs::remove_file(bt_common::rfcomm_uspace::PAIR_REJECTED_FLAG);
-        } else if !ran {
+        } else if !ran && !quick {
             backoff = (backoff * 2).min(BACKOFF_MAX_SECS);
         }
     }

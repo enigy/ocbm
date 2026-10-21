@@ -75,10 +75,34 @@ fn eir_hex(name: &str) -> String {
 }
 
 fn run(args: &[&str]) -> std::io::Result<()> {
+    run_with(Command::new("hciconfig"), args)
+}
+
+/// BusyBox `chrt`, present on the CCPA rootfs.
+const CHRT: &str = "/usr/bin/chrt";
+
+/// `hciconfig down` / `up` at SCHED_FIFO 1 where `chrt` exists, plain `hciconfig` otherwise.
+///
+/// Both are ioctls that wait in the kernel's `__hci_req_sync`, the path that loses its wake-up on
+/// the CCPA's 3.14 kernel when the controller answers before the caller is on the wait queue (the
+/// 10 s piscan stall, `hci::write_scan_enable`; seen once on `up` as well, 2026-10-20). Unlike scan
+/// enable these cannot go raw - the DOWN->UP cycle exists for what `hci_dev_do_open` does. But the
+/// box has ONE core, and the command is only sent by the HCI workqueue, which cannot preempt a
+/// real-time caller: the caller is always on the wait queue before the command even leaves.
+fn run_rt(args: &[&str]) -> std::io::Result<()> {
+    if !std::path::Path::new(CHRT).exists() {
+        return run(args);
+    }
+    let mut cmd = Command::new(CHRT);
+    cmd.args(["-f", "1", "hciconfig"]);
+    run_with(cmd, args)
+}
+
+fn run_with(mut cmd: Command, args: &[&str]) -> std::io::Result<()> {
     // Captured (not inherited) so a failure's stderr lands in the SAME log line as the argv and exit
     // status -- `hciconfig`'s own stderr is a few words with no context, and split across a raw
     // process's inherited stdio it is unattributable once other daemons are logging concurrently.
-    let out = Command::new("hciconfig").args(args).output()?;
+    let out = cmd.args(args).output()?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         eprintln!("[btd] hciconfig {args:?} failed: status={} stderr={stderr:?}", out.status);
@@ -280,9 +304,9 @@ pub fn bring_up(hci_dev: &str, name: &str) -> std::io::Result<()> {
         return Ok(());
     }
 
-    let _ = run(&[hci_dev, "down"]);
+    let _ = run_rt(&[hci_dev, "down"]);
     stamp(t0, "down");
-    run(&[hci_dev, "up"])?;
+    run_rt(&[hci_dev, "up"])?;
     stamp(t0, "up");
     // Force Simple Pairing mode ON at the HCI level (HCI Write_Simple_Pairing_Mode). The NXP IW416
     // firmware defaults SSP OFF and the mgmt SET_SSP path can be rejected silently, leaving "Simple

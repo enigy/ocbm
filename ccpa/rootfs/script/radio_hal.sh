@@ -187,6 +187,13 @@ bt_responsive() {  # $1 = hci dev
 bt_powered_up() {  # $1 = hci dev
   timeout 5 hciconfig "$1" 2>/dev/null | grep -q "UP RUNNING"
 }
+# `hciconfig <dev> up|down` at SCHED_FIFO 1 where chrt exists. Both wait in the kernel's
+# __hci_req_sync, which on the CCPA's single-core 3.14 kernel can lose its wake-up and sleep the
+# full 10 s timeout; a real-time caller is always waiting before the HCI workqueue can even send
+# the command (btd's bt_bringup::run_rt has the measurements).
+hci_rt() {
+  if command -v chrt >/dev/null 2>&1; then chrt -f 1 hciconfig "$@"; else hciconfig "$@"; fi
+}
 
 # Confirmed variant - used for DECISIONS, never inside a poll loop.
 #
@@ -516,7 +523,7 @@ do_bt_on() {
     else
       log "$_d powered down (between-sessions state) - powering it up"
     fi
-    hciconfig "$_d" up 2>/dev/null
+    hci_rt "$_d" up 2>/dev/null
     if bt_responsive_confirmed "$_d"; then
       log "$_d was only powered down - up and responsive, no reset needed"
       publish "$BT_STATE" "result=ok" "backend=$RADIO_BACKEND" "hci_dev=$_d" \
@@ -730,7 +737,14 @@ do_bt_off() {
   # timeout on the CCPA's 3.14 kernel (lost wake-up, btd's hci::write_scan_enable), and this
   # runs under the bt lock, so the next session's bt_on would wait behind it.
   timeout 5 hcitool -i "$_d" cmd 0x03 0x001a 0x00 >/dev/null 2>&1
-  hciconfig "$_d" down   2>/dev/null
+  # End every ACL with a real HCI Disconnect before powering down. `down` resets the controller,
+  # and a reset is not a disconnect: the phone is not told the link ended and may only learn it
+  # from its supervision timeout. Once this teardown actually ran (2026-10-20), the next session's
+  # first page failed in 3 of 8 reconnects, each costing the reconnect loop's 10 s backoff.
+  for _a in $(timeout 3 hcitool -i "$_d" con 2>/dev/null | awk '/ACL/ {print $3}'); do
+    timeout 3 hcitool -i "$_d" dc "$_a" 2>/dev/null && log "BT disconnected $_a before power-down"
+  done
+  hci_rt "$_d" down   2>/dev/null
   rm -f "$BT_STATE"
   log "BT $_d powered down (attach left in place)"
   return 0
