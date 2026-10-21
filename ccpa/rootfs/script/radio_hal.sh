@@ -181,6 +181,12 @@ hci_dev() {
 bt_responsive() {  # $1 = hci dev
   timeout 5 hciconfig "$1" name 2>/dev/null | grep -q "Name:"
 }
+# Kernel flags only (HCIGETDEVINFO, what `hciconfig <dev>` prints): never reaches the chip, so it
+# answers instantly even against a wedged controller. Says nothing about responsiveness - that is
+# still bt_responsive's job - only whether a name read can possibly succeed.
+bt_powered_up() {  # $1 = hci dev
+  timeout 5 hciconfig "$1" 2>/dev/null | grep -q "UP RUNNING"
+}
 
 # Confirmed variant - used for DECISIONS, never inside a poll loop.
 #
@@ -485,7 +491,11 @@ do_bt_on() {
   caps || { publish "$BT_STATE" "result=unsupported" "detail=no-descriptor"; return 3; }
 
   _d=$(hci_dev 2>/dev/null) || _d=""
-  if [ -n "$_d" ] && bt_responsive_confirmed "$_d"; then
+  # Only a POWERED-UP adapter can pass the confirmation: on a DOWN one every name read fails
+  # instantly with ENETDOWN, so the confirmation's 5 tries x 2 s sleeps were 8 s of pure waiting
+  # before the power-up branch below - paid on every session that starts from the supervisor's
+  # between-sessions state (measured 2026-10-20: bt_on 9.5 s from DOWN vs 0.4 s for the power-up).
+  if [ -n "$_d" ] && bt_powered_up "$_d" && bt_responsive_confirmed "$_d"; then
     log "already converged ($_d responsive)"
     publish "$BT_STATE" "result=ok" "backend=$RADIO_BACKEND" "hci_dev=$_d" \
             "bt_mac=$(cat /sys/class/bluetooth/$_d/address 2>/dev/null)"
@@ -501,7 +511,11 @@ do_bt_on() {
   # when a single `hciconfig up` was the entire fix. Today's testing was all cold bring-up, which
   # never exercises this path.
   if [ -n "$_d" ]; then
-    log "$_d present but not answering - trying to power it up before assuming it is wedged"
+    if bt_powered_up "$_d"; then
+      log "$_d present but not answering - trying to power it up before assuming it is wedged"
+    else
+      log "$_d powered down (between-sessions state) - powering it up"
+    fi
     hciconfig "$_d" up 2>/dev/null
     if bt_responsive_confirmed "$_d"; then
       log "$_d was only powered down - up and responsive, no reset needed"
