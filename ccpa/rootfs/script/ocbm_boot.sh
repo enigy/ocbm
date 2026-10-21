@@ -59,6 +59,15 @@ touch /tmp/UDiskPassThroughMode
   echo "[ocbm-boot] armed functions=$(cat $A/functions) class=$(cat $A/bDeviceClass) pid=$(cat $A/idProduct) state=$(cat $A/state) acc=$([ -e /dev/usb_accessory ] && echo yes) ocbmd=$OCBMD sup=$(pgrep -f session_supervisor)" >> "$L"
   echo "[ocbm-boot] armed functions=$(cat $A/functions) class=$(cat $A/bDeviceClass) pid=$(cat $A/idProduct) state=$(cat $A/state) acc=$([ -e /dev/usb_accessory ] && echo yes) ocbmd=$OCBMD sup=$(pgrep -f session_supervisor)" >> /tmp/box.log
 
+  # Opt-in boot radio preload: drivers + BT attach into the between-sessions state while the head
+  # unit boots (radio_hal.sh do_preload has the why and the wedge guards). After ocbmd and the
+  # supervisor, backgrounded, so it can never delay the management link; never on a first-boot
+  # trial, whose self-revert must not share the boot with anything new.
+  if [ -e /script/radio_preload ] && [ ! -e /script/ocbm_trial ] && [ -r /script/radio_hal.sh ]; then
+    echo "[ocbm-boot] radio preload starting" >> /tmp/box.log
+    setsid sh /script/radio_hal.sh preload >> /tmp/box.log 2>&1 </dev/null &
+  fi
+
   # ---- FIRST-BOOT DEAD-MAN (armed by ocbm_install.sh finalize: /script/ocbm_trial) --------
   # The installer tells the operator: "if this host does not confirm over the OCBM link within
   # 240s, the box restores ncm_only and reboots itself back to NCM." That promise was made by

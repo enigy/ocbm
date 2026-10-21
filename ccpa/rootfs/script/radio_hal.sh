@@ -492,6 +492,41 @@ do_wifi_ap_off() {
 }
 
 # =============================================================================================
+# BOOT PRELOAD (opt-in: /script/radio_preload; started by ocbm_boot.sh)
+# =============================================================================================
+# Load this unit's WLAN driver and attach BT, then power BT down: exactly the state the supervisor
+# leaves between sessions (drivers loaded, attached, hci0 DOWN, no AP - nothing a phone can see).
+# The first app connect after power-up then skips the driver and firmware load (~7 s measured
+# 2026-10-20, IW416), done here while the box waits for the head unit to boot. A deliberate,
+# owner-approved exception to docs/carplay/04_CAPABILITIES_AND_CONFIG.md directive 3 - see there.
+#
+# Two guards against a boot-time wedge on a unit with no UART:
+#  * ONE attach attempt (RADIO_BT_MAX_TRIES=1): never reclaim+reset, the GPIO reset under a live
+#    WLAN driver being the wedge-prone step. A failure is left to the app-driven bt_on, exactly as
+#    if this had not run.
+#  * An in-flight marker on flash. A boot that finds it knows the previous preload never finished
+#    (hung, or power lost inside it) and DISABLES the preload by removing the opt-in flag, so a
+#    unit that wedges here costs one bad boot, not one in two.
+PRELOAD_FLAG=/script/radio_preload
+PRELOAD_MARK=/script/.radio_preload_inflight
+do_preload() {
+  if [ -e "$PRELOAD_MARK" ]; then
+    rm -f "$PRELOAD_FLAG" "$PRELOAD_MARK"; sync
+    log "preload: the previous boot's preload never finished - preload DISABLED (touch $PRELOAD_FLAG to re-enable)"
+    return 1
+  fi
+  touch "$PRELOAD_MARK"; sync
+  _p0=$(cut -d' ' -f1 /proc/uptime)
+  RADIO_BT_MAX_TRIES=1
+  do_bt_on; _pr=$?
+  # Attached (fresh, or already there): power it down to the between-sessions state.
+  { [ "$_pr" = 0 ] || [ "$_pr" = 2 ]; } && do_bt_off
+  rm -f "$PRELOAD_MARK"; sync
+  log "preload: done rc=$_pr in $(awk "BEGIN{printf \"%.1f\", $(cut -d' ' -f1 /proc/uptime)-$_p0}") s, wlan=$(wlan_iface 2>/dev/null || echo none) bt=$(hciconfig 2>/dev/null | grep -oE 'UP RUNNING|DOWN' | head -1)"
+  return $_pr
+}
+
+# =============================================================================================
 # BLUETOOTH
 # =============================================================================================
 do_bt_on() {
@@ -683,8 +718,10 @@ do_bt_on() {
       # Clause 1: the attach runs detached so a helper that blocks cannot hang this verb, but we
       # DO NOT return until it converges. That is the whole difference from the vendor path,
       # which forks the attach and returns immediately.
+      # RADIO_BT_MAX_TRIES: the boot preload passes 1, so it never reaches reclaim+reset (attempt 1
+      # only reclaims a helper that is already running, which at boot none is).
       _try=0; _d=""
-      while [ "$_try" -lt 4 ]; do
+      while [ "$_try" -lt "${RADIO_BT_MAX_TRIES:-4}" ]; do
         _try=$((_try+1))
         if [ "$_try" -gt 1 ] || pgrep -x "$_helper" >/dev/null 2>&1 || ps | grep -v grep | grep -qw "$_helper"; then
           log "reclaim+reset (attempt $_try)"; bt_reclaim_reset
@@ -772,9 +809,13 @@ case "$VERB" in
   wifi_ap_off) lock_take wlan || exit 1; do_wifi_ap_off; _r=$?; lock_drop wlan; exit $_r ;;
   bt_on)       lock_take bt   || exit 1; do_bt_on;       _r=$?; lock_drop bt;   exit $_r ;;
   bt_off)      lock_take bt   || exit 1; do_bt_off;      _r=$?; lock_drop bt;   exit $_r ;;
+  # Both locks, wlan first (the supervisor's own order, one at a time, so no deadlock): bt_on loads
+  # the WLAN driver, which an app-driven wifi_ap_on arriving mid-preload must not race.
+  preload)     lock_take wlan || exit 1; lock_take bt || { lock_drop wlan; exit 1; }
+               do_preload; _r=$?; lock_drop bt; rm -rf /tmp/.radio_lock_wlan 2>/dev/null; exit $_r ;;
   # Best-effort and idempotent: the daemon calls it after every bring-up DOWN->UP, and a unit
   # whose branch carries no SCO mapping must report that (3) rather than fail the caller.
   sco_on)      log "sco_on: taking the bt lock"; lock_take bt || exit 1; log "sco_on: bt lock taken"
                do_sco_on;      _r=$?; lock_drop bt;   exit $_r ;;
-  *) echo "$LOGP usage: radio_hal.sh probe|status|wifi_ap_on|wifi_ap_off|bt_on|bt_off|sco_on" >&2; exit 64 ;;
+  *) echo "$LOGP usage: radio_hal.sh probe|status|wifi_ap_on|wifi_ap_off|bt_on|bt_off|sco_on|preload" >&2; exit 64 ;;
 esac

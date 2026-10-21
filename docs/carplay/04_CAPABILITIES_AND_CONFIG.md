@@ -32,6 +32,11 @@ Issued by the owner on 2026-08-10 (EV-telematics research session):
 3. **Configuration is pushed at initialization.** The box stays IDLE until the app connects; the app
    pushes all config; only then does the box enable WLAN/BT or accept a wired CarPlay connection —
    so everything needed is ready before the phone ever sees the accessory.
+   **Exception (owner-approved 2026-10-20, opt-in `/script/radio_preload`):** at boot the box may
+   load its radio drivers and attach BT into the between-sessions state — no AP, `hci0` DOWN,
+   nothing a phone can see — so the first connect after power-up skips the driver and firmware
+   load. The AP and a discoverable radio still come up only on app command. Mechanism and wedge
+   guards: `radio_hal.sh` `do_preload`.
 4. **Box placement is earned, never designed-in.** The only path for functionality onto the box:
    implement app-driven first → it demonstrably FAILS under excessive testing → the owner explicitly
    approves the move. (The box-driven SETUP local response — kept as a sticky fallback after
