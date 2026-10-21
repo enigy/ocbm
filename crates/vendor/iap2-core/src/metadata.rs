@@ -494,6 +494,30 @@ pub fn route_guidance(body: &[u8]) -> String {
                 j.n("maneuverTotalCount", n)
             }
         }
+        // ids 15-18: lane guidance presentation. iOS sends EVERY 0x5204 block of the route at once
+        // (route start and each re-route — 9 to 14 blocks on the 2026-10-21 drive) and then says here
+        // which block it is presenting (16, a 0x5204 LaneGuidanceIndex) and whether lanes are showing
+        // at all (18). Without these the host can only guess which lanes belong to the next junction.
+        15 => {
+            if let Some(n) = u8v(v) {
+                j.n("visibleInApp", n)
+            }
+        }
+        16 => {
+            if let Some(n) = uint(v) {
+                j.n("laneGuidanceCurrentIndex", n)
+            }
+        }
+        17 => {
+            if let Some(n) = uint(v) {
+                j.n("laneGuidanceTotalCount", n)
+            }
+        }
+        18 => {
+            if let Some(n) = u8v(v) {
+                j.n("presentLaneGuidance", n)
+            }
+        }
         // id 21 = DestinationTimeZoneOffsetMinutes (int16, SIGNED — e.g. UTC-8 = -480). Apple's catalog.
         21 => {
             if v.len() >= 2 {
@@ -1019,12 +1043,18 @@ pub fn app_icon(body: &[u8]) -> String {
 
 /// `0x5204 LaneGuidanceInformation` — one record per lane, with the recommendation status and the
 /// angle the lane leads to. `laneStatus`: 0 do not take, 1 usable, 2 preferred.
+///
+/// Every record also carries `laneCount` (the lanes in this 0x5204), so the host can replace a
+/// block whole when iOS re-sends it for a new route, and `laneAngles`: every direction the lane
+/// leads (a straight-or-right lane names two), next to the first one as `laneAngle` and the one
+/// the route takes as `laneAngleHighlight`.
 pub fn lane_guidance(body: &[u8], out: &mut Vec<String>) {
     let mut index = None;
-    walk(body, |id, v| {
-        if id == 1 {
-            index = uint(v);
-        }
+    let mut count = 0u64;
+    walk(body, |id, v| match id {
+        1 => index = uint(v),
+        2 => count += 1,
+        _ => {}
     });
     walk(body, |gid, gv| {
         if gid != 2 {
@@ -1034,6 +1064,7 @@ pub fn lane_guidance(body: &[u8], out: &mut Vec<String>) {
         if let Some(i) = index {
             j.n("guidanceIndex", i);
         }
+        let mut angles: Vec<i16> = Vec::new();
         walk(gv, |id, v| match id {
             0 => {
                 if let Some(n) = uint(v) {
@@ -1047,6 +1078,7 @@ pub fn lane_guidance(body: &[u8], out: &mut Vec<String>) {
             }
             // LaneAngle (2) is Apple-repeatable `[0+]`; emit only the first occurrence to avoid
             // duplicate JSON keys (unpredictable per RFC 8259, and Foundation keeps only the last).
+            // All of them go to `laneAngles`, whether iOS repeats the param or packs several int16s.
             2 | 3 => {
                 if let (Some(a), Some(b)) = (v.first(), v.get(1)) {
                     let key = if id == 2 { "laneAngle" } else { "laneAngleHighlight" };
@@ -1054,10 +1086,20 @@ pub fn lane_guidance(body: &[u8], out: &mut Vec<String>) {
                         j.i(key, i16::from_be_bytes([*a, *b]) as i64)
                     }
                 }
+                if id == 2 {
+                    angles.extend(v.chunks_exact(2).map(|c| i16::from_be_bytes([c[0], c[1]])));
+                }
             }
             _ => {}
         });
         if j.0.len() > 1 {
+            j.n("laneCount", count);
+            if !angles.is_empty() {
+                j.raw(
+                    "laneAngles",
+                    format!("[{}]", angles.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(",")),
+                );
+            }
             out.push(j.finish("laneGuidance"));
         }
     });
@@ -1717,6 +1759,42 @@ mod tests {
         assert_eq!(out.len(), 1, "{out:?}");
         assert_eq!(out[0].matches("\"laneAngle\"").count(), 1, "{}", out[0]);
         assert!(out[0].contains("\"laneAngle\":-45"), "{}", out[0]);
+    }
+
+    #[test]
+    fn lane_guidance_carries_the_count_and_every_direction() {
+        // A straight-or-right lane taken right: two LaneAngle params and a highlight.
+        let mut split = tlv(0, &1u16.to_be_bytes());
+        split.extend(tlv(1, &[2]));
+        split.extend(tlv(2, &0i16.to_be_bytes()));
+        split.extend(tlv(2, &90i16.to_be_bytes()));
+        split.extend(tlv(3, &90i16.to_be_bytes()));
+        let mut straight = tlv(0, &0u16.to_be_bytes());
+        straight.extend(tlv(1, &[0]));
+        straight.extend(tlv(2, &0i16.to_be_bytes()));
+        let mut body = tlv(1, &5u16.to_be_bytes());
+        body.extend(tlv(2, &straight));
+        body.extend(tlv(2, &split));
+        let mut out = Vec::new();
+        lane_guidance(&body, &mut out);
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert!(out.iter().all(|r| r.contains("\"laneCount\":2") && r.contains("\"guidanceIndex\":5")), "{out:?}");
+        assert!(out[1].contains("\"laneAngles\":[0,90]"), "{}", out[1]);
+        assert!(out[1].contains("\"laneAngle\":0") && out[1].contains("\"laneAngleHighlight\":90"), "{}", out[1]);
+        assert!(out[0].contains("\"laneAngles\":[0]"), "{}", out[0]);
+    }
+
+    #[test]
+    fn route_guidance_says_which_lane_block_is_showing() {
+        let mut body = tlv(1, &[1]); // RouteGuidanceState
+        body.extend(tlv(15, &[1])); // RouteGuidanceVisibleInApp
+        body.extend(tlv(16, &3u16.to_be_bytes())); // LaneGuidanceCurrentIndex
+        body.extend(tlv(17, &9u16.to_be_bytes())); // LaneGuidanceTotalCount
+        body.extend(tlv(18, &[1])); // PresentLaneGuidance
+        let j = route_guidance(&body);
+        for key in ["\"visibleInApp\":1", "\"laneGuidanceCurrentIndex\":3", "\"laneGuidanceTotalCount\":9", "\"presentLaneGuidance\":1"] {
+            assert!(j.contains(key), "{key} missing: {j}");
+        }
     }
 
     /// The dispatcher must own every id the feature table declares receivable — an update we asked
