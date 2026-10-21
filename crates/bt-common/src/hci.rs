@@ -50,6 +50,7 @@ const OP_WRITE_LOCAL_NAME: u16 = 0x0C13;
 const OP_WRITE_CLASS_OF_DEV: u16 = 0x0C24;
 const OP_WRITE_EIR: u16 = 0x0C52;
 const OP_WRITE_SSP_MODE: u16 = 0x0C56;
+const OP_WRITE_SCAN_ENABLE: u16 = 0x0C1A;
 
 /// `HCISETSCAN`, `_IOW('H', 221, int)`. Unlike the other operations this takes a POINTER to a
 /// `hci_dev_req`, matching BlueZ `tools/hciconfig.c`'s `cmd_scan`.
@@ -275,6 +276,24 @@ pub fn set_scan(dev: u16, scan: u32) -> io::Result<()> {
     Ok(())
 }
 
+/// `piscan` / `noscan` as a RAW Write_Scan_Enable command — for the CCPA's 3.14 kernel ONLY.
+///
+/// [`set_scan`] explains why modern kernels need the ioctl. On 3.14 the ioctl is the problem:
+/// HCISETSCAN waits in `__hci_req_sync` with the 10 s HCI_INIT_TIMEOUT, and that function starts
+/// the request before it joins the wait queue, so a controller that answers inside that window has
+/// its wake-up lost and the caller sleeps the full 10 s before returning success. Measured
+/// 2026-10-20 on an IW416 CCPA: 3 of 9 btd bring-ups spent 10.1 s in `hciconfig hci0 piscan`
+/// (wchan `__hci_req_sync` throughout) with no tx timeout in the kernel log.
+///
+/// A raw command never waits in the kernel. The Command Complete handler
+/// (`hci_cc_write_scan_enable`) still updates HCI_PSCAN/HCI_ISCAN from the sent parameter, so
+/// `hciconfig` reads back `PSCAN ISCAN` exactly as after the ioctl, and the ssp agent's mgmt
+/// SET_CONNECTABLE/SET_DISCOVERABLE that follow bring-up still succeed (both checked on the box).
+/// Fire-and-forget like the other writes.
+pub fn write_scan_enable(dev: u16, scan: u32) -> io::Result<()> {
+    HciSocket::open_bound(dev)?.cmd(OP_WRITE_SCAN_ENABLE, &[scan as u8])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -311,5 +330,6 @@ mod tests {
         assert_eq!(OP_WRITE_CLASS_OF_DEV, op(0x0024));
         assert_eq!(OP_WRITE_EIR, op(0x0052));
         assert_eq!(OP_WRITE_SSP_MODE, op(0x0056));
+        assert_eq!(OP_WRITE_SCAN_ENABLE, op(0x001A));
     }
 }

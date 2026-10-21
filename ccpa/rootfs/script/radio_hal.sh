@@ -726,7 +726,10 @@ do_bt_off() {
   # attach helper - re-attach is the wedge-prone half, which is why the supervisor stops at
   # `hciconfig down` rather than calling bt_off.sh.
   _d=$(hci_dev 2>/dev/null) || { rm -f "$BT_STATE"; return 0; }
-  hciconfig "$_d" noscan 2>/dev/null
+  # Raw Write_Scan_Enable(0x00), not `hciconfig noscan`: that ioctl can sleep its full 10 s
+  # timeout on the CCPA's 3.14 kernel (lost wake-up, btd's hci::write_scan_enable), and this
+  # runs under the bt lock, so the next session's bt_on would wait behind it.
+  timeout 5 hcitool -i "$_d" cmd 0x03 0x001a 0x00 >/dev/null 2>&1
   hciconfig "$_d" down   2>/dev/null
   rm -f "$BT_STATE"
   log "BT $_d powered down (attach left in place)"

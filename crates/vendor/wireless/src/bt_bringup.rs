@@ -294,7 +294,9 @@ pub fn bring_up(hci_dev: &str, name: &str) -> std::io::Result<()> {
     run(&[hci_dev, "class", &format!("0x{CLASS_OF_DEVICE:06x}")])?;
     run(&[hci_dev, "name", name])?;
     run(&[hci_dev, "inqdata", &eir_hex(name)])?;
-    run(&[hci_dev, "piscan"])?;
+    // NOT `hciconfig piscan`: its HCISETSCAN ioctl loses its wake-up on this 3.14 kernel about one
+    // bring-up in three and sleeps the full 10 s request timeout (`hci::write_scan_enable`).
+    crate::hci::write_scan_enable(crate::hci::dev_id(hci_dev)?, crate::hci::SCAN_PAGE_AND_INQUIRY)?;
     stamp(t0, "class, name, EIR, piscan set");
     restore_sco_setup();
     stamp(t0, "SCO setup restored");
@@ -309,7 +311,8 @@ pub fn go_quiet(hci_dev: &str) -> std::io::Result<()> {
         let dev = crate::hci::dev_id(hci_dev)?;
         return crate::hci::set_scan(dev, crate::hci::SCAN_NONE);
     }
-    run(&[hci_dev, "noscan"])
+    // Raw, not `hciconfig noscan`, for the same lost-wake-up reason as bring_up's scan enable.
+    crate::hci::write_scan_enable(crate::hci::dev_id(hci_dev)?, crate::hci::SCAN_NONE)
 }
 
 #[cfg(test)]
