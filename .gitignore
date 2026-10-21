@@ -1,5 +1,7 @@
 /target
 **/target
+# build.sh stages ocbm-host and iap_role_switch.armv7 here for the installer
+dist
 *.o
 *.armv7
 *.packed
