@@ -926,9 +926,11 @@ static multi-view-area) are documented with their implementation cost + teardown
   Practical consequence: the accessory owns the pacing of a Dock resize completely, and can make it
   instant. There is no reason to keep 3000 ms other than matching Apple's Simulator.
 
-  **Shipped range is 1000–10000 ms (owner, 2026-09-09) — a PRODUCT limit, not a protocol one.** iOS
-  has no floor; 10 ms was proven to work. The app deliberately does not offer sub-second because it
-  reads as abrupt in a vehicle. Anyone reading this later and wondering whether 10 ms is unreachable
+  **Shipped range is 100–10000 ms (owner, 2026-10-25; it was 1000–10000 from 2026-09-09) — a
+  PRODUCT limit, not a protocol one.** iOS has no floor; 10 ms was proven to work. The floor came down
+  for the Carlink3 split-screen pane, whose Dock switch is meant to take about half a second: the 1000
+  floor measured 1.4 s tap-to-picture on the truck (drive log 2026-10-25 18:46), and the app now sends
+  500. Anyone reading this later and wondering whether 10 ms is unreachable
   because iOS rejects it: it is not, the clamp is ours, in `levers::VIEW_AREA_ANIM_MS_RANGE` and in
   the app's emitter + `clampInPlace`. The DEFAULT remains 3000 (absent key).
   iPhone handler:

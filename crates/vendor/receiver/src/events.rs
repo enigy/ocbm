@@ -792,6 +792,25 @@ pub fn send_request_ui() -> bool {
     send_command(&body)
 }
 
+/// `requestUI` WITH a URL — ask iOS to bring a specific app forward on the MAIN screen (`maps:`,
+/// `nowplaying:`, …; OCBM `CMD_REQUEST_UI_URL`, 2026-10-25). Wire: `{type:"requestUI", params:{url}}`
+/// — the branch at 0x26bf5c in `_AirPlayReceiverSessionRequestUI` (CarPlaySDK 509.11 @0x26bf20) sets
+/// params["url"] when a url is given, so this is the SDK's own shape; [`send_request_ui`] is the
+/// no-url form. No uuid: requestUI cannot address a stream (see the CMD_NAV_* history in carplayd),
+/// which is why this is a main-screen command and the cluster keeps `showUI`.
+pub fn send_request_ui_url(url: &str) -> bool {
+    let mut params = Dictionary::new();
+    params.insert("url".into(), Value::String(url.into()));
+    let mut d = Dictionary::new();
+    d.insert("type".into(), Value::String("requestUI".into()));
+    d.insert("params".into(), Value::Dictionary(params));
+    let mut body = Vec::new();
+    if Value::Dictionary(d).to_writer_binary(&mut body).is_err() {
+        return false;
+    }
+    send_command(&body)
+}
+
 /// Wire value of the `streamID` param for the instrument-cluster (type-111) stream. VERIFIED by
 /// disassembling the authoritative standalone CarPlay Simulator: `AirPlayController.sendShowUI`
 /// switches the `VideoStreamID` enum into a literal string and bridges it straight to the CFString

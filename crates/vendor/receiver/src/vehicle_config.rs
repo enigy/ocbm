@@ -101,7 +101,7 @@ pub struct VehicleConfig {
     /// pre-existing pushed document stays byte-identical — and the `APP_EMITTED_DOCUMENT` fixture,
     /// being the app's default document, never carries it.
     ///
-    /// Out of range (0..=10000) is CLAMPED to the nearest bound at arm time
+    /// Out of range (100..=10000) is CLAMPED to the nearest bound at arm time
     /// (`levers::set_view_area_anim_ms`, logged by carplayd) — never a rejection. A non-integer value
     /// is a serde type error and rejects the whole document, exactly as a mistyped Apple key does.
     #[serde(default)]
@@ -1890,7 +1890,8 @@ metadata:
         let set = VehicleConfig::from_yaml(b"name: X\nview_area_anim_ms: 1000\n").unwrap();
         assert_eq!(set.view_area_anim_ms(), 1000);
         // The CONFIG carries any integer verbatim — clamping is the lever's job, not the parser's —
-        // so 0 still round-trips here even though the lever floor is now 1000 (owner, 2026-09-09).
+        // so 0 still round-trips here even though the lever floor is 100 (1000 from 2026-09-09,
+        // 100 from 2026-10-25).
         assert_eq!(VehicleConfig::from_yaml(b"view_area_anim_ms: 0\n").unwrap().view_area_anim_ms(), 0);
         assert_eq!(
             VehicleConfig::from_yaml(b"view_area_anim_ms: 10000\n").unwrap().view_area_anim_ms(),
@@ -1903,9 +1904,14 @@ metadata:
         assert_eq!(crate::levers::clamp_view_area_anim_ms(big.view_area_anim_ms()), 10000);
         let neg = VehicleConfig::from_yaml(b"view_area_anim_ms: -5\n").unwrap();
         assert_eq!(neg.view_area_anim_ms(), -5);
-        // Clamps UP to the 1000 ms floor, not to 0 — this assertion was left behind when the floor
-        // was raised on 2026-09-09 and is the second half of the Tier-0 red found 2026-09-10.
-        assert_eq!(crate::levers::clamp_view_area_anim_ms(neg.view_area_anim_ms()), 1000);
+        // Clamps UP to the lever floor (100 since 2026-10-25; 1000 from 2026-09-09), not to 0 — this
+        // assertion was left behind when the floor was raised on 2026-09-09 and is the second half of
+        // the Tier-0 red found 2026-09-10, so it is pinned to the lever's own constant.
+        assert_eq!(
+            crate::levers::clamp_view_area_anim_ms(neg.view_area_anim_ms()),
+            *crate::levers::VIEW_AREA_ANIM_MS_RANGE.start()
+        );
+        assert_eq!(*crate::levers::VIEW_AREA_ANIM_MS_RANGE.start(), 100);
         // A non-integer is a TYPE error: the whole document is rejected, exactly like a mistyped
         // Apple key, and carplayd falls back to its built-in default config (loudly).
         assert!(VehicleConfig::from_yaml(b"view_area_anim_ms: fast\n").is_err());

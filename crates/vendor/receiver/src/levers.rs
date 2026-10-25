@@ -360,13 +360,15 @@ pub fn set_appsetup(on: bool) {
 /// iOS never acknowledges this field, so the `[events] updateViewArea -> … duration=` line (which
 /// prints the value read from THIS cell, i.e. post-clamp) is the only observability there is.
 pub const VIEW_AREA_ANIM_MS_DEFAULT: i64 = 3000;
-/// FLOOR RAISED TO 1000 ms (owner, 2026-09-09) after the bench sweep. Both bounds are device-proven
-/// on a 1920x1080 panel: 10 ms renders the switch as an instant flicker and 10000 ms runs the full
-/// 10 s envelope, so iOS honours the field literally with NO floor and NO cap of its own — this
-/// range is a PRODUCT decision about what to offer, not a protocol limit. 10 ms is deliberately no
-/// longer reachable from the app: it works, it was simply judged too abrupt to ship as an option.
+/// FLOOR LOWERED TO 100 ms (owner, 2026-10-25) for the Carlink3 split-screen pane: its Dock switch
+/// should take about half a second, and the 1000 floor measured 1.4 s tap-to-picture on the truck.
+/// The floor had been RAISED to 1000 (owner, 2026-09-09) after the bench sweep. Both ends are
+/// device-proven on a 1920x1080 panel: 10 ms renders the switch as an instant flicker and 10000 ms
+/// runs the full 10 s envelope, so iOS honours the field literally with NO floor and NO cap of its
+/// own — this range is a PRODUCT decision about what to offer, not a protocol limit. 10 ms stays
+/// unreachable from the app: it works, it was judged too abrupt to ship as an option.
 /// The DEFAULT stays 3000 (absent key), so no existing pushed document changes.
-pub const VIEW_AREA_ANIM_MS_RANGE: std::ops::RangeInclusive<i64> = 1_000..=10_000;
+pub const VIEW_AREA_ANIM_MS_RANGE: std::ops::RangeInclusive<i64> = 100..=10_000;
 static VIEW_AREA_ANIM_MS: AtomicI64 = AtomicI64::new(VIEW_AREA_ANIM_MS_DEFAULT);
 
 /// Clamp a requested duration to the nearest bound of [`VIEW_AREA_ANIM_MS_RANGE`]. Never a rejection:
@@ -397,14 +399,18 @@ mod tests {
     fn view_area_anim_ms_clamps_to_nearest_bound_and_passes_in_range() {
         assert_eq!(VIEW_AREA_ANIM_MS_DEFAULT, 3000, "absent-key wire must stay 3000");
         assert_eq!(clamp_view_area_anim_ms(3000), 3000);
-        // FLOOR IS 1000, not 0 — raised by the owner 2026-09-09 (see VIEW_AREA_ANIM_MS_RANGE).
-        // These four assertions still expected the old 0 floor and were left behind by that
-        // change, which is what turned Tier-0 red from f836a2b onward (found 2026-09-10).
-        assert_eq!(clamp_view_area_anim_ms(1000), 1000, "the floor itself passes through");
-        assert_eq!(clamp_view_area_anim_ms(0), 1000);
+        // FLOOR IS 100, not 0 — raised to 1000 by the owner 2026-09-09, lowered to 100 on 2026-10-25
+        // for the split-screen pane (see VIEW_AREA_ANIM_MS_RANGE). Assertions left expecting an old
+        // floor are what turned Tier-0 red from f836a2b onward (found 2026-09-10), so every bound
+        // is spelled out here.
+        assert_eq!(clamp_view_area_anim_ms(100), 100, "the floor itself passes through");
+        assert_eq!(clamp_view_area_anim_ms(500), 500, "the app's split-screen value passes");
+        assert_eq!(clamp_view_area_anim_ms(1000), 1000, "the old floor still passes");
+        assert_eq!(clamp_view_area_anim_ms(99), 100);
+        assert_eq!(clamp_view_area_anim_ms(0), 100);
         assert_eq!(clamp_view_area_anim_ms(10_000), 10_000);
-        assert_eq!(clamp_view_area_anim_ms(-1), 1000);
-        assert_eq!(clamp_view_area_anim_ms(i64::MIN), 1000);
+        assert_eq!(clamp_view_area_anim_ms(-1), 100);
+        assert_eq!(clamp_view_area_anim_ms(i64::MIN), 100);
         assert_eq!(clamp_view_area_anim_ms(10_001), 10_000);
         assert_eq!(clamp_view_area_anim_ms(i64::MAX), 10_000);
         // The setter reports what it stored, and the getter reads the same (clamped) cell.

@@ -824,7 +824,7 @@ fn load_device_config() -> (DeviceConfig, u32) {
                 levers::set_map_appearance(vc.map_appearance_enabled());
                 levers::set_focus_transfer(vc.focus_transfer_enabled());
                 // updateViewArea animation duration from the top-level `view_area_anim_ms` (OUR
-                // extension; absent = 3000). The lever clamps to 0..=10000 and returns what it
+                // extension; absent = 3000). The lever clamps to 100..=10000 and returns what it
                 // stored: out of range is LOGGED, not rejected — a cosmetic knob must never take
                 // the owner's whole document off the air. The value actually sent is logged again
                 // by events.rs at every switch, since iOS never acknowledges the field.
@@ -1167,6 +1167,31 @@ fn handle_input_frame(pl: &[u8]) {
     if pl.first() == Some(&ocbm_proto::INPUT_COMMAND) && pl.len() >= 2 {
         let (name, sent) = match pl[1] {
             ocbm_proto::CMD_REQUEST_UI => ("requestUI", events::send_request_ui()),
+            // requestUI WITH a URL (2026-10-25): open a CarPlay app on the MAIN screen — the
+            // split-screen pane's "open the playing app" and "Maps back after a call". Payload
+            // `[cmd][url…]`, UTF-8, no terminator, 1..=REQUEST_UI_URL_MAX bytes. Refused with a log
+            // line when empty, too long or not UTF-8: a bad URL must never go out as a bare requestUI.
+            ocbm_proto::CMD_REQUEST_UI_URL => {
+                let raw = &pl[2..];
+                if raw.is_empty() || raw.len() > ocbm_proto::REQUEST_UI_URL_MAX {
+                    eprintln!(
+                        "[input] requestUI url refused — {} bytes (want 1..={})",
+                        raw.len(),
+                        ocbm_proto::REQUEST_UI_URL_MAX
+                    );
+                    return;
+                }
+                let url = match std::str::from_utf8(raw) {
+                    Ok(u) => u,
+                    Err(e) => {
+                        eprintln!("[input] requestUI url refused — not UTF-8 ({e})");
+                        return;
+                    }
+                };
+                let sent = events::send_request_ui_url(url);
+                eprintln!("[input] requestUI url={url} sent={sent}");
+                return;
+            }
             // Deprecated bare shape (iOS ignores it — kept for A/B only; docs/carplay/05_METADATA_AND_CONTROLS.md §2.4).
             ocbm_proto::CMD_REQUEST_SIRI => ("requestSiri(bare)", events::send_request_siri()),
             // Siri hold pair: siriAction INT enum buttondown=2 on press, buttonup=3 on release
