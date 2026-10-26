@@ -1051,134 +1051,6 @@ fn read_input(mut stream: TcpStream, gen: u32) {
 
 /// Turn one CH_INPUT sub-frame into a HID report to the iPhone. Single-touch MVP (uid 1): DOWN/MOVE =
 /// tip down, UP = tip up; normalized 0..=65535 coords scaled to the advertised resolution (`DISPLAY_WH`).
-/// Telephony keypad (HID uid 5) DTMF handling — change 3 of "OCBM adapter changes for Carlink3 v2"
-/// (2026-10-26). A keypad digit reached the phone TWICE per tap (voicemail echoed "3 3"), while
-/// Answer/End/Mute, sent through the same `[idx]` then `[0]` pair, act once. Per tap the app sends one
-/// `INPUT_TELEPHONY` and the box sent exactly one pair (call log 2026-10-25 22:10), so iOS is reading
-/// both halves of the pair as a digit for the keypad usages 0xB0–0xBB, and the box's shape is what
-/// changes. Three shapes, selectable per tap by the `CARPLAY_DTMF` lever (env, `/tmp/carplay_dtmf`,
-/// or `/script/carplay_dtmf` to survive a reboot; `hold` | `gap` | `pair`), read on EVERY tap so a
-/// bench can switch mid-call without restarting carplayd:
-///
-/// - `hold` (DEFAULT, the doc's step 1): a digit sends `[idx]` and NO release. The next digit's report
-///   replaces the array value (one transition per key), so a release goes out only before a non-DTMF
-///   index (Answer/End/Mute/Flash/Del keep their pair), before a REPEAT of the same digit (two equal
-///   array values in a row are no transition at all, so "33" needs a `[0]` in between), or after
-///   [`DTMF_IDLE_RELEASE`] with no key, from a timer thread.
-/// - `gap` (step 2): the pair with [`DTMF_GAP`] between press and release, in case the two reports
-///   were landing in one HID frame.
-/// - `pair`: the original back-to-back pair, for A/B.
-///
-/// Only indices [`TEL_DTMF_FIRST`]..=[`TEL_DTMF_LAST`] are affected; every other index keeps the pair
-/// in every mode.
-const TEL_DTMF_FIRST: u8 = 5;
-const TEL_DTMF_LAST: u8 = 16;
-const TEL_RELEASE: u8 = 0;
-const TEL_HID_UID: u32 = 5;
-const DTMF_IDLE_RELEASE: Duration = Duration::from_millis(500);
-const DTMF_GAP: Duration = Duration::from_millis(40);
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum DtmfMode {
-    Hold,
-    Gap,
-    Pair,
-}
-
-impl DtmfMode {
-    fn name(self) -> &'static str {
-        match self {
-            DtmfMode::Hold => "hold",
-            DtmfMode::Gap => "gap",
-            DtmfMode::Pair => "pair",
-        }
-    }
-}
-
-/// `CARPLAY_DTMF` env, else `/tmp/carplay_dtmf`, else `/script/carplay_dtmf`; unset or unknown = `hold`.
-/// Read per tap (a few bytes), deliberately NOT cached: this is a bench lever for a live call.
-fn dtmf_mode() -> DtmfMode {
-    let raw = std::env::var("CARPLAY_DTMF")
-        .ok()
-        .or_else(|| std::fs::read_to_string("/tmp/carplay_dtmf").ok())
-        .or_else(|| std::fs::read_to_string("/script/carplay_dtmf").ok())
-        .unwrap_or_default();
-    match raw.trim() {
-        "gap" => DtmfMode::Gap,
-        "pair" => DtmfMode::Pair,
-        _ => DtmfMode::Hold,
-    }
-}
-
-/// `hold` mode state: the digit whose `[idx]` report is still asserted, and a generation stamp so the
-/// idle-release thread of an OLDER tap never releases a newer one.
-struct DtmfHeld {
-    idx: u8,
-    gen: u64,
-}
-static DTMF_HELD: Mutex<(Option<DtmfHeld>, u64)> = Mutex::new((None, 0));
-
-fn telephony_pair(idx: u8) -> bool {
-    let sent = events::send_hid_report(TEL_HID_UID, &[idx]);
-    sent && events::send_hid_report(TEL_HID_UID, &[TEL_RELEASE])
-}
-
-/// Send one keypad/hook tap in the given [`DtmfMode`]; true when every report it needed went out.
-fn telephony_tap(idx: u8, mode: DtmfMode) -> bool {
-    let is_dtmf = (TEL_DTMF_FIRST..=TEL_DTMF_LAST).contains(&idx);
-    match mode {
-        DtmfMode::Pair => telephony_pair(idx),
-        DtmfMode::Gap if is_dtmf => {
-            let sent = events::send_hid_report(TEL_HID_UID, &[idx]);
-            std::thread::sleep(DTMF_GAP);
-            sent && events::send_hid_report(TEL_HID_UID, &[TEL_RELEASE])
-        }
-        DtmfMode::Gap => telephony_pair(idx),
-        DtmfMode::Hold if is_dtmf => {
-            let gen;
-            let mut ok = true;
-            {
-                let mut st = plock(&DTMF_HELD);
-                if let Some(h) = st.0.take() {
-                    if h.idx == idx {
-                        // Same digit again: the array value would not change, so iOS would see no
-                        // key at all. Release first, then re-assert.
-                        ok = events::send_hid_report(TEL_HID_UID, &[TEL_RELEASE]);
-                        eprintln!("[input] telephony dtmf repeat of idx={idx} — released first");
-                    }
-                }
-                ok = ok && events::send_hid_report(TEL_HID_UID, &[idx]);
-                st.1 += 1;
-                gen = st.1;
-                st.0 = Some(DtmfHeld { idx, gen });
-            }
-            std::thread::spawn(move || {
-                std::thread::sleep(DTMF_IDLE_RELEASE);
-                let mut st = plock(&DTMF_HELD);
-                if st.0.as_ref().is_some_and(|h| h.gen == gen) {
-                    st.0 = None;
-                    let released = events::send_hid_report(TEL_HID_UID, &[TEL_RELEASE]);
-                    eprintln!(
-                        "[input] telephony dtmf idx={idx} released after {} ms idle sent={released}",
-                        DTMF_IDLE_RELEASE.as_millis()
-                    );
-                }
-            });
-            ok
-        }
-        DtmfMode::Hold => {
-            // Hook/Flash/Mute/Del: close any held digit first so the pair starts from 0.
-            let held = plock(&DTMF_HELD).0.take();
-            let mut ok = true;
-            if let Some(h) = held {
-                ok = events::send_hid_report(TEL_HID_UID, &[TEL_RELEASE]);
-                eprintln!("[input] telephony dtmf idx={} released before idx={idx}", h.idx);
-            }
-            ok && telephony_pair(idx)
-        }
-    }
-}
-
 fn handle_input_frame(pl: &[u8]) {
     use std::sync::atomic::{Ordering};
     use portable_atomic::{AtomicU64};
@@ -1278,17 +1150,15 @@ fn handle_input_frame(pl: &[u8]) {
     }
     // Telephony (HID uid 5, Apple's exact HIDTelephony descriptor): a 1-byte ARRAY report = the pressed
     // usage index (1 HookSwitch/answer, 2 Flash, 3 Drop/end, 4 Mute, 5..14 DTMF 0..9, 15 *, 16 #, 17 Del).
-    // Tap = report the index then a 0 release, mirroring the D-Pad/Knob press/release pairing — except
-    // the DTMF digits, which iOS was dialling TWICE per tap (one app send, one box pair, "3 3" on the
-    // phone; Carlink3 call log 2026-10-25 22:10). See `telephony_tap` for the per-index handling.
+    // Tap = report the index then a 0 release, mirroring the D-Pad/Knob press/release pairing.
     if pl.first() == Some(&ocbm_proto::INPUT_TELEPHONY) && pl.len() >= 2 {
         if !events::telephony_advertised() {
             eprintln!("[input] telephony dropped — Telephony not advertised (CARPLAY_TELEPHONY off)");
             return;
         }
-        let mode = dtmf_mode();
-        let sent = telephony_tap(pl[1], mode);
-        eprintln!("[input] telephony idx={} dtmf={} sent={sent}", pl[1], mode.name());
+        let sent = events::send_hid_report(5, &[pl[1]]);
+        let released = sent && events::send_hid_report(5, &[0x00]);
+        eprintln!("[input] telephony idx={} sent={}", pl[1], sent && released);
         return;
     }
     // Home/Siri (task #35): AirPlay `/command` types, dispatched here because the box owns the

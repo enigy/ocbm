@@ -1327,16 +1327,6 @@ transition. Two idioms [E — `HIDMediaButtonsFillReport` shape + sibling `hid.r
   the report is an Array whose value 0 = "no usage asserted" — you MUST send a following 0 or the button
   stays logically held. [E — `hid::media_button_report`, carplayd `handle_input_frame`'s `INPUT_MEDIA_BTN`
   arm; anchors corrected 2026-08-16]
-  **Telephony DTMF exception (2026-10-26, device-observed):** for the keypad usages (array indices 5–16,
-  Telephony page 0xB0–0xBB) iOS dials the digit on BOTH halves of a back-to-back pair — voicemail
-  echoed "3 3" for one tap, with exactly one `INPUT_TELEPHONY` from the app and one pair from the box
-  (Carlink3 call log 2026-10-25 22:10); Answer/End/Mute through the same pair act once. carplayd's
-  `telephony_tap` therefore sends a digit as `[idx]` with NO release by default (`hold`): the next
-  digit's report replaces the array value, a release goes out only before a non-DTMF index, before a
-  repeat of the same digit (equal values in a row are no transition), or after 500 ms idle from a timer
-  thread. Bench lever `CARPLAY_DTMF=hold|gap|pair` (env, `/tmp/carplay_dtmf`, or `/script/carplay_dtmf`
-  to survive a reboot), read per tap: `gap` = the pair with 40 ms between, `pair` = the old shape.
-  Which of the three iOS wants is the bench question of "OCBM adapter changes for Carlink3 v2", change 3.
 - **Press-and-hold** (Var-bitfield devices: DPad, Knob buttons, SteeringWheel, TouchpadButtons, and touch):
   emit the **down** report (bit set / tip=1) on mouse-down and the **up** report (bit cleared / tip=0) on
   mouse-up. Touch already does this: carplayd `handle_input_frame` (`main.rs:882`, touch arm ~`:1160-1197`)
