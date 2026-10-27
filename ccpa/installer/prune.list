@@ -1,0 +1,42 @@
+# prune.list — what Stage A (once.sh) deletes from a stock 2025.10.15.1127 rootfs to make room for
+# OCBM while stock CarPlay and Android Auto stay as the fallback. One path or glob per line,
+# relative to /. Every match still goes through once.sh's is_radio() guard.
+# Paths come from the factory survey of 2026-10-27 (scratchpad/stock_survey_20261027/).
+
+# HiCar: exactly the set phone_link_deamon.sh stages for a HiCar session, and only for one.
+# The CarPlay and Android Auto branches use none of it, and no always-running process maps it.
+usr/sbin/ARMHiCar
+usr/lib/libdmsdp*
+usr/lib/libHisightSink.so
+usr/lib/libHwDeviceAuthSDK.so
+usr/lib/libHwKeystoreSDK.so
+usr/lib/libmanagement.so
+usr/lib/libsecurec.so
+usr/lib/libauthagent.so
+usr/lib/libnearby.so
+usr/lib/libhicar.so
+etc/udhcpd_hicar_ap.conf
+etc/hichain
+
+# Android Mirror: the helper app start_accessory_mass_storage.sh offers an Android phone.
+etc/BoxHelper.apk
+
+# Factory test and toolchain leftovers. NOT i2cdetect/i2cset/tinymix: init_audio_codec.sh and the
+# mixer scripts call them at every boot.
+usr/sbin/AutomaticTest
+script/test_mic.sh
+lib/*.la
+lib/*.spec
+lib/*.o
+lib/libstdc++.so.6.0.20-gdb.py
+lib/libSegFault.so
+lib/libmemusage.so
+lib/libpcprofile.so
+
+# Web UI pages. usr/sbin/boa, etc/boa/boa.conf and etc/mime.types stay: start_main_service.sh
+# brings the Wi-Fi AP up from inside its `test -e /usr/sbin/boa` block.
+etc/boa/www
+etc/boa/cgi-bin
+etc/boa/images
+
+# Kept on purpose: the car and brand logos (~40 KB on flash) may be read by packed vendor binaries.

@@ -59,6 +59,24 @@ with **neither** present the box boots the OCBM appliance. Always test
 > deploy dead-man on 2026-08-15 that no installer ships). `ocbm_boot.sh` is the mirror image: the
 > overlay copy is the one installed, and `tools/ocbm_boot.sh` is the stale duplicate.
 
+## `installer/` — the one-file install for a STOCK adapter (in progress)
+
+Box-side scripts of `A15W_Update.img`, which converts a stock 2025.10.15.1127 adapter from a USB stick
+or over USB from Carlink3. `tools/make_ocbm_installer.sh` builds it and `tools/ocbm_installer_test.sh`
+runs it end to end against synthetic stock trees.
+
+| File | Purpose |
+|---|---|
+| `once.sh` | Stage A, run by the stock updater before its copy step: checks (refuse = nothing changed), flash backup to the stick + `/etc/ocbm/identity.tgz`, `prune.list`, place the payload, keep `start_main_service.stock.sh`, then rename the dispatcher over `start_main_service.sh` as the one boot-critical write |
+| `finish.sh` | writes `OCBM_RESULT.txt`, parks the stick image, restarts into the trial |
+| `prune.list` | what goes to make room while stock CarPlay/AA stay as the fallback: HiCar, Android Mirror helper, test leftovers, web UI pages. Every match still passes `is_radio()` |
+| `identity.list` | unit identity archived before anything changes (holds secrets: never log or commit it) |
+
+Not written yet (M3/M4): `ocbm_dispatch.sh` (must carry a `# OCBM_DISPATCH` line, and touch
+`/tmp/not_change_mass_storage` in OCBM modes so the stock stick handler leaves the USB gadget alone),
+`ocbm_selftest.sh`, `ocbm_revert.sh` (appends `reverted version=<VERSION>` to
+`/etc/ocbm/last_result.txt`), `ocbm_finish.sh`. The builder refuses until they exist.
+
 ## Daemons — `ocbmd/`, `iap2d/`, `carplayd/` (shipped, hardware-validated) + `mfid/` (bring-up only)
 
 Each is a sibling crate (`Cargo.toml` + `src/`), cross-built for `armv7-unknown-linux-musleabihf`:

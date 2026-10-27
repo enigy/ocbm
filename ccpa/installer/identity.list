@@ -1,0 +1,17 @@
+# identity.list — unit identity Stage A archives to /etc/ocbm/identity.tgz before it changes
+# anything (with the Wi-Fi and Bluetooth addresses in /etc/ocbm/addresses.txt). Relative to /;
+# missing entries are skipped. The archive holds the Wi-Fi passphrase, Bluetooth link keys and
+# iPhone pairing records: it must never reach a log, an issue or a repo.
+etc/riddle.conf
+etc/hostapd.conf
+etc/bluetooth
+etc/bluetooth_name
+etc/wifi_name
+etc/box_name
+etc/device_serial
+etc/serial_number
+etc/factory_name
+etc/manufacture_date
+etc/.manufacture_date_sign
+etc/uuid_sign
+var/lib/lockdown

@@ -56,6 +56,8 @@ run "ocbm-host"  cargo test -p ocbm-host --quiet
 run "stock-restore" sh tools/stock_restore_test.sh
 # The stick/OTA update-image packer and the stock survey image built with it.
 run "update-img" bash tools/make_update_img_test.sh
+# The one-file installer: build, unwrap, and run its once.sh/finish.sh against synthetic stock trees.
+run "ocbm-installer" bash tools/ocbm_installer_test.sh
 
 # host/MacHost's own hardware-free Swift harness (tests/run_tests.sh) — no Xcode project, no
 # dongle. Skipped (not a failure) when the Swift toolchain isn't on this machine, since the rest of
