@@ -54,6 +54,8 @@ run "mfi"        cargo test --manifest-path crates/vendor/mfi/Cargo.toml --quiet
 run "ocbm-host"  cargo test -p ocbm-host --quiet
 # The back-to-stock restore payload (busybox sh), against synthetic trees: no adapter, no backup.
 run "stock-restore" sh tools/stock_restore_test.sh
+# The stick/OTA update-image packer and the stock survey image built with it.
+run "update-img" bash tools/make_update_img_test.sh
 
 # host/MacHost's own hardware-free Swift harness (tests/run_tests.sh) — no Xcode project, no
 # dongle. Skipped (not a failure) when the Swift toolchain isn't on this machine, since the rest of
