@@ -108,6 +108,32 @@ via `projection_up.sh`, carplayd via the supervisor) are **not** started at boot
 boots to IDLE and only projects when a host app SUBSCRIBEs (see [`../carplay/02_SESSION_LIFECYCLE.md`](../carplay/02_SESSION_LIFECYCLE.md)
 and [`../carplay/07_PHONE_SIDE.md`](../carplay/07_PHONE_SIDE.md)).
 
+### Back to stock Carlinkit firmware
+
+`tools/stock_restore.sh` puts a converted box back on its stock firmware with no SPI programmer, from
+that unit's own `backup_pre/` (written by `ncm_base_install.sh backup` before anything was stripped).
+That backup is stock 2025.10.15.1127 plus lvalen's SSH-minimal and NCM scripts with `/script/ncm_only`
+set, so that is the state it restores; removing the flag then boots the Carlinkit stack.
+
+    tools/stock_restore.sh --backup <backup_pre> dryrun   # over the OCBM console; flash untouched
+    tools/stock_restore.sh --backup <backup_pre> all      # revert to NCM, apply, coldtest, stock
+
+- **Identity gate.** `/dev/mtd0` and `/dev/mtd1` on the box must be byte-identical to the backup's,
+  which proves the backup belongs to this unit and the boot stack was never written.
+- **File by file, never `flashcp` of `mtd2`.** Rewriting the partition the system runs from has no
+  safe stopping point. `tools/stock_restore_box.sh` instead makes the rootfs match the unpacked backup
+  in an order that still boots NCM if it stops anywhere: OCBM's binaries out (that is the room), files
+  in (each `.rsnew`, md5-checked, renamed, free space checked first), the five boot files, then the
+  `/script` and `/etc` extras (the owned `inittab` names `early_console.sh`, so it goes only after
+  `inittab` is back), and the login files last. It never touches `proc sys dev tmp mnt media`, the NCM
+  flags, or runtime state under `var/run`, `var/log`, `var/lock` and `var/tmp`, and it is idempotent:
+  re-run `apply` after any abort. `apply` refuses on a live box without an NCM flag.
+- **One-way door.** Up to `apply`, `ocbm_install.sh finalize` returns the box to OCBM. After it,
+  OCBM comes back only by reinstalling it from scratch.
+- **Tests.** `tools/stock_restore_test.sh` (run by `tools/run_tests.sh`) exercises plan, apply,
+  verify, the space abort, idempotence and type conflicts against synthetic trees, under `sh` and
+  `dash`.
+
 ### UART console reference
 
 Pads **TX1/RX1** (+ GND) = i.MX6UL UART1 = `ttymxc0`, 3.3 V logic, always-on root serial console (physical-pad access only)
