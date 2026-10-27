@@ -236,15 +236,22 @@ fn media_buttons_descriptor() -> Vec<u8> {
     // because CarPlay's list Select needs a Generic-Desktop Button which a Consumer array can't express
     // (2026-07-12: a Consumer-array Home+Menu extension made the focus
     // overlay appear but Up/Down didn't scroll and Menu-Pick didn't select).
+    //
+    // Indices 0-6 are Apple's current CarPlaySDK template (docs/carplay/03_SDK_GROUND_TRUTH.md: index 6
+    // = 0x029E, "AC Navigation Guidance" in the USB HID Usage Tables). 7 Random Play and 8 Repeat are
+    // the standard Consumer usages appended for the head unit's shuffle/repeat buttons (2026-10-27).
     vec![
         0x05, 0x0C, 0x09, 0x01, 0xA1, 0x01, // Consumer / Consumer Control / Collection(App)
-        0x15, 0x00, 0x25, 0x05, 0x05, 0x0C, // Logical Min 0 / Max 5 / Consumer
-        0x0A, 0x00, 0x00, // Usage 0 (unassigned)
-        0x0A, 0xB0, 0x00, // Play
-        0x0A, 0xB1, 0x00, // Pause
-        0x0A, 0xCD, 0x00, // Play/Pause
-        0x0A, 0xB5, 0x00, // Next
-        0x0A, 0xB6, 0x00, // Previous
+        0x15, 0x00, 0x25, 0x08, 0x05, 0x0C, // Logical Min 0 / Max 8 / Consumer
+        0x0A, 0x00, 0x00, // 0 Usage 0 (unassigned)
+        0x0A, 0xB0, 0x00, // 1 Play
+        0x0A, 0xB1, 0x00, // 2 Pause
+        0x0A, 0xCD, 0x00, // 3 Play/Pause
+        0x0A, 0xB5, 0x00, // 4 Next
+        0x0A, 0xB6, 0x00, // 5 Previous
+        0x0A, 0x9E, 0x02, // 6 AC Navigation Guidance (Apple's template)
+        0x0A, 0xB9, 0x00, // 7 Random Play
+        0x0A, 0xBC, 0x00, // 8 Repeat
         0x75, 0x08, 0x95, 0x01, 0x81, 0x00, // Report Size 8 / Count 1 / Input(Array)
         0xC0, // End
     ]

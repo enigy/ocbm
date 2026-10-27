@@ -213,19 +213,23 @@ fn group(id: u16, subs: &[Vec<u8>]) -> Vec<u8> {
 /// it fully accepts, and a subscribe carrying selectors it doesn't like degrades **silently** — you
 /// keep getting elapsed-time deltas with no title/artist forever (observed 2026-07-12 when this
 /// function requested a superset of SDK-declared ids: 287 NowPlaying updates, zero titles).
-/// Extra ids the SDK declares (genre/composer/track+disc counts/queue/shuffle/repeat) are parsed by
+/// Extra ids the SDK declares (genre/composer/track+disc counts/queue) are parsed by
 /// `now_playing()` if they ever appear, but must NOT be requested here.
 ///
+/// The ONE deliberate departure from the capture is PlaybackShuffleMode (5) and PlaybackRepeatMode
+/// (6) in group 1 (2026-10-27): iOS never sends either unasked, so without them the head unit cannot
+/// show the phone's modes (proven on the emulator: CarPlay shuffle on, no `shuffleMode` in the stream).
+///
 /// MediaItem (group 0): Title(1), Duration(4), AlbumTitle(6), Artist(12), ArtworkFileTransferId(26).
-/// Playback  (group 1): PlaybackStatus(0), ElapsedTimeMs(1), AppName(7).
+/// Playback  (group 1): PlaybackStatus(0), ElapsedTimeMs(1), ShuffleMode(5), RepeatMode(6), AppName(7).
 pub fn start_now_playing() -> Vec<u8> {
     vec![
         // group 0 MediaItemAttributes (len 0x18 = 24)
         0x00, 0x18, 0x00, 0x00, 0x00, 0x04, 0x00, 0x01, 0x00, 0x04, 0x00, 0x04, 0x00, 0x04, 0x00,
         0x06, 0x00, 0x04, 0x00, 0x0c, 0x00, 0x04, 0x00, 0x1a,
-        // group 1 PlaybackAttributes (len 0x10 = 16)
-        0x00, 0x10, 0x00, 0x01, 0x00, 0x04, 0x00, 0x00, 0x00, 0x04, 0x00, 0x01, 0x00, 0x04, 0x00,
-        0x07,
+        // group 1 PlaybackAttributes (len 0x18 = 24)
+        0x00, 0x18, 0x00, 0x01, 0x00, 0x04, 0x00, 0x00, 0x00, 0x04, 0x00, 0x01, 0x00, 0x04, 0x00,
+        0x05, 0x00, 0x04, 0x00, 0x06, 0x00, 0x04, 0x00, 0x07,
     ]
 }
 
@@ -1514,6 +1518,24 @@ mod tests {
         assert_eq!(&rg[0..6], &[0x00, 0x06, 0x00, 0x00, 0x00, 0x2a]);
         // ...and ask for ExitInfo with the bare selector 3 (00 04 00 03) as its last param.
         assert_eq!(&rg[rg.len() - 4..], &[0x00, 0x04, 0x00, 0x03]);
+    }
+
+    /// The NowPlaying subscribe asks for exactly the captured selectors plus shuffle (5) and repeat
+    /// (6) in the Playback group, in ascending order, with each group length matching its contents.
+    #[test]
+    fn now_playing_subscribe_asks_for_shuffle_and_repeat() {
+        let np = start_now_playing();
+        let mut groups = Vec::new();
+        walk(&np, |id, v| {
+            let mut sel = Vec::new();
+            walk(v, |s, sv| {
+                assert!(sv.is_empty(), "a selector carries no value");
+                sel.push(s)
+            });
+            groups.push((id, sel));
+        });
+        assert_eq!(groups, vec![(0, vec![1, 4, 6, 12, 26]), (1, vec![0, 1, 5, 6, 7])]);
+        assert_eq!(np.len(), 48);
     }
 
     #[test]

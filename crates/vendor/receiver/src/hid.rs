@@ -15,6 +15,14 @@ pub mod media_button {
     pub const PLAY_PAUSE: u8 = 3;
     pub const NEXT_TRACK: u8 = 4;
     pub const PREV_TRACK: u8 = 5;
+    /// Consumer 0x029E, AC Navigation Guidance: the 7th usage in Apple's current template.
+    pub const NAV_GUIDANCE: u8 = 6;
+    /// Consumer 0x00B9 Random Play: the shuffle button.
+    pub const RANDOM_PLAY: u8 = 7;
+    /// Consumer 0x00BC Repeat: the repeat button.
+    pub const REPEAT: u8 = 8;
+    /// The descriptor's Logical Maximum: the highest index a report may carry.
+    pub const MAX: u8 = REPEAT;
 }
 
 /// Build a 5-byte touchscreen report from absolute coordinates.

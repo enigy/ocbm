@@ -1086,10 +1086,10 @@ fn handle_input_frame(pl: &[u8]) {
     // between sessions like every other input.
     if pl.first() == Some(&ocbm_proto::INPUT_MEDIA_BTN) && pl.len() >= 2 {
         let index = pl[1];
-        // The uid-2 media descriptor is a Consumer ARRAY with Logical Max 5; only 1..=5 are valid usages
-        // (0 = released). Reject anything else so we never send an out-of-range array index (audit LOW).
-        if !(1..=5).contains(&index) {
-            eprintln!("[input] media-btn index={index} out of range 1..=5 — dropped");
+        // The uid-2 media descriptor is a Consumer ARRAY; only 1..=MAX are valid usages (0 =
+        // released). Reject anything else so we never send an out-of-range array index (audit LOW).
+        if !(1..=hid::media_button::MAX).contains(&index) {
+            eprintln!("[input] media-btn index={index} out of range 1..={} — dropped", hid::media_button::MAX);
             return;
         }
         let pressed = events::send_hid_report(2, &hid::media_button_report(index));

@@ -438,7 +438,10 @@ pub const INPUT_KNOB: u8 = 0x07; // [INPUT_KNOB][flags u8][nudge_x i8][nudge_y i
                                 // (receiver info.rs::media_buttons_descriptor); MEDIA-TRANSPORT ONLY (Home/Back/nav are the uid-3
                                 // D-Pad, INPUT_NAV). 0 = release; the box completes press+release. Wire indices (the contract with
                                 // the descriptor's usage order; carplayd forwards the raw index, the host names them in Swift):
-                                //   1 play, 2 pause, 3 play/pause, 4 next, 5 prev
+                                //   1 play, 2 pause, 3 play/pause, 4 next, 5 prev, 6 AC Navigation Guidance
+                                //   (0x029E, Apple's template), 7 Random Play (0xB9, shuffle), 8 Repeat (0xBC).
+                                //   7 and 8 drive the playing app's changeShuffleMode/changeRepeatMode: Apple
+                                //   Music cycles them (device-verified 2026-10-27); Spotify ignores both.
 
 // INPUT_NAV actions — the CarPlay D-Pad (HID uid 3, Apple's exact HIDDPadCreateDescriptor). carplayd
 // builds the 2-byte variable-bitfield report (byte0 Home/Back, byte1 Menu Select/Up/Down/Left/Right)

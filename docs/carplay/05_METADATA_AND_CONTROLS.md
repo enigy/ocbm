@@ -1111,8 +1111,15 @@ is iAP2, NOT AirPlay"]
 
   (Genre/other attrs exist in the catalog; only the subscribed ones stream.)
 - **PlaybackAttributes** (group id 1) [E]: id 0x00 PlaybackStatus (u8 play/pause/stop), id 0x01
-  ElapsedTime (u32 ms), id 0x07 AppName (utf8, e.g. "Music"). Catalog also: queue index/count, shuffle,
-  repeat, `SetElapsedTimeAvailable` [E — `WIRED_METADATA_PLANE.md` §36-40].
+  ElapsedTime (u32 ms), id 0x05 ShuffleMode (u8 0 off, 1 songs, 2 albums), id 0x06 RepeatMode (u8 0
+  off, 1 one, 2 all), id 0x07 AppName (utf8, e.g. "Music"). Catalog also: queue index/count,
+  `SetElapsedTimeAvailable` [E — `WIRED_METADATA_PLANE.md` §36-40].
+  **CORRECTED 2026-10-27:** shuffle and repeat stream ONLY when subscribed. iOS never sent them while
+  `start_now_playing()` carried the stock-CCPA selectors alone (wireless session, Spotify shuffle on,
+  no `shuffleMode` in the stream). Selectors 5 and 6 are now in the subscribe; titles still stream, and
+  every shuffle/repeat change made in CarPlay's Now Playing (Spotify and Apple Music) arrives. The box
+  forwards them as `shuffleMode`/`repeatMode`. Wireless (carplayd) is device-verified; the wired arm
+  (iap2d) shares the function but has not been rebuilt or run with it.
 
 **What the accessory must do to receive it** (all four are load-bearing, learned the hard way) [E —
 `WIRED_METADATA_PLANE.md` L133-140]:
@@ -1270,8 +1277,14 @@ MediaButtons (0x28): 05 0c 09 01 a1 01 15 00 25 06 05 0c 0a 00 00 0a b0 00 0a b1
                      0a cd 00 0a b5 00 0a b6 00 0a 9e 02 75 08 95 01 81 00 c0
   Consumer array, LogicalMax=6, Input(Array). Usage list (report byte = index into it):
     0=0x0000(none/release) 1=0x00B0 Play 2=0x00B1 Pause 3=0x00CD Play/Pause
-    4=0x00B5 ScanNext 5=0x00B6 ScanPrev  6=0x029E [E present; semantic [I], Apple-specific]
-  NOTE: sibling/ncm port declares LogicalMax=5 (6 usages) — the real SDK has a 7th usage (index 6). [NEW]
+    4=0x00B5 ScanNext 5=0x00B6 ScanPrev  6=0x029E AC Navigation Guidance (USB HID Usage Tables name)
+  **CORRECTED 2026-10-27:** the box now ships this template plus two appended standard usages, LogicalMax=8:
+  7=0x00B9 Random Play, 8=0x00BC Repeat (`receiver/src/info.rs` `media_buttons_descriptor`). Device-verified on
+  a wireless session (iOS 27.2): iOS turns 7 and 8 into the playing app's shuffle and repeat commands.
+  **Apple Music** honours both — Random Play toggles shuffle, Repeat cycles all, one, off — and the iAP2
+  NowPlayingUpdate reports each change. **Spotify ignores both** (its CarPlay shuffle/repeat are its own
+  buttons, with a Spotify-only Smart Shuffle state). Index 6 had no visible effect with no route active.
+  Play, Pause, Play/Pause, Next and Previous are unchanged by the larger descriptor.
 
 Telephony (0x39): 05 0b 09 07 a1 01 15 00 25 11 05 0b 09 00 09 20 09 21 09 26 09 2f
                   09 b0 09 b1 09 b2 09 b3 09 b4 09 b5 09 b6 09 b7 09 b8 09 b9 09 ba 09 bb
@@ -1728,8 +1741,9 @@ as touch. No auto-repeat in the transmit path. Timing is not the cause.
   addition to the touch bits we already advertise.
 - iAP2 param-ID maps in §1.2-1.4 are **wire-verified** on a stock CCPA capture, but a few enum *values*
   (PlaybackStatus, ManeuverType, CallState Status/Direction) are [I] pending per-value capture.
-- The MediaButtons 7th usage (index 6 = Consumer 0x029E) is **[E] present** in the real SDK descriptor but
-  its semantic is **[I]** (Apple-specific; our port omits it). **CORRECTED 2026-08-16 — this bullet
+- The MediaButtons 7th usage (index 6 = Consumer 0x029E) is **[E] present** in the real SDK descriptor;
+  the USB HID Usage Tables name it AC Navigation Guidance, and our port carries it since 2026-10-27
+  (§2.1). What iOS does with it is still **[I]**. **CORRECTED 2026-08-16 — this bullet
   previously said the numeric `AirPlaySiriAction` / `AirPlayZoomDirection` values "remain [I] (only string
   forms emitted)". Both are wrong now:** `AirPlaySiriAction` is **[E]** (R14G17 `AirPlayCommon.h:1366-1369`
   — 0 n/a · 1 prewarm · 2 buttondown · 3 buttonup; 4 voiceactivation is from `CarPlaySDK.framework`, not

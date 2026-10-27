@@ -688,8 +688,9 @@ Box `/info` emission + parser + app re-emit are landing 2026-09-05, unverified o
   2 buttondown · 3 buttonup, and a device log records `Siri Action - 2` then `- 3` on a real
   press/release. 1/2 was off by one (1 = prewarm). The "confirmed working on-device" evidence covered
   Siri *audio*, not that our `/command` initiated the session — see ../carplay/05_METADATA_AND_CONTROLS.md §2.4b.
-- Media-buttons descriptor lags the shipped-ARM template (LMax 5 vs 6, missing usage 0x029E) — inert
-  for transport (Apple's own FillReport writes only byte0).
+- ~~Media-buttons descriptor lags the shipped-ARM template (LMax 5 vs 6, missing usage 0x029E)~~
+  **CORRECTED 2026-10-27:** the port now carries the full template (index 6 = 0x029E) plus Random Play
+  and Repeat at 7 and 8; see ../carplay/05_METADATA_AND_CONTROLS.md §2.1.
 
 ---
 
@@ -749,8 +750,8 @@ templates are emitted verbatim (`memcpy`, no post-write patching).
 Two descriptors have evolved since 2017, neither in a way that affects report layout:
 
 - **MediaButtons 37 → 40.** A clean additive extension: Logical Maximum `05`→`06` plus one inserted
-  Consumer usage `0A 9E 02`. Indices 0–5 unchanged. (Usage `0x029E` was not identifiable from any
-  source at hand; recorded as a raw value.)
+  Consumer usage `0A 9E 02`. Indices 0–5 unchanged. (Usage `0x029E` is AC Navigation Guidance in the
+  USB HID Usage Tables, identified 2026-10-27.)
 - **TouchScreen.** Not a divergence — a *different function*. The Simulator calls
   `HIDTouchScreenMultiWithCancelCreateDescriptor`, which has no R14G17 counterpart
   (`grep -rn "WithCancel"` over the SDK returns zero). Like-for-like, `…MultiCreateDescriptor` went
