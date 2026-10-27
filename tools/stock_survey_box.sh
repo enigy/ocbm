@@ -75,11 +75,31 @@ secret() {  # $1 path: true when the file may hold a secret (names from a stock 
   done
   show 'cat /etc/rgbLight.conf 2>/dev/null'
   show 'ls -la /dev'
+  # Who owns each pin, and the state of every exported one: the LED pins are among them.
+  show 'cat /sys/kernel/debug/gpio 2>/dev/null'
+  for g in /sys/class/gpio/gpio[0-9]*; do
+    [ -e "$g" ] || continue
+    printf '%s direction=%s value=%s active_low=%s\n' "$g" "$(cat "$g/direction" 2>/dev/null)" \
+      "$(cat "$g/value" 2>/dev/null)" "$(cat "$g/active_low" 2>/dev/null)"
+  done
 
   sec "processes"
   show 'ps w'
   show 'netstat -lntu 2>/dev/null'
 } > "$R" 2>&1
+
+# Per running program: what it is, the shared libraries it has mapped (packed vendor binaries hide
+# their links on disk, not in memory) and the files and sockets it holds open (colorLightDaemon's
+# GPIO value files and its IPC end show up here).
+for d in /proc/[0-9]*; do
+  pid=${d#/proc/}
+  exe=$(readlink "$d/exe" 2>/dev/null) || continue   # kernel threads have no exe
+  echo "--- pid $pid exe $exe"
+  echo "cmdline: $(tr '\0' ' ' < "$d/cmdline" 2>/dev/null)"
+  awk '$6 ~ /\// {print "map: " $6}' "$d/maps" 2>/dev/null | sort -u
+  for f in "$d"/fd/*; do readlink "$f" 2>/dev/null; done | sort | uniq -c | sed 's/^/fd: /'
+done > "$OUT/processes.txt" 2>&1
+{ echo "--- /proc/net/unix"; cat /proc/net/unix; } >> "$OUT/processes.txt" 2>&1
 
 dmesg > "$OUT/dmesg.txt" 2>&1
 [ -e /proc/config.gz ] && cp /proc/config.gz "$OUT/kernel_config.gz"

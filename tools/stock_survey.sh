@@ -5,7 +5,7 @@
 #
 # Copy OUT_DIR/A15W_Update.img to the root of a FAT32 stick and plug it into the stock adapter as for
 # a Carlinkit stick update. The image's once.sh (tools/stock_survey_box.sh) writes ocbm_survey_<n>/
-# to the stick (report.txt, inventory.tsv, dmesg.txt, SURVEY_DONE) and then fails the update on
+# to the stick (report.txt, inventory.tsv, processes.txt, dmesg.txt, SURVEY_DONE) and then fails the update on
 # purpose, so nothing on flash changes. Pull the stick once SURVEY_DONE is there, then power-cycle the
 # adapter: stock keeps CarPlay down after a failed update.
 set -euo pipefail
