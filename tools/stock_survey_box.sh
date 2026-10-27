@@ -104,6 +104,11 @@ done < "$W/paths" > "$OUT/inventory.tsv"
 
 echo "seconds=$(( $(cut -d. -f1 /proc/uptime) - t0 )) entries=$(wc -l < "$OUT/inventory.tsv")" > "$OUT/SURVEY_DONE"
 rm -rf "$W"
+# The updater has already copied the image to /tmp. Renaming it on the stick means the next insert
+# finds no image, so start_mass_storage.sh hands the stick through to the host and the report can be
+# read without moving the stick, instead of the survey running again.
+img="$STICK/$(cat /etc/box_product_type 2>/dev/null)_Update.img"
+[ -f "$img" ] && mv "$img" "$img.surveyed"
 sync
 echo "ocbm survey written to $OUT; stopping the update on purpose" > /dev/console 2>/dev/null
 exit 1
