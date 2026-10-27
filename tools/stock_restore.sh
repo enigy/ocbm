@@ -80,13 +80,28 @@ gate() {
 #   stock  1314:1520 or 1314:1521 — Carlinkit firmware; nothing left to do
 # ------------------------------------------------------------------------------------------
 VIA=""
+OCBM_WARM=0
 usb_has() { ioreg -p IOUSB -w0 -l 2>/dev/null | grep -q "\"idProduct\" = $1\$"; }
 ssh_ok() { ssh -n -o ConnectTimeout=6 -o BatchMode=yes "root@$NCM_IP" true >/dev/null 2>&1; }
 telnet_ok() { python3 "$BOXSH" --host "$NCM_IP" --timeout 8 probe >/dev/null 2>&1; }
 
+# The first console attach can swallow a command (the 2026-10-27 dry run lost its first md5),
+# so wait for one round trip before trusting the console's answers.
+ocbm_warm() {
+  [ "$OCBM_WARM" = 1 ] && return 0
+  local i
+  for i in 1 2 3 4 5; do
+    if python3 "$REPO/tools/ocbmcmd.py" --timeout 15 'echo OCBM_$((40+2))' 2>/dev/null | grep -q OCBM_42; then
+      OCBM_WARM=1; return 0
+    fi
+    sleep 3
+  done
+  die "the adapter is on OCBM but its console does not answer"
+}
+
 detect() {
   VIA=""
-  if usb_has $((16#2d00)); then VIA=ocbm
+  if usb_has $((16#2d00)); then VIA=ocbm; ocbm_warm
   elif ssh_ok; then VIA=ssh
   elif telnet_ok; then VIA=telnet
   elif usb_has $((16#1520)) || usb_has $((16#1521)); then VIA=stock
@@ -121,7 +136,8 @@ pull() {  # $1 remote, $2 local
   esac
 }
 
-box_md5() { run "md5sum '$1' 2>/dev/null | cut -c1-32" 120 | tr -d ' \r\n' | grep -oE '[0-9a-f]{32}' | tail -1; }
+# A lookup that finds nothing must return empty, not trip set -e: the caller's die names the problem.
+box_md5() { run "md5sum '$1' 2>/dev/null | cut -c1-32" 120 | tr -d ' \r\n' | grep -oE '[0-9a-f]{32}' | tail -1 || true; }
 
 need_ncm() {
   detect
@@ -165,10 +181,10 @@ phase_preflight() {
   [ "$m0" = "$b0" ] && [ "$m1" = "$b1" ] \
     || die "mtd0/mtd1 on the box differ from the backup's: this backup is NOT from this adapter (box $m0/$m1, backup $b0/$b1)"
   say "identity: mtd0 and mtd1 match the backup byte for byte"
-  sw="$(run 'cat /etc/software_version' 20 | tr -d '\r' | grep -E '^[0-9]{4}\.' | tail -1)"
+  sw="$(run 'cat /etc/software_version' 20 | tr -d '\r' | grep -E '^[0-9]{4}\.' | tail -1 || true)"
   [ "$sw" = "$want_sw" ] || die "software_version on the box is '$sw', the backup's is '$want_sw'"
   say "software_version: $sw"
-  tmpfree="$(run "df -k /tmp | awk 'NR>1{f=\$4} END{print f+0}'" 20 | tr -d '\r' | grep -E '^[0-9]+$' | tail -1)"
+  tmpfree="$(run "df -k /tmp | awk 'NR>1{f=\$4} END{print f+0}'" 20 | tr -d '\r' | grep -E '^[0-9]+$' | tail -1 || true)"
   [ "${tmpfree:-0}" -ge 40000 ] || die "only ${tmpfree:-?} KB free in /tmp; staging needs about 40 MB"
   say "/tmp: ${tmpfree} KB free"
   run 'df -k / | tail -1' 20 | tr -d '\r' | sed 's/^/[stock-restore] rootfs: /' | tail -1

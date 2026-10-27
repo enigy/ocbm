@@ -91,6 +91,11 @@ def run(cmd: str, timeout: float = 15.0, raw: bool = False):
             started = s.endswith(begin)
             continue
         if done in s:
+            # Output without a trailing newline (`cat /etc/software_version`) shares the
+            # marker's line; keep what precedes the marker.
+            head = ln.split(done)[0]
+            if head.strip():
+                out.append(head)
             break
         out.append(ln)
     return ("\n".join(out).strip("\n") if started else text.strip()), status
