@@ -79,6 +79,11 @@ runs it end to end against synthetic stock trees.
 Tested on the host by `tools/ocbm_installer_test.sh` (Stage A) and `tools/ocbm_stageb_test.sh` (Stages B
 and C). On the bench, `ocbm-host install [vid pid] info|confirm|stock` stands in for the app.
 
+After `final` there is no `ocbm_revert.sh` way back. `tools/stock_restore.sh --profile onefile` restores
+stock over the OCBM console from the archive the unit took of its rootfs during the trial, keeping the
+dispatcher booting OCBM until one rename of the stock start script (docs/ops/01_RECOVERY.md, "Back to
+stock from a one-file install"; tested by `tools/stock_restore_test.sh`).
+
 ## Daemons — `ocbmd/`, `iap2d/`, `carplayd/` (shipped, hardware-validated) + `mfid/` (bring-up only)
 
 Each is a sibling crate (`Cargo.toml` + `src/`), cross-built for `armv7-unknown-linux-musleabihf`:

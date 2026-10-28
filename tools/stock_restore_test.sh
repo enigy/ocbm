@@ -87,6 +87,161 @@ run_payload() {  # $1 shell, $2 mode, $3 root, rest: env
   return $rc_
 }
 
+# ---- PROFILE=onefile: a one-file adapter, finished by the real ocbm_finish.sh, restored to stock ----
+REPO="$(cd "$HERE/.." && pwd)"
+TREE="${STOCK_RESTORE_TREE:-$HERE/stock_restore_onefile_tree.sh}"   # override to mutation-test the test
+FINISH="$REPO/ccpa/installer/ocbm_finish.sh"
+OCBM_PATHS="$(bash "$HERE/make_ocbm_installer.sh" --list)"
+# Carlinkit daemon names this host runs itself (macOS has its own usbmuxd): ocbm_finish.sh skips them.
+HOST_DAEMONS="$(for n in usbmuxd mdnsd boa; do pgrep -x "$n" >/dev/null 2>&1 && printf '%s ' "$n"; done)"
+
+make_trial() {  # $1 dir: an adapter in its one-file trial — stock kept, OCBM placed, the dispatcher armed
+  r="$1"
+  mkdir -p "$r/bin" "$r/usr/sbin" "$r/usr/bin" "$r/usr/lib" "$r/lib/firmware/nxp" "$r/script" "$r/etc/mdev" \
+           "$r/etc/init.d" "$r/etc/ocbm" "$r/etc/bluetooth" "$r/var/run" "$r/var/log" "$r/proc" "$r/tmp" "$r/id/etc"
+  blob "$r/bin/busybox" 60000; chmod 755 "$r/bin/busybox"; ln -s busybox "$r/bin/sh"
+  for b in ARMadb-driver AppleCarPlay ARMiPhoneIAP2 boa mdnsd hostapd; do blob "$r/usr/sbin/$b" 40000; chmod 755 "$r/usr/sbin/$b"; done
+  blob "$r/usr/lib/libssl.so.1.1" 20000; ln -s libssl.so.1.1 "$r/usr/lib/libssl.so"
+  blob "$r/lib/firmware/nxp/sd8987.bin" 5000
+  for s in update_box.sh update_box_ota.sh init_gpio.sh; do echo "stock $s" > "$r/script/$s"; chmod 755 "$r/script/$s"; done
+  echo "stock radio bring-up" > "$r/script/init_bluetooth_wifi.sh"
+  echo "stock airplay.conf"   > "$r/etc/airplay.conf"
+  echo "stock riddle.conf"    > "$r/etc/riddle.conf"
+  printf 'mount /dev/sda1 /mnt/UPAN\n/script/update_box.sh\n' > "$r/etc/mdev/udisk_insert.sh"; chmod 755 "$r/etc/mdev/udisk_insert.sh"
+  echo "stock rcS"     > "$r/etc/init.d/rcS"
+  echo "stock inittab" > "$r/etc/inittab"
+  echo "bond: phone A" > "$r/etc/bluetooth/keys"
+  echo "stock start_main_service" > "$r/script/start_main_service.stock.sh"; chmod 755 "$r/script/start_main_service.stock.sh"
+  printf '#!/bin/sh\n# OCBM_DISPATCH 1\necho dispatch\n' > "$r/script/start_main_service.sh"; chmod 755 "$r/script/start_main_service.sh"
+  for p in $OCBM_PATHS; do mkdir -p "$r/$(dirname "$p")"; blob "$r/$p" 3000; chmod 755 "$r/$p"; done
+  echo trial > "$r/script/ocbm_mode"
+  echo "1.0.0 ocbm 153df7f" > "$r/etc/ocbm/installed_version"
+  echo 'wpa_passphrase=stock-original' > "$r/id/etc/hostapd.conf"
+  (cd "$r/id" && tar -cf - etc/hostapd.conf) | gzip -c > "$r/etc/ocbm/identity.tgz"; rm -rf "$r/id"
+  echo 'wpa_passphrase=ocbm-rewritten' > "$r/etc/hostapd.conf"
+  echo "ccpa-1234" > "$r/etc/carplay_ident"
+  echo "crash"     > "$r/script/box_crash.log"
+  echo 77          > "$r/var/run/ocbmd.pid"
+}
+
+archive_of() {  # $1 trial dir, $2 archive: what the adapter took of its own rootfs during the trial
+  (cd "$1" && tar -cf - --exclude=./proc --exclude=./tmp .) | gzip -c > "$2"
+}
+
+finish_box() {  # $1 trial dir, $2 box dir: the real ocbm_finish.sh after a confirmed session
+  cp -pR "$1" "$2"
+  echo confirmed > "$2/script/ocbm_mode"
+  mkdir -p "$2.run"
+  env ROOT="$2" RUN="$2.run" FINISH_IGNORE="$HOST_DAEMONS" sh "$FINISH" > "$2.fin" 2>&1
+  echo "bond: phone A, phone B" > "$2/etc/bluetooth/keys"   # paired after the archive was taken
+}
+
+run_onefile() {  # $1 shell, $2 mode, $3 root, rest: env. The lock lives in $T/run1.
+  sh_="$1" mode_="$2" root_="$3"; shift 3
+  mkdir -p "$T/run1"
+  env PROFILE=onefile RUN="$T/run1" SRC="$T/tree" ROOT="$root_" WORK="$T/work.$$" "$@" "$sh_" "$PAYLOAD" "$mode_" > "$T/out" 2>&1
+  rc_=$?
+  rm -rf "$T/work.$$"
+  return $rc_
+}
+
+is_dispatcher() { grep -q '^# OCBM_DISPATCH' "$1/script/start_main_service.sh"; }
+
+onefile_tests() {  # $1 shell
+  SH1="$1"
+  echo "=== onefile profile under $SH1"
+  rm -rf "$T/trial" "$T/fin" "$T/fin.run" "$T/tree" "$T/run1" "$T/a.tgz"
+  make_trial "$T/trial"; archive_of "$T/trial" "$T/a.tgz"; finish_box "$T/trial" "$T/fin"
+  check '[ "$(cat "$T/fin/script/ocbm_mode")" = final ] && [ ! -e "$T/fin/usr/sbin/ARMadb-driver" ] && [ ! -e "$T/fin/script/start_main_service.stock.sh" ]' \
+    "the real ocbm_finish.sh left the box final, its Carlinkit stack gone"
+
+  "$SH1" "$TREE" "$T/a.tgz" "$T/tree" > "$T/out" 2>&1; rc=$?
+  check '[ $rc -eq 0 ] && grep -q TREE_OK "$T/out"' "tree: made from the trial archive"
+  check '[ "$(cat "$T/tree/script/start_main_service.sh")" = "stock start_main_service" ] && [ ! -e "$T/tree/script/start_main_service.stock.sh" ]' "tree: the stock start script is back under its own name"
+  check '[ ! -e "$T/tree/usr/sbin/ocbmd" ] && [ ! -e "$T/tree/script/ocbm_boot.sh" ] && [ ! -e "$T/tree/etc/ocbm" ] && [ ! -e "$T/tree/script/ocbm_mode" ]' "tree: OCBM's payload, /etc/ocbm and the mode are dropped"
+  check '[ ! -e "$T/tree/etc/carplay_ident" ] && [ ! -e "$T/tree/script/box_crash.log" ]' "tree: OCBM's runtime files are dropped"
+  left_ocbm=0; for p in $OCBM_PATHS; do [ -e "$T/tree/$p" ] && left_ocbm=$((left_ocbm + 1)); done
+  check '[ $left_ocbm -eq 0 ]' "tree: every path of make_ocbm_installer.sh --list is dropped"
+  check '[ "$(cat "$T/tree/etc/hostapd.conf")" = "wpa_passphrase=stock-original" ]' "tree: hostapd.conf comes from the identity archive"
+  check '[ ! -e "$T/tree/proc/version" ] && [ -x "$T/tree/usr/sbin/ARMadb-driver" ]' "tree: stock programs kept"
+  rm -rf "$T/bad"; cp -pR "$T/trial" "$T/bad"; cp "$T/bad/script/start_main_service.stock.sh" "$T/bad/script/start_main_service.sh"
+  archive_of "$T/bad" "$T/bad.tgz"; rm -rf "$T/badtree"
+  "$SH1" "$TREE" "$T/bad.tgz" "$T/badtree" > "$T/out" 2>&1; rc=$?
+  check '[ $rc -ne 0 ] && grep -q "not a trial" "$T/out"' "tree: refuses an archive whose start script is not the dispatcher"
+  rm -rf "$T/bad"; cp -pR "$T/trial" "$T/bad"; rm -f "$T/bad/script/start_main_service.stock.sh"
+  archive_of "$T/bad" "$T/bad.tgz"; rm -rf "$T/badtree"
+  "$SH1" "$TREE" "$T/bad.tgz" "$T/badtree" > "$T/out" 2>&1; rc=$?
+  check '[ $rc -ne 0 ] && grep -q "no start_main_service.stock.sh" "$T/out"' "tree: refuses an archive without the stock start script"
+
+  rm -rf "$T/box"; cp -pR "$T/fin" "$T/box"
+  before=$(tree_sum "$T/box")
+  run_onefile "$SH1" plan "$T/box"; rc=$?
+  check '[ $rc -eq 0 ] && grep -q RESTORE_PLAN_OK "$T/out" && grep -q "switch      :" "$T/out"' "plan succeeds and names the switch"
+  check '[ "$(tree_sum "$T/box")" = "$before" ]' "plan changes nothing"
+
+  # Stopped right before the switch: every stock file back, OCBM still whole and booting.
+  run_onefile "$SH1" apply "$T/box" STOP_AT=switch; rc=$?
+  check '[ $rc -eq 99 ] && grep -q "3/5 check" "$T/out"' "apply reaches the check before the switch"
+  check 'cmp -s "$T/tree/usr/sbin/ARMadb-driver" "$T/box/usr/sbin/ARMadb-driver" && [ "$(readlink "$T/box/usr/lib/libssl.so")" = libssl.so.1.1 ]' "before the switch: the Carlinkit stack is back"
+  check 'is_dispatcher "$T/box" && [ -x "$T/box/usr/sbin/ocbmd" ] && [ -f "$T/box/script/ocbm_boot.sh" ] && [ "$(cat "$T/box/script/ocbm_mode")" = final ]' "OCBM kept until the switch"
+  check '[ ! -e "$T/run1/ocbm_mode.lock" ]' "the mode lock is released after a stop"
+
+  run_onefile "$SH1" apply "$T/box"; rc=$?
+  check '[ $rc -eq 0 ] && grep -q RESTORE_DONE "$T/out"' "a re-run after the stop converges"
+  check 'awk "/2\/5 files/{a=NR} /3\/5 check/{b=NR} /4\/5 switch/{c=NR} /5\/5 OCBM programs/{d=NR} END{exit !(a<b && b<c && c<d)}" "$T/out"' "order: stock files, check, switch, then OCBM's files"
+  check '[ "$(cat "$T/box/script/start_main_service.sh")" = "stock start_main_service" ]' "the stock start script is in place"
+  check '[ ! -e "$T/box/usr/sbin/ocbmd" ] && [ ! -e "$T/box/etc/ocbm" ] && [ ! -e "$T/box/script/ocbm_mode" ] && [ ! -e "$T/box/script/ocbm_boot.sh" ]' "OCBM's files removed after the switch"
+  check '[ -e "$T/box/script/radio_hal.sh" ] && grep -q "kept by the radio guard" "$T/out"' "the radio guard keeps the radio seam"
+  check 'grep -q "^/script/update_box.sh" "$T/box/etc/mdev/udisk_insert.sh"' "the stick handler calls the stock updater again"
+  check '[ "$(cat "$T/box/etc/hostapd.conf")" = "wpa_passphrase=stock-original" ] && [ "$(cat "$T/box/etc/bluetooth/keys")" = "bond: phone A" ]' "Wi-Fi settings and bonds as in the trial archive"
+  check '[ -z "$(find "$T/box" -name "*.rsnew")" ] && [ ! -e "$T/run1/ocbm_mode.lock" ]' "no .rsnew and no lock left behind"
+  run_onefile "$SH1" verify "$T/box"; rc=$?
+  check '[ $rc -eq 0 ] && grep -q RESTORE_VERIFIED "$T/out"' "verify passes after apply"
+  before=$(tree_sum "$T/box")
+  run_onefile "$SH1" apply "$T/box"; rc=$?
+  check '[ $rc -ne 0 ] && grep -q "not OCBM.s dispatcher" "$T/out" && [ "$(tree_sum "$T/box")" = "$before" ]' "refusal without the OCBM start script, nothing changed"
+
+  # A write that did not land: the check stops before the switch.
+  rm -rf "$T/box"; cp -pR "$T/fin" "$T/box"
+  run_onefile "$SH1" apply "$T/box" SKIP_WRITE=usr/sbin/ARMadb-driver; rc=$?
+  check '[ $rc -ne 0 ] && grep -q "not switching" "$T/out"' "a difference left before the switch stops the apply"
+  check 'is_dispatcher "$T/box" && [ -x "$T/box/usr/sbin/ocbmd" ]' "after that stop OCBM still boots"
+
+  # Room shortfall: stops before the first file; the box still boots OCBM; a re-run converges.
+  rm -rf "$T/box"; cp -pR "$T/fin" "$T/box"
+  run_onefile "$SH1" apply "$T/box" FAKE_FREE_KB=10; rc=$?
+  check '[ $rc -ne 0 ] && grep -q "no room for" "$T/out" && grep -q RESTORE_ABORT "$T/out"' "too little flash aborts"
+  check 'is_dispatcher "$T/box" && [ "$(cat "$T/box/script/ocbm_mode")" = final ] && [ -z "$(find "$T/box" -name "*.rsnew")" ]' "the abort leaves OCBM booting and no partial file"
+  run_onefile "$SH1" apply "$T/box"; rc=$?
+  check '[ $rc -eq 0 ] && grep -q RESTORE_DONE "$T/out"' "a re-run after the shortfall converges"
+
+  # Refusals that change nothing.
+  rm -rf "$T/tree2"; cp -pR "$T/tree" "$T/tree2"
+  for case_ in confirmed pending lock noocbmd noboot srcdispatch srcocbm; do
+    rm -rf "$T/box"; cp -pR "$T/fin" "$T/box"; rm -rf "$T/run1"; mkdir -p "$T/run1"
+    rm -rf "$T/tree2"; cp -pR "$T/tree" "$T/tree2"
+    case "$case_" in
+      confirmed)   echo confirmed > "$T/box/script/ocbm_mode"; want="is confirmed" ;;
+      pending)     : > "$T/box/etc/ocbm/finish_pending"; want="finish was interrupted" ;;
+      lock)        mkdir "$T/run1/ocbm_mode.lock"; want="holds" ;;
+      noocbmd)     rm -f "$T/box/usr/sbin/ocbmd"; want="OCBM is not complete" ;;
+      noboot)      rm -f "$T/box/script/ocbm_boot.sh"; want="OCBM is not complete" ;;
+      srcdispatch) cp "$T/box/script/start_main_service.sh" "$T/tree2/script/start_main_service.sh"; want="dispatcher, not stock" ;;
+      srcocbm)     cp "$T/box/usr/sbin/ocbmd" "$T/tree2/usr/sbin/ocbmd"; want="still holds OCBM" ;;
+    esac
+    before=$(tree_sum "$T/box")
+    run_onefile "$SH1" apply "$T/box" SRC="$T/tree2"; rc=$?
+    check '[ $rc -ne 0 ] && grep -q "$want" "$T/out" && [ "$(tree_sum "$T/box")" = "$before" ]' "refuses ($case_), nothing changed"
+  done
+  rm -rf "$T/run1" "$T/tree2"
+
+  # The rehearsal: the same restore from a trial that was never finished.
+  rm -rf "$T/box"; cp -pR "$T/trial" "$T/box"
+  run_onefile "$SH1" apply "$T/box"; rc=$?
+  check '[ $rc -eq 0 ] && grep -q RESTORE_DONE "$T/out" && [ "$(cat "$T/box/script/start_main_service.sh")" = "stock start_main_service" ] && [ ! -e "$T/box/script/start_main_service.stock.sh" ]' \
+    "a trial restores the same way (the rehearsal)"
+}
+
 SHELLS="sh"
 command -v dash >/dev/null 2>&1 && SHELLS="$SHELLS dash"
 
@@ -142,6 +297,8 @@ for SH in $SHELLS; do
   run_payload "$SH" apply "$T/box"; rc=$?
   check '[ $rc -ne 0 ] && grep -q "type conflicts" "$T/out"' "type conflict refuses"
   check '[ "$(tree_sum "$T/box")" = "$before" ]' "refusal changes nothing"
+
+  onefile_tests "$SH"
 done
 
 echo

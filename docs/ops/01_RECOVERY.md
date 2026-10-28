@@ -161,9 +161,38 @@ kept `start_main_service.stock.sh`, and the report lands on the next stick plugg
 2025.10.15.1127 image puts them back.
 
 In `final` there is no stock left and `ocbm_revert.sh` refuses. Carlinkit's image cannot rebuild it
-either: it omits files the finish deletes, its own decrypter `ARMimg_maker` among them. The way back is
-then the stick's `OCBM_BACKUP/<serial>/` flash dump (taken before the install changed anything, and
-kept across re-installs), written back with an SPI programmer.
+either: it omits files the finish deletes, its own decrypter `ARMimg_maker` among them. The way back
+without an SPI programmer is `tools/stock_restore.sh --profile onefile`, over the OCBM console, from a
+file-level archive the unit took of its own rootfs during its trial (`rootfs_files_trial.tgz`, kept
+with the stick's `OCBM_BACKUP/<serial>/` folder):
+
+    tools/stock_restore.sh --profile onefile --backup OCBM_BACKUP/<serial> dryrun   # flash untouched
+    tools/stock_restore.sh --profile onefile --backup OCBM_BACKUP/<serial> all
+
+- **The target.** `tools/stock_restore_onefile_tree.sh` makes stock of the trial's rootfs: OCBM's
+  payload (`make_ocbm_installer.sh --list`), `/etc/ocbm/`, `/script/ocbm_mode` and OCBM's runtime files
+  dropped, `/etc/hostapd.conf` from the identity archive (as `ocbm_revert.sh` does), and
+  `start_main_service.stock.sh` back as `start_main_service.sh`. The pruned extras are not in it.
+- **The order** (`PROFILE=onefile` in `tools/stock_restore_box.sh`). The dispatcher keeps booting OCBM
+  while every stock file goes back (`.rsnew`, md5-checked, renamed, free space checked first) and no
+  OCBM file is touched; a check then stops the run if anything but the start script and OCBM's own
+  files still differs; one rename of the stock start script over the dispatcher is the switch; OCBM's
+  files go after it, each through `is_radio()` (the `radio_*.sh` seam stays, inert). Every stopping
+  point boots OCBM, where the restore runs again, or complete stock.
+- **Refusals**, before anything changes: the start script is not OCBM's dispatcher, `ocbmd` or
+  `ocbm_boot.sh` is missing, the mode is not `trial` or `final` (a `confirmed` trial finishes when its
+  session ends), a finish is pending, or `ocbm_mode.lock` is held (`ocbm_revert.sh` and
+  `ocbm_finish.sh` take the same lock). The identity gate (`mtd0`/`mtd1` against the stick's dump) and
+  `software_version` against the archive's are checked first.
+- **Rehearsal.** In `trial` the same restore works with stock still on the unit; afterwards a stick
+  with the installer converts it again. The stock updater is back, so Carlinkit's 2025.10.15.1127
+  image then restores the pruned extras too.
+- **Tests.** `tools/stock_restore_test.sh` finishes a synthetic trial with the real `ocbm_finish.sh`
+  and restores it: OCBM kept until the switch, the check before the switch, the room shortfall, the
+  re-run that converges, every refusal, and the rehearsal, under `sh` and `dash`.
+- **Not on an adapter yet** (28 Oct): host tests only. Until a rehearsal and a confirm, finish and
+  restore have run on the factory adapter, no adapter is confirmed (`MGMT_INSTALL_CONFIRM`). The flash
+  dump and an SPI programmer stay the last resort.
 
 ### UART console reference
 

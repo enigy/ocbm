@@ -30,20 +30,45 @@
 # Recovery behind it: the UART console (TX1/RX1, armed by the NCM scripts too) and an SPI programmer
 # with backup_pre/full_nor_16MB.bin. The boot stack (mtd0/mtd1) is never written.
 #
+# ============================== --profile onefile =======================================
+# For an adapter converted by the one-file install (ccpa/installer/), in its trial or after the
+# finish: there is no NCM, so everything runs over the OCBM console. INPUT: the stick's backup
+# folder OCBM_BACKUP/<adapter>/ (mtd0.bin mtd1.bin mtd2.bin SHA256SUMS) and the file-level archive
+# the adapter took of its own rootfs during the trial (--archive; default rootfs_files_trial.tgz in
+# that folder). The archive and the tree made from it hold the Wi-Fi passphrase and Bluetooth keys.
+#   preflight  backup checksums; the adapter on OCBM; mtd0 + mtd1 match the dump; the mode is trial
+#              or final, the start script is OCBM's dispatcher, no finish pending; same
+#              software_version as the archive; room in /tmp
+#   stage      make the stock tree on this Mac (tools/stock_restore_onefile_tree.sh), push it and
+#              the payload, unpack to /tmp/rs; the local tree is deleted once it is on the box
+#   plan       read-only on the box (PROFILE=onefile)
+#   apply      gated: every stock file back while OCBM still boots, the check, ONE rename of the
+#              stock start script over the dispatcher, then OCBM's files go. Before the switch a
+#              stop leaves OCBM booting and apply can run again; after it the next start is stock
+#   verify     read-only, before the restart
+#   stock      gated: restart; the adapter must enumerate as stock 1314:1520/1521
+#   all        preflight, stage, plan, apply, verify, stock
+# The extras the install pruned (HiCar, the Android Mirror helper, the web pages) are not in the
+# archive: once stock is back, Carlinkit's own 2025.10.15.1127 image on a stick restores them.
+#
 # ============================== USAGE ===================================================
 #   tools/stock_restore.sh --backup DIR dryrun     # safe any time; the adapter must be on this Mac
 #   tools/stock_restore.sh --backup DIR all
 #   tools/stock_restore.sh --backup DIR <phase>...
+#   tools/stock_restore.sh --profile onefile --backup OCBM_BACKUP/<adapter> [--archive FILE] dryrun|all|<phase>...
 # Options: --yes (skip the two gates), --run-dir DIR (reports; default scratchpad/stockrestore_<stamp>)
 # Run under Homebrew bash, like the other installers.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PAYLOAD="$REPO/tools/stock_restore_box.sh"
+TREE_TOOL="$REPO/tools/stock_restore_onefile_tree.sh"
 OCBM_HOST="$REPO/target/release/ocbm-host"
 BOXSH="$REPO/tools/boxsh.py"
 NCM_IP=192.168.50.2
 BACKUP=""
+ARCHIVE=""
+PROFILE=ncm
 RUN_DIR=""
 ASSUME_YES=0
 PHASES=()
@@ -51,16 +76,25 @@ PHASES=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --backup) BACKUP="$2"; shift 2 ;;
+    --archive) ARCHIVE="$2"; shift 2 ;;
+    --profile) PROFILE="$2"; shift 2 ;;
     --run-dir) RUN_DIR="$2"; shift 2 ;;
     --yes|-y) ASSUME_YES=1; shift ;;
-    -h|--help) sed -n '2,40p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,60p' "$0"; exit 0 ;;
     -*) echo "unknown option: $1" >&2; exit 2 ;;
     *) PHASES+=("$1"); shift ;;
   esac
 done
 [ ${#PHASES[@]} -gt 0 ] || { echo "no phase given (try --help)" >&2; exit 2; }
-[ -n "$BACKUP" ] || { echo "--backup DIR is required (the backup_pre folder of THIS adapter)" >&2; exit 2; }
+[ -n "$BACKUP" ] || { echo "--backup DIR is required (the backup folder of THIS adapter)" >&2; exit 2; }
+case "$PROFILE" in ncm|onefile) ;; *) echo "--profile is ncm or onefile" >&2; exit 2 ;; esac
 BACKUP="$(cd "$BACKUP" && pwd)"
+if [ "$PROFILE" = onefile ]; then
+  [ -n "$ARCHIVE" ] || ARCHIVE="$BACKUP/rootfs_files_trial.tgz"
+  [ -s "$ARCHIVE" ] || { echo "no trial archive at $ARCHIVE (--archive FILE)" >&2; exit 2; }
+  ARCHIVE="$(cd "$(dirname "$ARCHIVE")" && pwd)/$(basename "$ARCHIVE")"
+fi
+BOXENV="PROFILE=$PROFILE"
 [ -n "$RUN_DIR" ] || RUN_DIR="$REPO/scratchpad/stockrestore_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$RUN_DIR"
 
@@ -208,7 +242,7 @@ phase_stage() {
 phase_plan() {
   say "=== plan — read-only"
   detect
-  run 'sh /tmp/stock_restore_box.sh plan > /tmp/rs_plan.out 2>&1; echo rc=$?' 900 | grep -q 'rc=0' || warn "plan exited non-zero"
+  run "$BOXENV sh /tmp/stock_restore_box.sh plan > /tmp/rs_plan.out 2>&1; echo rc=\$?" 900 | grep -q 'rc=0' || warn "plan exited non-zero"
   pull /tmp/rs_plan.out "$RUN_DIR/plan.out"
   pull /tmp/rsw/plan.txt "$RUN_DIR/plan.txt" || true
   grep -E '^\[restore\]' "$RUN_DIR/plan.out" | grep -v -E 'full plan' || true
@@ -264,11 +298,119 @@ phase_apply() {
 phase_verify() {
   say "=== verify"
   detect
-  run '[ -d /tmp/rs ] && [ -s /tmp/stock_restore_box.sh ] && echo READY' 20 | grep -q READY || phase_stage
-  run 'sh /tmp/stock_restore_box.sh verify > /tmp/rs_verify.out 2>&1; echo rc=$?' 900 >/dev/null || true
+  run '[ -d /tmp/rs ] && [ -s /tmp/stock_restore_box.sh ] && echo READY' 20 | grep -q READY || { if [ "$PROFILE" = onefile ]; then phase_stage_onefile; else phase_stage; fi; }
+  run "$BOXENV sh /tmp/stock_restore_box.sh verify > /tmp/rs_verify.out 2>&1; echo rc=\$?" 900 >/dev/null || true
   pull /tmp/rs_verify.out "$RUN_DIR/verify.out"
   grep -q RESTORE_VERIFIED "$RUN_DIR/verify.out" || { sed -n '1,30p' "$RUN_DIR/verify.out"; die "the rootfs does not match the backup"; }
   say "the rootfs matches the backup"
+}
+
+# ---- --profile onefile -------------------------------------------------------------------------
+
+need_ocbm() {
+  detect
+  [ "$VIA" = ocbm ] || die "this profile works over the OCBM console: the adapter must be on OCBM, 1314:2d00 (state: ${VIA:-none})"
+}
+
+phase_preflight_onefile() {
+  say "=== preflight (one-file install)"
+  local f
+  for f in mtd0.bin mtd1.bin SHA256SUMS; do [ -s "$BACKUP/$f" ] || die "backup is missing $f ($BACKUP)"; done
+  ( cd "$BACKUP" && shasum -a 256 -c SHA256SUMS >/dev/null 2>&1 ) || die "backup checksums do not verify; do not restore from it"
+  say "backup checksums verify: $BACKUP"
+  say "trial archive: $ARCHIVE (md5 $(md5 -q "$ARCHIVE"))"
+  need_ocbm
+  say "adapter: on OCBM (console over USB)"
+
+  local m0 m1 b0 b1 st sw want_sw tmpfree
+  b0="$(md5 -q "$BACKUP/mtd0.bin")"; b1="$(md5 -q "$BACKUP/mtd1.bin")"
+  m0="$(box_md5 /dev/mtd0)"; m1="$(box_md5 /dev/mtd1)"
+  [ -n "$m0" ] && [ -n "$m1" ] || die "could not read /dev/mtd0 and /dev/mtd1 on the box"
+  [ "$m0" = "$b0" ] && [ "$m1" = "$b1" ] \
+    || die "mtd0/mtd1 on the box differ from the backup's: this backup is NOT from this adapter (box $m0/$m1, backup $b0/$b1)"
+  say "identity: mtd0 and mtd1 match the backup byte for byte"
+
+  st="$(run 'echo mode=$(cat /script/ocbm_mode 2>/dev/null); grep -q "^# OCBM_DISPATCH" /script/start_main_service.sh && echo DISPATCH; [ -e /etc/ocbm/finish_pending ] && echo PENDING; true' 20 | tr -d '\r')"
+  printf '%s\n' "$st" | grep -q DISPATCH || die "the start script is not OCBM's dispatcher: this is not a one-file install"
+  printf '%s\n' "$st" | grep -q PENDING && die "a finish was interrupted: restart the adapter on OCBM so it completes, then restore"
+  case "$(printf '%s\n' "$st" | sed -n 's/^mode=//p' | tail -1)" in
+    trial) say "install: trial (stock is still on the adapter; this is the rehearsal)" ;;
+    final) say "install: final (the Carlinkit stack is gone)" ;;
+    confirmed) die "the trial is confirmed and finishes when this session ends; let it finish, or go back to stock from the app" ;;
+    *) die "no one-file install mode on the adapter" ;;
+  esac
+
+  want_sw="$(gzip -dc "$ARCHIVE" | tar -xOf - ./etc/software_version etc/software_version 2>/dev/null | head -1 | tr -d '\r' || true)"
+  sw="$(run 'cat /etc/software_version' 20 | tr -d '\r' | grep -E '^[0-9]{4}\.' | tail -1 || true)"
+  [ -n "$want_sw" ] && [ "$sw" = "$want_sw" ] || die "software_version on the box is '$sw', the archive's is '${want_sw:-missing}'"
+  say "software_version: $sw"
+  tmpfree="$(run "df -k /tmp | awk 'NR>1{f=\$4} END{print f+0}'" 20 | tr -d '\r' | grep -E '^[0-9]+$' | tail -1 || true)"
+  [ "${tmpfree:-0}" -ge 30000 ] || die "only ${tmpfree:-?} KB free in /tmp; staging needs about 30 MB"
+  say "/tmp: ${tmpfree} KB free"
+  run 'df -k / | tail -1' 20 | tr -d '\r' | sed 's/^/[stock-restore] rootfs: /' | tail -1
+}
+
+phase_stage_onefile() {
+  say "=== stage — the stock tree, made here, into RAM on the box"
+  need_ocbm
+  local tree="$RUN_DIR/tree" tgz="$RUN_DIR/tree.tgz" want got
+  rm -rf "$tree" "$tgz"
+  sh "$TREE_TOOL" "$ARCHIVE" "$tree" | tee "$RUN_DIR/tree.out" | grep -q TREE_OK || die "could not make the stock tree; see $RUN_DIR/tree.out"
+  ( cd "$tree" && tar -czf "$tgz" . ) || die "could not pack the stock tree"
+  rm -rf "$tree"   # it held the Wi-Fi passphrase and Bluetooth keys
+  push "$PAYLOAD" /tmp/stock_restore_box.sh
+  push "$tgz" /tmp/rootfs.tar.gz
+  want="$(md5 -q "$tgz")"; got="$(box_md5 /tmp/rootfs.tar.gz)"
+  rm -f "$tgz"
+  [ "$want" = "$got" ] || die "the stock tree did not arrive intact (box $got, host $want)"
+  [ "$(md5 -q "$PAYLOAD")" = "$(box_md5 /tmp/stock_restore_box.sh)" ] || die "stock_restore_box.sh did not arrive intact"
+  run 'rm -rf /tmp/rs /tmp/rsw && mkdir -p /tmp/rs && tar -xzf /tmp/rootfs.tar.gz -C /tmp/rs && rm -f /tmp/rootfs.tar.gz && echo STAGED' 300 \
+    | grep -q STAGED || die "could not unpack the stock tree on the box"
+  say "staged: /tmp/rs ($(run 'du -sk /tmp/rs | cut -f1' 60 | tr -d '\r' | grep -E '^[0-9]+$' | tail -1) KB)"
+}
+
+phase_apply_onefile() {
+  say "=== apply — stock back while OCBM still boots, then the switch"
+  need_ocbm
+  run '[ -d /tmp/rs ] && [ -s /tmp/stock_restore_box.sh ] && echo READY' 20 | grep -q READY || phase_stage_onefile
+  gate "Apply now? Stock goes back on while OCBM keeps booting; then one rename makes the next start stock, and OCBM's files are removed."
+  run "mkdir -p /tmp/rsw; rm -f /tmp/rsw/apply.log; (PROFILE=onefile nohup sh /tmp/stock_restore_box.sh apply > /tmp/rsw/apply.log 2>&1 &) ; echo STARTED" 20 \
+    | grep -q STARTED || die "could not start apply on the box"
+  local end=$(( SECONDS + 1200 )) seen=0 log
+  while [ $SECONDS -lt $end ]; do
+    sleep 5
+    log="$(run 'cat /tmp/rsw/apply.log 2>/dev/null' 30 2>/dev/null || true)"
+    printf '%s\n' "$log" | tr -d '\r' | grep -E '^\[restore\] [0-9]/5|^RESTORE_' | tail -n +$((seen + 1)) | while IFS= read -r l; do say "box: $l"; done
+    seen=$(printf '%s\n' "$log" | tr -d '\r' | grep -c -E '^\[restore\] [0-9]/5|^RESTORE_' || true)
+    if printf '%s' "$log" | grep -q RESTORE_DONE; then break; fi
+    if printf '%s' "$log" | grep -q RESTORE_ABORT; then
+      printf '%s\n' "$log" > "$RUN_DIR/apply.log"
+      if printf '%s' "$log" | grep -q '4/5 the stock start script is in place'; then
+        die "apply stopped AFTER the switch: $(printf '%s\n' "$log" | grep ABORT: | tail -1). The next start is stock; OCBM files may be left over. Log: $RUN_DIR/apply.log"
+      fi
+      die "apply stopped before the switch: $(printf '%s\n' "$log" | grep ABORT: | tail -1). The adapter still boots OCBM; fix the cause and re-run apply. Log: $RUN_DIR/apply.log"
+    fi
+  done
+  printf '%s\n' "$log" > "$RUN_DIR/apply.log"
+  printf '%s' "$log" | grep -q RESTORE_DONE || die "apply did not finish within 20 minutes; log so far: $RUN_DIR/apply.log"
+  say "apply done; the next start is stock. Log: $RUN_DIR/apply.log"
+}
+
+phase_stock_onefile() {
+  say "=== stock — restart on the Carlinkit stack"
+  need_ocbm
+  gate "Restart now? The adapter comes back as stock Carlinkit; OCBM's console goes away."
+  run 'sync; (sleep 1; /sbin/reboot) >/dev/null 2>&1 & echo REBOOTING' 20 >/dev/null || true
+  local end=$(( SECONDS + 240 ))
+  while [ $SECONDS -lt $end ]; do
+    if usb_has $((16#1520)) || usb_has $((16#1521)); then
+      say "the adapter enumerates as stock Carlinkit (1314:$(usb_has $((16#1520)) && echo 1520 || echo 1521))"
+      say "done. To put back HiCar, the Android Mirror helper and the web pages, put Carlinkit's 2025.10.15.1127 A15W_Update.img on a FAT32 stick and plug it in on a USB charger."
+      return 0
+    fi
+    sleep 5
+  done
+  die "no stock enumeration within 4 minutes. Unplug and replug the adapter; if it stays silent, the UART console is the way in"
 }
 
 phase_coldtest() {
@@ -321,5 +463,24 @@ run_phase() {
   esac
 }
 
+run_phase_onefile() {
+  case "$1" in
+    preflight) phase_preflight_onefile ;;
+    stage)     phase_stage_onefile ;;
+    plan)      phase_plan ;;
+    dryrun)    phase_preflight_onefile; phase_stage_onefile; phase_plan; phase_cleanup
+               say "dry run complete: nothing on the adapter's flash changed" ;;
+    apply)     phase_apply_onefile ;;
+    verify)    phase_verify ;;
+    stock)     phase_stock_onefile ;;
+    all)       phase_preflight_onefile; phase_stage_onefile; phase_plan; phase_apply_onefile; phase_verify
+               phase_stock_onefile ;;
+    revert|coldtest) die "$1 needs NCM, which a one-file install does not have" ;;
+    *) die "unknown phase: $1" ;;
+  esac
+}
+
 say "run dir: $RUN_DIR"
-for ph in "${PHASES[@]}"; do run_phase "$ph"; done
+for ph in "${PHASES[@]}"; do
+  if [ "$PROFILE" = onefile ]; then run_phase_onefile "$ph"; else run_phase "$ph"; fi
+done
