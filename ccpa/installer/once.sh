@@ -7,7 +7,8 @@
 #
 #   1 checks     refuse, changing nothing: product, firmware, chip, factory mode, OCBM state,
 #                payload checksums, flash room, stick room, same-version guard
-#   2 backup     stick: mtd0-2 to OCBM_BACKUP/<id>/, each read back against its SHA-256; both
+#   2 backup     stick: mtd0-2 to OCBM_BACKUP/<id>/, each read back against its SHA-256 (a complete one
+#                from an earlier try is kept: it predates every change); both
 #                routes: /etc/ocbm/identity.tgz. A failed backup is a refusal.
 #   3 make room  delete prune.list (HiCar, Android Mirror, test leftovers, web UI pages); stock
 #                CarPlay and Android Auto keep working. Removed paths go to /etc/ocbm/pruned.txt.
@@ -231,6 +232,12 @@ id=$(tr -cd 'A-Za-z0-9' < "$ROOT/etc/device_serial" 2>/dev/null | cut -c1-32)
 B=""
 if [ "$ROUTE" = stick ]; then
   B="$STICK/OCBM_BACKUP/$id"
+  # A complete backup of this adapter already on the stick was taken by an earlier try before it
+  # changed anything, so it holds the factory flash: keep it rather than dump the changed one over it.
+  if [ "$(grep -cE '^[0-9a-f]{64}  mtd[012]\.bin$' "$B/SHA256SUMS" 2>/dev/null)" = 3 ] \
+     && (cd "$B" && sha256sum -c SHA256SUMS >/dev/null 2>&1); then
+    say "flash backup: kept the earlier one in OCBM_BACKUP/$id"
+  else
   mkdir -p "$B" || fail_backup "cannot write to the stick"
   rm -f "$B/SHA256SUMS"
   for n in 0 1 2; do
@@ -244,6 +251,7 @@ if [ "$ROUTE" = stick ]; then
     echo "$sum  mtd$n.bin" >> "$B/SHA256SUMS"
   done
   say "flash backup: OCBM_BACKUP/$id on the stick"
+  fi
 fi
 mkdir -p "$EO" || fail_backup "cannot create /etc/ocbm"
 bt=$(cat "$SYS/class/bluetooth/hci0/address" 2>/dev/null)

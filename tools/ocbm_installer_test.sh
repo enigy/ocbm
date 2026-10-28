@@ -185,9 +185,17 @@ for sh in ${SHELLS:-sh dash}; do
     [ "$rel" = script/ocbm_dispatch.sh ] || old_kb=$((old_kb + $(du -sk "$r/root/$rel" | cut -f1))); done
   need=$(( $(sed -n 's/^need_kb=//p' "$T/img/tmp/ocbm/BUDGET") + 384 ))
   touch "$r/stick/OCBM_RETRY"; refresh "$r"
+  B="$r/stick/OCBM_BACKUP/ABCDEF0123456789"; bk="$(cksum "$B"/*)"; echo changed >> "$r/dev/mtd2"
   run_once "$sh" "$r" FAKE_FREE_KB=$((need - old_kb * 6 / 10 + 8)) FAKE_FREE_AFTER_KB=$((need + 8)); rc=$?
   check '[ $rc = 0 ] && installed "$r" && grep -q "removed the earlier try" "$r/install.log"' \
     "the earlier try's OCBM files count as room, are removed and placed again"
+  check '[ "$(cksum "$B"/*)" = "$bk" ] && grep -q "kept the earlier one" "$r/install.log"' \
+    "the earlier try's flash backup is kept, not dumped over with the changed flash"
+  head -c 100 "$B/mtd2.bin" > "$B/x"; mv "$B/x" "$B/mtd2.bin"
+  r2="$T/$sh-badbk"; make_box "$r2"; mkdir -p "$r2/stick/OCBM_BACKUP"; cp -R "$B" "$r2/stick/OCBM_BACKUP/"
+  run_once "$sh" "$r2"; rc=$?
+  check '[ $rc = 0 ] && ( cd "$r2/stick/OCBM_BACKUP/ABCDEF0123456789" && sha256sum -c SHA256SUMS >/dev/null 2>&1 ) && cmp -s "$r2/dev/mtd2" "$r2/stick/OCBM_BACKUP/ABCDEF0123456789/mtd2.bin"' \
+    "a damaged earlier backup is taken again"
 
   echo "== $sh: not enough room after the prune"
   r="$T/$sh-tight"; make_box "$r"; run_once "$sh" "$r" FAKE_FREE_AFTER_KB=10; rc=$?
