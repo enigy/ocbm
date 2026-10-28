@@ -65,6 +65,13 @@ that closes behind itself.
    link layer: a device-derived WPA2 PSK. The shell behind it is the same open login.
 2. **Flashed `mtd2`** — bake the daemons into a custom jffs2 rootfs image, program it with the SPI
    programmer. Reproducible image + guaranteed brick recovery. Best for release.
+3. **One-file install** — a STOCK 2025.10.15.1127 unit takes `A15W_Update.img` from a USB stick
+   (`tools/make_ocbm_installer.sh`; the stock updater runs its `tmp/once.sh` as root). No Mac and no
+   shell. It backs the flash up to the stick, deletes the HiCar/Mirror/web extras, places OCBM and
+   arms a trial with stock CarPlay kept: `/script/ocbm_mode` goes `trial` → `confirmed` (an app that
+   offers the way back sends `MGMT_INSTALL_CONFIRM`) → `final` (the Carlinkit stack is removed once
+   that session ends). The scripts and their contract are in [`../../ccpa/README.md`](../../ccpa/README.md)
+   `installer/`; first proven on a factory unit 2026-10-28.
 
 The partition layout is fixed by the vendor kernel/U-Boot (`mtd0` 256 K uboot / `mtd1` 3328 K
 kernel / `mtd2` 12800 K rootfs); you control everything inside `mtd2`. See
@@ -133,6 +140,30 @@ set, so that is the state it restores; removing the flag then boots the Carlinki
 - **Tests.** `tools/stock_restore_test.sh` (run by `tools/run_tests.sh`) exercises plan, apply,
   verify, the space abort, idempotence and type conflicts against synthetic trees, under `sh` and
   `dash`.
+
+### Back to stock from a one-file install
+
+While stock is still on the unit (`trial` or `confirmed`), `ccpa/installer/ocbm_revert.sh` is the one
+way back, and five things call it:
+
+- the start-up self-test failing (the gadget is not `1314:2d00`, no `/dev/usb_accessory`, no `ocbmd`,
+  or `radio_detect.sh` finds no radio bring-up for this unit);
+- two starts in a row that never passed the self-test (a hang or a reboot loop), at the next start;
+- a file named `OCBM_RESTORE` on a stick, at any time during the trial (renamed `.done` once used);
+- `MGMT_GO_STOCK` from the app, or `ocbm-host install stock` on the bench;
+- by hand over the OCBM console: `/script/ocbm_revert.sh "why"`.
+
+It puts `/etc/hostapd.conf` back from `/etc/ocbm/identity.tgz`, records `reverted version=<VERSION>`
+in `/etc/ocbm/last_result.txt` (the installer then refuses that version unless the stick holds
+`OCBM_RETRY`), removes `/script/ocbm_mode` and restarts. The start script then hands every boot to the
+kept `start_main_service.stock.sh`, and the report lands on the next stick plugged in as
+`OCBM_RESULT.txt`. HiCar, the Android Mirror helper and the web pages stay deleted; Carlinkit's own
+2025.10.15.1127 image puts them back.
+
+In `final` there is no stock left and `ocbm_revert.sh` refuses. Carlinkit's image cannot rebuild it
+either: it omits files the finish deletes, its own decrypter `ARMimg_maker` among them. The way back is
+then the stick's `OCBM_BACKUP/<serial>/` flash dump (taken before the install changed anything, and
+kept across re-installs), written back with an SPI programmer.
 
 ### UART console reference
 

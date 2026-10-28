@@ -53,8 +53,10 @@ echo 'PASSED in 3 s'"
   echo "42.17 80.00" > "$d/proc/uptime"
   printf 'OCBM install: INSTALLED (trial)\ninstaller: %s\n' "$VER" > "$d/stick/OCBM_RESULT.txt"
 }
+# Carlinkit daemon names this host runs itself (macOS has its own usbmuxd): ocbm_finish.sh skips them.
+HOST_DAEMONS="$(for n in usbmuxd mdnsd boa; do pgrep -x "$n" >/dev/null 2>&1 && printf '%s ' "$n"; done)"
 boot() {  # $1 shell, $2 dir: one start of the adapter
-  env ROOT="$2/root" RUN="$2/run" STICK="$2/stick" PROC="$2/proc" POLL=1 STICK_WAIT=2 \
+  env ROOT="$2/root" RUN="$2/run" STICK="$2/stick" PROC="$2/proc" POLL=1 STICK_WAIT=2 FINISH_IGNORE="$HOST_DAEMONS" \
       REBOOT="touch $2/rebooted" "$1" "$2/root/script/start_main_service.sh" > "$2/boot.out" 2>&1
 }
 restart() { reap; rm -rf "${1:?}/run"; mkdir -p "$1/run"; rm -f "$1"/m.* "$1/rebooted"; }  # power cycle: /tmp is gone
@@ -156,6 +158,72 @@ for sh in ${SHELLS:-sh dash}; do
   env ROOT="$d/root" RUN="$d/run" REBOOT="touch $d/rebooted" "$sh" "$d/root/script/ocbm_revert.sh" "test" > "$d/rv.out" 2>&1; rc=$?
   check '[ $rc = 0 ] && [ ! -e "$d/root/etc/ocbm/last_result.txt" ] && [ ! -e "$d/rebooted" ]' "on stock already: nothing to do"
 
+  echo "== $sh: ocbm_finish.sh (Stage C)"
+  fin_box() {  # $1 dir, $2 mode: a converted adapter that still carries a (small) Carlinkit stack
+    local R="$1/root" f
+    make_box "$1" "$2"
+    cp "$INST/ocbm_finish.sh" "$R/script/ocbm_finish.sh"; chmod 755 "$R/script/ocbm_finish.sh"
+    mkdir -p "$R/usr/lib" "$R/lib" "$R/bin" "$R/etc/mdev" "$R/etc/boa/www" "$R/etc/dbus-1/system.d"
+    for f in AppleCarPlay ARMadb-driver mdnsd boa riddle_top i2cset; do printf 'elf' > "$R/usr/sbin/$f"; done
+    printf 'hostapd: libssl.so.1.1 libc.so.6\n' > "$R/usr/sbin/hostapd"
+    printf 'busybox: libc.so.6 libm.so.6 libcrypt.so.1 libgcc_s.so.1 libpthread.so.0 libdl.so.2 librt.so.1 libresolv.so.2 libutil.so.1 libnsl.so.1\n' > "$R/bin/busybox"
+    for f in usr/lib/libssl.so.1.1 usr/lib/libdmsdp.so lib/crt1.o etc/BoxHelper.apk etc/rgbLight.conf \
+             etc/dbus-1/system.d/riddle.conf etc/boa/www/index.html etc/riddle.conf; do printf 'x' > "$R/$f"; done
+    for f in update_box.sh phone_link_deamon.sh init_audio_codec.sh init_bluetooth_wifi.sh; do printf '#!/bin/sh\n' > "$R/script/$f"; done
+    printf '#!/bin/sh\nif [ -d /sys/block/*/$MDEV ] ; then\n\tmount /dev/$MDEV /mnt/UPAN -t vfat -o utf8=1\n\t/script/update_box.sh /dev/$MDEV >> /dev/console &\nfi\n' \
+      > "$R/etc/mdev/udisk_insert.sh"
+  }
+  run_finish() {  # $1 dir, then arguments: output in $1/fin.out
+    local d="$1"; shift
+    env ROOT="$d/root" RUN="$d/run" GRACE=2 POLL=1 FINISH_IGNORE="$HOST_DAEMONS" "$sh" "$d/root/script/ocbm_finish.sh" "$@" > "$d/fin.out" 2>&1
+  }
+  stock_left() { [ -e "$1/root/usr/sbin/AppleCarPlay" ] && [ -e "$1/root/script/update_box.sh" ] && [ -e "$1/root/script/start_main_service.stock.sh" ]; }
+  d="$T/$sh-fin-trial"; fin_box "$d" trial; run_finish "$d" --after-session
+  check 'mode_is "$d" trial && stock_left "$d"' "in the trial it does nothing"
+  d="$T/$sh-fin-back"; fin_box "$d" confirmed; echo 1 > "$d/run/host_present"; run_finish "$d" --after-session
+  check 'mode_is "$d" confirmed && stock_left "$d" && grep -q "an app is back" "$d/fin.out"' "an app back within the grace: not yet"
+  d="$T/$sh-fin"; fin_box "$d" confirmed; echo 0 > "$d/run/host_present"; run_finish "$d" --after-session; rc=$?
+  R="$d/root"
+  check '[ $rc = 0 ] && mode_is "$d" final && [ ! -e "$R/etc/ocbm/finish_pending" ]' "after the grace: mode final"
+  check '[ ! -e "$R/usr/sbin/AppleCarPlay" ] && [ ! -e "$R/usr/sbin/mdnsd" ] && [ ! -e "$R/usr/sbin/boa" ] && [ ! -e "$R/script/update_box.sh" ] && [ ! -e "$R/etc/boa" ] && [ ! -e "$R/etc/BoxHelper.apk" ] && [ ! -e "$R/script/start_main_service.stock.sh" ]' \
+    "the Carlinkit programs, scripts, updater, web pages and the stock start script are gone"
+  check '[ -e "$R/usr/sbin/hostapd" ] && [ -e "$R/usr/sbin/i2cset" ] && [ -e "$R/etc/riddle.conf" ] && [ -e "$R/script/init_bluetooth_wifi.sh" ] && [ -x "$R/usr/sbin/ocbmd" ] && [ -e "$R/script/start_main_service.sh" ]' \
+    "the radio stack, i2c tools, riddle.conf, OCBM and the start script stay"
+  check '[ -e "$R/usr/lib/libssl.so.1.1" ] && [ ! -e "$R/usr/lib/libdmsdp.so" ] && [ ! -e "$R/lib/crt1.o" ]' \
+    "libraries: a still-named one stays (libssl for hostapd), unnamed ones go"
+  check 'grep -q "^# OTA-removed #" "$R/etc/mdev/udisk_insert.sh" && grep -q "mount /dev" "$R/etc/mdev/udisk_insert.sh"' \
+    "the stick handler still mounts, without its call into the deleted updater"
+  check 'grep -qx /usr/sbin/AppleCarPlay "$R/etc/ocbm/finished.txt" && grep -qx /usr/lib/libdmsdp.so "$R/etc/ocbm/finished.txt"' "finished.txt records what went"
+  env ROOT="$R" RUN="$d/run" REBOOT="touch $d/rebooted" "$sh" "$R/script/ocbm_revert.sh" "test" > "$d/rv.out" 2>&1; rc=$?
+  check '[ $rc = 1 ] && mode_is "$d" final && [ ! -e "$d/rebooted" ]' "afterwards there is no going back"
+  d="$T/$sh-fin-thin"; fin_box "$d" confirmed; printf 'static\n' > "$d/root/bin/busybox"; printf 'hostapd\n' > "$d/root/usr/sbin/hostapd"
+  run_finish "$d"; check 'mode_is "$d" final && [ -e "$d/root/usr/lib/libdmsdp.so" ] && [ -e "$d/root/usr/lib/libssl.so.1.1" ] && grep -q "the libraries stay" "$d/fin.out"' \
+    "a library scan that finds no libc.so removes no library, and the finish still completes"
+  d="$T/$sh-fin-busy"; fin_box "$d" confirmed; pname="riddle_top"
+  cp "$(command -v sleep)" "$T/$pname"; [ "$(uname)" = Darwin ] && codesign -f -s - "$T/$pname" 2>/dev/null
+  "$T/$pname" 20 & busy=$!; sleep 0.3
+  run_finish "$d"; rc=$?; kill "$busy" 2>/dev/null; wait "$busy" 2>/dev/null
+  check '[ $rc = 1 ] && mode_is "$d" confirmed && stock_left "$d" && grep -q "running: riddle_top" "$d/fin.out"' "refuses while a Carlinkit daemon runs, nothing removed"
+  d="$T/$sh-fin-noocbmd"; fin_box "$d" confirmed; rm -f "$d/root/usr/sbin/ocbmd"; run_finish "$d"; rc=$?
+  check '[ $rc = 1 ] && mode_is "$d" confirmed && stock_left "$d"' "refuses without ocbmd, nothing removed"
+  d="$T/$sh-fin-lock"; fin_box "$d" confirmed; mkdir "$d/run/ocbm_mode.lock"; run_finish "$d"
+  check 'mode_is "$d" confirmed && stock_left "$d" && [ -d "$d/run/ocbm_mode.lock" ]' "waits its turn behind a revert, and leaves that revert's lock alone"
+  env ROOT="$d/root" RUN="$d/run" REBOOT="touch $d/rebooted" "$sh" "$d/root/script/ocbm_revert.sh" "test" > "$d/rv.out" 2>&1; rc=$?
+  check '[ $rc = 1 ] && mode_is "$d" confirmed' "and a revert that finds the lock taken refuses (exit 1)"
+  d="$T/$sh-fin-cut"; fin_box "$d" confirmed
+  env ROOT="$d/root" RUN="$d/run" FINISH_IGNORE="$HOST_DAEMONS" STOP_AT=deletes "$sh" "$d/root/script/ocbm_finish.sh" > "$d/fin.out" 2>&1; rc=$?
+  check '[ $rc = 99 ] && mode_is "$d" final && [ -e "$d/root/etc/ocbm/finish_pending" ] && stock_left "$d"' \
+    "power lost before the first delete: already final, so no start can hand the boot to a half-removed stock"
+  boot "$sh" "$d"
+  check 'waitfor "[ ! -e $d/root/etc/ocbm/finish_pending ]" 5 && [ ! -e "$d/root/usr/sbin/AppleCarPlay" ] && mode_is "$d" final' \
+    "a start in final with finish_pending (power cut mid-finish) completes it"
+  d="$T/$sh-fin-boot"; fin_box "$d" confirmed; boot "$sh" "$d"
+  check 'waitfor "mode_is $d final" 8 && waitfor "[ ! -e $d/root/usr/sbin/AppleCarPlay ]" 5' \
+    "a start in confirmed (the power went off during the session) finishes once the self-test passes"
+  d="$T/$sh-fin-fail"; fin_box "$d" confirmed; touch "$d/st.fail"; boot "$sh" "$d"
+  check 'waitfor "[ -e $d/rebooted ]" 5 && reverted "$d" && stock_left "$d"' "a start in confirmed that fails its self-test goes back to stock instead"
+  reap
+
   echo "== $sh: ocbm_selftest.sh"
   d="$T/$sh-st"; G="$d/sys/class/android_usb_accessory/android0"
   mkdir -p "$G" "$d/sys/bus/sdio/devices/mmc0:0001:1" "$d/dev" "$d/run" "$d/bin"
@@ -192,5 +260,11 @@ for sh in ${SHELLS:-sh dash}; do
   kill "$ocbmd_pid" 2>/dev/null; wait "$ocbmd_pid" 2>/dev/null
   reap
 done
+
+echo "== ocbm_finish.sh keeps tools/ncm_base_install.sh's lists"
+lists() { bash -c 'eval "$(sed -n "/^SBIN_A=/,/^KILL_PROCS=/p;/^KILL_PROCS=/,/^[A-Z_]*=\"[^\"]*\"$/p" "$1" | sed "/^KILL_LOOPS=/d")" 2>/dev/null
+  for v in SBIN_A SCRIPT_A ETC_A LIB_VENDOR LIB_DEV KILL_PROCS; do eval "echo $v: \$$v"; done' _ "$1"; }
+check '[ "$(lists "$REPO/tools/ncm_base_install.sh")" = "$(lists "$INST/ocbm_finish.sh")" ] && [ -n "$(lists "$INST/ocbm_finish.sh" | grep "^SBIN_A: AppleCarPlay")" ]' \
+  "SBIN_A SCRIPT_A ETC_A LIB_VENDOR LIB_DEV KILL_PROCS match"
 
 [ "$fails" -eq 0 ] && echo "ocbm_stageb_test: all passed" || { echo "ocbm_stageb_test: $fails failed"; exit 1; }

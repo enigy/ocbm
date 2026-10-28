@@ -11,9 +11,10 @@
 #                     two in a row that never passed the self-test go back to stock (hangs, reboot
 #                     loops). Then start OCBM, keep ocbmd and the session supervisor running, run
 #                     ocbm_selftest.sh (a failure goes back to stock), and watch the stick for a file
-#                     named OCBM_RESTORE (goes back to stock).
-#   final             OCBM only: Stage C (M4) has removed the Carlinkit stack, so there is nothing
-#                     to go back to.
+#                     named OCBM_RESTORE (goes back to stock). In `confirmed` a passing self-test runs
+#                     ocbm_finish.sh: the confirming session was ended by the power going off.
+#   final             OCBM only: ocbm_finish.sh removed the Carlinkit stack, so there is nothing to
+#                     go back to. A finish a power cut interrupted (finish_pending) is resumed.
 #
 # In every OCBM mode it creates /tmp/not_change_mass_storage before OCBM starts. Without it the stock
 # stick handler (update_box.sh, still run by mdev) switches the USB port to stick sharing when a
@@ -93,6 +94,7 @@ selftest() {
     rm -f "$EO/boot_attempts"; sync
     log "self-test: $(tail -1 "$RUN/ocbm_selftest.txt")"
     first_start PASSED
+    [ "$mode" = confirmed ] && [ -x "$S/ocbm_finish.sh" ] && "$S/ocbm_finish.sh" >> "$RUN/box.log" 2>&1
   else
     log "self-test: $(tail -1 "$RUN/ocbm_selftest.txt")"
     "$S/ocbm_revert.sh" "the start-up self-test failed ($(tail -1 "$RUN/ocbm_selftest.txt"))"
@@ -145,7 +147,10 @@ fi
 [ -x "$S/init_gpio.sh" ] && "$S/init_gpio.sh" >/dev/null 2>&1 &   # stock: Bluetooth reset line, quick-charge pins
 respawn "$S/run_ocbmd.sh" </dev/null >/dev/null 2>&1 &
 respawn "$S/run_supervisor.sh" </dev/null >/dev/null 2>&1 &
-[ "$mode" = final ] && exit 0
+if [ "$mode" = final ]; then
+  [ -e "$EO/finish_pending" ] && [ -x "$S/ocbm_finish.sh" ] && "$S/ocbm_finish.sh" </dev/null >> "$RUN/box.log" 2>&1 &
+  exit 0
+fi
 selftest </dev/null >/dev/null 2>&1 &
 restore_watch </dev/null >/dev/null 2>&1 &
 exit 0

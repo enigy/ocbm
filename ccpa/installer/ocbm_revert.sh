@@ -17,7 +17,7 @@
 #
 # OCBM's own files stay on flash, and the extras the install removed stay removed.
 # Exit 0: on stock now (or already was). Exit 1: refused, nothing changed (mode final: the Carlinkit
-# stack is gone; or start_main_service.stock.sh is missing).
+# stack is gone; start_main_service.stock.sh is missing; or ocbm_finish.sh holds the lock).
 #
 # Test hooks (tools/ocbm_stageb_test.sh): ROOT RUN REBOOT
 ROOT="${ROOT:-}"
@@ -31,8 +31,9 @@ restart=1
 why="${1:-no reason given}"
 
 log() { echo "[revert] $*"; echo "[revert] $*" >> "$RUN/box.log"; }
-mkdir "$RUN/ocbm_revert.lock" 2>/dev/null || { log "another revert is running"; exit 0; }
-done_() { rmdir "$RUN/ocbm_revert.lock" 2>/dev/null; exit "$1"; }
+# The same lock as ocbm_finish.sh: a go-back and a finish never interleave.
+mkdir "$RUN/ocbm_mode.lock" 2>/dev/null || { log "refused: another revert, or the finish, is running"; exit 1; }
+done_() { rmdir "$RUN/ocbm_mode.lock" 2>/dev/null; exit "$1"; }
 
 mode=$(cat "$MODE" 2>/dev/null)
 case "$mode" in

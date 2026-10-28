@@ -1552,6 +1552,65 @@ fn write_cfg_file(bytes: &[u8]) {
 }
 
 /// Remove the ephemeral config so it can't outlive the session (STOP / heartbeat-loss / startup).
+// --- The one-file install's state (ccpa/installer/): once.sh writes `trial`, MGMT_INSTALL_CONFIRM
+// moves it to `confirmed`, ocbm_finish.sh to `final`, and ocbm_revert.sh removes it (stock).
+// The `cfg(test)` paths for the same reason as `HOST_PRESENT_FLAG`: the tests really write the mode
+// file, and under the real names a `cargo test` on the box would confirm, finish or revert a live trial.
+#[cfg(not(test))]
+const INSTALL_MODE_FILE: &str = "/script/ocbm_mode";
+#[cfg(test)]
+const INSTALL_MODE_FILE: &str = "/tmp/ocbmd_selftest_ocbm_mode";
+#[cfg(not(test))]
+const INSTALL_REVERT: &str = "/script/ocbm_revert.sh";
+#[cfg(test)]
+const INSTALL_REVERT: &str = "/tmp/ocbmd_selftest_no_such_revert.sh";
+#[cfg(not(test))]
+const INSTALL_FINISH: &str = "/script/ocbm_finish.sh";
+#[cfg(test)]
+const INSTALL_FINISH: &str = "/tmp/ocbmd_selftest_no_such_finish.sh";
+
+/// The install mode reported in MGMT_INFO: `trial`, `confirmed`, `final`, or `none` (no one-file
+/// install: a box converted with ocbm_install.sh).
+fn install_mode(path: &str) -> &'static str {
+    match std::fs::read_to_string(path).as_deref().map(str::trim) {
+        Ok("trial") => "trial",
+        Ok("confirmed") => "confirmed",
+        Ok("final") => "final",
+        _ => "none",
+    }
+}
+
+/// MGMT_INSTALL_CONFIRM: `trial` -> `confirmed`, written `.new` + rename on the same filesystem, so a
+/// power cut leaves the old word or the new one, never a torn file. Ok(true) = confirmed now;
+/// Ok(false) = already `confirmed` or `final`; Err = no one-file install to confirm.
+fn confirm_install(path: &str) -> Result<bool, String> {
+    match install_mode(path) {
+        "trial" => {
+            let tmp = format!("{path}.new");
+            std::fs::write(&tmp, b"confirmed\n")
+                .and_then(|()| std::fs::rename(&tmp, path))
+                .map_err(|e| format!("could not write {path}: {e}"))?;
+            unsafe { libc::sync() };
+            Ok(true)
+        }
+        "confirmed" | "final" => Ok(false),
+        _ => Err("no one-file install on this box".into()),
+    }
+}
+
+/// A confirmed trial's session has ended: start the finish, which waits out a grace in which a
+/// reconnecting app cancels it, then removes the Carlinkit stack. Detached, so ocbmd never waits on
+/// it (SIGCHLD is SIG_IGN, so it leaves no zombie).
+fn start_install_finish() {
+    if !std::path::Path::new(INSTALL_FINISH).exists() {
+        return;
+    }
+    eprintln!("[ocbmd] install: the confirmed session ended — starting {INSTALL_FINISH}");
+    let _ = std::process::Command::new("sh")
+        .args(["-c", &format!("setsid sh {INSTALL_FINISH} --after-session >> /tmp/box.log 2>&1 &")])
+        .spawn();
+}
+
 fn clear_cfg_file() {
     let _ = std::fs::remove_file(CARPLAY_CFG_FILE);
 }
@@ -2091,6 +2150,10 @@ impl Daemon {
                 self.conns.len()
             );
             self.conns.clear();
+        }
+        // The one-file install: the session after the confirm is over, so stock goes now.
+        if install_mode(INSTALL_MODE_FILE) == "confirmed" {
+            start_install_finish();
         }
     }
 
@@ -3556,6 +3619,33 @@ impl Daemon {
                 };
                 self.mgmt_ack(verb, u8::from(!ok));
             }
+            // The one-file install (ccpa/installer/). Only an app that offers the way back confirms.
+            p::MGMT_INSTALL_CONFIRM => {
+                let status = match confirm_install(INSTALL_MODE_FILE) {
+                    Ok(true) => {
+                        eprintln!("[ocbmd] install: trial CONFIRMED by the host app — stock goes when this session ends");
+                        0
+                    }
+                    Ok(false) => 0,
+                    Err(e) => {
+                        eprintln!("[ocbmd] install: refused MGMT_INSTALL_CONFIRM ({e})");
+                        1
+                    }
+                };
+                self.mgmt_ack(verb, status);
+            }
+            p::MGMT_GO_STOCK => {
+                let mode = install_mode(INSTALL_MODE_FILE);
+                let ok = matches!(mode, "trial" | "confirmed") && std::path::Path::new(INSTALL_REVERT).exists();
+                eprintln!("[ocbmd] install: host asked to go back to stock (mode {mode}) — {}", if ok { "going" } else { "refused" });
+                self.mgmt_ack(verb, u8::from(!ok));
+                self.drain(); // the ack must reach the app before the box restarts
+                if ok {
+                    let _ = std::process::Command::new("sh")
+                        .args(["-c", &format!("sleep 1; {INSTALL_REVERT} 'Go back to stock was chosen in the app' >> /tmp/box.log 2>&1")])
+                        .spawn();
+                }
+            }
             _ => {}
         }
     }
@@ -3611,7 +3701,8 @@ impl Daemon {
              \"rootfs_free_kb\":{rt_free},\"ssp\":{ssp},\"hci_up\":{hci_up},\"wlan_ap\":{ap},\
              \"transport\":\"{transport}\",\"host_present\":{host},\"phone_present\":{phone},\
              \"daemons\":{{\"ocbmd\":{d0},\"iap2d\":{d1},\"airplayd\":{d2},\"carplay_wireless\":{d3}}},\
-             \"host_name\":\"{host_name}\",\"devices\":[{devs}]}}",
+             \"install\":\"{install}\",\"host_name\":\"{host_name}\",\"devices\":[{devs}]}}",
+            install = install_mode(INSTALL_MODE_FILE),
             ser = json_escape(&serial),
             host_name = json_escape(self.host_name.as_deref().unwrap_or("")),
             ap = procs[4],
@@ -3721,7 +3812,8 @@ impl Daemon {
                         self.hello_cleared_conns = true;
                     }
                     let mut caps =
-                        p::CAP_CONSOLE | p::CAP_ECHO | p::CAP_IP | p::CAP_FILE | p::CAP_ETH | p::CAP_PHONE_POLICY | p::CAP_PAIR_WINDOW;
+                        p::CAP_CONSOLE | p::CAP_ECHO | p::CAP_IP | p::CAP_FILE | p::CAP_ETH | p::CAP_PHONE_POLICY | p::CAP_PAIR_WINDOW
+                        | p::CAP_INSTALL;
                     if self.mfi.is_some() {
                         caps |= p::CAP_MFI;
                     }
@@ -4878,6 +4970,52 @@ mod tests {
             v.push((ch, fl, out[..n].to_vec()));
         }
         v
+    }
+
+    // ---- the one-file install's mode (ccpa/installer/) ----------------------------------------
+
+    fn install_tmp(name: &str) -> String {
+        format!("{}/ocbmd_test_install_{}_{name}", std::env::temp_dir().display(), std::process::id())
+    }
+
+    #[test]
+    fn install_mode_reads_the_three_words_and_nothing_else() {
+        let f = install_tmp("mode");
+        for (body, want) in [("trial\n", "trial"), ("confirmed", "confirmed"), ("final\n", "final"), ("sideways\n", "none"), ("", "none")] {
+            std::fs::write(&f, body).unwrap();
+            assert_eq!(install_mode(&f), want, "{body:?}");
+        }
+        let _ = std::fs::remove_file(&f);
+        assert_eq!(install_mode(&f), "none", "no mode file: no one-file install");
+    }
+
+    #[test]
+    fn confirm_moves_trial_to_confirmed_once_and_refuses_without_an_install() {
+        let f = install_tmp("confirm");
+        std::fs::write(&f, "trial\n").unwrap();
+        assert_eq!(confirm_install(&f), Ok(true));
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "confirmed\n");
+        assert_eq!(confirm_install(&f), Ok(false), "a second confirm changes nothing");
+        std::fs::write(&f, "final\n").unwrap();
+        assert_eq!(confirm_install(&f), Ok(false));
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "final\n", "final is never moved back");
+        let _ = std::fs::remove_file(&f);
+        assert!(confirm_install(&f).is_err());
+        assert!(!std::path::Path::new(&f).exists(), "a refused confirm creates no mode file");
+    }
+
+    #[test]
+    fn mgmt_confirm_and_info_go_through_the_install_mode_file() {
+        std::fs::write(INSTALL_MODE_FILE, "trial\n").unwrap();
+        let mut d = td();
+        assert!(d.box_info_json().contains("\"install\":\"trial\""));
+        d.handle_mgmt(&[p::MGMT_INSTALL_CONFIRM]);
+        assert_eq!(install_mode(INSTALL_MODE_FILE), "confirmed");
+        assert!(d.box_info_json().contains("\"install\":\"confirmed\""));
+        // Under cfg(test) the revert script never exists, so going back is refused and nothing runs.
+        d.handle_mgmt(&[p::MGMT_GO_STOCK]);
+        assert_eq!(install_mode(INSTALL_MODE_FILE), "confirmed");
+        let _ = std::fs::remove_file(INSTALL_MODE_FILE);
     }
 
     // ---- mic-uplink gate relay ----------------------------------------------------------------

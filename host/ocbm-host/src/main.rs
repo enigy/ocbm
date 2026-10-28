@@ -388,6 +388,45 @@ fn mode_mfi(link: &mut Link) {
 /// received ACK means "accepted", not "already in NCM" — the caller must poll for the NCM address.
 /// A missing ACK is reported rather than assumed: on a box that never armed the flag, a caller that
 /// blindly waited would hang for its whole timeout with no idea why.
+/// The one-file install's management verbs, for the bench: `info` prints MGMT_INFO (its `install`
+/// key is the mode), `confirm` sends MGMT_INSTALL_CONFIRM as the Carlink3 build with the way back
+/// would, and `stock` sends MGMT_GO_STOCK. `confirm` is what lets the box remove the Carlinkit stack
+/// after the session ends, so only send it when that is meant.
+fn mode_install(link: &mut Link, what: &str) {
+    let verb = match what {
+        "info" => p::MGMT_GET_INFO,
+        "confirm" => p::MGMT_INSTALL_CONFIRM,
+        "stock" => p::MGMT_GO_STOCK,
+        _ => {
+            eprintln!("usage: ocbm-host install [vid pid] info|confirm|stock");
+            std::process::exit(2);
+        }
+    };
+    link.send(p::CH_MGMT, p::F_SOM | p::F_EOM, &[verb]);
+    let mut out = vec![0u8; p::MAX_PAYLOAD];
+    let deadline = Instant::now() + std::time::Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let Some((ch, _flags, l)) = link.recv(&mut out, deadline) else { break };
+        if ch != p::CH_MGMT || l == 0 {
+            continue; // clock ack / keepalive
+        }
+        if verb == p::MGMT_GET_INFO && out[0] == p::MGMT_INFO {
+            println!("{}", String::from_utf8_lossy(&out[1..l]));
+            return;
+        }
+        if l >= 3 && out[0] == p::MGMT_ACK && out[1] == verb {
+            if out[2] == 0 {
+                println!("install {what}: accepted");
+                return;
+            }
+            eprintln!("install {what}: refused by the box (status {})", out[2]);
+            std::process::exit(1);
+        }
+    }
+    eprintln!("install {what}: no answer within 5 s");
+    std::process::exit(1);
+}
+
 fn mode_ncm(link: &mut Link) {
     link.send(p::CH_MGMT, p::F_SOM | p::F_EOM, &[p::MGMT_ENTER_NCM]);
     // Same reassembler contract as push/pull: full-size buffer, and filter the CT_SETTIME chatter the
@@ -1595,6 +1634,7 @@ fn main() {
         "mfi" => mode_mfi(&mut link),
         "console" => mode_console(&mut link),
         "ncm" => mode_ncm(&mut link),
+        "install" => mode_install(&mut link, args.get(4).map(String::as_str).unwrap_or("info")),
         "ip" => mode_ip(
             &mut link,
             args.get(4).map(String::as_str).unwrap_or("127.0.0.1:22"),

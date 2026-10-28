@@ -67,6 +67,12 @@ The size cost of those five lands almost entirely in `carplayd` — the only bin
 - Live free after stripping riddleBox: **~6 MB** on the jffs2 rootfs. jffs2 **compresses on write**,
   so compressible binaries consume less on-media than their raw size.
 - RAM: **128 MB**, ~107 MB free (tmpfs) — a real staging option.
+- The one-file install on a STOCK unit (measured on a factory adapter, 2026-10-28): 1,680 KB free
+  on stock; deleting the HiCar/Mirror/web extras frees 2,080 KB; the OCBM payload takes 2,568 KB on
+  jffs2 (whole-file gzip says 2,119 KB, but jffs2 compresses 4 KiB pages); **1,256 KB free** during
+  the trial, with stock kept. `tools/make_ocbm_installer.sh` writes the payload's jffs2 estimate into
+  the image (`BUDGET`: the model plus 5%, 2,644 KB against the 2,568 measured), and once.sh refuses
+  a unit without that room plus 384 KB.
 
 ### Component footprint
 

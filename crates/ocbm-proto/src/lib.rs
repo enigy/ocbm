@@ -357,6 +357,17 @@ pub const MGMT_CONNECT_DEVICE: u8 = 0x08;
 /// and hands Wi-Fi configuration (iAP2 0x5703) only to bonded phones. MGMT_ACK status 0 = done.
 /// Security plan 2026-10-21 §3 (enigy/ocbm docs/ops/SECURITY_PLAN_2026-10-21.md).
 pub const MGMT_PAIR_WINDOW: u8 = 0x09;
+/// [MGMT_INSTALL_CONFIRM] -> the one-file install's trial (`/script/ocbm_mode` = `trial`) becomes
+/// `confirmed`: an app that offers the way back (MGMT_GO_STOCK) has seen this box. When that session
+/// ends, or at the next start if the power was cut first, the box removes the Carlinkit stack and the
+/// mode becomes `final` (ccpa/installer/ocbm_finish.sh). Send it only from an app that shows the user
+/// the way back for the rest of the session. MGMT_ACK status 0 = confirmed (or was already
+/// `confirmed`/`final`); 1 = no one-file install on this box.
+pub const MGMT_INSTALL_CONFIRM: u8 = 0x0A;
+/// [MGMT_GO_STOCK] -> while stock is still on the box (`trial` or `confirmed`) the box ACKs status 0,
+/// then goes back to stock Carlinkit firmware (ccpa/installer/ocbm_revert.sh) and restarts. Status 1 =
+/// nothing to go back to (`final`, or no one-file install).
+pub const MGMT_GO_STOCK: u8 = 0x0B;
                                             //   Box->host:
 pub const MGMT_INFO: u8 = 0x81; // [MGMT_INFO][utf8 JSON] — identity + health + bonded-device snapshot
 pub const MGMT_ACK: u8 = 0x82; // [MGMT_ACK][verb u8][status u8] — 0 ok / 1 error, echoing the request verb
@@ -374,6 +385,7 @@ pub const CAP_FILE: u32 = 0x0000_0010;
 pub const CAP_ETH: u32 = 0x0000_0020; // box can bridge a raw-ethernet netdev (ncm0) over CH_ETH
 pub const CAP_PHONE_POLICY: u32 = 0x0000_0040; // box takes MGMT_SET_POLICY / MGMT_CONNECT_DEVICE
 pub const CAP_PAIR_WINDOW: u32 = 0x0000_0080; // box takes MGMT_PAIR_WINDOW and gates pairing behind it
+pub const CAP_INSTALL: u32 = 0x0000_0100; // box takes MGMT_INSTALL_CONFIRM / MGMT_GO_STOCK and reports "install" in MGMT_INFO
 
 // OCBM_CH_IP stream-mux sub-frame types. Payload = [type u8][conn_id u16 LE][data].
 // AAOS has no NCM, so L3 is done in userspace over this channel (no kernel TUN needed).
