@@ -173,6 +173,29 @@ onefile_tests() {  # $1 shell
   "$SH1" "$TREE" "$T/bad.tgz" "$T/badtree" > "$T/out" 2>&1; rc=$?
   check '[ $rc -ne 0 ] && grep -q "no start_main_service.stock.sh" "$T/out"' "tree: refuses an archive without the stock start script"
 
+  # The pack for the box: exactly the tree. macOS tar adds a ._ AppleDouble entry per file that has
+  # extended attributes unless COPYFILE_DISABLE is set (the Mac's dry run of 28 Oct planned 702); this
+  # host's tar never does, so a tar that notes its environment shows the pack sets it.
+  rm -rf "$T/fakebin" "$T/tar.env" "$T/pack.tgz"; mkdir -p "$T/fakebin"
+  printf '#!/bin/sh\necho "COPYFILE_DISABLE=${COPYFILE_DISABLE:-unset} $1" >> "%s"\nexec %s "$@"\n' "$T/tar.env" "$(command -v tar)" > "$T/fakebin/tar"
+  chmod 755 "$T/fakebin/tar"
+  PATH="$T/fakebin:$PATH" "$SH1" "$TREE" --pack "$T/tree" "$T/pack.tgz" > "$T/out" 2>&1; rc=$?
+  check '[ $rc -eq 0 ] && grep -q PACK_OK "$T/out" && grep -q "exactly the tree" "$T/out"' "pack: the tree packs, entry for entry"
+  check '[ "$(head -1 "$T/tar.env")" = "COPYFILE_DISABLE=1 -czf" ]' "pack: tar packs with COPYFILE_DISABLE=1"
+  check '[ "$(gzip -dc "$T/pack.tgz" | tar -tf - | grep -c "start_main_service.sh")" -eq 1 ] && ! gzip -dc "$T/pack.tgz" | tar -tf - | grep -q "/\._"' "pack: the stock start script is in it, no AppleDouble entry"
+  rm -rf "$T/mac"; cp -pR "$T/tree" "$T/mac"; echo "AppleDouble" > "$T/mac/bin/._busybox"
+  (cd "$T/mac" && tar -czf "$T/mac.tgz" .)
+  "$SH1" "$TREE" --check "$T/tree" "$T/mac.tgz" > "$T/out" 2>&1; rc=$?
+  check '[ $rc -ne 0 ] && grep -q "not in the tree: 1, first bin/._busybox" "$T/out" && [ ! -e "$T/mac.tgz" ]' "pack: refuses an entry the tree lacks, and deletes the pack"
+  rm -rf "$T/mac"; cp -pR "$T/tree" "$T/mac"; rm -f "$T/mac/etc/inittab"
+  (cd "$T/mac" && tar -czf "$T/mac.tgz" .)
+  "$SH1" "$TREE" --check "$T/tree" "$T/mac.tgz" > "$T/out" 2>&1; rc=$?
+  check '[ $rc -ne 0 ] && grep -q "not in the pack: 1, first etc/inittab" "$T/out"' "pack: refuses a pack missing a file of the tree"
+  rm -rf "$T/mac"; cp -pR "$T/tree" "$T/mac"; echo "AppleDouble" > "$T/mac/etc/._inittab"
+  "$SH1" "$TREE" --pack "$T/mac" "$T/mac.tgz" > "$T/out" 2>&1; rc=$?
+  check '[ $rc -ne 0 ] && grep -q "AppleDouble files: 1, first etc/._inittab" "$T/out" && [ ! -e "$T/mac.tgz" ]' "pack: refuses AppleDouble files in the tree itself (a FAT or exFAT volume)"
+  rm -rf "$T/mac" "$T/mac.tgz" "$T/pack.tgz" "$T/fakebin" "$T/tar.env"
+
   rm -rf "$T/box"; cp -pR "$T/fin" "$T/box"
   before=$(tree_sum "$T/box")
   run_onefile "$SH1" plan "$T/box"; rc=$?

@@ -101,6 +101,10 @@ mkdir -p "$RUN_DIR"
 say()  { printf '[stock-restore] %s\n' "$*"; }
 warn() { printf '[stock-restore] !! %s\n' "$*" >&2; }
 die()  { printf '[stock-restore] ABORT: %s\n' "$*" >&2; exit 1; }
+# The onefile stage's private temp dir while it exists: the stock tree and its pack hold the Wi-Fi
+# passphrase and Bluetooth keys, so it goes on any exit, a die included.
+STAGE_WORK=""
+trap '[ -z "$STAGE_WORK" ] || rm -rf "$STAGE_WORK"' EXIT
 gate() {
   [ "$ASSUME_YES" = 1 ] && return 0
   printf '[stock-restore] %s [type yes] ' "$1"; read -r a
@@ -353,15 +357,20 @@ phase_preflight_onefile() {
 phase_stage_onefile() {
   say "=== stage — the stock tree, made here, into RAM on the box"
   need_ocbm
-  local tree="$RUN_DIR/tree" tgz="$RUN_DIR/tree.tgz" want got
-  rm -rf "$tree" "$tgz"
-  sh "$TREE_TOOL" "$ARCHIVE" "$tree" | tee "$RUN_DIR/tree.out" | grep -q TREE_OK || die "could not make the stock tree; see $RUN_DIR/tree.out"
-  ( cd "$tree" && tar -czf "$tgz" . ) || die "could not pack the stock tree"
-  rm -rf "$tree"   # it held the Wi-Fi passphrase and Bluetooth keys
+  local tree tgz want got
+  # The tree and its pack are made in a private temp dir (STAGE_WORK, gone on any exit), not in RUN_DIR,
+  # which sits under the repo and keeps the run's reports.
+  STAGE_WORK="$(mktemp -d "${TMPDIR:-/tmp}/stock_restore.XXXXXX")" || die "could not make a private temp dir for the stock tree"
+  tree="$STAGE_WORK/tree"; tgz="$STAGE_WORK/tree.tgz"
+  sh "$TREE_TOOL" "$ARCHIVE" "$tree" 2>&1 | tee "$RUN_DIR/tree.out" | grep -q TREE_OK || die "could not make the stock tree; see $RUN_DIR/tree.out"
+  # Only the tree's own files go to the box: --pack keeps macOS tar's ._ AppleDouble entries out (the
+  # 28 Oct dry run planned 702 of them) and refuses a pack that is not exactly the tree.
+  sh "$TREE_TOOL" --pack "$tree" "$tgz" 2>&1 | tee -a "$RUN_DIR/tree.out" | grep -q PACK_OK || die "could not pack the stock tree; see $RUN_DIR/tree.out"
+  rm -rf "$tree"
   push "$PAYLOAD" /tmp/stock_restore_box.sh
   push "$tgz" /tmp/rootfs.tar.gz
   want="$(md5 -q "$tgz")"; got="$(box_md5 /tmp/rootfs.tar.gz)"
-  rm -f "$tgz"
+  rm -rf "$STAGE_WORK"; STAGE_WORK=""
   [ "$want" = "$got" ] || die "the stock tree did not arrive intact (box $got, host $want)"
   [ "$(md5 -q "$PAYLOAD")" = "$(box_md5 /tmp/stock_restore_box.sh)" ] || die "stock_restore_box.sh did not arrive intact"
   run 'rm -rf /tmp/rs /tmp/rsw && mkdir -p /tmp/rs && tar -xzf /tmp/rootfs.tar.gz -C /tmp/rs && rm -f /tmp/rootfs.tar.gz && echo STAGED' 300 \

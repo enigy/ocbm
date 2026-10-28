@@ -19,6 +19,17 @@
 #
 # OUT_DIR then holds the adapter's Wi-Fi passphrase and Bluetooth link keys: keep it, like the
 # archive, out of repos, issues and logs, and delete it when the restore is done.
+#
+# Packing it for the box (tools/stock_restore.sh, stage):
+#
+#   tools/stock_restore_onefile_tree.sh --pack TREE TGZ    pack TREE into TGZ, then check it as below
+#   tools/stock_restore_onefile_tree.sh --check TREE TGZ   refuse (and delete) a TGZ whose entries are
+#                                                          not exactly TREE's own; prints PACK_OK
+#
+# macOS tar adds a "._name" AppleDouble entry beside every file that has extended attributes unless
+# COPYFILE_DISABLE is set, and on the box each one is a file written to flash: the Mac's dry run of
+# 28 Oct planned 702 of them next to the one real write. AppleDouble files on disk (a tree made on a
+# FAT or exFAT volume) are refused the same way.
 # Test hook (tools/stock_restore_test.sh): OCBM_LIST, a file of payload paths in place of --list.
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -30,6 +41,47 @@ script/box_crash.log etc/carplay_ident etc/hostapd.conf.stock etc/hostapd.conf.n
 
 say() { echo "[onefile-tree] $*"; }
 die() { echo "[onefile-tree] ABORT: $*" >&2; exit 1; }
+
+entries() {  # dir DIR | tgz FILE: its entries as relative paths, one a line, sorted bytewise
+  case "$1" in
+    dir) (cd "$2" && find . -print) | sed 's#^\./##' ;;
+    tgz) gzip -dc "$2" | tar -tf - | sed 's#^\./##; s#/$##' ;;
+  esac | grep -v '^\.\{0,1\}$' | LC_ALL=C sort -u
+}
+
+check_pack() {  # $1 tree, $2 tgz: exactly the tree's entries, and no AppleDouble file, or $2 goes
+  w="$(mktemp -d "${TMPDIR:-/tmp}/onefile_pack.XXXXXX")" || die "cannot make a temp dir"
+  entries dir "$1" > "$w/tree"
+  entries tgz "$2" > "$w/tgz"
+  extra="$(LC_ALL=C comm -23 "$w/tgz" "$w/tree")"
+  missing="$(LC_ALL=C comm -13 "$w/tgz" "$w/tree")"
+  apple="$(grep -E '(^|/)\._' "$w/tgz")"
+  n="$(wc -l < "$w/tree" | tr -d ' ')"
+  rm -rf "$w"
+  [ -z "$extra$missing$apple" ] && { say "packed: exactly the tree's $n entries"; return 0; }
+  rm -f "$2"
+  [ -n "$extra" ] && say "in the pack, not in the tree: $(printf '%s\n' "$extra" | wc -l | tr -d ' '), first $(printf '%s\n' "$extra" | head -1)"
+  [ -n "$missing" ] && say "in the tree, not in the pack: $(printf '%s\n' "$missing" | wc -l | tr -d ' '), first $(printf '%s\n' "$missing" | head -1)"
+  [ -n "$apple" ] && say "macOS AppleDouble files: $(printf '%s\n' "$apple" | wc -l | tr -d ' '), first $(printf '%s\n' "$apple" | head -1)"
+  die "the pack is not exactly the stock tree; deleted it, nothing goes to the box"
+}
+
+case "${1:-}" in
+  --pack|--check)
+    TREE="${2:-}"; TGZ="${3:-}"
+    [ -d "$TREE" ] && [ -n "$TGZ" ] || die "usage: $0 $1 TREE TGZ"
+    TREE="$(cd "$TREE" && pwd)"
+    case "$TGZ" in /*) ;; *) TGZ="$(pwd)/$TGZ" ;; esac
+    case "$TGZ" in "$TREE"/*) die "the pack cannot go inside the tree" ;; esac
+    if [ "$1" = --pack ]; then
+      rm -f "$TGZ"
+      (cd "$TREE" && COPYFILE_DISABLE=1 tar -czf "$TGZ" .) || { rm -f "$TGZ"; die "could not pack $TREE"; }
+    fi
+    [ -s "$TGZ" ] || die "no pack at $TGZ"
+    check_pack "$TREE" "$TGZ"
+    echo "PACK_OK"
+    exit 0 ;;
+esac
 
 [ -n "$ARCHIVE" ] && [ -n "$OUT" ] || die "usage: $0 ARCHIVE OUT_DIR"
 [ -s "$ARCHIVE" ] || die "no archive at $ARCHIVE"

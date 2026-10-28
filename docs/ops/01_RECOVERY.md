@@ -173,6 +173,10 @@ with the stick's `OCBM_BACKUP/<serial>/` folder):
   payload (`make_ocbm_installer.sh --list`), `/etc/ocbm/`, `/script/ocbm_mode` and OCBM's runtime files
   dropped, `/etc/hostapd.conf` from the identity archive (as `ocbm_revert.sh` does), and
   `start_main_service.stock.sh` back as `start_main_service.sh`. The pruned extras are not in it.
+  The tree holds the Wi-Fi passphrase and Bluetooth keys, so the stage step makes it in a private temp
+  dir that goes on any exit. Its `--pack` runs `tar` with `COPYFILE_DISABLE=1` and refuses a pack that
+  is not exactly the tree: macOS `tar` otherwise adds a `._` AppleDouble entry per file with extended
+  attributes, and the factory adapter's first dry run (28 Oct) planned 702 of them as writes.
 - **The order** (`PROFILE=onefile` in `tools/stock_restore_box.sh`). The dispatcher keeps booting OCBM
   while every stock file goes back (`.rsnew`, md5-checked, renamed, free space checked first) and no
   OCBM file is touched; a check then stops the run if anything but the start script and OCBM's own
@@ -189,10 +193,11 @@ with the stick's `OCBM_BACKUP/<serial>/` folder):
   image then restores the pruned extras too.
 - **Tests.** `tools/stock_restore_test.sh` finishes a synthetic trial with the real `ocbm_finish.sh`
   and restores it: OCBM kept until the switch, the check before the switch, the room shortfall, the
-  re-run that converges, every refusal, and the rehearsal, under `sh` and `dash`.
-- **Not on an adapter yet** (28 Oct): host tests only. Until a rehearsal and a confirm, finish and
-  restore have run on the factory adapter, no adapter is confirmed (`MGMT_INSTALL_CONFIRM`). The flash
-  dump and an SPI programmer stay the last resort.
+  re-run that converges, every refusal, the rehearsal and the pack check, under `sh` and `dash`.
+- **On an adapter** (28 Oct): the dry run on the factory adapter, in its trial on `153df7f`, passed
+  every preflight check with flash unchanged; it found the AppleDouble writes above. Until a rehearsal
+  and a confirm, finish and restore have run on it, no adapter is confirmed (`MGMT_INSTALL_CONFIRM`).
+  The flash dump and an SPI programmer stay the last resort.
 
 ### UART console reference
 
