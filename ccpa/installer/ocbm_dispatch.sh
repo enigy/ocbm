@@ -18,7 +18,7 @@
 #
 # In every OCBM mode it creates /tmp/not_change_mass_storage before OCBM starts. Without it the stock
 # stick handler (update_box.sh, still run by mdev) switches the USB port to stick sharing when a
-# stick without an image goes in, and Carlink3 loses the adapter.
+# stick without an image goes in, and Carlink loses the adapter.
 #
 # The install leaves /etc/inittab alone, and the stock one has no respawn lines, so this script runs
 # run_ocbmd.sh and run_supervisor.sh in loops of its own: the same restart-when-dead that
@@ -79,8 +79,10 @@ back_to_stock() {  # at boot, before OCBM has started: no restart needed
 
 first_start() {  # $1 PASSED: the first trial start adds its verdict to the install's result file
   [ -e "$EO/first_start.txt" ] && return 0
+  up=$(cut -d. -f1 "$PROC/uptime" 2>/dev/null)
   { echo; echo "--- first start"
-    echo "self-test: $1. Connect the adapter with Carlink3."; cat "$RUN/ocbm_selftest.txt"; } > "$EO/first_start.txt"
+    echo "self-test: $1, ${up:-?} s after power-on. Connect the adapter with Carlink."
+    cat "$RUN/ocbm_selftest.txt"; } > "$EO/first_start.txt"
   sync
   i=0
   while ! stick_in && [ "$i" -lt "$STICK_WAIT" ]; do sleep "$POLL"; i=$((i + POLL)); done

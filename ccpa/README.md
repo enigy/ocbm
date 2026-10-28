@@ -62,13 +62,13 @@ with **neither** present the box boots the OCBM appliance. Always test
 ## `installer/` — the one-file install for a STOCK adapter (in progress)
 
 Box-side scripts of `A15W_Update.img`, which converts a stock 2025.10.15.1127 adapter from a USB stick
-or over USB from Carlink3. `tools/make_ocbm_installer.sh` builds it and `tools/ocbm_installer_test.sh`
+or over USB from Carlink. `tools/make_ocbm_installer.sh` builds it and `tools/ocbm_installer_test.sh`
 runs it end to end against synthetic stock trees.
 
 | File | Purpose |
 |---|---|
 | `once.sh` | Stage A, run by the stock updater before its copy step: checks (refuse = nothing changed), flash backup to the stick + `/etc/ocbm/identity.tgz`, `prune.list`, place the payload, keep `start_main_service.stock.sh`, then rename the dispatcher over `start_main_service.sh` as the one boot-critical write |
-| `finish.sh` | writes `OCBM_RESULT.txt`, parks the stick image, restarts into the trial |
+| `finish.sh` | writes `OCBM_RESULT.txt` (once.sh keeps the one before as `OCBM_RESULT.prev.txt`), parks the stick image, restarts into the trial |
 | `prune.list` | what goes to make room while stock CarPlay/AA stay as the fallback: HiCar, Android Mirror helper, test leftovers, web UI pages. Every match still passes `is_radio()` |
 | `identity.list` | unit identity archived before anything changes (holds secrets: never log or commit it) |
 | `ocbm_dispatch.sh` | Stage B, installed as `/script/start_main_service.sh` (carries `# OCBM_DISPATCH`). No `/script/ocbm_mode`: `exec` the kept `start_main_service.stock.sh`, and copy a pending revert report to the next stick. `trial`/`confirmed`: count the start (two in a row without a passing self-test go back to stock), create `/tmp/not_change_mass_storage` so the stock stick handler leaves the USB port alone, run `ocbm_boot.sh`, respawn `ocbmd` and the supervisor in loops of its own (the install leaves `/etc/inittab` alone), run the self-test, watch the stick for `OCBM_RESTORE`. `final`: OCBM only |

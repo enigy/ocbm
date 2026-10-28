@@ -155,7 +155,8 @@ way back, and five things call it:
 
 It puts `/etc/hostapd.conf` back from `/etc/ocbm/identity.tgz`, records `reverted version=<VERSION>`
 in `/etc/ocbm/last_result.txt` (a stick install then refuses that version unless the stick holds
-`OCBM_RETRY`; an install over USB from the app is not checked, since each one is a press of Convert),
+`OCBM_RETRY`, which an install that uses it renames `OCBM_RETRY.used`; an install over USB from the
+app is not checked, since each one is a press of Convert),
 removes `/script/ocbm_mode` and restarts. The start script then hands every boot to the
 kept `start_main_service.stock.sh`, and the report lands on the next stick plugged in as
 `OCBM_RESULT.txt`. HiCar, the Android Mirror helper and the web pages stay deleted; Carlinkit's own

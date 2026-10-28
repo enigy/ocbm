@@ -5,7 +5,7 @@
 #
 # Called by the dispatcher (a failed self-test, OCBM_RESTORE on a stick, and with --no-reboot at
 # boot for the start counter, when it hands the boot to stock itself), and later by ocbmd for
-# Carlink3's "Go back to stock" (M4). Removing /script/ocbm_mode is the switch: everything before it
+# Carlink's "Go back to stock" (M4). Removing /script/ocbm_mode is the switch: everything before it
 # is safe to repeat, and the dispatcher then hands every boot to start_main_service.stock.sh.
 #
 #   1 put back /etc/hostapd.conf from /etc/ocbm/identity.tgz: OCBM rewrites the access point's

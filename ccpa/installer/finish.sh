@@ -16,8 +16,8 @@ REBOOT_DELAY="${REBOOT_DELAY:-3}"
   echo "OCBM install: INSTALLED (trial)"
   echo "installer: $VER"
   echo
-  echo "The adapter restarts now and runs OCBM. Connect it with Carlink3."
-  echo "Stock CarPlay stays on the adapter as a fallback until your first Carlink3 session ends."
+  echo "The adapter restarts now and runs OCBM. Connect it with Carlink."
+  echo "Stock CarPlay stays on the adapter as a fallback until the Carlink session that confirms it ends."
   echo "If OCBM fails its start-up self-test, the adapter goes back to stock CarPlay by itself."
   if [ -n "$BACKUP" ]; then
     echo

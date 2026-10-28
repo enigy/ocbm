@@ -85,6 +85,7 @@ for sh in ${SHELLS:-sh dash}; do
     "the ocbmd and supervisor respawn loops run, and stock init_gpio.sh"
   check 'waitfor "grep -q \"^--- first start\" $d/stick/OCBM_RESULT.txt" 5' \
     "the first start adds its verdict to OCBM_RESULT.txt on the stick"
+  check 'grep -q "^self-test: PASSED, 42 s after power-on" "$d/stick/OCBM_RESULT.txt"' "the verdict says when, counted from power-on"
   check '[ ! -e "$d/root/etc/ocbm/boot_attempts" ] && mode_is "$d" trial && [ ! -e "$d/rebooted" ] && grep -q "PASSED" "$d/root/etc/ocbm/first_start.txt"' \
     "a pass clears the start counter and stays in the trial"
   restart "$d"; boot "$sh" "$d"; sleep 3

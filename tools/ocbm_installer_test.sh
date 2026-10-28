@@ -78,6 +78,7 @@ make_box() {  # $1 dir: root/ sys/ proc/ dev/ stick/ update/ of a stock adapter 
   echo 11:22:33:44:55:66 > "$d/sys/class/bluetooth/hci0/address"
   blob "$d/dev/mtd0" 8192; blob "$d/dev/mtd1" 16384; blob "$d/dev/mtd2" 32768
   printf 'dev:    size   erasesize  name\nmtd0: 00002000 00010000 "uboot"\nmtd1: 00004000 00010000 "kernel"\nmtd2: 00008000 00010000 "rootfs"\n' > "$d/proc/mtd"
+  echo "4242.17 8000.00" > "$d/proc/uptime"   # a fixed clock: the log times steps from power-on
   refresh "$d"
 }
 refresh() {  # $1 dir: a fresh image on the stick and a fresh /tmp/update, as on a re-insert
@@ -137,6 +138,8 @@ for sh in ${SHELLS:-sh dash}; do
   check '[ "$(cd "$d/update" && find . -type f)" = "./tmp/finish.sh" ]' "/tmp/update holds only tmp/finish.sh"
   run_finish "$sh" "$d"
   check 'grep -q "INSTALLED (trial)" "$d/stick/OCBM_RESULT.txt" && grep -q "keep the stick private" "$d/stick/OCBM_RESULT.txt"' "finish.sh writes the result to the stick"
+  check 'grep -q "started 4242 s after power-on" "$d/stick/OCBM_RESULT.txt" && grep -q "^\[ocbm\] == backup (+0 s)" "$d/stick/OCBM_RESULT.txt" && grep -q "^\[ocbm\] installer took 0 s" "$d/stick/OCBM_RESULT.txt"' \
+    "the result's log times each step from power-on"
   check '[ ! -e "$d/stick/A15W_Update.img" ] && [ -e "$d/stick/A15W_Update.img.installed" ]' "finish.sh parks the image as .installed"
   check '[ -e "$d/rebooted" ]' "finish.sh restarts the adapter"
 
@@ -177,6 +180,9 @@ for sh in ${SHELLS:-sh dash}; do
   check '[ $rc = 1 ] && grep -q "OCBM_RETRY" "$r/stick/OCBM_RESULT.txt"' "an undone version is refused without OCBM_RETRY"
   touch "$r/stick/OCBM_RETRY"; refresh "$r"; run_once "$sh" "$r"; rc=$?
   check '[ $rc = 0 ] && installed "$r"' "with OCBM_RETRY it installs again, and start_main_service.stock.sh is still stock"
+  check '[ ! -e "$r/stick/OCBM_RETRY" ] && [ -e "$r/stick/OCBM_RETRY.used" ]' "the install uses OCBM_RETRY up: it is renamed OCBM_RETRY.used"
+  check 'grep -q "^OCBM install: REFUSED" "$r/stick/OCBM_RESULT.prev.txt" && [ ! -e "$r/stick/OCBM_RESULT.txt" ]' \
+    "the refusal's report is kept as OCBM_RESULT.prev.txt until finish.sh writes the new one"
   check '[ ! -e "$r/root/etc/ocbm/boot_attempts" ] && [ ! -e "$r/root/etc/ocbm/pending_result.txt" ]' "arming clears the earlier try's start counter and report"
   echo "== $sh: re-install after a revert, on a flash with no extras left to delete"
   r="$T/$sh-reinst"; make_box "$r"; run_once "$sh" "$r" >/dev/null; mkdir -p "$r/run"

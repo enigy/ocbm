@@ -21,7 +21,9 @@
 #   6 hand off   empty /tmp/update except tmp/finish.sh, so the stock copy step copies nothing
 #
 # A refusal or a stop renames the image on the stick (.refused/.stopped): stock keeps CarPlay down
-# after a failed update, and an image left in place would fail again on every boot.
+# after a failed update, and an image left in place would fail again on every boot. Each stick run
+# writes OCBM_RESULT.txt anew and keeps the one before as OCBM_RESULT.prev.txt; an install that
+# used OCBM_RETRY renames it OCBM_RETRY.used. The log times each step from power-on.
 #
 # Contract with Stage B (ccpa/installer/ocbm_dispatch.sh and ocbm_revert.sh): the dispatcher
 # carries a line starting "# OCBM_DISPATCH", and a revert to stock appends
@@ -55,9 +57,11 @@ EO="$ROOT/etc/ocbm"
 
 : > "$LOG"
 say() { echo "[ocbm] $*" | tee -a "$LOG"; }
+up() { u=$(cut -d. -f1 "$PROC/uptime" 2>/dev/null); echo "${u:-0}"; }   # seconds since power-on
+T0=$(up)
 step() {
   [ "${STOP_AT:-}" = "$1" ] && { say "simulated power loss before $1"; exit 99; }
-  say "== $1"
+  say "== $1 (+$(( $(up) - T0 )) s)"
 }
 
 product=$(cat "$ROOT/etc/box_product_type" 2>/dev/null)
@@ -68,6 +72,9 @@ if [ -z "${ROUTE:-}" ]; then
     *update_box_ota*) ROUTE=ota ;;
     *) ROUTE=stick ;;
   esac
+fi
+if [ "$ROUTE" = stick ] && [ -f "$STICK/OCBM_RESULT.txt" ]; then   # this run's report replaces it
+  mv -f "$STICK/OCBM_RESULT.txt" "$STICK/OCBM_RESULT.prev.txt"; sync
 fi
 
 result() {  # $1 headline, then lines of text for the user
@@ -140,7 +147,7 @@ free_kb() { df -k "$1" 2>/dev/null | awk 'NR>1 {f=$4} END {print f+0}'; }
 
 # ---------------------------------------------------------------------------------------------
 step checks
-say "route: $ROUTE; installer: ${VER:-?}"
+say "route: $ROUTE; installer: ${VER:-?}; started $T0 s after power-on"
 [ -n "$VER" ] || refuse "The installer's VERSION file is missing: the image is damaged."
 case "$UPDATE" in ''|/) refuse "The update folder is not set." ;; esac
 [ -f "$UPDATE/tmp/finish.sh" ] || refuse "The image has no finish.sh: it is damaged."
@@ -326,6 +333,12 @@ step rename
 mv -f "$SMS.new" "$SMS" || { rm -f "$MODE"; abort "Could not put the OCBM start script in place."; }
 sync
 say "armed: the next start runs OCBM (trial); stock is kept as start_main_service.stock.sh"
+# OCBM_RETRY is consent for one install: left on the stick, it would switch the same-version guard
+# off for every later install from it.
+if [ "$ROUTE" = stick ] && [ -e "$STICK/OCBM_RETRY" ]; then
+  mv -f "$STICK/OCBM_RETRY" "$STICK/OCBM_RETRY.used" && say "OCBM_RETRY used: renamed OCBM_RETRY.used"
+  sync
+fi
 
 # ---------------------------------------------------------------------------------------------
 step hand_off
@@ -340,4 +353,5 @@ for e in "$UPDATE"/tmp/* "$UPDATE"/tmp/.[!.]*; do
   [ "$e" = "$UPDATE/tmp/finish.sh" ] || rm -rf "$e"
 done
 say "handed off: the stock copy step has nothing to copy"
+say "installer took $(( $(up) - T0 )) s; the restart into the trial follows"
 exit 0
