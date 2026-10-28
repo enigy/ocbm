@@ -37,7 +37,11 @@ gadget_ok() {
   [ "$(cat "$A/enable" 2>/dev/null)" = 1 ]
 }
 node_ok() { [ -e "$DEVDIR/usb_accessory" ]; }
-ocbmd_ok() { pgrep -x "$OCBMD" >/dev/null 2>&1; }
+# busybox pidof matches the process name, argv[0]'s basename or the executable. Not busybox pgrep -x:
+# it matches all of argv[0], so it never sees an ocbmd started as /usr/sbin/ocbmd (factory bench,
+# 2026-10-28: a healthy trial reverted). pgrep -x is for hosts without pidof (macOS, the tests).
+ocbmd_pids() { if command -v pidof >/dev/null 2>&1; then pidof "$OCBMD"; else pgrep -x "$OCBMD"; fi 2>/dev/null; }
+ocbmd_ok() { [ -n "$(ocbmd_pids)" ]; }
 
 i=0
 while :; do
@@ -52,7 +56,7 @@ done
 
 echo "gadget: functions=$(cat "$A/functions" 2>/dev/null) idProduct=$(cat "$A/idProduct" 2>/dev/null) enable=$(cat "$A/enable" 2>/dev/null) state=$(cat "$A/state" 2>/dev/null)"
 echo "node: $([ $n = 1 ] && echo "$DEVDIR/usb_accessory present" || echo "no $DEVDIR/usb_accessory")"
-echo "ocbmd: $([ $o = 1 ] && echo "running (pid $(pgrep -x "$OCBMD" | head -1))" || echo "not running")"
+echo "ocbmd: $([ $o = 1 ] && echo "running (pid $(ocbmd_pids | tr ' ' '\n' | head -1))" || echo "not running")"
 echo "radio: hardware ${hw:-none}, descriptor $(cap CHIP) $(cap SDIO_DEVICE), backend $(cap BACKEND), wireless $(cap WIRELESS)"
 if [ $g$n$o$radio_ok = 1111 ]; then
   echo "PASSED in ${i} s"

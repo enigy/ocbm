@@ -178,6 +178,16 @@ for sh in ${SHELLS:-sh dash}; do
   touch "$r/stick/OCBM_RETRY"; refresh "$r"; run_once "$sh" "$r"; rc=$?
   check '[ $rc = 0 ] && installed "$r"' "with OCBM_RETRY it installs again, and start_main_service.stock.sh is still stock"
   check '[ ! -e "$r/root/etc/ocbm/boot_attempts" ] && [ ! -e "$r/root/etc/ocbm/pending_result.txt" ]' "arming clears the earlier try's start counter and report"
+  echo "== $sh: re-install after a revert, on a flash with no extras left to delete"
+  r="$T/$sh-reinst"; make_box "$r"; run_once "$sh" "$r" >/dev/null; mkdir -p "$r/run"
+  env ROOT="$r/root" RUN="$r/run" "$sh" "$r/root/script/ocbm_revert.sh" --no-reboot "test" > "$r/revert.out" 2>&1
+  old_kb=0; for rel in $(bash "$HERE/make_ocbm_installer.sh" --list); do
+    [ "$rel" = script/ocbm_dispatch.sh ] || old_kb=$((old_kb + $(du -sk "$r/root/$rel" | cut -f1))); done
+  need=$(( $(sed -n 's/^need_kb=//p' "$T/img/tmp/ocbm/BUDGET") + 384 ))
+  touch "$r/stick/OCBM_RETRY"; refresh "$r"
+  run_once "$sh" "$r" FAKE_FREE_KB=$((need - old_kb * 6 / 10 + 8)) FAKE_FREE_AFTER_KB=$((need + 8)); rc=$?
+  check '[ $rc = 0 ] && installed "$r" && grep -q "removed the earlier try" "$r/install.log"' \
+    "the earlier try's OCBM files count as room, are removed and placed again"
 
   echo "== $sh: not enough room after the prune"
   r="$T/$sh-tight"; make_box "$r"; run_once "$sh" "$r" FAKE_FREE_AFTER_KB=10; rc=$?

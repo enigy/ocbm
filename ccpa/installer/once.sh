@@ -11,6 +11,7 @@
 #                routes: /etc/ocbm/identity.tgz. A failed backup is a refusal.
 #   3 make room  delete prune.list (HiCar, Android Mirror, test leftovers, web UI pages); stock
 #                CarPlay and Android Auto keep working. Removed paths go to /etc/ocbm/pruned.txt.
+#                On a re-install after a revert or a stopped try, the earlier OCBM files go too.
 #   4 place      each payload file as .new, checked against SHA256SUMS, then renamed
 #   5 arm        keep start_main_service.stock.sh, write /script/ocbm_mode=trial, then the one
 #                boot-critical write: rename the dispatcher over start_main_service.sh. Power lost
@@ -127,6 +128,11 @@ prune_targets() {  # existing paths matched by prune.list, radio files excluded.
   done < "$PAYLOAD/prune.list"
 }
 under_root() { case "$1" in "$ROOT"/?*) return 0 ;; esac; return 1; }
+payload_files() {  # what the place step writes: the manifest's usr/sbin, usr/bin and script files
+  while read -r sum rel; do
+    case "$rel" in script/ocbm_dispatch.sh) ;; usr/sbin/*|usr/bin/*|script/*) echo "$rel" ;; esac
+  done < "$PAYLOAD/SHA256SUMS"
+}
 
 sum_of() { sha256sum "$1" 2>/dev/null | cut -c1-64; }
 free_kb() { df -k "$1" 2>/dev/null | awk 'NR>1 {f=$4} END {print f+0}'; }
@@ -186,8 +192,16 @@ prune_kb=0
 for p in $(prune_targets); do
   under_root "$p" && prune_kb=$((prune_kb + $(du -sk "$p" | cut -f1)))
 done
+# An earlier try's OCBM files (reverted, or stopped part way) are replaced, so they count as room too:
+# make_room deletes them. Stock boots without them, since nothing names them while no mode is set.
+old_kb=0
+if [ -d "$EO" ]; then
+  for rel in $(payload_files); do
+    [ -f "$ROOT/$rel" ] && old_kb=$((old_kb + $(du -sk "$ROOT/$rel" | cut -f1)))
+  done
+fi
 free=${FAKE_FREE_KB:-$(free_kb "$ROOT/")}
-gain=$((prune_kb * 7 / 10))   # JFFS2 holds these at ~0.8 of their size; count 0.7
+gain=$((prune_kb * 7 / 10 + old_kb * 6 / 10))   # JFFS2 holds these at ~0.8 and OCBM's binaries at ~0.62 of their size
 say "flash: $free KB free, ~$gain KB more after making room, OCBM needs $need_kb KB + $RESERVE_KB KB spare"
 [ $((free + gain)) -ge $((need_kb + RESERVE_KB)) ] \
   || refuse "Not enough flash: $free KB free and about $gain KB more after making room, but OCBM needs $need_kb KB plus $RESERVE_KB KB spare."
@@ -255,6 +269,10 @@ for p in $(prune_targets); do
   under_root "$p" || continue
   rm -rf "$p" && echo "/${p#$ROOT/}" >> "$EO/pruned.txt"
 done
+if [ "$old_kb" -gt 0 ]; then
+  for rel in $(payload_files); do rm -f "$ROOT/$rel" "$ROOT/$rel.new"; done
+  say "removed the earlier try's OCBM files ($old_kb KB)"
+fi
 sync
 free2=${FAKE_FREE_AFTER_KB:-${FAKE_FREE_KB:-$(free_kb "$ROOT/")}}
 say "flash after making room: $free2 KB free"
