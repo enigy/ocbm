@@ -183,18 +183,28 @@ onefile_tests() {  # $1 shell
   check '[ $rc -eq 0 ] && grep -q PACK_OK "$T/out" && grep -q "exactly the tree" "$T/out"' "pack: the tree packs, entry for entry"
   check '[ "$(head -1 "$T/tar.env")" = "COPYFILE_DISABLE=1 -czf" ]' "pack: tar packs with COPYFILE_DISABLE=1"
   check '[ "$(gzip -dc "$T/pack.tgz" | tar -tf - | grep -c "start_main_service.sh")" -eq 1 ] && ! gzip -dc "$T/pack.tgz" | tar -tf - | grep -q "/\._"' "pack: the stock start script is in it, no AppleDouble entry"
-  rm -rf "$T/mac"; cp -pR "$T/tree" "$T/mac"; echo "AppleDouble" > "$T/mac/bin/._busybox"
-  (cd "$T/mac" && tar -czf "$T/mac.tgz" .)
+  # The bad packs below are made with COPYFILE_DISABLE=1 and without ._ names, so they hold the same
+  # entries whatever the host's tar (macOS tar treats ._ names its own way; 28 Oct, the Mac).
+  rm -rf "$T/mac"; cp -pR "$T/tree" "$T/mac"; echo "not stock" > "$T/mac/bin/extra"
+  (cd "$T/mac" && COPYFILE_DISABLE=1 tar -czf "$T/mac.tgz" .)
   "$SH1" "$TREE" --check "$T/tree" "$T/mac.tgz" > "$T/out" 2>&1; rc=$?
-  check '[ $rc -ne 0 ] && grep -q "not in the tree: 1, first bin/._busybox" "$T/out" && [ ! -e "$T/mac.tgz" ]' "pack: refuses an entry the tree lacks, and deletes the pack"
+  check '[ $rc -ne 0 ] && grep -q "not in the tree: 1, first bin/extra" "$T/out" && [ ! -e "$T/mac.tgz" ]' "pack: refuses an entry the tree lacks, and deletes the pack"
   rm -rf "$T/mac"; cp -pR "$T/tree" "$T/mac"; rm -f "$T/mac/etc/inittab"
-  (cd "$T/mac" && tar -czf "$T/mac.tgz" .)
+  (cd "$T/mac" && COPYFILE_DISABLE=1 tar -czf "$T/mac.tgz" .)
   "$SH1" "$TREE" --check "$T/tree" "$T/mac.tgz" > "$T/out" 2>&1; rc=$?
   check '[ $rc -ne 0 ] && grep -q "not in the pack: 1, first etc/inittab" "$T/out"' "pack: refuses a pack missing a file of the tree"
+  # AppleDouble files in the tree itself (made on a FAT or exFAT volume): refused whether tar packs
+  # them or leaves them out, the second by a tar that skips ._ names.
   rm -rf "$T/mac"; cp -pR "$T/tree" "$T/mac"; echo "AppleDouble" > "$T/mac/etc/._inittab"
   "$SH1" "$TREE" --pack "$T/mac" "$T/mac.tgz" > "$T/out" 2>&1; rc=$?
   check '[ $rc -ne 0 ] && grep -q "AppleDouble files: 1, first etc/._inittab" "$T/out" && [ ! -e "$T/mac.tgz" ]' "pack: refuses AppleDouble files in the tree itself (a FAT or exFAT volume)"
-  rm -rf "$T/mac" "$T/mac.tgz" "$T/pack.tgz" "$T/fakebin" "$T/tar.env"
+  rm -rf "$T/skipbin"; mkdir -p "$T/skipbin"
+  printf '#!/bin/sh\ncase "$1" in -c*) exec %s --exclude="._*" "$@" ;; esac\nexec %s "$@"\n' "$(command -v tar)" "$(command -v tar)" > "$T/skipbin/tar"
+  chmod 755 "$T/skipbin/tar"
+  PATH="$T/skipbin:$PATH" "$SH1" "$TREE" --pack "$T/mac" "$T/mac.tgz" > "$T/out" 2>&1; rc=$?
+  check '[ $rc -ne 0 ] && grep -q "AppleDouble files: 1, first etc/._inittab" "$T/out" && grep -q "not in the pack: 1, first etc/._inittab" "$T/out" && [ ! -e "$T/mac.tgz" ]' \
+    "pack: refuses them too when tar leaves them out of the pack"
+  rm -rf "$T/mac" "$T/mac.tgz" "$T/pack.tgz" "$T/fakebin" "$T/skipbin" "$T/tar.env"
 
   rm -rf "$T/box"; cp -pR "$T/fin" "$T/box"
   before=$(tree_sum "$T/box")

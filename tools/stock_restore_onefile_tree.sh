@@ -55,7 +55,8 @@ check_pack() {  # $1 tree, $2 tgz: exactly the tree's entries, and no AppleDoubl
   entries tgz "$2" > "$w/tgz"
   extra="$(LC_ALL=C comm -23 "$w/tgz" "$w/tree")"
   missing="$(LC_ALL=C comm -13 "$w/tgz" "$w/tree")"
-  apple="$(grep -E '(^|/)\._' "$w/tgz")"
+  # The tree's own ._ files count too, so the refusal does not hang on what tar does with them.
+  apple="$(cat "$w/tree" "$w/tgz" | grep -E '(^|/)\._' | LC_ALL=C sort -u)"
   n="$(wc -l < "$w/tree" | tr -d ' ')"
   rm -rf "$w"
   [ -z "$extra$missing$apple" ] && { say "packed: exactly the tree's $n entries"; return 0; }
