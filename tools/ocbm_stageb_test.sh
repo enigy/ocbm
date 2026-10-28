@@ -162,7 +162,7 @@ for sh in ${SHELLS:-sh dash}; do
   echo 0x9159 > "$d/sys/bus/sdio/devices/mmc0:0001:1/device"
   printf '#!/bin/sh\nprintf "RADIO_CHIP=nxp_iw416\\nRADIO_SDIO_DEVICE=%%s\\nRADIO_BACKEND=mapped\\nRADIO_WIRELESS=%%s\\n" "$(cat %s 2>/dev/null || echo 0x9159)" "$(cat %s 2>/dev/null || echo yes)" > "$RADIO_CAPS"\n' \
     "$d/radio_id" "$d/radio_wl" > "$d/radio_detect.sh"
-  gadget() { echo "$1" > "$G/functions"; echo "$2" > "$G/idProduct"; echo 1 > "$G/enable"; echo CONFIGURED > "$G/state"; }
+  gadget() { echo "$1" > "$G/functions"; echo "${3:-1314}" > "$G/idVendor"; echo "$2" > "$G/idProduct"; echo 1 > "$G/enable"; echo CONFIGURED > "$G/state"; }
   name="ocbmdt$$"; cp "$(command -v sleep)" "$d/bin/$name"   # a process that pgrep -x sees as $name
   [ "$(uname)" = Darwin ] && codesign -f -s - "$d/bin/$name" 2>/dev/null   # macOS kills a copied system binary
   selftest() {  # env overrides, then: run it, output in $d/st.out
@@ -174,6 +174,8 @@ for sh in ${SHELLS:-sh dash}; do
   check '[ $rc = 0 ] && [ "$(tail -1 "$d/st.out")" = "PASSED in 0 s" ] && grep -q "running (pid" "$d/st.out"' "passes on a working adapter"
   gadget mass_storage a4a5; selftest; rc=$?
   check '[ $rc = 1 ] && tail -1 "$d/st.out" | grep -q "^FAILED after 1 s: the USB gadget is not the OCBM accessory$"' "fails while the port is in stick sharing"
+  gadget accessory 2d00 12d1; selftest; rc=$?
+  check '[ $rc = 1 ] && tail -1 "$d/st.out" | grep -q "the USB gadget is not the OCBM accessory$"' "fails on the module's own vendor id (12d1:2d00), which host apps do not match"
   gadget accessory 2d00; rm -f "$d/dev/usb_accessory"; selftest; rc=$?
   check '[ $rc = 1 ] && tail -1 "$d/st.out" | grep -q "no /dev/usb_accessory$"' "fails without /dev/usb_accessory"
   : > "$d/dev/usb_accessory"; kill "$ocbmd_pid" 2>/dev/null; wait "$ocbmd_pid" 2>/dev/null; selftest; rc=$?

@@ -23,7 +23,9 @@ import sys
 import time
 
 HOST = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "target", "release", "ocbm-host")
-VID, PID = "1314", "2d00"
+# OCBM_VID/OCBM_PID reach a box whose gadget kept another vendor id (a factory unit before
+# ocbm_boot.sh pinned 1314 came up as 12d1:2d00, 2026-10-28).
+VID, PID = os.environ.get("OCBM_VID", "1314"), os.environ.get("OCBM_PID", "2d00")
 ANSI = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\[m")
 # The box's PS1, e.g. `[(19:05)root@~]#`. It is emitted without a trailing newline, so it glues
 # itself onto the front of the next line of real output.
@@ -47,20 +49,27 @@ def run(cmd: str, timeout: float = 15.0, raw: bool = False):
     # Phase 1: get a prompt, then kill PTY echo. Without this the box echoes the command back,
     # hard-wrapped at the PTY's 80 columns, which no amount of string-matching unwraps reliably.
     # Phase 2: run the command fenced by exact-line markers.
+    # The console drops input for several seconds after it attaches, and with no app subscribed
+    # ocbmd sends console output only when the host next writes (factory bench, 2026-10-28): a
+    # newline every second keeps it moving. The shell runs them after the command, as empty lines.
     buf, deadline, phase = b"", time.time() + timeout, 0
     try:
         feed("\n")
+        nudged = time.time()
         while time.time() < deadline:
             chunk = p.stdout.read(65536)
             if chunk:
                 buf += chunk
             else:
                 time.sleep(0.02)
+            if time.time() - nudged > 1:
+                feed("\n")
+                nudged = time.time()
             if phase == 0 and b"#" in buf:
                 feed("stty -echo\n")
                 phase, buf = 1, b""
                 time.sleep(0.25)
-            elif phase == 1:
+            elif phase == 1 and b"#" in buf:   # stty can flush input typed before it finishes
                 feed(f"printf '{begin}\\n'\n{cmd}\nprintf '{done}%s\\n' \"$?\"\n")
                 phase, buf = 2, b""
             elif phase == 2 and done.encode() in buf:

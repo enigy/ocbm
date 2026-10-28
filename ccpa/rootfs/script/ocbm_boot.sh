@@ -48,6 +48,10 @@ touch /tmp/UDiskPassThroughMode
   # claiming a converted box. Host apps that DO speak OCBM must list 0x1314:0x2d00 in their
   # usb_device_filter.xml + runtime allowlist, or Android never matches USB_DEVICE_ATTACHED and they
   # lose the implicit permission grant. See docs/carplay/00_ARCHITECTURE.md.
+  # The vendor id is written too, not left to the gadget module: its built-in default differs per
+  # unit's ko.tar.gz, and a factory unit came up as 12d1:2d00 (Huawei's id; 2026-10-28), which no
+  # OCBM host app matches.
+  echo 1314 > "$A/idVendor"
   echo 2d00 > "$A/idProduct"                # stable OCBM accessory PID (see comment above)
   echo accessory > "$A/functions"; echo 1 > "$A/enable"
   i=0; while [ ! -e /dev/usb_accessory ] && [ "$i" -lt 50 ]; do i=$((i+1)); sleep 0.1; done

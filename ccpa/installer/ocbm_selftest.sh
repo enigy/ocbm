@@ -3,7 +3,7 @@
 # on every trial start; a failure sends the adapter back to stock. It passes the first moment all of
 # these hold together, checking once a second for up to SECS (30):
 #
-#   gadget    the USB gadget is the OCBM accessory: functions=accessory, idProduct 2d00, enabled
+#   gadget    the USB gadget is the OCBM accessory: functions=accessory, 1314:2d00, enabled
 #   node      /dev/usb_accessory exists
 #   ocbmd     ocbmd is running
 #   radio     radio_detect.sh resolves this unit's own Wi-Fi/Bluetooth bring-up: its descriptor
@@ -33,6 +33,7 @@ radio_ok=0
 
 gadget_ok() {
   [ "$(cat "$A/functions" 2>/dev/null)" = accessory ] || return 1
+  case "$(cat "$A/idVendor" 2>/dev/null)" in 1314|0x1314) ;; *) return 1 ;; esac   # what host apps match
   case "$(cat "$A/idProduct" 2>/dev/null)" in 2d00|0x2d00|2D00|0x2D00) ;; *) return 1 ;; esac
   [ "$(cat "$A/enable" 2>/dev/null)" = 1 ]
 }
@@ -54,7 +55,7 @@ while :; do
   sleep 1; i=$((i + 1))
 done
 
-echo "gadget: functions=$(cat "$A/functions" 2>/dev/null) idProduct=$(cat "$A/idProduct" 2>/dev/null) enable=$(cat "$A/enable" 2>/dev/null) state=$(cat "$A/state" 2>/dev/null)"
+echo "gadget: functions=$(cat "$A/functions" 2>/dev/null) id=$(cat "$A/idVendor" 2>/dev/null):$(cat "$A/idProduct" 2>/dev/null) enable=$(cat "$A/enable" 2>/dev/null) state=$(cat "$A/state" 2>/dev/null)"
 echo "node: $([ $n = 1 ] && echo "$DEVDIR/usb_accessory present" || echo "no $DEVDIR/usb_accessory")"
 echo "ocbmd: $([ $o = 1 ] && echo "running (pid $(ocbmd_pids | tr ' ' '\n' | head -1))" || echo "not running")"
 echo "radio: hardware ${hw:-none}, descriptor $(cap CHIP) $(cap SDIO_DEVICE), backend $(cap BACKEND), wireless $(cap WIRELESS)"
