@@ -1,0 +1,38 @@
+name: Shell suites
+
+# The box runs busybox ash, and the shell suites loop their payload scripts (once.sh,
+# stock_restore_box.sh, ocbm_dispatch.sh, radio_detect.sh, the packers) over sh and dash. The host
+# side of all of this is macOS — Scott's Mac — and the Rust workflow runs on Linux, where the image
+# packer cannot build (it needs macOS tools) so three of these suites never ran in CI at all. Both
+# 28 Oct restore bugs showed up only on the Mac: macOS tar's ._ AppleDouble side files, and two pack
+# checks. This job runs the five shell suites on macOS, as tools/run_tests.sh does, under /bin/sh
+# (bash 3.2) and Homebrew dash. Keep the list in step with the shell suites in tools/run_tests.sh.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The self-looping suites (stock_restore, ocbm_installer, ocbm_stageb) run their payload under
+      # every shell they find; dash is not on the runner, so install it for the dash half.
+      - name: Install dash
+        run: brew install dash
+      - name: Shell suites under sh and dash
+        run: |
+          fail=0
+          run() { echo "=== $1"; shift; "$@" || fail=1; }
+          run "stock-restore"  sh   tools/stock_restore_test.sh
+          run "ocbm-installer" bash tools/ocbm_installer_test.sh
+          run "ocbm-stageb"    bash tools/ocbm_stageb_test.sh
+          run "radio-detect"   bash tools/radio_detect_test.sh
+          run "update-img"     bash tools/make_update_img_test.sh
+          [ "$fail" -eq 0 ] || { echo "FAILURES"; exit 1; }
+          echo "all shell suites passed"
