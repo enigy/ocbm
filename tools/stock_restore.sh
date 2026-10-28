@@ -19,7 +19,8 @@
 #              box still boots NCM if it stops at any point (see stock_restore_box.sh)
 #   verify     read-only: the rootfs matches the backup
 #   coldtest   reboot; it must come back on NCM by itself; then verify again
-#   stock      remove /script/ncm_only and reboot; the adapter must enumerate as stock 1314:1520/1521
+#   stock      remove /script/ncm_only and reboot; the adapter must enumerate as stock 1314:1520/1521,
+#              or 1d6b:a4a5 when stock shares a stick in the adapter
 #   all        preflight, revert, stage, plan, apply, verify, coldtest, stock — gated before apply
 #              and before stock
 #
@@ -46,7 +47,8 @@
 #              stock start script over the dispatcher, then OCBM's files go. Before the switch a
 #              stop leaves OCBM booting and apply can run again; after it the next start is stock
 #   verify     read-only, before the restart
-#   stock      gated: restart; the adapter must enumerate as stock 1314:1520/1521
+#   stock      gated: restart; the adapter must enumerate as stock 1314:1520/1521,
+#              or 1d6b:a4a5 when stock shares a stick in the adapter
 #   all        preflight, stage, plan, apply, verify, stock
 # The extras the install pruned (HiCar, the Android Mirror helper, the web pages) are not in the
 # archive: once stock is back, Carlinkit's own 2025.10.15.1127 image on a stick restores them.
@@ -80,7 +82,7 @@ while [ $# -gt 0 ]; do
     --profile) PROFILE="$2"; shift 2 ;;
     --run-dir) RUN_DIR="$2"; shift 2 ;;
     --yes|-y) ASSUME_YES=1; shift ;;
-    -h|--help) sed -n '2,60p' "$0"; exit 0 ;;
+    -h|--help) awk 'NR > 1 && /^set -euo pipefail$/ { exit } NR > 1' "$0"; exit 0 ;;
     -*) echo "unknown option: $1" >&2; exit 2 ;;
     *) PHASES+=("$1"); shift ;;
   esac
@@ -120,6 +122,23 @@ gate() {
 VIA=""
 OCBM_WARM=0
 usb_has() { ioreg -p IOUSB -w0 -l 2>/dev/null | grep -q "\"idProduct\" = $1\$"; }
+# A vendor's product: ioreg prints both ids, in decimal, in each entry's block under its "+-o" line.
+usb_has_id() {
+  ioreg -p IOUSB -w0 -l 2>/dev/null | awk -v v="$1" -v p="$2" '
+    /\+-o / { vid = ""; pid = "" }
+    /"idVendor" = / { vid = $NF }
+    /"idProduct" = / { pid = $NF }
+    vid == v && pid == p { found = 1 }
+    END { exit !found }'
+}
+# The adapter back on its Carlinkit stack, and how it shows: 1314:1520 or 1314:1521, or, with a stick in
+# it, stock sharing that stick straight away as 1d6b:a4a5 (the factory adapter's rehearsal, 28 Oct).
+stock_seen() {
+  if usb_has $((16#1520)); then echo "stock Carlinkit (1314:1520)"
+  elif usb_has $((16#1521)); then echo "stock Carlinkit (1314:1521)"
+  elif usb_has_id $((16#1d6b)) $((16#a4a5)); then echo "stock Carlinkit, sharing the stick in it (1d6b:a4a5)"
+  else return 1; fi
+}
 ssh_ok() { ssh -n -o ConnectTimeout=6 -o BatchMode=yes "root@$NCM_IP" true >/dev/null 2>&1; }
 telnet_ok() { python3 "$BOXSH" --host "$NCM_IP" --timeout 8 probe >/dev/null 2>&1; }
 
@@ -410,10 +429,10 @@ phase_stock_onefile() {
   need_ocbm
   gate "Restart now? The adapter comes back as stock Carlinkit; OCBM's console goes away."
   run 'sync; (sleep 1; /sbin/reboot) >/dev/null 2>&1 & echo REBOOTING' 20 >/dev/null || true
-  local end=$(( SECONDS + 240 ))
+  local end=$(( SECONDS + 240 )) seen
   while [ $SECONDS -lt $end ]; do
-    if usb_has $((16#1520)) || usb_has $((16#1521)); then
-      say "the adapter enumerates as stock Carlinkit (1314:$(usb_has $((16#1520)) && echo 1520 || echo 1521))"
+    if seen="$(stock_seen)"; then
+      say "the adapter enumerates as $seen"
       say "done. To put back HiCar, the Android Mirror helper and the web pages, put Carlinkit's 2025.10.15.1127 A15W_Update.img on a FAT32 stick and plug it in on a USB charger."
       return 0
     fi
@@ -442,10 +461,10 @@ phase_stock() {
   need_ncm
   gate "Switch to stock now? NCM goes away; afterwards the adapter is reachable only over its Wi-Fi AP or the UART."
   run 'rm -f /script/ncm_only /script/ncm_wifi; sync; (sleep 1; /sbin/reboot) >/dev/null 2>&1 & echo REBOOTING' 20 >/dev/null || true
-  local end=$(( SECONDS + 240 ))
+  local end=$(( SECONDS + 240 )) seen
   while [ $SECONDS -lt $end ]; do
-    if usb_has $((16#1520)) || usb_has $((16#1521)); then
-      say "the adapter enumerates as stock Carlinkit (1314:$(usb_has $((16#1520)) && echo 1520 || echo 1521))"
+    if seen="$(stock_seen)"; then
+      say "the adapter enumerates as $seen"
       say "done. To make it factory-clean as well, put Carlinkit's 2025.10.15.1127 A15W_Update.img on a FAT32 stick and plug it in on a USB charger."
       return 0
     fi

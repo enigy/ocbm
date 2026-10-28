@@ -196,9 +196,12 @@ with the stick's `OCBM_BACKUP/<serial>/` folder):
   and restores it: OCBM kept until the switch, the check before the switch, the room shortfall, the
   re-run that converges, every refusal, the rehearsal and the pack check, under `sh` and `dash`.
 - **On an adapter** (28 Oct): the dry run on the factory adapter, in its trial on `153df7f`, passed
-  every preflight check with flash unchanged; it found the AppleDouble writes above. Until a rehearsal
-  and a confirm, finish and restore have run on it, no adapter is confirmed (`MGMT_INSTALL_CONFIRM`).
-  The flash dump and an SPI programmer stay the last resort.
+  every preflight check with flash unchanged; it found the AppleDouble writes above. The rehearsal then
+  ran there (`c15209d`, `all`): `RESTORE_DONE` (the switch, 7 programs and 18 scripts and settings
+  removed, the 3 `radio_*.sh` kept) and verify "rootfs matches the backup". With a stick in the
+  adapter, stock comes up sharing it as 1d6b:a4a5 rather than 1314:1520, which the `stock` step now
+  accepts. Until a confirm, finish and restore have run on it, no adapter is confirmed
+  (`MGMT_INSTALL_CONFIRM`). The flash dump and an SPI programmer stay the last resort.
 
 ### UART console reference
 
