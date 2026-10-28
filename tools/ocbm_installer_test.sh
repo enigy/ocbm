@@ -219,6 +219,13 @@ for sh in ${SHELLS:-sh dash}; do
   check '[ $rc = 0 ] && installed "$r" && [ -s "$r/root/etc/ocbm/identity.tgz" ] && [ ! -d "$r/stick" ]' "installs with no stick: identity archive only"
   run_finish "$sh" "$r"
   check 'grep -q "INSTALLED (trial)" "$r/result.txt" && [ ! -e "$r/rebooted" ]' "finish.sh leaves the restart to update_box_ota.sh"
+
+  echo "== $sh: over USB, a version undone before installs again (the same-version guard is the stick's)"
+  r="$T/$sh-ota-again"; make_box "$r"; run_once "$sh" "$r" >/dev/null; mkdir -p "$r/run"
+  env ROOT="$r/root" RUN="$r/run" "$sh" "$r/root/script/ocbm_revert.sh" --no-reboot "test" > "$r/revert.out" 2>&1
+  check 'grep -qxF "reverted version=$VER" "$r/root/etc/ocbm/last_result.txt"' "the revert recorded the version"
+  refresh "$r"; rm -rf "$r/stick"; run_once "$sh" "$r" ROUTE=ota; rc=$?
+  check '[ $rc = 0 ] && installed "$r"' "installs again with no stick and no OCBM_RETRY: each install over USB is a press of Convert"
 done
 
 [ "$fails" -eq 0 ] && echo "ocbm_installer_test: all passed" || { echo "ocbm_installer_test: $fails failed"; exit 1; }

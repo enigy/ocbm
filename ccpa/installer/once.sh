@@ -6,7 +6,7 @@
 # non-zero exit stops the stock updater with nothing copied. The payload is tmp/ocbm/ next to this.
 #
 #   1 checks     refuse, changing nothing: product, firmware, chip, factory mode, OCBM state,
-#                payload checksums, flash room, stick room, same-version guard
+#                payload checksums, flash room, stick room, same-version guard (stick only)
 #   2 backup     stick: mtd0-2 to OCBM_BACKUP/<id>/, each read back against its SHA-256 (a complete one
 #                from an earlier try is kept: it predates every change); both
 #                routes: /etc/ocbm/identity.tgz. A failed backup is a refusal.
@@ -213,7 +213,10 @@ if [ "$ROUTE" = stick ]; then
   [ "$sfree" -ge "$STICK_NEED_KB" ] \
     || refuse "The stick has $((sfree / 1024)) MB free; the flash backup needs 40 MB."
 fi
-if grep -qxF "reverted version=$VER" "$EO/last_result.txt" 2>/dev/null && [ ! -e "$STICK/OCBM_RETRY" ]; then
+# The same-version guard is for the stick: an image left on it would reinstall a version that was undone
+# (a failed self-test, say) on every start. Over USB each install is a press of Convert in the app, which
+# has no way to put OCBM_RETRY anywhere, so the guard would only block a deliberate retry.
+if [ "$ROUTE" = stick ] && grep -qxF "reverted version=$VER" "$EO/last_result.txt" 2>/dev/null && [ ! -e "$STICK/OCBM_RETRY" ]; then
   refuse "This installer ($VER) was installed and undone on this adapter before. To try it again anyway, put an empty file named OCBM_RETRY on the stick next to the image."
 fi
 
