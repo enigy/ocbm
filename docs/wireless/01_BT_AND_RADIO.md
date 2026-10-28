@@ -383,20 +383,28 @@ still carrying `$`, a backtick or quotes becomes an empty mapping, so the seam r
 *unsupported* honestly), and `caps()` can no longer be killed by any descriptor. The usage-error
 exit moved off 2, which it had been colliding with.
 
-**So the honest scope of the design claim:** RTL8822BS/CS and RTL8733BS resolve on paper;
-Broadcom and NXP currently resolve to an honest "unsupported" rather than to a wrong command.
-Making those two families work needs the extraction to resolve the dispatcher's own literal
-variable assignments within the unit's branch — tracked in §7, not claimed here.
+**So the honest scope of the design claim:** RTL8822BS/CS and RTL8733BS resolve on paper. NXP
+resolves since 2026-10-18 for the one closed shape its branches use: a literal default assigned in
+the unit's own SDIO branch, plus at most one alternative behind `if [ $gate -eq 1 ]` whose gate is a
+one-line `test -e PATH`. Anything else still falls to the refusal above. Broadcom still resolves to
+an honest "unsupported" rather than to a wrong command.
+
+The gate's quoting is not cosmetic. Carlinkit's own 2025.10.15.1127 `init_bluetooth_wifi.sh` writes
+`if [ $supportStaMode -eq 1 ]`; lvalen's NCM image rewrote it as `if [ "$supportStaMode" -eq 1 ]`.
+Until 2026-10-28 only the quoted form resolved, which is the only text the IW416 baseline had ever
+carried, so a factory IW416 unit (the one-file install's target) would have lost `moal.ko` and,
+because BT attach waits for WLAN on this part, Bluetooth with it. Both forms now resolve, and
+`tools/radio_detect_test.sh` runs both texts.
 
 ### 7. Not yet done / not yet proven
 
-* Broadcom and NXP mappings are **refused, not resolved** (§6d). Making them work requires
-  slicing the dispatcher to the unit's own SDIO branch and resolving that branch's literal
-  `var=value` assignments. Until then those units report `unsupported` — correct behaviour, but
-  not working wireless.
-* `RADIO_BT_PRELOAD_CMD` is consumed by `radio_hal.sh` but **never emitted** by
-  `radio_detect.sh`, so a mapped-path unit needing `fw_loader_linux` before attach would never
-  run it. Moot while IW416 resolves to the `owned` backend, latent otherwise.
+* Broadcom mappings are **refused, not resolved** (§6d): their branches assign the firmware and
+  MAC variables in shapes the NXP resolver does not accept. Those units report `unsupported` —
+  correct behaviour, but not working wireless.
+* The `mapped` backend on a **factory** IW416 unit (Carlinkit's own scripts, no `wlan_on.sh`) is
+  resolved on paper only: offline against the 2025.10.15.1127 text it yields both module lines,
+  `hciattach /dev/ttymxc2 any 3000000 flow` and the `fw_loader_linux` preload. The one-file install's
+  bench (M3) is its first run on hardware.
 * `ocbm_install.sh`: the generic manifest cross-reference assertion (§6). The specific Realtek
   failure it would have caught is now closed — `--full` ships the seam alongside the supervisor
   (`ocbm_install.sh:158-160`) — but a future shipped script referencing a path the target lacks

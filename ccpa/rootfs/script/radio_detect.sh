@@ -184,7 +184,9 @@ resolve_var() {  # $1 var  $2 file -> literal value, or nothing
   [ -z "$(echo "$_as" | sed -n 3p)" ] || return 0          # three or more shapes: not closed-form
   [ -n "$_alt" ] || { echo "$_dflt"; return 0; }
   # The alternative must sit behind `if [ "$gate" -eq 1 ]`, and the gate must be a one-line file test.
-  _gate=$(echo "$_br" | grep -oE 'if \[ "\$[A-Za-z_][A-Za-z0-9_]*" -eq 1 \]' | head -1 | sed 's/.*\$//; s/".*//')
+  # Quotes optional: Carlinkit's own 2025.10.15.1127 dispatcher writes `if [ $supportStaMode -eq 1 ]`
+  # (lvalen's NCM image quotes it), and missing that dropped moal.ko on factory IW416 units.
+  _gate=$(echo "$_br" | grep -oE 'if \[ "?\$[A-Za-z_][A-Za-z0-9_]*"? -eq 1 \]' | head -1 | sed 's/.*\$//; s/[" ].*//')
   [ -n "$_gate" ] || return 0
   _test=$(grep -oE "test -e [^[:space:]]+ && $_gate=1 \|\| $_gate=0" "$_f" | head -1 | awk '{print $3}')
   [ -n "$_test" ] || return 0

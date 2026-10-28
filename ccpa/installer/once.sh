@@ -23,7 +23,8 @@
 #
 # Contract with Stage B (ccpa/installer/ocbm_dispatch.sh and ocbm_revert.sh): the dispatcher
 # carries a line starting "# OCBM_DISPATCH", and a revert to stock appends
-# "reverted version=<first line of VERSION>" to /etc/ocbm/last_result.txt.
+# "reverted version=<first line of VERSION>" to /etc/ocbm/last_result.txt. Arming clears Stage B's
+# per-try state in /etc/ocbm (boot_attempts, first_start.txt, pending_result.txt).
 #
 # Test hooks (tools/ocbm_installer_test.sh): ROOT SYS PROC DEVDIR STICK UPDATE ROUTE PAYLOAD LOG
 # STATE RESULT FAKE_FREE_KB FAKE_FREE_AFTER_KB FAKE_STICK_FREE_KB, and STOP_AT=<step> to simulate
@@ -283,6 +284,7 @@ if [ "$dispatcher" = 0 ]; then   # the current start script IS stock: keep it fo
     abort "Could not keep a copy of the stock start script."
   fi
 fi
+rm -f "$EO/boot_attempts" "$EO/first_start.txt" "$EO/pending_result.txt"   # Stage B state of an earlier try
 { echo trial > "$MODE.new" && mv -f "$MODE.new" "$MODE"; } || abort "Could not write /script/ocbm_mode."
 echo "$VER" > "$EO/installed_version" || abort "Could not write /etc/ocbm/installed_version."
 want=$(awk '$2 == "script/ocbm_dispatch.sh" {print $1}' "$PAYLOAD/SHA256SUMS")

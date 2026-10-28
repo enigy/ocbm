@@ -71,11 +71,12 @@ runs it end to end against synthetic stock trees.
 | `finish.sh` | writes `OCBM_RESULT.txt`, parks the stick image, restarts into the trial |
 | `prune.list` | what goes to make room while stock CarPlay/AA stay as the fallback: HiCar, Android Mirror helper, test leftovers, web UI pages. Every match still passes `is_radio()` |
 | `identity.list` | unit identity archived before anything changes (holds secrets: never log or commit it) |
+| `ocbm_dispatch.sh` | Stage B, installed as `/script/start_main_service.sh` (carries `# OCBM_DISPATCH`). No `/script/ocbm_mode`: `exec` the kept `start_main_service.stock.sh`, and copy a pending revert report to the next stick. `trial`/`confirmed`: count the start (two in a row without a passing self-test go back to stock), create `/tmp/not_change_mass_storage` so the stock stick handler leaves the USB port alone, run `ocbm_boot.sh`, respawn `ocbmd` and the supervisor in loops of its own (the install leaves `/etc/inittab` alone), run the self-test, watch the stick for `OCBM_RESTORE`. `final`: OCBM only |
+| `ocbm_selftest.sh` | passes when, within 30 s, the gadget is the OCBM accessory (`2d00`), `/dev/usb_accessory` exists, `ocbmd` runs and `radio_detect.sh` resolves this unit's own radio bring-up. No car or app needed |
+| `ocbm_revert.sh` | back to stock: puts `/etc/hostapd.conf` back from `identity.tgz`, appends the reason and `reverted version=<VERSION>` to `/etc/ocbm/last_result.txt` (once.sh's same-version guard), writes the stick report, removes `/script/ocbm_mode`, restarts. Refuses in `final` |
+| `ocbm_finish.sh` | Stage C, **a placeholder until M4**: nothing calls it, so an install stays in its trial. The builder marks images built with it `1.0.0-bench` |
 
-Not written yet (M3/M4): `ocbm_dispatch.sh` (must carry a `# OCBM_DISPATCH` line, and touch
-`/tmp/not_change_mass_storage` in OCBM modes so the stock stick handler leaves the USB gadget alone),
-`ocbm_selftest.sh`, `ocbm_revert.sh` (appends `reverted version=<VERSION>` to
-`/etc/ocbm/last_result.txt`), `ocbm_finish.sh`. The builder refuses until they exist.
+Tested on the host by `tools/ocbm_installer_test.sh` (Stage A) and `tools/ocbm_stageb_test.sh` (Stage B).
 
 ## Daemons — `ocbmd/`, `iap2d/`, `carplayd/` (shipped, hardware-validated) + `mfid/` (bring-up only)
 

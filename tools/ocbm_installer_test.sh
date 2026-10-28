@@ -34,8 +34,6 @@ mkdir -p "$T/bin"
 for b in ocbmd iap2d carplayd btd aa-bridge; do blob "$T/bin/$b" 70000; done
 blob "$T/irs" 20000
 cp -R "$REPO/ccpa/installer" "$T/inst"
-printf '#!/bin/sh\n# OCBM_DISPATCH (test stand-in)\nexec /script/start_main_service.stock.sh\n' > "$T/inst/ocbm_dispatch.sh"
-for s in ocbm_selftest ocbm_revert ocbm_finish; do printf '#!/bin/sh\nexit 0\n' > "$T/inst/$s.sh"; done
 echo "== build"
 BIN_DIR="$T/bin" IRS_BIN="$T/irs" INSTALLER_DIR="$T/inst" bash "$HERE/make_ocbm_installer.sh" "$T/out" > "$T/build.log" 2>&1
 check '[ -s "$T/out/A15W_Update.img" ]' "the builder writes A15W_Update.img"
@@ -43,6 +41,9 @@ bash "$HERE/make_update_img.sh" unpack "$T/out/A15W_Update.img" "$T/u.tgz"
 mkdir -p "$T/img"; tar -xzf "$T/u.tgz" -C "$T/img"
 check '( cd "$T/img/tmp/ocbm" && sha256sum -c SHA256SUMS >/dev/null 2>&1 )' "the payload manifest verifies"
 check 'grep -q "^need_kb=[0-9]" "$T/img/tmp/ocbm/BUDGET"' "BUDGET carries need_kb"
+if grep -q '^# OCBM_STAGE_C_PLACEHOLDER' "$REPO/ccpa/installer/ocbm_finish.sh"; then
+  check 'head -1 "$T/img/tmp/ocbm/VERSION" | grep -q "^1.0.0-bench ocbm "' "with the Stage C placeholder, VERSION says bench"
+fi
 want="$(grep -oE '\|/(usr/sbin|usr/bin|script)/[^|]+\|755' "$REPO/tools/ocbm_install.sh" | cut -d'|' -f2 | sed 's|^/||' | LC_ALL=C sort -u)"
 have="$(bash "$HERE/make_ocbm_installer.sh" --list | grep -vE '^script/ocbm_(dispatch|selftest|revert|finish)\.sh$' | LC_ALL=C sort -u)"
 check '[ "$want" = "$have" ]' "the payload is ocbm_install.sh --full's file set"
@@ -165,13 +166,18 @@ for sh in ${SHELLS:-sh dash}; do
       "refuses on $c, adapter unchanged ($(sed -n 's/.*REFUSED: //p' "$r/once.out" | cut -c1-60)...)"
   done
 
-  echo "== $sh: same-version guard, and a retry keeps the real stock script"
-  r="$T/$sh-again"; make_box "$r"; run_once "$sh" "$r" >/dev/null
-  rm -f "$r/root/script/ocbm_mode"; echo "reverted version=$VER" > "$r/root/etc/ocbm/last_result.txt"
+  echo "== $sh: same-version guard after ocbm_revert.sh, and a retry keeps the real stock script"
+  r="$T/$sh-again"; make_box "$r"; run_once "$sh" "$r" >/dev/null; mkdir -p "$r/run"
+  echo 'wpa_passphrase=ocbm' > "$r/root/etc/hostapd.conf"
+  env ROOT="$r/root" RUN="$r/run" "$sh" "$r/root/script/ocbm_revert.sh" --no-reboot "test" > "$r/revert.out" 2>&1; rc=$?
+  check '[ $rc = 0 ] && [ ! -e "$r/root/script/ocbm_mode" ] && grep -qxF "reverted version=$VER" "$r/root/etc/ocbm/last_result.txt" && grep -qx "wpa_passphrase=secret" "$r/root/etc/hostapd.conf"' \
+    "the installed ocbm_revert.sh records the version and puts hostapd.conf back from identity.tgz"
+  echo 2 > "$r/root/etc/ocbm/boot_attempts"
   refresh "$r"; run_once "$sh" "$r"; rc=$?
   check '[ $rc = 1 ] && grep -q "OCBM_RETRY" "$r/stick/OCBM_RESULT.txt"' "an undone version is refused without OCBM_RETRY"
   touch "$r/stick/OCBM_RETRY"; refresh "$r"; run_once "$sh" "$r"; rc=$?
   check '[ $rc = 0 ] && installed "$r"' "with OCBM_RETRY it installs again, and start_main_service.stock.sh is still stock"
+  check '[ ! -e "$r/root/etc/ocbm/boot_attempts" ] && [ ! -e "$r/root/etc/ocbm/pending_result.txt" ]' "arming clears the earlier try's start counter and report"
 
   echo "== $sh: not enough room after the prune"
   r="$T/$sh-tight"; make_box "$r"; run_once "$sh" "$r" FAKE_FREE_AFTER_KB=10; rc=$?

@@ -58,7 +58,12 @@ done < <(payload)
 
 rev="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 git -C "$REPO" diff --quiet HEAD 2>/dev/null || rev="$rev-dirty"
-echo "1.0.0 ocbm $rev" > "$P/VERSION"
+ver=1.0.0
+if grep -q '^# OCBM_STAGE_C_PLACEHOLDER' "$INSTALLER_DIR/ocbm_finish.sh"; then
+  ver=1.0.0-bench   # Stage C (M4) is not written: the adapter would stay in its trial
+  echo "make_ocbm_installer: ocbm_finish.sh is the Stage C placeholder, so this is a bench image" >&2
+fi
+echo "$ver ocbm $rev" > "$P/VERSION"
 
 # BUDGET: what the payload occupies once written to JFFS2 (4 KiB pages, zlib, 68-byte node headers,
 # a dirent each), plus 5%. This model came within 3% of df on the factory survey of 2026-10-27.

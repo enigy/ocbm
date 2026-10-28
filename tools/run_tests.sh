@@ -58,6 +58,10 @@ run "stock-restore" sh tools/stock_restore_test.sh
 run "update-img" bash tools/make_update_img_test.sh
 # The one-file installer: build, unwrap, and run its once.sh/finish.sh against synthetic stock trees.
 run "ocbm-installer" bash tools/ocbm_installer_test.sh
+# Its Stage B: the boot dispatcher, the self-test and the revert to stock, against synthetic converted adapters.
+run "ocbm-stageb" bash tools/ocbm_stageb_test.sh
+# The radio seam's detection against synthetic units (Carlinkit's and lvalen's dispatcher texts).
+run "radio-detect" bash tools/radio_detect_test.sh
 
 # host/MacHost's own hardware-free Swift harness (tests/run_tests.sh) — no Xcode project, no
 # dongle. Skipped (not a failure) when the Swift toolchain isn't on this machine, since the rest of
