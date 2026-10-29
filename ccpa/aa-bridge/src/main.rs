@@ -567,7 +567,7 @@ fn apple_on_bus() -> bool {
 fn phone_on_bus() -> bool {
     usb::enumerate_bus(USB_BUS)
         .iter()
-        .any(|d| phone::classify_dev(d.vid, d.class) == PhoneType::Android || is_accessory(d))
+        .any(|d| phone::classify_dev(d.vid, d.class, d.storage_only) == PhoneType::Android || is_accessory(d))
 }
 
 fn serve_session(client: TcpStream, acc: Accessory) -> Result<(), String> {
@@ -748,7 +748,7 @@ fn wait_for_android_phone(timeout: Duration) -> Option<usb::BusDevice> {
         if let Some(dev) = usb::enumerate_bus(USB_BUS).into_iter().find(|d| {
             // class-aware: a bare hub is not a phone, and picking it here made AA through a hub
             // impossible (readdir order decides which node we try to switch).
-            phone::classify_dev(d.vid, d.class) == PhoneType::Android && !is_accessory(d)
+            phone::classify_dev(d.vid, d.class, d.storage_only) == PhoneType::Android && !is_accessory(d)
         }) {
             return Some(dev);
         }

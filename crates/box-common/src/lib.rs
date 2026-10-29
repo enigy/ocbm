@@ -44,6 +44,7 @@ pub mod usb {
         pub vid: u16,
         pub pid: u16,
         pub class: u8,
+        pub storage_only: bool,
     }
 
     pub fn control(

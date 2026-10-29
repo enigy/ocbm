@@ -42,19 +42,48 @@ pub fn classify(vid: u16) -> PhoneType {
 /// USB device class for a hub — mandatory in every hub's DEVICE descriptor (USB 2.0 §11.23.1).
 pub const USB_CLASS_HUB: u8 = 0x09;
 
-/// Classify with the device class as well as the vendor id.
+/// USB interface class for mass storage (a stick, a card reader, a dashcam's storage).
+pub const USB_CLASS_MASS_STORAGE: u8 = 0x08;
+
+/// Classify with the device class, and whether every interface is mass storage, as well as the
+/// vendor id.
 ///
 /// `classify()` alone calls every non-Apple, non-root-hub vendor an Android candidate, which makes a
 /// bare external hub — or a dashcam, or a card reader — look like a phone. That is not cosmetic: it
 /// launches an aa-bridge that AOAP-probes the hub forever, and a permanently resident bridge is the
 /// precondition for the CarPlay-hijack class of defect. A hub is unambiguous at the descriptor level,
-/// so exclude it here. Devices that are NOT hubs still fall through to the vid-only rule, and the
-/// AOAP probe remains the definitive test.
-pub fn classify_dev(vid: u16, dev_class: u8) -> PhoneType {
-    if dev_class == USB_CLASS_HUB {
+/// so exclude it here. So is a device whose interfaces are all mass storage ([`storage_only`]): the
+/// one-file install leaves its USB stick in the adapter for the first trial start, and on 29 Oct that
+/// stick suppressed wireless CarPlay, Bluetooth included. A phone always has other interfaces (MTP,
+/// ADB, AOAP). Everything else still falls through to the vid-only rule, and the AOAP probe remains
+/// the definitive test.
+pub fn classify_dev(vid: u16, dev_class: u8, storage_only: bool) -> PhoneType {
+    if dev_class == USB_CLASS_HUB || storage_only {
         return PhoneType::Unknown;
     }
     classify(vid)
+}
+
+/// True when a device's descriptors (device + configuration blob, as read from usbfs) declare at
+/// least one interface and every interface is mass storage. Same rule as `session_supervisor.sh`'s
+/// `android_phone_on_bus`, which reads `bInterfaceClass` from sysfs.
+pub fn storage_only(descriptors: &[u8]) -> bool {
+    const INTERFACE: u8 = 0x04;
+    let (mut i, mut n, mut ms) = (0usize, 0u32, 0u32);
+    while i + 2 <= descriptors.len() {
+        let len = descriptors[i] as usize;
+        if len < 2 {
+            break; // malformed: a zero length would loop forever
+        }
+        if descriptors[i + 1] == INTERFACE && i + 5 < descriptors.len() {
+            n += 1;
+            if descriptors[i + 5] == USB_CLASS_MASS_STORAGE {
+                ms += 1;
+            }
+        }
+        i += len;
+    }
+    n > 0 && ms == n
 }
 
 /// A device discovered on the host-facing USB bus via sysfs.
@@ -109,11 +138,34 @@ mod tests {
     #[test]
     fn classify_dev_excludes_hubs() {
         // Measured on the box: root hub reads vid=1d6b class=09; the Pixel reads vid=18d1 class=00.
-        assert_eq!(classify_dev(0x05e3, USB_CLASS_HUB), PhoneType::Unknown); // Genesys hub
-        assert_eq!(classify_dev(0x2109, USB_CLASS_HUB), PhoneType::Unknown); // VIA hub
-        assert_eq!(classify_dev(0x18d1, 0x00), PhoneType::Android); // Pixel, normal mode
-        assert_eq!(classify_dev(0x18d1, 0x00), classify(0x18d1)); // non-hubs unchanged
-        assert_eq!(classify_dev(0x05ac, 0x00), PhoneType::Apple);
+        assert_eq!(classify_dev(0x05e3, USB_CLASS_HUB, false), PhoneType::Unknown); // Genesys hub
+        assert_eq!(classify_dev(0x2109, USB_CLASS_HUB, false), PhoneType::Unknown); // VIA hub
+        assert_eq!(classify_dev(0x18d1, 0x00, false), PhoneType::Android); // Pixel, normal mode
+        assert_eq!(classify_dev(0x18d1, 0x00, false), classify(0x18d1)); // non-hubs unchanged
+        assert_eq!(classify_dev(0x05ac, 0x00, false), PhoneType::Apple);
+    }
+
+    /// Device descriptor (18 B) + config (9 B) + the given interfaces (9 B each, no endpoints).
+    fn blob(classes: &[u8]) -> Vec<u8> {
+        let mut d = vec![18, 0x01, 0x00, 0x02, 0, 0, 0, 64, 0x81, 0x07, 0x81, 0x55, 0, 1, 1, 2, 3, 1];
+        d.extend_from_slice(&[9, 0x02, 0, 0, classes.len() as u8, 1, 0, 0x80, 50]);
+        for (n, c) in classes.iter().enumerate() {
+            d.extend_from_slice(&[9, 0x04, n as u8, 0, 0, *c, 0x06, 0x50, 0]);
+        }
+        d
+    }
+
+    #[test]
+    fn storage_only_is_a_stick_not_a_phone() {
+        assert!(storage_only(&blob(&[0x08]))); // a USB stick (the install's stick, 29 Oct)
+        assert!(!storage_only(&blob(&[0x06, 0xff]))); // a phone: MTP + ADB
+        assert!(!storage_only(&blob(&[0x08, 0xff]))); // storage plus anything else
+        assert!(!storage_only(&blob(&[]))); // no interfaces: not known to be storage
+        assert!(!storage_only(&[18, 0x01, 0])); // truncated
+        assert!(!storage_only(&[0, 0x01])); // zero length stops the walk
+        assert_eq!(classify_dev(0x0781, 0x00, true), PhoneType::Unknown); // SanDisk stick
+        assert_eq!(classify_dev(0x18d1, 0x00, false), PhoneType::Android); // Pixel
+        assert_eq!(classify_dev(0x05ac, 0x00, false), PhoneType::Apple);
     }
 
     #[test]

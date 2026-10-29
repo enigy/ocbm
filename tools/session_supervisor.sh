@@ -139,6 +139,18 @@ android_phone_on_bus() {
     case "$(cat "${_v%/idVendor}/bDeviceClass" 2>/dev/null)" in
       09 | 9) continue ;;
     esac
+    # A USB STICK is not a phone either. The one-file install leaves its stick in the adapter for the
+    # first trial start, and on 29 Oct that stick read as an Android Auto candidate: aa-bridge started
+    # and wireless CarPlay, Bluetooth included, was suppressed, so no iPhone could pair. A device whose
+    # interfaces are ALL mass storage (bInterfaceClass 08) is skipped; a phone always has others (MTP,
+    # ADB, AOAP). Mirrors box_common::phone::classify_dev.
+    _n=0; _ms=0
+    for _c in "${_v%/idVendor}"/*:*/bInterfaceClass; do
+      [ -f "$_c" ] || continue
+      _n=$((_n + 1))
+      [ "$(cat "$_c" 2>/dev/null)" = 08 ] && _ms=$((_ms + 1))
+    done
+    [ "$_n" -gt 0 ] && [ "$_ms" = "$_n" ] && continue
     return 0
   done
   return 1

@@ -64,7 +64,7 @@ arbitration is the shell supervisor.
 **Phone-type detection was two ISOLATED probes** — CarPlay grepping Apple `05ac`, `aa-bridge`
 matching Google `0x18d1`, neither aware of the other vendor. It is now one resolver:
 `box_common::phone::classify` / `classify_dev`, shared by both paths, with hubs excluded by
-`bDeviceClass == 0x09` (see §5, F6).
+`bDeviceClass == 0x09` and USB sticks by all interfaces being mass storage (see §5, F6).
 
 ### 2. Configuration matrix — the state this design started from
 
@@ -174,6 +174,13 @@ and the shell (`box_common::flags::owner()`).
   §11.23.1) and never used by a phone — Apple, Android normal mode and AOAP accessories are all
   per-interface `0x00`. Measured on the box: Pixel `vid=18d1 class=00`, root hub `vid=1d6b class=09`.
   `apple_on_bus()` stays deliberately VID-only: over-inclusive there fails toward CarPlay.
+  **Nor is a USB stick** (29 Oct 2026): the one-file install leaves its stick in the adapter for the
+  first trial start, and the stick read as an Android candidate, so `aa-bridge` started and wireless
+  CarPlay, Bluetooth included, was suppressed: no iPhone could pair until the stick came out and the
+  adapter restarted. A device whose interfaces are ALL mass storage (`bInterfaceClass 0x08`) is now
+  excluded in both places: `android_phone_on_bus` reads the classes from sysfs, and
+  `phone::storage_only` walks the usbfs descriptor blob that `usb::enumerate_bus` now reads whole. A
+  phone always has other interfaces (MTP, ADB, AOAP), so a stick next to a phone still counts.
 - **F4 — a crashed app wedged AA.** ocbmd's `CT_HELLO` reattach cleared the output queues but not
   `self.conns`, so a host that died without `CT_STOP` and relaunched inside the heartbeat grace left
   its corpse's CH_IP socket being pumped while the new host's `IP_OPEN` sat unaccepted in the bridge's

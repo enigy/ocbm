@@ -131,10 +131,13 @@ pub struct BusDevice {
     /// descriptor is already read here, so this costs nothing and is what lets the arbiter stop
     /// treating a bare hub as an Android Auto candidate.
     pub class: u8,
+    /// Every interface is mass storage ([`crate::phone::storage_only`]): a USB stick, not a phone.
+    pub storage_only: bool,
 }
 
-/// Enumerate `/dev/bus/usb/BBB`, reading each node's 18-byte device descriptor. Skips the root hub
-/// node ("001") and anything that isn't a device descriptor.
+/// Enumerate `/dev/bus/usb/BBB`, reading each node's descriptors (the device descriptor, then the
+/// configuration blob usbfs appends). Skips the root hub node ("001") and anything that isn't a
+/// device descriptor.
 pub fn enumerate_bus(bus_dir: &str) -> Vec<BusDevice> {
     let mut out = Vec::new();
     let entries = match std::fs::read_dir(bus_dir) {
@@ -150,8 +153,8 @@ pub fn enumerate_bus(bus_dir: &str) -> Vec<BusDevice> {
             Ok(f) => f,
             Err(_) => continue,
         };
-        let mut dd = [0u8; 18];
-        if f.read_exact(&mut dd).is_err() || dd[1] != 0x01 {
+        let mut dd = Vec::with_capacity(512);
+        if f.take(8192).read_to_end(&mut dd).is_err() || dd.len() < 18 || dd[1] != 0x01 {
             continue;
         }
         out.push(BusDevice {
@@ -159,6 +162,7 @@ pub fn enumerate_bus(bus_dir: &str) -> Vec<BusDevice> {
             vid: u16::from_le_bytes([dd[8], dd[9]]),
             pid: u16::from_le_bytes([dd[10], dd[11]]),
             class: dd[4],
+            storage_only: crate::phone::storage_only(&dd),
         });
     }
     out
