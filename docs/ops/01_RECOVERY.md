@@ -191,8 +191,10 @@ with the stick's `OCBM_BACKUP/<serial>/` folder):
   `ocbm_finish.sh` take the same lock). The identity gate (`mtd0`/`mtd1` against the stick's dump) and
   `software_version` against the archive's are checked first.
 - **Rehearsal.** In `trial` the same restore works with stock still on the unit; afterwards a stick
-  with the installer converts it again. The stock updater is back, so Carlinkit's 2025.10.15.1127
-  image then restores the pruned extras too.
+  with the installer converts it again. The kept `radio_*.sh` are replaced by the install like the rest
+  of the payload: until 29 Oct `once.sh` refused on them ("already has /script/radio_ap_up.sh"), because
+  with `/etc/ocbm` gone it took them for a stranger's files. The stock updater is back, so Carlinkit's
+  2025.10.15.1127 image then restores the pruned extras too.
 - **Tests.** `tools/stock_restore_test.sh` finishes a synthetic trial with the real `ocbm_finish.sh`
   and restores it: OCBM kept until the switch, the check before the switch, the room shortfall, the
   re-run that converges, every refusal, the rehearsal and the pack check, under `sh` and `dash`.

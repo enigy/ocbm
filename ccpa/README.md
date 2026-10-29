@@ -67,7 +67,7 @@ runs it end to end against synthetic stock trees.
 
 | File | Purpose |
 |---|---|
-| `once.sh` | Stage A, run by the stock updater before its copy step: checks (refuse = nothing changed), flash backup to the stick + `/etc/ocbm/identity.tgz`, `prune.list`, place the payload, keep `start_main_service.stock.sh`, then rename the dispatcher over `start_main_service.sh` as the one boot-critical write |
+| `once.sh` | Stage A, run by the stock updater before its copy step: checks (refuse = nothing changed; a payload file already on the adapter is refused unless `/etc/ocbm` exists, except the `radio_*.sh` seam a restore keeps), flash backup to the stick + `/etc/ocbm/identity.tgz`, `prune.list`, place the payload, keep `start_main_service.stock.sh`, then rename the dispatcher over `start_main_service.sh` as the one boot-critical write |
 | `finish.sh` | writes `OCBM_RESULT.txt` (once.sh keeps the one before as `OCBM_RESULT.prev.txt`), parks the stick image, restarts into the trial |
 | `prune.list` | what goes to make room while stock CarPlay/AA stay as the fallback: HiCar, Android Mirror helper, test leftovers, web UI pages. Every match still passes `is_radio()` |
 | `identity.list` | unit identity archived before anything changes (holds secrets: never log or commit it) |

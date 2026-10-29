@@ -190,6 +190,10 @@ grep -q "^$MARK" "$PAYLOAD/script/ocbm_dispatch.sh" 2>/dev/null \
   || refuse "The image has no OCBM start script: it is damaged or incomplete."
 while read -r sum rel; do
   case "$rel" in script/ocbm_dispatch.sh) continue ;; usr/sbin/*|usr/bin/*|script/*) ;; *) continue ;; esac
+  # The radio seam (script/radio_*.sh) is ours even without /etc/ocbm: stock never ships it, and every
+  # tool that takes OCBM off keeps it through is_radio(), stock_restore.sh included. An adapter restored
+  # to stock still has it (the factory adapter, 29 Oct), so it is replaced like the rest of the payload.
+  case "$rel" in script/radio_*) continue ;; esac
   [ -e "$ROOT/$rel" ] && [ ! -d "$EO" ] \
     && refuse "The adapter already has /$rel, which the installer would overwrite."
 done < "$PAYLOAD/SHA256SUMS"

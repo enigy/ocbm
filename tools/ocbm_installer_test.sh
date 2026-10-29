@@ -150,7 +150,7 @@ for sh in ${SHELLS:-sh dash}; do
   echo "0.9.0 ocbm older" > "$d/root/etc/ocbm/installed_version"; refresh "$d"; snap "$d/root" > "$d/b3"; run_once "$sh" "$d"; rc=$?
   check '[ $rc = 1 ] && grep -q "^OCBM install: REFUSED" "$d/stick/OCBM_RESULT.txt" && [ "$(snap "$d/root")" = "$(cat "$d/b3")" ] && [ -e "$d/stick/A15W_Update.img.refused" ]' \
     "another version installed: REFUSED, nothing changed, image parked as .refused"
-  for c in product firmware chip factory handmade damaged flash stick backup; do
+  for c in product firmware chip factory handmade stray damaged flash stick backup; do
     r="$T/$sh-$c"; make_box "$r"; extra=""
     case $c in
       product)  printf A15 > "$r/root/etc/box_product_type"; cp "$r/stick/A15W_Update.img" "$r/stick/A15_Update.img" ;;
@@ -158,6 +158,7 @@ for sh in ${SHELLS:-sh dash}; do
       chip)     echo 0xb822 > "$r/sys/bus/sdio/devices/mmc0:0001:1/device" ;;
       factory)  echo 2 > "$r/sys/module/libcomposite/parameters/mfgmode" ;;
       handmade) blob "$r/root/usr/sbin/ocbmd" 100 ;;
+      stray)    blob "$r/root/usr/sbin/iap2d" 100 ;;
       damaged)  echo x >> "$r/update/tmp/ocbm/script/radio_hal.sh" ;;
       flash)    extra="FAKE_FREE_KB=100" ;;
       stick)    extra="FAKE_STICK_FREE_KB=1000" ;;
@@ -202,6 +203,14 @@ for sh in ${SHELLS:-sh dash}; do
   run_once "$sh" "$r2"; rc=$?
   check '[ $rc = 0 ] && ( cd "$r2/stick/OCBM_BACKUP/ABCDEF0123456789" && sha256sum -c SHA256SUMS >/dev/null 2>&1 ) && cmp -s "$r2/dev/mtd2" "$r2/stick/OCBM_BACKUP/ABCDEF0123456789/mtd2.bin"' \
     "a damaged earlier backup is taken again"
+
+  echo "== $sh: install on an adapter restored to stock, with the radio seam left behind"
+  r="$T/$sh-restored"; make_box "$r"
+  for f in radio_ap_up.sh radio_detect.sh radio_hal.sh; do cp "$T/img/tmp/ocbm/script/$f" "$r/root/script/$f"; done
+  echo "# an older OCBM's copy" >> "$r/root/script/radio_hal.sh"
+  run_once "$sh" "$r"; rc=$?
+  check '[ $rc = 0 ] && installed "$r"' "stock_restore.sh keeps radio_*.sh: the install goes ahead and replaces them"
+  check 'grep -q "would overwrite" "$T/$sh-stray/once.out"' "any other OCBM file already there, with no /etc/ocbm, is still refused"
 
   echo "== $sh: not enough room after the prune"
   r="$T/$sh-tight"; make_box "$r"; run_once "$sh" "$r" FAKE_FREE_AFTER_KB=10; rc=$?
