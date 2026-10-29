@@ -293,6 +293,8 @@ check '[ "$(wc -l < "$b/x/SHA256SUMS")" = "$(wc -l < "$b/from/SHA256SUMS")" ] &&
   "SHA256SUMS covers every payload file, the update script included"
 check '[ "$(cat "$b/x/FROM_MIN")" = 1.0.0 ] && grep -q "^1.1.0 ocbm " "$b/x/VERSION" && grep -qx "trial=yes" "$b/x/ROOM"' \
   "VERSION, FROM_MIN and ROOM (fits a trial adapter)"
+check '[ "$(gzip -dc "$pk" | tar -tvf - | awk "{print \$2}" | sort -u)" = root/root ] && ! gzip -dc "$pk" | tar -tf - | grep -q "\._"' \
+  "every entry root-owned, and no AppleDouble ._ entries"
 printf 'final_kb=3900\ntrial_kb=300\n' > "$b/inst/update_budget"
 out=$("$REPO/tools/make_ocbm_update.sh" --from "$b/from/SHA256SUMS" "$b/out" 2>&1); rc=$?
 rm -rf "$b/x"; mkdir -p "$b/x" && (cd "$b/x" && gzip -dc "$pk" | tar -xf -)

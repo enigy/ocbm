@@ -92,7 +92,17 @@ printf 'need_kb=%s\ntrial=%s\n' "$need_kb" "$trial" > "$stage/pkg/ROOM"
 
 mkdir -p "$OUT"
 pkg="$OUT/ocbm-update-$ver.tgz"
-( cd "$stage/pkg" && tar -cf - VERSION FROM_MIN SHA256SUMS ROOM files ) | gzip -n -9 > "$pkg"
+# Plain ustar, root-owned, and nothing but the package: the Mac's tar adds a ._ entry beside every file
+# with extended attributes unless told not to (b93e050), and the adapter would unpack each one.
+if tar --version 2>/dev/null | grep -q bsdtar; then
+  tflags=(--format ustar --uid 0 --gid 0 --uname root --gname root --no-mac-metadata --no-xattrs)
+else
+  tflags=(--format=ustar --owner=root:0 --group=root:0 --sort=name)
+fi
+( cd "$stage/pkg" && COPYFILE_DISABLE=1 tar "${tflags[@]}" -cf - VERSION FROM_MIN SHA256SUMS ROOM files ) | gzip -n -9 > "$pkg"
+stray=$(gzip -dc "$pkg" | tar -tf - | grep -Ev '^(VERSION|FROM_MIN|SHA256SUMS|ROOM|files/.*)$' || true)
+stray="$stray$(gzip -dc "$pkg" | tar -tf - | grep -E '(^|/)\._' || true)"
+[ -z "$stray" ] || { rm -f "$pkg"; die "the package holds entries it should not:"$'\n'"$stray"; }
 ( cd "$OUT" && sha "$(basename "$pkg")" > "$(basename "$pkg").sha256" )
 printf 'make_ocbm_update: %s (from %s): %s files changed, about %s KB on flash, trial=%s\n  %s\n  %s\n' \
   "$ver ocbm $rev" "$from_ver" "$changed" "$need_kb" "$trial" "$pkg" "$(cut -d' ' -f1 "$pkg.sha256")"
