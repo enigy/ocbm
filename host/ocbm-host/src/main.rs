@@ -1634,7 +1634,15 @@ fn main() {
         "mfi" => mode_mfi(&mut link),
         "console" => mode_console(&mut link),
         "ncm" => mode_ncm(&mut link),
-        "install" => mode_install(&mut link, args.get(4).map(String::as_str).unwrap_or("info")),
+        // `install info|confirm|stock`, or with the ids first as the usage says. The verb used to be
+        // read from the fourth argument only, so `install stock` silently ran `info` (29 Oct).
+        "install" => {
+            let what = match args.get(2).map(String::as_str) {
+                Some(w @ ("info" | "confirm" | "stock")) => w,
+                _ => args.get(4).map(String::as_str).unwrap_or("info"),
+            };
+            mode_install(&mut link, what)
+        }
         "ip" => mode_ip(
             &mut link,
             args.get(4).map(String::as_str).unwrap_or("127.0.0.1:22"),
