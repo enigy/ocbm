@@ -45,7 +45,7 @@ if grep -q '^# OCBM_STAGE_C_PLACEHOLDER' "$REPO/ccpa/installer/ocbm_finish.sh"; 
   check 'head -1 "$T/img/tmp/ocbm/VERSION" | grep -q "^1.0.0-bench ocbm "' "with the Stage C placeholder, VERSION says bench"
 fi
 want="$(grep -oE '\|/(usr/sbin|usr/bin|script)/[^|]+\|755' "$REPO/tools/ocbm_install.sh" | cut -d'|' -f2 | sed 's|^/||' | LC_ALL=C sort -u)"
-have="$(bash "$HERE/make_ocbm_installer.sh" --list | grep -vE '^script/ocbm_(dispatch|selftest|revert|finish)\.sh$' | LC_ALL=C sort -u)"
+have="$(bash "$HERE/make_ocbm_installer.sh" --list | grep -vE '^script/ocbm_(dispatch|selftest|revert|finish|update)\.sh$' | LC_ALL=C sort -u)"
 check '[ "$want" = "$have" ]' "the payload is ocbm_install.sh --full's file set"
 mkdir -p "$T/noinst"; cp "$REPO/ccpa/installer/"* "$T/noinst/"; rm -f "$T/noinst/ocbm_dispatch.sh"
 check '! BIN_DIR="$T/bin" IRS_BIN="$T/irs" INSTALLER_DIR="$T/noinst" bash "$HERE/make_ocbm_installer.sh" "$T/out2" >/dev/null 2>&1' \

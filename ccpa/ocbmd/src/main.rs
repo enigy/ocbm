@@ -1135,33 +1135,32 @@ fn rootfs_stats_kb() -> (u64, u64) {
 /// SIGCHLD. Fixed 2026-07-29. Nothing here needs the exit status; EOF on the pipe means the child is
 /// gone either way, and SIG_IGN guarantees it leaves no zombie.
 fn ssp_enabled() -> bool {
-    let mut child = match std::process::Command::new("hciconfig")
-        .args(["hci0", "sspmode"])
+    child_stdout("hciconfig", &["hci0", "sspmode"], Duration::from_secs(2))
+        .is_some_and(|out| String::from_utf8_lossy(&out).contains("Enabled"))
+}
+
+/// What `cmd args` writes to stdout, read to EOF within `limit`; None when it can't be started, times out
+/// or fails. Bounded read (was read_to_string to EOF with no deadline — a wedged hciconfig froze the
+/// whole daemon). Still deliberately NO waitpid anywhere: SIGCHLD is SIG_IGN so waitpid() returns
+/// ECHILD and the kernel auto-reaps; a killed or exited child leaves no zombie either way. Poll the
+/// pipe against the deadline; on timeout or a hard error, kill the child — EOF on the pipe still means
+/// the child is gone.
+fn child_stdout(cmd: &str, args: &[&str], limit: Duration) -> Option<Vec<u8>> {
+    let mut child = std::process::Command::new(cmd)
+        .args(args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn()
-    {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    // Bounded read (was read_to_string to EOF with no deadline — a wedged hciconfig froze the whole
-    // daemon; this now runs on the `bt_probe` thread, but the bound is still what keeps the SSP
-    // sample from aging out). Still deliberately NO waitpid anywhere: SIGCHLD is SIG_IGN
-    // so waitpid() returns ECHILD and the kernel auto-reaps; a killed or exited child leaves no
-    // zombie either way. Poll the pipe with a 2 s overall deadline; on timeout or a hard error,
-    // kill the child and report false — EOF on the pipe still means the child is gone.
-    let pipe = match child.stdout.take() {
-        Some(p) => p,
-        None => return false,
-    };
+        .ok()?;
+    let pipe = child.stdout.take()?;
     let fd = pipe.as_raw_fd();
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + limit;
     let mut out: Vec<u8> = Vec::new();
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             let _ = child.kill();
-            return false;
+            return None;
         }
         let mut pfd = libc::pollfd {
             fd,
@@ -1172,14 +1171,14 @@ fn ssp_enabled() -> bool {
         let r = unsafe { libc::poll(&mut pfd, 1, ms) };
         if r == 0 {
             let _ = child.kill(); // timed out — don't let one sample stall the probe thread
-            return false;
+            return None;
         }
         if r < 0 {
             if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
                 continue; // EINTR — retry with the remaining budget
             }
             let _ = child.kill();
-            return false;
+            return None;
         }
         let mut tmp = [0u8; 128];
         let n = unsafe { libc::read(fd, tmp.as_mut_ptr() as *mut libc::c_void, tmp.len()) };
@@ -1192,10 +1191,11 @@ fn ssp_enabled() -> bool {
                 continue;
             }
             let _ = child.kill();
-            return false;
+            return None;
         }
     }
-    String::from_utf8_lossy(&out).contains("Enabled")
+    drop(pipe);
+    Some(out)
 }
 
 /// `ssp_enabled()` behind a short-TTL cache. Every SSP sample is host-REQUESTED — SUBSCRIBE and
@@ -1609,6 +1609,87 @@ fn start_install_finish() {
     let _ = std::process::Command::new("sh")
         .args(["-c", &format!("setsid sh {INSTALL_FINISH} --after-session >> /tmp/box.log 2>&1 &")])
         .spawn();
+}
+
+// --- Updating OCBM in place (ccpa/installer/ocbm_update.sh, MGMT_UPDATE): the host pushes a package
+// to UPDATE_PACKAGE over CH_FILE and names its SHA-256; the script places it as a trial that the
+// dispatcher keeps or undoes at the next start. The journal and the last outcome live in /etc/ocbm.
+// The `cfg(test)` paths for the same reason as the install's: a `cargo test` on the box must not start
+// or report a real update.
+#[cfg(not(test))]
+const UPDATE_PACKAGE: &str = "/tmp/ocbm-update.tgz";
+#[cfg(test)]
+const UPDATE_PACKAGE: &str = "/tmp/ocbmd_selftest_update.tgz";
+#[cfg(not(test))]
+const UPDATE_SCRIPT: &str = "/script/ocbm_update.sh";
+#[cfg(test)]
+const UPDATE_SCRIPT: &str = "/tmp/ocbmd_selftest_no_such_update.sh";
+#[cfg(not(test))]
+const UPDATE_PENDING: &str = "/etc/ocbm/update_pending";
+#[cfg(test)]
+const UPDATE_PENDING: &str = "/tmp/ocbmd_selftest_update_pending";
+#[cfg(not(test))]
+const UPDATE_RESULT: &str = "/etc/ocbm/update_result";
+#[cfg(test)]
+const UPDATE_RESULT: &str = "/tmp/ocbmd_selftest_update_result";
+
+/// MGMT_UPDATE's argument: the package's SHA-256 as 64 hex digits, lower-cased; None for anything else.
+fn update_hash(arg: &[u8]) -> Option<String> {
+    let s = std::str::from_utf8(arg).ok()?.trim();
+    (s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())).then(|| s.to_ascii_lowercase())
+}
+
+/// MGMT_INFO's "update": `installing` while the script swaps files in (a journal with no "placed"
+/// yet), `trial` until the next start's self-test decides, then the last outcome (`committed`,
+/// `rolled_back`, `refused`), or `none`.
+fn update_state(pending: &str, result: &str) -> &'static str {
+    if let Ok(journal) = std::fs::read_to_string(pending) {
+        return if journal.lines().any(|l| l == "placed") { "trial" } else { "installing" };
+    }
+    match std::fs::read_to_string(result).ok().as_deref().and_then(|r| r.split_whitespace().next()) {
+        Some("committed") => "committed",
+        Some("rolled_back") => "rolled_back",
+        Some("refused") => "refused",
+        _ => "none",
+    }
+}
+
+/// The SHA-256 of `path` in lower-case hex, from busybox `sha256sum` (no hashing crate in ocbmd);
+/// None when the file is missing or can't be read.
+fn file_sha256(path: &str) -> Option<String> {
+    if !std::path::Path::new(path).is_file() {
+        return None;
+    }
+    let out = child_stdout("sha256sum", &[path], Duration::from_secs(20))?;
+    let hex = String::from_utf8_lossy(&out).split_whitespace().next()?.to_ascii_lowercase();
+    (hex.len() == 64).then_some(hex)
+}
+
+/// MGMT_UPDATE: start ocbm_update.sh on the pushed package once its SHA-256 is the one the host named.
+/// Detached, like the finish (SIGCHLD is SIG_IGN, so it leaves no zombie); the script restarts the box
+/// once the update is placed, or records why it refused. False = nothing started.
+fn start_update(want: &str) -> bool {
+    if !std::path::Path::new(UPDATE_SCRIPT).exists() {
+        eprintln!("[ocbmd] update: refused: no {UPDATE_SCRIPT} on this box");
+        return false;
+    }
+    match file_sha256(UPDATE_PACKAGE) {
+        Some(have) if have == want => {}
+        Some(have) => {
+            eprintln!("[ocbmd] update: refused: {UPDATE_PACKAGE} has SHA-256 {have}, not {want}");
+            return false;
+        }
+        None => {
+            eprintln!("[ocbmd] update: refused: no {UPDATE_PACKAGE} to install");
+            return false;
+        }
+    }
+    let _ = std::fs::remove_file(UPDATE_RESULT); // the next outcome reported is this update's
+    eprintln!("[ocbmd] update: package {want} checked — starting {UPDATE_SCRIPT}");
+    let _ = std::process::Command::new("sh")
+        .args(["-c", &format!("setsid sh {UPDATE_SCRIPT} {UPDATE_PACKAGE} >> /tmp/box.log 2>&1 &")])
+        .spawn();
+    true
 }
 
 fn clear_cfg_file() {
@@ -3621,7 +3702,13 @@ impl Daemon {
             }
             // The one-file install (ccpa/installer/). Only an app that offers the way back confirms.
             p::MGMT_INSTALL_CONFIRM => {
-                let status = match confirm_install(INSTALL_MODE_FILE) {
+                // A confirmed trial finishes when its session ends; an update in its trial settles first.
+                let confirmed = if std::path::Path::new(UPDATE_PENDING).exists() {
+                    Err("an update is in its trial".to_string())
+                } else {
+                    confirm_install(INSTALL_MODE_FILE)
+                };
+                let status = match confirmed {
                     Ok(true) => {
                         eprintln!("[ocbmd] install: trial CONFIRMED by the host app — stock goes when this session ends");
                         0
@@ -3645,6 +3732,16 @@ impl Daemon {
                         .args(["-c", &format!("sleep 1; {INSTALL_REVERT} 'Go back to stock was chosen in the app' >> /tmp/box.log 2>&1")])
                         .spawn();
                 }
+            }
+            p::MGMT_UPDATE => {
+                let started = match update_hash(&pl[1..]) {
+                    Some(want) => start_update(&want),
+                    None => {
+                        eprintln!("[ocbmd] update: refused a MGMT_UPDATE of {} B (want 64 hex digits)", pl.len() - 1);
+                        false
+                    }
+                };
+                self.mgmt_ack(verb, u8::from(!started));
             }
             _ => {}
         }
@@ -3701,8 +3798,11 @@ impl Daemon {
              \"rootfs_free_kb\":{rt_free},\"ssp\":{ssp},\"hci_up\":{hci_up},\"wlan_ap\":{ap},\
              \"transport\":\"{transport}\",\"host_present\":{host},\"phone_present\":{phone},\
              \"daemons\":{{\"ocbmd\":{d0},\"iap2d\":{d1},\"airplayd\":{d2},\"carplay_wireless\":{d3}}},\
-             \"install\":\"{install}\",\"host_name\":\"{host_name}\",\"devices\":[{devs}]}}",
+             \"install\":\"{install}\",\"update\":\"{update}\",\"update_result\":\"{update_result}\",\
+             \"host_name\":\"{host_name}\",\"devices\":[{devs}]}}",
             install = install_mode(INSTALL_MODE_FILE),
+            update = update_state(UPDATE_PENDING, UPDATE_RESULT),
+            update_result = json_escape(read_trim(UPDATE_RESULT).lines().next().unwrap_or("")),
             ser = json_escape(&serial),
             host_name = json_escape(self.host_name.as_deref().unwrap_or("")),
             ap = procs[4],
@@ -3816,6 +3916,9 @@ impl Daemon {
                         | p::CAP_INSTALL;
                     if self.mfi.is_some() {
                         caps |= p::CAP_MFI;
+                    }
+                    if std::path::Path::new(UPDATE_SCRIPT).exists() {
+                        caps |= p::CAP_UPDATE;
                     }
                     // Unconditional: everything above logs only CHANGES, so a host reattaching with
                     // the same nonce and label — the ordinary case, and the one a "why is there no
@@ -4961,9 +5064,18 @@ mod tests {
     /// parsed back through a real `Reassembler` so the header the host would actually see is the
     /// thing under test.
     fn sent(d: &mut Daemon) -> Vec<(u16, u8, Vec<u8>)> {
+        frames(&mut d.out_hi)
+    }
+
+    /// The frames queued on out_lo, which carries CH_MGMT among the bulk channels.
+    fn sent_lo(d: &mut Daemon) -> Vec<(u16, u8, Vec<u8>)> {
+        frames(&mut d.out_lo)
+    }
+
+    fn frames(q: &mut OutQueue) -> Vec<(u16, u8, Vec<u8>)> {
         let mut r = p::Reassembler::new();
-        r.push(&d.out_hi.buf[d.out_hi.cursor..]);
-        d.out_hi.clear();
+        r.push(&q.buf[q.cursor..]);
+        q.clear();
         let mut out = vec![0u8; p::MAX_PAYLOAD];
         let mut v = Vec::new();
         while let Some((ch, fl, n)) = r.next(&mut out) {
@@ -5005,10 +5117,91 @@ mod tests {
     }
 
     #[test]
-    fn mgmt_confirm_and_info_go_through_the_install_mode_file() {
+    fn update_hash_takes_64_hex_digits_only() {
+        let h = "AB".repeat(32);
+        assert_eq!(update_hash(h.as_bytes()), Some("ab".repeat(32)));
+        assert_eq!(update_hash(format!("{h}\n").as_bytes()), Some("ab".repeat(32)), "a trailing newline is fine");
+        assert!(update_hash(&h.as_bytes()[..63]).is_none());
+        assert!(update_hash("zz".repeat(32).as_bytes()).is_none());
+        assert!(update_hash(b"").is_none());
+    }
+
+    #[test]
+    fn update_state_follows_the_journal_then_the_last_outcome() {
+        let j = install_tmp("update_journal");
+        let r = install_tmp("update_result");
+        let _ = std::fs::remove_file(&j);
+        let _ = std::fs::remove_file(&r);
+        assert_eq!(update_state(&j, &r), "none");
+        std::fs::write(&r, "refused 1.1.0 ocbm x: Not enough flash\n").unwrap();
+        assert_eq!(update_state(&j, &r), "refused");
+        std::fs::write(&j, "journal=1\nfrom=1.0.0 ocbm y\nto=1.1.0 ocbm x\nreplace usr/sbin/ocbmd\n").unwrap();
+        assert_eq!(update_state(&j, &r), "installing", "a journal with no \"placed\" is still being swapped in");
+        std::fs::write(&j, "journal=1\nreplace usr/sbin/ocbmd\nplaced\n").unwrap();
+        assert_eq!(update_state(&j, &r), "trial");
+        std::fs::remove_file(&j).unwrap();
+        for (line, want) in [
+            ("committed 1.1.0 ocbm x (from 1.0.0 ocbm y)", "committed"),
+            ("rolled_back 1.1.0 ocbm x: its start-up self-test failed (kept 1.0.0 ocbm y)", "rolled_back"),
+            ("trial 1.1.0 ocbm x (from 1.0.0 ocbm y)", "none"),
+            ("", "none"),
+        ] {
+            std::fs::write(&r, line).unwrap();
+            assert_eq!(update_state(&j, &r), want, "{line:?}");
+        }
+        let _ = std::fs::remove_file(&r);
+    }
+
+    #[test]
+    fn file_sha256_is_busybox_sha256sum_of_the_file() {
+        if child_stdout("sha256sum", &["/dev/null"], Duration::from_secs(5)).is_none() {
+            return; // a host without sha256sum (macOS before 15): the box always has it
+        }
+        let f = install_tmp("sha");
+        std::fs::write(&f, b"abc").unwrap();
+        assert_eq!(
+            file_sha256(&f).as_deref(),
+            Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        );
+        std::fs::remove_file(&f).unwrap();
+        assert!(file_sha256(&f).is_none(), "a missing package has no hash");
+    }
+
+    // One test for every verb that goes through the install's and the update's files: cargo runs tests in
+    // parallel, and these paths are shared.
+    #[test]
+    fn mgmt_confirm_update_and_info_go_through_the_install_and_update_files() {
+        let _ = std::fs::remove_file(UPDATE_PENDING);
+        let _ = std::fs::remove_file(UPDATE_RESULT);
         std::fs::write(INSTALL_MODE_FILE, "trial\n").unwrap();
         let mut d = td();
         assert!(d.box_info_json().contains("\"install\":\"trial\""));
+        assert!(d.box_info_json().contains("\"update\":\"none\",\"update_result\":\"\""));
+
+        // Under cfg(test) the update script never exists, so MGMT_UPDATE is refused, nothing runs,
+        // and the last outcome stays as it was.
+        std::fs::write(UPDATE_RESULT, "committed 1.0.0 ocbm y\n").unwrap();
+        let ack = |d: &mut Daemon| sent_lo(d).into_iter().filter(|f| f.0 == p::CH_MGMT).map(|f| f.2).last();
+        let _ = sent_lo(&mut d);
+        d.handle_mgmt(&[&[p::MGMT_UPDATE][..], "ab".repeat(32).as_bytes()].concat());
+        assert_eq!(ack(&mut d), Some(vec![p::MGMT_ACK, p::MGMT_UPDATE, 1]), "no update script");
+        d.handle_mgmt(&[p::MGMT_UPDATE, b'x']);
+        assert_eq!(ack(&mut d), Some(vec![p::MGMT_ACK, p::MGMT_UPDATE, 1]), "a malformed hash");
+        assert!(d.box_info_json().contains("\"update\":\"committed\""));
+        std::fs::remove_file(UPDATE_RESULT).unwrap();
+
+        // An update in its trial: no confirm until it settles, and MGMT_INFO says so.
+        std::fs::write(UPDATE_PENDING, "journal=1\nreplace usr/sbin/ocbmd\nplaced\n").unwrap();
+        d.handle_mgmt(&[p::MGMT_INSTALL_CONFIRM]);
+        assert_eq!(install_mode(INSTALL_MODE_FILE), "trial", "no confirm while an update is in its trial");
+        assert!(d.box_info_json().contains("\"update\":\"trial\""));
+        std::fs::remove_file(UPDATE_PENDING).unwrap();
+        std::fs::write(UPDATE_RESULT, "rolled_back 1.1.0 ocbm x: its start-up self-test failed (kept 1.0.0 ocbm y)\n").unwrap();
+        let info = d.box_info_json();
+        assert!(info.contains("\"update\":\"rolled_back\""));
+        assert!(info.contains("\"update_result\":\"rolled_back 1.1.0 ocbm x: its start-up self-test failed (kept 1.0.0 ocbm y)\""));
+        std::fs::remove_file(UPDATE_RESULT).unwrap();
+
         d.handle_mgmt(&[p::MGMT_INSTALL_CONFIRM]);
         assert_eq!(install_mode(INSTALL_MODE_FILE), "confirmed");
         assert!(d.box_info_json().contains("\"install\":\"confirmed\""));
@@ -5016,6 +5209,8 @@ mod tests {
         d.handle_mgmt(&[p::MGMT_GO_STOCK]);
         assert_eq!(install_mode(INSTALL_MODE_FILE), "confirmed");
         let _ = std::fs::remove_file(INSTALL_MODE_FILE);
+        let _ = std::fs::remove_file(UPDATE_PENDING);
+        let _ = std::fs::remove_file(UPDATE_RESULT);
     }
 
     // ---- mic-uplink gate relay ----------------------------------------------------------------

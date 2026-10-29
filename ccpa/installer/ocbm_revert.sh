@@ -17,7 +17,8 @@
 #
 # OCBM's own files stay on flash, and the extras the install removed stay removed.
 # Exit 0: on stock now (or already was). Exit 1: refused, nothing changed (mode final: the Carlinkit
-# stack is gone; start_main_service.stock.sh is missing; or ocbm_finish.sh holds the lock).
+# stack is gone; start_main_service.stock.sh is missing; ocbm_finish.sh holds the lock; or an update is
+# in its trial, which the dispatcher settles first).
 #
 # Test hooks (tools/ocbm_stageb_test.sh): ROOT RUN REBOOT
 ROOT="${ROOT:-}"
@@ -41,6 +42,8 @@ case "$mode" in
   final) log "refused: OCBM is final and the Carlinkit files are gone"; done_ 1 ;;
 esac
 [ -s "$S/start_main_service.stock.sh" ] || { log "refused: start_main_service.stock.sh is missing"; done_ 1; }
+# An update in its trial (ocbm_update.sh) finishes or rolls back first: the dispatcher settles it.
+[ -f "$EO/update_pending" ] && { log "refused: an update is in its trial"; done_ 1; }
 ver=$(cat "$EO/installed_version" 2>/dev/null)
 up=$(cut -d' ' -f1 /proc/uptime 2>/dev/null)
 log "going back to stock from $mode (${ver:-unknown version}): $why"

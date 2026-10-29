@@ -368,6 +368,15 @@ pub const MGMT_INSTALL_CONFIRM: u8 = 0x0A;
 /// then goes back to stock Carlinkit firmware (ccpa/installer/ocbm_revert.sh) and restarts. Status 1 =
 /// nothing to go back to (`final`, or no one-file install).
 pub const MGMT_GO_STOCK: u8 = 0x0B;
+/// [MGMT_UPDATE][ascii lower-case hex SHA-256 of /tmp/ocbm-update.tgz, 64 bytes] -> update OCBM from
+/// the package the host pushed there over CH_FILE (tools/make_ocbm_update.sh). The box checks the
+/// package's SHA-256, then starts ccpa/installer/ocbm_update.sh and ACKs status 0: the script checks
+/// the package and the adapter (each refusal changes nothing), places the update and restarts into its
+/// trial, which keeps it on a passing self-test and puts the old version back otherwise. Status 1 = no
+/// such package, a different SHA-256, or a box without the update script. Progress and the outcome are
+/// MGMT_INFO's "update" (`none`, `installing`, `trial`, `committed`, `rolled_back`, `refused`) and
+/// "update_result" (one line, with the reason). Only on a box with CAP_UPDATE.
+pub const MGMT_UPDATE: u8 = 0x0C;
                                             //   Box->host:
 pub const MGMT_INFO: u8 = 0x81; // [MGMT_INFO][utf8 JSON] — identity + health + bonded-device snapshot
 pub const MGMT_ACK: u8 = 0x82; // [MGMT_ACK][verb u8][status u8] — 0 ok / 1 error, echoing the request verb
@@ -386,6 +395,7 @@ pub const CAP_ETH: u32 = 0x0000_0020; // box can bridge a raw-ethernet netdev (n
 pub const CAP_PHONE_POLICY: u32 = 0x0000_0040; // box takes MGMT_SET_POLICY / MGMT_CONNECT_DEVICE
 pub const CAP_PAIR_WINDOW: u32 = 0x0000_0080; // box takes MGMT_PAIR_WINDOW and gates pairing behind it
 pub const CAP_INSTALL: u32 = 0x0000_0100; // box takes MGMT_INSTALL_CONFIRM / MGMT_GO_STOCK and reports "install" in MGMT_INFO
+pub const CAP_UPDATE: u32 = 0x0000_0200; // box takes MGMT_UPDATE and reports "update" in MGMT_INFO
 
 // OCBM_CH_IP stream-mux sub-frame types. Payload = [type u8][conn_id u16 LE][data].
 // AAOS has no NCM, so L3 is done in userspace over this channel (no kernel TUN needed).

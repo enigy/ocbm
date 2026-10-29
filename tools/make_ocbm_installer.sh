@@ -4,6 +4,7 @@
 #
 #   tools/make_ocbm_installer.sh [OUT_DIR]   # default ~/.cache/carlink-artifacts/ocbm_installer
 #   tools/make_ocbm_installer.sh --list      # print the payload's on-box paths
+#   tools/make_ocbm_installer.sh --sources   # print SOURCE|PATH-ON-BOX for each payload file
 #
 # Stages tmp/once.sh + tmp/finish.sh (Stage A, ccpa/installer/) and tmp/ocbm/: the box binaries and
 # scripts of `ocbm_install.sh --full` (keep the two lists in step: make_ocbm_installer's test
@@ -28,10 +29,11 @@ payload() {  # SOURCE|PATH-ON-BOX: ocbm_install.sh manifest() --full, then Stage
   echo "$REPO/tools/run_ocbmd.sh|script/run_ocbmd.sh"
   for s in radio_detect radio_hal radio_ap_up; do echo "$REPO/ccpa/rootfs/script/$s.sh|script/$s.sh"; done
   for s in session_supervisor projection_up phone_reset run_supervisor; do echo "$REPO/tools/$s.sh|script/$s.sh"; done
-  for s in ocbm_dispatch ocbm_selftest ocbm_revert ocbm_finish; do echo "$INSTALLER_DIR/$s.sh|script/$s.sh"; done
+  for s in ocbm_dispatch ocbm_selftest ocbm_revert ocbm_finish ocbm_update; do echo "$INSTALLER_DIR/$s.sh|script/$s.sh"; done
 }
 
 if [ "${1:-}" = --list ]; then payload | cut -d'|' -f2; exit 0; fi
+if [ "${1:-}" = --sources ]; then payload; exit 0; fi
 OUT="${1:-$HOME/.cache/carlink-artifacts/ocbm_installer}"
 
 missing=""
@@ -58,9 +60,10 @@ done < <(payload)
 
 rev="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 git -C "$REPO" diff --quiet HEAD 2>/dev/null || rev="$rev-dirty"
-ver=1.0.0
+ver=$(head -1 "$INSTALLER_DIR/VERSION" 2>/dev/null)   # the OCBM version this tree builds; the update package reads it too
+ver=${ver:-1.0.0}
 if grep -q '^# OCBM_STAGE_C_PLACEHOLDER' "$INSTALLER_DIR/ocbm_finish.sh"; then
-  ver=1.0.0-bench   # Stage C (M4) is not written: the adapter would stay in its trial
+  ver="$ver-bench"   # Stage C (M4) is not written: the adapter would stay in its trial
   echo "make_ocbm_installer: ocbm_finish.sh is the Stage C placeholder, so this is a bench image" >&2
 fi
 echo "$ver ocbm $rev" > "$P/VERSION"

@@ -1,0 +1,10 @@
+# Free flash, in KB, that an update package can count on: tools/make_ocbm_update.sh fails a package
+# whose changed files (at JFFS2's ~0.7 of their size) plus the 384 KB spare exceed final_kb, and
+# says when it exceeds trial_kb (Carlink then updates trial adapters by going back to stock and
+# converting again). ocbm_update.sh checks the adapter's own free flash the same way.
+#
+# trial_kb: the factory adapter's trial, 28 Oct (ocbm-host install info: 1,252 KB free).
+# final_kb: an estimate (about 3.9 MB, the plan of 28 Oct); no adapter is final yet. The bench (U3)
+#           measures it on the factory adapter in final and replaces this figure.
+final_kb=3900
+trial_kb=1252

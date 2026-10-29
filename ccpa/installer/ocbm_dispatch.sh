@@ -16,6 +16,15 @@
 #   final             OCBM only: ocbm_finish.sh removed the Carlinkit stack, so there is nothing to
 #                     go back to. A finish a power cut interrupted (finish_pending) is resumed.
 #
+# An update (ocbm_update.sh, in trial or final) leaves /etc/ocbm/update_pending, its journal, and
+# restarts. Before OCBM starts, the dispatcher settles it: a commit a power cut interrupted is
+# finished, a swap or an undo it interrupted is undone, and otherwise the start is counted (two that
+# never passed the self-test put the old version back). Then the self-test decides: a pass keeps the
+# update (the .prev copies go, installed_version moves on), a failure puts the version it replaced
+# back and restarts. During an update's trial its own counter and self-test replace the install's: a
+# failed update falls back to the OCBM it replaced, never to stock. The outcome is one line in
+# /etc/ocbm/update_result.
+#
 # In every OCBM mode it creates /tmp/not_change_mass_storage before OCBM starts. Without it the stock
 # stick handler (update_box.sh, still run by mdev) switches the USB port to stick sharing when a
 # stick without an image goes in, and Carlink loses the adapter.
@@ -24,8 +33,8 @@
 # run_ocbmd.sh and run_supervisor.sh in loops of its own: the same restart-when-dead that
 # ocbm_install.sh gets from ::respawn.
 #
-# Test hooks (tools/ocbm_stageb_test.sh): ROOT RUN STICK PROC POLL STICK_WAIT, and REBOOT for
-# ocbm_revert.sh.
+# Test hooks (tools/ocbm_stageb_test.sh, tools/ocbm_update_test.sh): ROOT RUN STICK PROC POLL
+# STICK_WAIT REBOOT.
 ROOT="${ROOT:-}"
 RUN="${RUN:-/tmp}"
 STICK="${STICK:-/mnt/UPAN}"
@@ -35,6 +44,9 @@ STICK_WAIT="${STICK_WAIT:-60}"
 S="$ROOT/script"
 EO="$ROOT/etc/ocbm"
 SMS_STOCK="$S/start_main_service.stock.sh"
+U="$EO/update_pending"
+REBOOT="${REBOOT:-/sbin/reboot}"
+update_trial=0
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin:/tmp/bin:$PATH
 
 log() { echo "[dispatch] $*" >> "$RUN/ocbm_dispatch.log"; echo "[dispatch] $*" >> "$RUN/box.log"; }
@@ -66,6 +78,11 @@ stock() {
 }
 
 back_to_stock() {  # at boot, before OCBM has started: no restart needed
+  if [ "$update_trial" = 1 ]; then   # an update's trial falls back to the OCBM it replaced, not to stock
+    update_rollback "$1"
+    sync; $REBOOT
+    exit 0
+  fi
   log "going back to stock: $1"
   if [ -x "$S/ocbm_revert.sh" ]; then
     "$S/ocbm_revert.sh" --no-reboot "$1" && stock
@@ -91,14 +108,72 @@ first_start() {  # $1 PASSED: the first trial start adds its verdict to the inst
   fi
 }
 
+# ---- an update's trial (ocbm_update.sh writes the journal; these settle it) ----------------------
+journal() { sed -n "s/^$1=//p" "$U" | head -1; }
+ver_of() { set -- $1; echo "${1:-?}"; }
+put() {  # $1 file, $2 its one line: written .new + rename, so a power cut leaves the old line or the new
+  { echo "$2" > "$1.new" && mv -f "$1.new" "$1"; } 2>/dev/null
+}
+
+update_commit() {  # the update passed its self-test, or a power cut stopped its commit: keep it
+  grep -qx committing "$U" || { echo committing >> "$U"; sync; }
+  awk '$1 == "replace" { print $2 }' "$U" | while read -r t; do rm -f "$ROOT/$t.prev"; done
+  to=$(journal to); from=$(journal from)
+  put "$EO/installed_version" "$to"
+  put "$EO/update_result" "committed $to (from $from)"
+  rm -f "$EO/update_attempts" "$U"; sync
+  log "update committed: $to (from $from)"
+}
+
+update_rollback() {  # $1 why: put back the version the update replaced
+  grep -q '^rolling_back=' "$U" || { echo "rolling_back=$1" >> "$U"; sync; }
+  why=$(journal rolling_back)
+  awk '$1 == "replace" || $1 == "add" { print $1, $2 }' "$U" | while read -r kind t; do
+    f="$ROOT/$t"
+    if [ "$kind" = replace ]; then
+      [ -e "$f.prev" ] && mv -f "$f.prev" "$f"
+    else
+      rm -f "$f"
+    fi
+    rm -f "$f.new"
+  done
+  to=$(journal to); from=$(journal from)
+  put "$EO/update_result" "rolled_back $to: $why (kept $from)"
+  # The failed starts were the update's, not the install's.
+  rm -f "$EO/update_attempts" "$EO/boot_attempts" "$U"; sync
+  log "update rolled back to $from: $why"
+}
+
+update_boot() {  # before OCBM starts
+  if grep -qx committing "$U"; then update_commit; return; fi
+  if grep -q '^rolling_back=' "$U"; then update_rollback "power was lost while the update was being undone"; return; fi
+  if ! grep -qx placed "$U"; then update_rollback "power was lost while the update was being placed"; return; fi
+  n=$(cat "$EO/update_attempts" 2>/dev/null)
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  if [ "$n" -ge 2 ]; then
+    update_rollback "OCBM $(ver_of "$(journal to)") started $n times in a row without passing its start-up self-test"
+    return
+  fi
+  { echo $((n + 1)) > "$EO/update_attempts.new" && mv -f "$EO/update_attempts.new" "$EO/update_attempts" && sync; } \
+    || log "could not count this start (flash full?)"
+  update_trial=1
+  log "update trial: $(journal to), start $((n + 1))"
+}
+
 selftest() {
   if "$S/ocbm_selftest.sh" > "$RUN/ocbm_selftest.txt" 2>&1; then
     rm -f "$EO/boot_attempts"; sync
     log "self-test: $(tail -1 "$RUN/ocbm_selftest.txt")"
+    [ "$update_trial" = 1 ] && update_commit
     first_start PASSED
     [ "$mode" = confirmed ] && [ -x "$S/ocbm_finish.sh" ] && "$S/ocbm_finish.sh" >> "$RUN/box.log" 2>&1
   else
     log "self-test: $(tail -1 "$RUN/ocbm_selftest.txt")"
+    if [ "$update_trial" = 1 ]; then   # back to the OCBM the update replaced, not to stock
+      update_rollback "its start-up self-test failed ($(tail -1 "$RUN/ocbm_selftest.txt"))"
+      sync; $REBOOT
+      return
+    fi
     "$S/ocbm_revert.sh" "the start-up self-test failed ($(tail -1 "$RUN/ocbm_selftest.txt"))"
   fi
 }
@@ -108,6 +183,7 @@ restore_watch() {  # OCBM_RESTORE on a stick: back to stock
     if stick_in && [ -e "$STICK/OCBM_RESTORE" ]; then
       mv -f "$STICK/OCBM_RESTORE" "$STICK/OCBM_RESTORE.done"; sync   # one use: a later install is not undone
       log "OCBM_RESTORE found on the stick"
+      [ -f "$U" ] && update_rollback "a file named OCBM_RESTORE was found on a USB stick"   # stock gets the OCBM it had
       "$S/ocbm_revert.sh" "a file named OCBM_RESTORE was found on a USB stick"
       return
     fi
@@ -126,17 +202,20 @@ case "$mode" in
 esac
 [ -s "$SMS_STOCK" ] || mode=final   # nothing to go back to
 log "mode $mode, uptime $(cut -d' ' -f1 "$PROC/uptime" 2>/dev/null)s"
+[ -f "$U" ] && update_boot
 
 if [ "$mode" != final ]; then
   for f in usr/sbin/ocbmd script/ocbm_boot.sh script/ocbm_selftest.sh script/ocbm_revert.sh \
            script/run_ocbmd.sh script/run_supervisor.sh; do
     [ -x "$ROOT/$f" ] || back_to_stock "/$f is missing"
   done
-  n=$(cat "$EO/boot_attempts" 2>/dev/null)
-  case "$n" in ''|*[!0-9]*) n=0 ;; esac
-  [ "$n" -ge 2 ] && back_to_stock "OCBM started $n times in a row without passing its start-up self-test"
-  { echo $((n + 1)) > "$EO/boot_attempts.new" && mv -f "$EO/boot_attempts.new" "$EO/boot_attempts" && sync; } \
-    || log "could not count this start (flash full?)"
+  if [ "$update_trial" = 0 ]; then   # an update's trial counts its own starts
+    n=$(cat "$EO/boot_attempts" 2>/dev/null)
+    case "$n" in ''|*[!0-9]*) n=0 ;; esac
+    [ "$n" -ge 2 ] && back_to_stock "OCBM started $n times in a row without passing its start-up self-test"
+    { echo $((n + 1)) > "$EO/boot_attempts.new" && mv -f "$EO/boot_attempts.new" "$EO/boot_attempts" && sync; } \
+      || log "could not count this start (flash full?)"
+  fi
 fi
 
 touch "$RUN/not_change_mass_storage"
@@ -151,6 +230,7 @@ respawn "$S/run_ocbmd.sh" </dev/null >/dev/null 2>&1 &
 respawn "$S/run_supervisor.sh" </dev/null >/dev/null 2>&1 &
 if [ "$mode" = final ]; then
   [ -e "$EO/finish_pending" ] && [ -x "$S/ocbm_finish.sh" ] && "$S/ocbm_finish.sh" </dev/null >> "$RUN/box.log" 2>&1 &
+  [ "$update_trial" = 1 ] && selftest </dev/null >/dev/null 2>&1 &
   exit 0
 fi
 selftest </dev/null >/dev/null 2>&1 &
