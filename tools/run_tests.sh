@@ -60,6 +60,9 @@ run "update-img" bash tools/make_update_img_test.sh
 run "ocbm-installer" bash tools/ocbm_installer_test.sh
 # Its Stage B: the boot dispatcher, the self-test and the revert to stock, against synthetic converted adapters.
 run "ocbm-stageb" bash tools/ocbm_stageb_test.sh
+# Updating a converted adapter: the update script, the dispatcher's update trial with a power cut at every
+# step, and the package builder's room budget.
+run "ocbm-update" bash tools/ocbm_update_test.sh
 # The radio seam's detection against synthetic units (Carlinkit's and lvalen's dispatcher texts).
 run "radio-detect" bash tools/radio_detect_test.sh
 

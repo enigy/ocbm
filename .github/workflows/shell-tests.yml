@@ -5,7 +5,7 @@ name: Shell suites
 # side of all of this is macOS — Scott's Mac — and the Rust workflow runs on Linux, where the image
 # packer cannot build (it needs macOS tools) so three of these suites never ran in CI at all. Both
 # 28 Oct restore bugs showed up only on the Mac: macOS tar's ._ AppleDouble side files, and two pack
-# checks. This job runs the five shell suites on macOS, as tools/run_tests.sh does, under /bin/sh
+# checks. This job runs the six shell suites on macOS, as tools/run_tests.sh does, under /bin/sh
 # (bash 3.2) and Homebrew dash. Keep the list in step with the shell suites in tools/run_tests.sh.
 
 on:
@@ -32,6 +32,7 @@ jobs:
           run "stock-restore"  sh   tools/stock_restore_test.sh
           run "ocbm-installer" bash tools/ocbm_installer_test.sh
           run "ocbm-stageb"    bash tools/ocbm_stageb_test.sh
+          run "ocbm-update"    bash tools/ocbm_update_test.sh
           run "radio-detect"   bash tools/radio_detect_test.sh
           run "update-img"     bash tools/make_update_img_test.sh
           [ "$fail" -eq 0 ] || { echo "FAILURES"; exit 1; }
