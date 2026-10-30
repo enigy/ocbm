@@ -100,7 +100,9 @@ newer() {
 step unpack
 [ -n "$PKG" ] && [ -f "$PKG" ] || refuse "The update package is missing."
 rm -rf "$WORK"
-mkdir -p "$WORK" && gzip -dc "$PKG" 2>/dev/null | (cd "$WORK" && tar -xf -) \
+# gzip first, on its own: in a pipe only tar's status counts, and a tar handed nothing (macOS tar, maybe
+# busybox's) takes it as an empty archive and succeeds.
+gzip -dc "$PKG" > /dev/null 2>&1 && mkdir -p "$WORK" && gzip -dc "$PKG" 2>/dev/null | (cd "$WORK" && tar -xf -) \
   || refuse "The update package could not be unpacked: it is damaged."
 
 step checks
