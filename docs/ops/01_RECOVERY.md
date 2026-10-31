@@ -284,10 +284,12 @@ console, from one of the unit's own backups:
   the reboot log, the `/var/run` tmpfs). The flag, the directory modes and the copy are fixed since
   (`1ffc503`), and the whole round ran again with the fix the same afternoon: install, `--dump`
   restore (182 files and 6 directories back, nothing kept by the radio guard), stock, survey. 883 of
-  891 entries now match the dump, the Bluetooth name files included after stock's first boot; what
-  differs is the three runtime entries and five modes left by the first round (the four
-  directories, `hostapd.conf`), since the restore compares content, not the modes of entries that
-  already exist.
+  891 entries then matched the dump, the Bluetooth name files included after stock's first boot. The
+  restore compares content, not the mode or owner of an entry that already exists, so five entries
+  the first round had left kept them: the four directories and `hostapd.conf`, root's at 755 where
+  the image has 1000:1000 at 775 and 777. A one-off stick set those five back. A survey and a listing
+  of every owner then matched the dump in all but the three runtime entries: 888 of 891 entries
+  identical in type, content, mode and link target, and every owner on flash as in the image.
   A tester took an IW416 unit from `final` back to full stock with these tools, a dump decoder
   of his own and a few hand steps (Oct 2026): the identity gate, the dry run, the switch order and
   `verify` behaved as documented, and a read-only survey found 669 files identical to the pre-install
