@@ -54,6 +54,8 @@ run "mfi"        cargo test --manifest-path crates/vendor/mfi/Cargo.toml --quiet
 run "ocbm-host"  cargo test -p ocbm-host --quiet
 # The back-to-stock restore payload (busybox sh), against synthetic trees: no adapter, no backup.
 run "stock-restore" sh tools/stock_restore_test.sh
+# The flash-dump decoder the restore's --dump uses, against JFFS2 images built node by node.
+run "jffs2-extract" python3 -I tools/jffs2_extract_test.py
 # The stick/OTA update-image packer and the stock survey image built with it.
 run "update-img" bash tools/make_update_img_test.sh
 # The one-file installer: build, unwrap, and run its once.sh/finish.sh against synthetic stock trees.

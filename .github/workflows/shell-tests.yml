@@ -6,7 +6,8 @@ name: Shell suites
 # packer cannot build (it needs macOS tools) so three of these suites never ran in CI at all. Both
 # 28 Oct restore bugs showed up only on the Mac: macOS tar's ._ AppleDouble side files, and two pack
 # checks. This job runs the six shell suites on macOS, as tools/run_tests.sh does, under /bin/sh
-# (bash 3.2) and Homebrew dash. Keep the list in step with the shell suites in tools/run_tests.sh.
+# (bash 3.2) and Homebrew dash, and the flash-dump decoder's Python suite, which the stock_restore
+# suite also uses to build its dump images. Keep the list in step with tools/run_tests.sh.
 
 on:
   push:
@@ -30,6 +31,7 @@ jobs:
           fail=0
           run() { echo "=== $1"; shift; "$@" || fail=1; }
           run "stock-restore"  sh   tools/stock_restore_test.sh
+          run "jffs2-extract"  python3 -I tools/jffs2_extract_test.py
           run "ocbm-installer" bash tools/ocbm_installer_test.sh
           run "ocbm-stageb"    bash tools/ocbm_stageb_test.sh
           run "ocbm-update"    bash tools/ocbm_update_test.sh
