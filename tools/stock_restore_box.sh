@@ -52,10 +52,11 @@
 #   3. check: anything other than the start script and OCBM's own files still differing stops here
 #   4. THE SWITCH: the stock start script, written as .rsnew, checked, renamed over the dispatcher
 #   5. remove OCBM's files (each through is_radio(), except OCBM's own radio seam, radio_*.sh in
-#      /script: stock has none, and without OCBM they are dead files), then directories left empty,
-#      then /etc/carplay, OCBM's bond store; verify. The OCBM processes still running (ocbmd carries
-#      the console until the restart) can write /etc/carplay again: verify tolerates it, and
-#      tools/stock_restore.sh removes it once more right before the restart into stock
+#      /script: stock has none, and without OCBM they are dead files, and the seam's Bluetooth name
+#      flag, see ocbm_bt_flag), then directories left empty, then /etc/carplay, OCBM's bond store;
+#      verify. The OCBM processes still running (ocbmd carries the console until the restart) can
+#      write /etc/carplay again: verify tolerates it, and tools/stock_restore.sh removes it once more
+#      right before the restart into stock
 # It REFUSES, changing nothing, unless the start script is OCBM's dispatcher, ocbmd and ocbm_boot.sh
 # are there, the mode is `trial` or `final` (a `confirmed` trial finishes when its session ends), no
 # finish is pending, and SRC's start script is stock. It takes ocbm_mode.lock, as ocbm_revert.sh and
@@ -82,6 +83,7 @@ PROTECT="script/ncm_only script/ncm_wifi"
 CONSOLE="usr/sbin/ocbmd"                          # onefile: the program the restore's own console needs
 SEAM="script/radio_ap_up.sh script/radio_detect.sh script/radio_hal.sh"   # OCBM's radio seam, payload
 OCBM_STATE="etc/carplay"                          # OCBM's Bluetooth bond store, written while it runs
+BT_FLAG="etc/.custom_bluetooth_name"              # the seam's Bluetooth name flag (ocbm_bt_flag)
 
 say() { echo "[restore] $*"; }
 die() { echo "[restore] ABORT: $*"; echo "RESTORE_ABORT"; exit 1; }
@@ -112,6 +114,14 @@ is_radio() {
     *wifi*|*WiFi*|*wlan*|*WLAN*) return 0;;
   esac
   return 1
+}
+
+# The Bluetooth name flag OCBM's seam writes (radio_hal.sh bt_set_name): ccpa-<4 hex> in
+# /etc/.custom_bluetooth_name, and while it is there stock's bluetoothDaemon applies that name.
+# is_radio() matches "*bluetooth*", so the guard kept it (the dev adapter's restore, 31 Oct). Like the
+# seam it is let through, but only with the seam's content: a name set on stock is not ccpa-<4 hex>.
+ocbm_bt_flag() {  # $1 path relative to ROOT
+  [ "$1" = "$BT_FLAG" ] && grep -qxE 'ccpa-[0-9a-f]{4}' "$ROOT/$1" 2>/dev/null
 }
 
 free_kb() {
@@ -236,6 +246,18 @@ report() {
   say "full plan   : $W/plan.txt"
 }
 
+# A directory made back takes the backup's mode and owner, as `cp -p` gives a file: a bare mkdir
+# left the dev adapter's etc/boa/www, cgi-bin, images and etc/hichain 755, where Carlinkit's image
+# has 775 (31 Oct). busybox and GNU stat take -c, the BSD stat of the host-side test -f.
+mkdir_like() {  # $1 relative path
+  mkdir -p "$ROOT/$1" || die "mkdir failed: $1"
+  _m=$(stat -c %a "$SRC/$1" 2>/dev/null || stat -f %Lp "$SRC/$1" 2>/dev/null)
+  [ -n "$_m" ] && { chmod "$_m" "$ROOT/$1" || die "chmod failed: $1"; }
+  _o=$(stat -c %u:%g "$SRC/$1" 2>/dev/null || stat -f %u:%g "$SRC/$1" 2>/dev/null)
+  [ -n "$_o" ] && chown "$_o" "$ROOT/$1" 2>/dev/null
+  return 0
+}
+
 put_file() {  # $1 relative path
   src="$SRC/$1"; dst="$ROOT/$1"; new="$dst.rsnew"
   need=$(( $(size_kb "$src") + RESERVE_KB ))
@@ -289,7 +311,7 @@ do_apply() {
   remove_list "$W/extra_payload" "1/6 payload extras"
   sync
   n=0
-  while IFS= read -r p; do mkdir -p "$ROOT/$p" || die "mkdir failed: $p"; n=$((n + 1)); done < "$W/mkdir"
+  while IFS= read -r p; do mkdir_like "$p"; n=$((n + 1)); done < "$W/mkdir"
   say "2/6 directories: $n created"
   walk "$W/main" "3/6 files and links"
   sync
@@ -329,7 +351,7 @@ remove_guarded() {  # $1 list of paths, $2 label, $3 paths to leave: as remove_l
   while IFS= read -r p; do
     in_list "$p" "$PROTECT" && continue
     in_list "$p" "${3:-}" && continue
-    if is_radio "/$p" && ! in_list "$p" "$SEAM"; then k=$((k + 1)); continue; fi
+    if is_radio "/$p" && ! in_list "$p" "$SEAM" && ! ocbm_bt_flag "$p"; then k=$((k + 1)); continue; fi
     if [ -L "$ROOT/$p" ] || [ -e "$ROOT/$p" ]; then
       [ -d "$ROOT/$p" ] && [ ! -L "$ROOT/$p" ] && continue
       rm -f "$ROOT/$p" || die "could not remove $p"
@@ -347,7 +369,7 @@ do_apply_onefile() {
   remove_guarded "$W/extra_payload" "1/5 room: OCBM programs other than the console's ocbmd" "$CONSOLE"
   sync
   n=0
-  while IFS= read -r p; do mkdir -p "$ROOT/$p" || die "mkdir failed: $p"; n=$((n + 1)); done < "$W/mkdir"
+  while IFS= read -r p; do mkdir_like "$p"; n=$((n + 1)); done < "$W/mkdir"
   say "1/5 directories: $n created"
   walk "$W/main" "2/5 files and links"
   walk "$W/boot.ordered" "2/5 boot scripts other than the start script"
@@ -382,7 +404,7 @@ remaining() {  # $1 out: differences that still count (not the NCM flags; onefil
   while IFS="$TAB" read -r act typ key p; do
     in_list "$p" "$PROTECT" && continue
     if [ "$PROFILE" = onefile ] && [ "$act" = extra ]; then
-      is_radio "/$p" && ! in_list "$p" "$SEAM" && continue
+      is_radio "/$p" && ! in_list "$p" "$SEAM" && ! ocbm_bt_flag "$p" && continue
       # Written again by the OCBM still running; the restart into stock comes after its removal.
       case "$p" in "$OCBM_STATE"|"$OCBM_STATE"/*) [ -e "$SRC/$OCBM_STATE" ] || continue ;; esac
     fi

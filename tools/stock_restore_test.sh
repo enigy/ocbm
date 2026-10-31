@@ -117,9 +117,13 @@ make_trial() {  # $1 dir: an adapter in its one-file trial — stock kept, OCBM 
   echo trial > "$r/script/ocbm_mode"
   echo "1.0.0 ocbm 153df7f" > "$r/etc/ocbm/installed_version"
   echo 'wpa_passphrase=stock-original' > "$r/id/etc/hostapd.conf"
-  (cd "$r/id" && tar -cf - etc/hostapd.conf) | gzip -c > "$r/etc/ocbm/identity.tgz"; rm -rf "$r/id"
+  echo 'carlink' > "$r/id/etc/bluetooth_name"
+  (cd "$r/id" && tar -cf - etc/hostapd.conf etc/bluetooth_name) | gzip -c > "$r/etc/ocbm/identity.tgz"; rm -rf "$r/id"
   echo 'wpa_passphrase=ocbm-rewritten' > "$r/etc/hostapd.conf"
   echo "ccpa-1234" > "$r/etc/carplay_ident"
+  # The seam's Bluetooth name (radio_hal.sh bt_set_name), and OCBM's peer store
+  echo "ccpa-1234" > "$r/etc/bluetooth_name"; echo "ccpa-1234" > "$r/etc/.custom_bluetooth_name"
+  blob "$r/etc/carplay_peers.bin" 200
   mkdir -p "$r/etc/carplay"; echo "bond: phone A (OCBM)" > "$r/etc/carplay/bt_link_keys"
   echo "crash"     > "$r/script/box_crash.log"
   echo 77          > "$r/var/run/ocbmd.pid"
@@ -164,6 +168,15 @@ onefile_tests() {  # $1 shell
   left_ocbm=0; for p in $OCBM_PATHS; do [ -e "$T/tree/$p" ] && left_ocbm=$((left_ocbm + 1)); done
   check '[ $left_ocbm -eq 0 ]' "tree: every path of make_ocbm_installer.sh --list is dropped"
   check '[ "$(cat "$T/tree/etc/hostapd.conf")" = "wpa_passphrase=stock-original" ]' "tree: hostapd.conf comes from the identity archive"
+  check '[ "$(cat "$T/tree/etc/bluetooth_name")" = carlink ] && [ ! -e "$T/tree/etc/.custom_bluetooth_name" ] && [ ! -e "$T/tree/etc/carplay_peers.bin" ]' \
+    "tree: the Bluetooth name comes from the identity archive; the seam's name flag and OCBM's peer store are dropped"
+  rm -rf "$T/own"; cp -pR "$T/trial" "$T/own"; mkdir -p "$T/own/id/etc"
+  echo 'wpa_passphrase=stock-original' > "$T/own/id/etc/hostapd.conf"; echo "My Car" > "$T/own/id/etc/.custom_bluetooth_name"
+  (cd "$T/own/id" && tar -cf - etc) | gzip -c > "$T/own/etc/ocbm/identity.tgz"; rm -rf "$T/own/id"
+  archive_of "$T/own" "$T/own.tgz"; rm -rf "$T/owntree" "$T/owntree.owners"
+  "$SH1" "$TREE" "$T/own.tgz" "$T/owntree" > "$T/out" 2>&1; rc=$?
+  check '[ $rc -eq 0 ] && [ "$(cat "$T/owntree/etc/.custom_bluetooth_name")" = "My Car" ]' "tree: a Bluetooth name flag the install found comes back from the identity archive"
+  rm -rf "$T/own" "$T/own.tgz" "$T/owntree" "$T/owntree.owners"
   check '[ ! -e "$T/tree/proc/version" ] && [ -x "$T/tree/usr/sbin/ARMadb-driver" ]' "tree: stock programs kept"
   check '[ ! -e "$T/tree/etc/carplay" ]' "tree: /etc/carplay, OCBM's bond store, is dropped"
   check '[ -d "$T/tree/etc/boa/www" ] && [ -d "$T/tree/etc/hichain" ] && [ -d "$T/tree/etc/boa/images" ] && [ -d "$T/tree/etc/boa/cgi-bin" ] && grep -q "deleted, back (empty)" "$T/out"' \
@@ -227,6 +240,8 @@ onefile_tests() {  # $1 shell
   check '[ $rc -eq 0 ] && grep -q TREE_OK "$T/out" && [ "$(cat "$T/dtree/script/start_main_service.sh")" = "stock start_main_service" ]' "dump of a trial: the stock tree, start script back"
   check '[ ! -e "$T/dtree/usr/sbin/ocbmd" ] && [ ! -e "$T/dtree/etc/ocbm" ] && [ ! -e "$T/dtree/etc/carplay" ] && [ "$(cat "$T/dtree/etc/hostapd.conf")" = "wpa_passphrase=stock-original" ]' \
     "dump of a trial: OCBM, /etc/ocbm and /etc/carplay dropped, hostapd.conf from the identity archive"
+  check '[ ! -e "$T/dtree/etc/.custom_bluetooth_name" ] && [ "$(cat "$T/dtree/etc/bluetooth_name")" = carlink ]' \
+    "dump of a trial: the seam's Bluetooth name flag dropped, the name from the identity archive"
   check 'cmp -s "$T/dtree/usr/sbin/ARMadb-driver" "$T/tree/usr/sbin/ARMadb-driver" && grep -q "^1000	0	usr/sbin/ARMadb-driver$" "$T/dtree.owners"' \
     "dump of a trial: the same files as the archive gives, owned as in the image (1000)"
   # A dump from before any install: the factory rootfs, extras included, taken as it is.
@@ -271,6 +286,8 @@ onefile_tests() {  # $1 shell
   check '[ ! -e "$T/box/script/radio_hal.sh" ] && [ ! -e "$T/box/script/radio_detect.sh" ] && [ ! -e "$T/box/script/radio_ap_up.sh" ]' "OCBM's radio seam goes with OCBM: stock has none"
   check '[ -e "$T/box/lib/firmware/nxp/added_after.bin" ] && grep -q "1 kept by the radio guard" "$T/out"' "the radio guard still keeps the unit's own radio files"
   check '[ ! -e "$T/box/etc/carplay" ] && grep -q "/etc/carplay removed" "$T/out"' "/etc/carplay, OCBM's bond store, is removed"
+  check '[ ! -e "$T/box/etc/.custom_bluetooth_name" ] && [ ! -e "$T/box/etc/carplay_peers.bin" ] && [ "$(cat "$T/box/etc/bluetooth_name")" = carlink ]' \
+    "the seam's Bluetooth name flag goes despite the radio guard (the dev adapter, 31 Oct), with OCBM's peer store; the name is stock's"
   check 'grep -q "^/script/update_box.sh" "$T/box/etc/mdev/udisk_insert.sh"' "the stick handler calls the stock updater again"
   check '[ "$(cat "$T/box/etc/hostapd.conf")" = "wpa_passphrase=stock-original" ] && [ "$(cat "$T/box/etc/bluetooth/keys")" = "bond: phone A" ]' "Wi-Fi settings and bonds as in the trial archive"
   check '[ -z "$(find "$T/box" -name "*.rsnew")" ] && [ ! -e "$T/run1/ocbm_mode.lock" ]' "no .rsnew and no lock left behind"
@@ -324,6 +341,15 @@ onefile_tests() {  # $1 shell
   run_onefile "$SH1" apply "$T/box" RECREATE=etc/carplay/bt_link_keys; rc=$?
   check '[ $rc -eq 0 ] && grep -q RESTORE_DONE "$T/out"' "apply tolerates /etc/carplay written again after its removal (a tester, Oct 2026)"
 
+  # A Bluetooth name flag that is not the seam's (a name set on stock after the archive): the radio
+  # guard keeps it, and verify does not count it.
+  rm -rf "$T/box"; cp -pR "$T/fin" "$T/box"; echo "My Car" > "$T/box/etc/.custom_bluetooth_name"
+  run_onefile "$SH1" apply "$T/box"; rc=$?
+  check '[ $rc -eq 0 ] && grep -q RESTORE_DONE "$T/out" && [ "$(cat "$T/box/etc/.custom_bluetooth_name")" = "My Car" ]' \
+    "a Bluetooth name flag that is not the seam's stays, as the radio guard wants"
+  run_onefile "$SH1" verify "$T/box"; rc=$?
+  check '[ $rc -eq 0 ] && grep -q RESTORE_VERIFIED "$T/out"' "and verify passes with it there"
+
   # From the factory dump onto a trial: the extras the install pruned come back, OCBM goes.
   rm -rf "$T/box"; cp -pR "$T/trial" "$T/box"
   run_onefile "$SH1" apply "$T/box" SRC="$T/ftree"; rc=$?
@@ -331,6 +357,15 @@ onefile_tests() {  # $1 shell
     "a trial restored from the factory dump gets the pruned extras and the HiCar identity back"
   check '[ ! -e "$T/box/usr/sbin/ocbmd" ] && [ ! -e "$T/box/script/radio_hal.sh" ] && [ ! -e "$T/box/etc/carplay" ] && [ "$(cat "$T/box/script/start_main_service.sh")" = "stock start_main_service" ]' \
     "and nothing of OCBM's is left"
+  check '[ ! -e "$T/box/etc/.custom_bluetooth_name" ] && [ ! -e "$T/box/etc/carplay_peers.bin" ]' \
+    "not the seam's Bluetooth name flag either, which the radio guard kept on the dev adapter (31 Oct)"
+  check '[ "$(ls -ld "$T/box/etc/boa/www" | cut -c1-10)" = drwxrwxr-x ] && [ "$(ls -ld "$T/box/etc/hichain" | cut -c1-10)" = drwxrwxr-x ]' \
+    "a directory made back takes the tree's mode (775, not mkdir's 755 as on the dev adapter, 31 Oct)"
+  run_onefile "$SH1" verify "$T/box" SRC="$T/ftree"; rc=$?
+  check '[ $rc -eq 0 ] && grep -q RESTORE_VERIFIED "$T/out"' "verify passes"
+  echo "ccpa-1234" > "$T/box/etc/.custom_bluetooth_name"
+  run_onefile "$SH1" verify "$T/box" SRC="$T/ftree"; rc=$?
+  check '[ $rc -ne 0 ] && grep -q "etc/.custom_bluetooth_name" "$T/out"' "verify counts the seam's flag when it is still there (it passed it by on 31 Oct)"
 
   # The rehearsal: the same restore from a trial that was never finished.
   rm -rf "$T/box"; cp -pR "$T/trial" "$T/box"

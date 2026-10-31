@@ -18,8 +18,11 @@
 #   - drop OCBM's own files: the image's payload (tools/make_ocbm_installer.sh --list), /etc/ocbm/,
 #     /etc/carplay/ (OCBM's Bluetooth bond store), /script/ocbm_mode, and what OCBM writes at runtime
 #     (RUNTIME below)
-#   - put /etc/hostapd.conf back from /etc/ocbm/identity.tgz, as ocbm_revert.sh does: OCBM rewrites
-#     the access point's name, passphrase and interface there
+#   - put /etc/hostapd.conf and /etc/bluetooth_name back from /etc/ocbm/identity.tgz, as
+#     ocbm_revert.sh does: OCBM rewrites the access point's name, passphrase and interface, and the
+#     Bluetooth name. The seam's Bluetooth name flag /etc/.custom_bluetooth_name (ccpa-<4 hex>; while
+#     it is there stock's bluetoothDaemon applies that name) comes back as the install found it, or
+#     is dropped when the install found none
 #   - put start_main_service.stock.sh back as start_main_service.sh
 # A dump from before any install has nothing of OCBM's and is taken as it is. Either way the tree has
 # the stock directories the install used to delete (etc/boa/www, etc/boa/cgi-bin, etc/boa/images,
@@ -52,8 +55,9 @@ set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 RUNTIME="script/ocbm_mode script/ocbm_dispatch.sh script/ocbm_trial script/ocbm_trial.log \
 script/ocbm_failover script/ocbm_failover.log script/radio_preload script/.radio_preload_inflight \
-script/box_crash.log etc/carplay_ident etc/hostapd.conf.stock etc/hostapd.conf.new"
+script/box_crash.log etc/carplay_ident etc/carplay_peers.bin etc/hostapd.conf.stock etc/hostapd.conf.new"
 STOCK_DIRS="etc/boa/www etc/boa/cgi-bin etc/boa/images etc/hichain"
+BT_FLAG="etc/.custom_bluetooth_name"
 
 say() { echo "[onefile-tree] $*"; }
 die() { echo "[onefile-tree] ABORT: $*" >&2; exit 1; }
@@ -110,14 +114,22 @@ fi
 if [ "$TRIAL" = 1 ]; then
   t="$OUT/.identity.$$"
   mkdir "$t" || die "cannot create $t"
-  if gzip -dc "$OUT/etc/ocbm/identity.tgz" 2>/dev/null | (cd "$t" && tar -xf - etc/hostapd.conf 2>/dev/null) \
-     && [ -s "$t/etc/hostapd.conf" ]; then
-    cp -p "$t/etc/hostapd.conf" "$OUT/etc/hostapd.conf" || die "could not put back /etc/hostapd.conf"
-    say "/etc/hostapd.conf: put back from the identity archive"
-  else
-    say "no hostapd.conf in /etc/ocbm/identity.tgz: keeping the $KIND's /etc/hostapd.conf"
+  gzip -dc "$OUT/etc/ocbm/identity.tgz" 2>/dev/null | (cd "$t" && tar -xf - 2>/dev/null)
+  for f in etc/hostapd.conf etc/bluetooth_name; do
+    if [ -s "$t/$f" ]; then
+      cp -p "$t/$f" "$OUT/$f" || die "could not put back /$f"
+      say "/$f: put back from the identity archive"
+    else
+      say "no $f in /etc/ocbm/identity.tgz: keeping the $KIND's /$f"
+    fi
+  done
+  if [ -f "$t/$BT_FLAG" ]; then
+    cp -p "$t/$BT_FLAG" "$OUT/$BT_FLAG" || die "could not put back /$BT_FLAG"
+    say "/$BT_FLAG: put back from the identity archive"
+  elif grep -qxE 'ccpa-[0-9a-f]{4}' "$OUT/$BT_FLAG" 2>/dev/null; then
+    rm -f "$OUT/$BT_FLAG" && say "/$BT_FLAG dropped: OCBM's Bluetooth name flag, which the install did not find"
   fi
-  rm -rf "$t"   # it held the Wi-Fi passphrase
+  rm -rf "$t"   # it held the Wi-Fi passphrase and Bluetooth keys
 
   if [ -n "${OCBM_LIST:-}" ]; then
     payload=$(cat "$OCBM_LIST") || die "cannot read $OCBM_LIST"

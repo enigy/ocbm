@@ -51,9 +51,25 @@ log "going back to stock from $mode (${ver:-unknown version}): $why"
 t="$RUN/ocbm_revert.$$"
 mkdir -p "$t"
 gzip -dc "$EO/identity.tgz" 2>/dev/null | (cd "$t" && tar -xf - 2>/dev/null)
+# cp -p, so each file comes back as the install found it, mode and owner included: a plain cp left
+# the dev adapter's hostapd.conf 0755 where Carlinkit's image has 0777 (31 Oct).
 if [ -s "$t/etc/hostapd.conf" ]; then
-  cp "$t/etc/hostapd.conf" "$ROOT/etc/hostapd.conf.new" && mv -f "$ROOT/etc/hostapd.conf.new" "$ROOT/etc/hostapd.conf" \
+  cp -p "$t/etc/hostapd.conf" "$ROOT/etc/hostapd.conf.new" && mv -f "$ROOT/etc/hostapd.conf.new" "$ROOT/etc/hostapd.conf" \
     && log "put back /etc/hostapd.conf"
+fi
+# The seam renames the adapter on Bluetooth (radio_hal.sh bt_set_name): ccpa-<4 hex> in
+# /etc/bluetooth_name and in the flag /etc/.custom_bluetooth_name, and while the flag is there
+# stock's bluetoothDaemon applies that name. Both go back as the install found them; the flag goes
+# when the install found none (a name set on stock is not ccpa-<4 hex>, so it stays).
+if [ -s "$t/etc/bluetooth_name" ]; then
+  cp -p "$t/etc/bluetooth_name" "$ROOT/etc/bluetooth_name.new" && mv -f "$ROOT/etc/bluetooth_name.new" "$ROOT/etc/bluetooth_name" \
+    && log "put back /etc/bluetooth_name"
+fi
+if [ -f "$t/etc/.custom_bluetooth_name" ]; then
+  cp -p "$t/etc/.custom_bluetooth_name" "$ROOT/etc/.custom_bluetooth_name.new" \
+    && mv -f "$ROOT/etc/.custom_bluetooth_name.new" "$ROOT/etc/.custom_bluetooth_name" && log "put back /etc/.custom_bluetooth_name"
+elif grep -qxE 'ccpa-[0-9a-f]{4}' "$ROOT/etc/.custom_bluetooth_name" 2>/dev/null; then
+  rm -f "$ROOT/etc/.custom_bluetooth_name" && log "removed /etc/.custom_bluetooth_name, OCBM's Bluetooth name flag"
 fi
 # The unit's HiCar identity: the prune empties etc/hichain with HiCar, and Carlinkit's own image ships
 # only an empty etc/hichain, so it comes back from here or not at all. Only files that are missing.

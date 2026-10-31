@@ -6,6 +6,9 @@ etc/riddle.conf
 etc/hostapd.conf
 etc/bluetooth
 etc/bluetooth_name
+# Stock's custom Bluetooth name flag. OCBM's seam writes its own name into it (and into
+# etc/bluetooth_name): ocbm_revert.sh puts back the one the install found, or removes the seam's.
+etc/.custom_bluetooth_name
 etc/wifi_name
 etc/box_name
 etc/device_serial

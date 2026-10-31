@@ -65,7 +65,8 @@ make_box() {  # $1 dir: root/ sys/ proc/ dev/ stick/ update/ of a stock adapter 
   for f in $KEPT; do blob "$R/$f" 2000; done
   ln -s libbluetooth.so.2.11.2 "$R/usr/lib/libbluetooth.so.2"
   echo 'WiFiPassword=secret' > "$R/etc/riddle.conf"
-  echo 'wpa_passphrase=secret' > "$R/etc/hostapd.conf"
+  echo 'wpa_passphrase=secret' > "$R/etc/hostapd.conf"; touch -t 202001010000 "$R/etc/hostapd.conf"
+  printf 'carlink ' > "$R/etc/bluetooth_name"
   blob "$R/etc/bluetooth/mybluetooth.tar.gz" 500
   printf 'ABCDEF0123456789' > "$R/etc/device_serial"
   printf 20250101 > "$R/etc/manufacture_date"
@@ -176,6 +177,7 @@ for sh in ${SHELLS:-sh dash}; do
   echo "== $sh: same-version guard after ocbm_revert.sh, and a retry keeps the real stock script"
   r="$T/$sh-again"; make_box "$r"; hk="$(cksum < "$r/root/etc/hichain/hks_keystore")"; run_once "$sh" "$r" >/dev/null; mkdir -p "$r/run"
   echo 'wpa_passphrase=ocbm' > "$r/root/etc/hostapd.conf"
+  echo ccpa-eeff > "$r/root/etc/bluetooth_name"; echo ccpa-eeff > "$r/root/etc/.custom_bluetooth_name"   # the seam's, in the trial
   rm -rf "$r/root/etc/boa/www"    # as an install before 31 Oct left it
   env ROOT="$r/root" RUN="$r/run" "$sh" "$r/root/script/ocbm_revert.sh" --no-reboot "test" > "$r/revert.out" 2>&1; rc=$?
   check '[ $rc = 0 ] && [ ! -e "$r/root/script/ocbm_mode" ] && grep -qxF "reverted version=$VER" "$r/root/etc/ocbm/last_result.txt" && grep -qx "wpa_passphrase=secret" "$r/root/etc/hostapd.conf"' \
@@ -183,6 +185,12 @@ for sh in ${SHELLS:-sh dash}; do
   check '[ "$(cksum < "$r/root/etc/hichain/hks_keystore")" = "$hk" ] && grep -q "put back the HiCar identity" "$r/revert.out"' \
     "it puts the unit's HiCar identity back from identity.tgz"
   check '[ -d "$r/root/etc/boa/www" ] && grep -q "made /etc/boa/www again" "$r/revert.out"' "it makes etc/boa/www again where an older install deleted it"
+  check '[ "$(cat "$r/root/etc/bluetooth_name")" = "carlink " ] && [ ! -e "$r/root/etc/.custom_bluetooth_name" ] && grep -q "removed /etc/.custom_bluetooth_name" "$r/revert.out"' \
+    "it puts the Bluetooth name back and removes the seam's name flag, which the install did not find"
+  # Modes are masked by a non-root tar here, so the 2020 mtime shows the copy kept what it found (cp -p).
+  touch -t 202101010000 "$T/ref2021"
+  check '[ -z "$(find "$r/root/etc/hostapd.conf" -newer "$T/ref2021")" ]' \
+    "it copies hostapd.conf back with cp -p (a plain cp left the dev adapter's 0777 file 0755, 31 Oct)"
   echo 2 > "$r/root/etc/ocbm/boot_attempts"
   refresh "$r"; run_once "$sh" "$r"; rc=$?
   check '[ $rc = 1 ] && grep -q "OCBM_RETRY" "$r/stick/OCBM_RESULT.txt"' "an undone version is refused without OCBM_RETRY"
@@ -192,6 +200,13 @@ for sh in ${SHELLS:-sh dash}; do
   check 'grep -q "^OCBM install: REFUSED" "$r/stick/OCBM_RESULT.prev.txt" && [ ! -e "$r/stick/OCBM_RESULT.txt" ]' \
     "the refusal's report is kept as OCBM_RESULT.prev.txt until finish.sh writes the new one"
   check '[ ! -e "$r/root/etc/ocbm/boot_attempts" ] && [ ! -e "$r/root/etc/ocbm/pending_result.txt" ]' "arming clears the earlier try's start counter and report"
+  echo "== $sh: a Bluetooth name flag the install found comes back with the go-back"
+  r="$T/$sh-btflag"; make_box "$r"; echo "My Car" > "$r/root/etc/.custom_bluetooth_name"; run_once "$sh" "$r" >/dev/null; mkdir -p "$r/run"
+  check 'gzip -dc "$r/root/etc/ocbm/identity.tgz" | tar -tf - | grep -qx etc/.custom_bluetooth_name' "identity.tgz holds the Bluetooth name flag the install found"
+  echo ccpa-eeff > "$r/root/etc/.custom_bluetooth_name"
+  env ROOT="$r/root" RUN="$r/run" "$sh" "$r/root/script/ocbm_revert.sh" --no-reboot "test" > "$r/revert.out" 2>&1; rc=$?
+  check '[ $rc = 0 ] && [ "$(cat "$r/root/etc/.custom_bluetooth_name")" = "My Car" ] && grep -q "put back /etc/.custom_bluetooth_name" "$r/revert.out"' \
+    "the go-back puts it back over the seam's"
   echo "== $sh: re-install after a revert, on a flash with no extras left to delete"
   r="$T/$sh-reinst"; make_box "$r"; run_once "$sh" "$r" >/dev/null; mkdir -p "$r/run"
   env ROOT="$r/root" RUN="$r/run" "$sh" "$r/root/script/ocbm_revert.sh" --no-reboot "test" > "$r/revert.out" 2>&1

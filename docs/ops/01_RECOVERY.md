@@ -154,7 +154,13 @@ way back, and five things call it:
 - by hand over the OCBM console: `/script/ocbm_revert.sh "why"`.
 
 It puts `/etc/hostapd.conf` back from `/etc/ocbm/identity.tgz`, and the unit's HiCar identity
-(`/etc/hichain`, archived by installs since 31 Oct) with it, records `reverted version=<VERSION>`
+(`/etc/hichain`, archived by installs since 31 Oct) with it, and the Bluetooth name the seam rewrote
+(`radio_hal.sh bt_set_name` writes `ccpa-<4 hex>` into `/etc/bluetooth_name` and into the flag
+`/etc/.custom_bluetooth_name`, and while the flag is there stock's bluetoothDaemon applies that name):
+`/etc/bluetooth_name` from the archive, the flag as the install found it (archived since 31 Oct), or
+removed when it holds the seam's `ccpa-<4 hex>`; a name set on stock stays. Each comes back with
+`cp -p`, mode and owner as the install found them (a plain copy left the dev adapter's 0777
+`hostapd.conf` 0755, 31 Oct). It records `reverted version=<VERSION>`
 in `/etc/ocbm/last_result.txt` (a stick install then refuses that version unless the stick holds
 `OCBM_RETRY`, which an install that uses it renames `OCBM_RETRY.used`; an install over USB from the
 app is not checked, since each one is a press of Convert),
@@ -207,8 +213,10 @@ console, from one of the unit's own backups:
   use between the two days, not by the decoder.
 - **The target.** `tools/stock_restore_onefile_tree.sh` makes stock of the source: from a trial's
   rootfs, OCBM's payload (`make_ocbm_installer.sh --list`), `/etc/ocbm/`, `/etc/carplay/` (OCBM's bond
-  store), `/script/ocbm_mode` and OCBM's runtime files dropped, `/etc/hostapd.conf` from the identity
-  archive (as `ocbm_revert.sh` does), and `start_main_service.stock.sh` back as `start_main_service.sh`;
+  store), `/script/ocbm_mode` and OCBM's runtime files (`/etc/carplay_peers.bin`, its peer store,
+  among them) dropped, `/etc/hostapd.conf` and `/etc/bluetooth_name` from the identity archive and the
+  seam's Bluetooth name flag dropped unless the install found one (as `ocbm_revert.sh` does), and
+  `start_main_service.stock.sh` back as `start_main_service.sh`;
   a dump from before any install is taken as it is. The tree always has `etc/boa/www`,
   `etc/boa/cgi-bin`, `etc/boa/images` and `etc/hichain`, so a restored unit takes Carlinkit's image
   whole. It holds the Wi-Fi passphrase and Bluetooth keys, so the stage step makes it in a private temp
@@ -224,12 +232,16 @@ console, from one of the unit's own backups:
   than `ocbmd`, which carries the console, go (a trial has stock and OCBM on flash, about 1.3 MB free,
   and the extras need about 1.8 MB to come back; this frees about 2 MB, and OCBM still boots its
   console from the start script, `ocbm_boot.sh` and `ocbmd`). Then every stock file goes back
-  (`.rsnew`, md5-checked, renamed, free space checked first); a check stops the run if anything but the
+  (`.rsnew`, md5-checked, renamed, free space checked first; a directory made back takes the tree's
+  mode and owner, where a bare `mkdir` left the dev adapter's `etc/boa/www`, `cgi-bin`, `images` and
+  `etc/hichain` 755 instead of 775, 31 Oct); a check stops the run if anything but the
   start script and OCBM's own files still differs; one rename of the stock start script over the
   dispatcher is the switch; OCBM's files go after it, each through `is_radio()` except OCBM's own
   radio seam (`radio_ap_up.sh`, `radio_detect.sh`, `radio_hal.sh`: stock has none, and without OCBM
-  they are dead files; the radio guard still keeps every file of the unit's own), and then
-  `/etc/carplay`. The OCBM still running (`ocbmd` carries the console until the restart) can write
+  they are dead files; the radio guard still keeps every file of the unit's own) and the seam's
+  Bluetooth name flag, `/etc/.custom_bluetooth_name` while it holds `ccpa-<4 hex>` (its name matches
+  the guard's `*bluetooth*`, so the dev adapter's restore of 31 Oct kept it and verify passed it by;
+  a name set on stock is not `ccpa-<4 hex>` and stays), and then `/etc/carplay`. The OCBM still running (`ocbmd` carries the console until the restart) can write
   `/etc/carplay/bt_link_keys` again: verify tolerates it, and the `stock` phase removes it once more
   right before the restart. Every stopping point boots OCBM, where the restore runs again, or complete
   stock.
@@ -250,7 +262,8 @@ console, from one of the unit's own backups:
 - **Tests.** `tools/stock_restore_test.sh` finishes a synthetic trial with the real `ocbm_finish.sh`
   and restores it: the tree from an archive and from dumps (a trial's and a factory one, written as
   JFFS2 images by `tools/jffs2_extract_test.py`), the pack and its owners, room first, the check
-  before the switch, the room shortfall, the re-run that converges, the seam and `/etc/carplay`, every
+  before the switch, the room shortfall, the re-run that converges, the seam, its Bluetooth name flag
+  and `/etc/carplay`, every
   refusal, the rehearsal, and the driver's monitor under `pipefail`, under `sh` and `dash`.
   `tools/jffs2_extract_test.py` builds JFFS2 images node by node: every compression type, deletions,
   renames, truncation, hard links, bad CRCs, obsolete nodes, unsafe names, and a type-22 node that was
@@ -260,10 +273,19 @@ console, from one of the unit's own backups:
   ran there (`c15209d`, `all`): `RESTORE_DONE` (the switch, 7 programs and 18 scripts and settings
   removed, the 3 `radio_*.sh` kept) and verify "rootfs matches the backup". With a stick in the
   adapter, stock comes up sharing it as 1d6b:a4a5 rather than 1314:1520, which the `stock` step now
-  accepts. A tester took an IW416 unit from `final` back to full stock with these tools, a dump decoder
+  accepts. On 31 Oct the same adapter, in a trial on `07c94df`, went back to its own 28 Oct factory dump
+  (`--dump`, `apply verify stock`): 184 files and 10 directories back (HiCar and its libraries, the
+  web pages, the HiCar identity, the Android Mirror helper), 32 of OCBM's files and 2 directories
+  gone, `RESTORE_DONE`, verify, stock at 1d6b:a4a5. The radio guard had kept the seam's Bluetooth name
+  flag (`ccpa-fe01`), and stock's first boot with it wrote that name into `bluetooth_name`,
+  `eir_info`, `hcid.conf` and `riddle.conf`; after a one-off stick removed the flag, a read-only survey
+  found 879 of 891 entries identical to the dump: those four, the four directories `mkdir` made 755, a
+  0755 `hostapd.conf` from an older go-back's plain copy, and three runtime entries (the DHCP leases,
+  the reboot log, the `/var/run` tmpfs). The flag, the directory modes and the copy are fixed since.
+  A tester took an IW416 unit from `final` back to full stock with these tools, a dump decoder
   of his own and a few hand steps (Oct 2026): the identity gate, the dry run, the switch order and
   `verify` behaved as documented, and a read-only survey found 669 files identical to the pre-install
-  flash; the fixes of 31 Oct are the five problems he found on the way (the silent monitor, 502:20
+  flash; the fixes of 31 Oct are the five problems the tester found on the way (the silent monitor, 502:20
   owners, `/etc/carplay` left over, the pruned directories, the `ARMimg_maker` claim). Until a
   confirm, finish and restore have run on it, no adapter is confirmed (`MGMT_INSTALL_CONFIRM`). The
   flash dump and an SPI programmer stay the last resort.
