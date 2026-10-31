@@ -291,12 +291,23 @@ console, from one of the unit's own backups:
   of every owner then matched the dump in all but the three runtime entries: 888 of 891 entries
   identical in type, content, mode and link target, and every owner on flash as in the image.
   A tester took an IW416 unit from `final` back to full stock with these tools, a dump decoder
-  of his own and a few hand steps (Oct 2026): the identity gate, the dry run, the switch order and
+  of their own and a few hand steps (Oct 2026): the identity gate, the dry run, the switch order and
   `verify` behaved as documented, and a read-only survey found 669 files identical to the pre-install
   flash; the fixes of 31 Oct are the five problems the tester found on the way (the silent monitor, 502:20
-  owners, `/etc/carplay` left over, the pruned directories, the `ARMimg_maker` claim). Until a
-  confirm, finish and restore have run on it, no adapter is confirmed (`MGMT_INSTALL_CONFIRM`). The
-  flash dump and an SPI programmer stay the last resort.
+  owners, `/etc/carplay` left over, the pruned directories, the `ARMimg_maker` claim). The same
+  evening the dev adapter went the whole way on `f8cc90f`: a stick install into the trial,
+  `ocbm-host install confirm`, a host session ended with `CT_STOP`, and the finish after its 60 s grace
+  (105 entries removed, the Carlinkit programs, the stock updater and `/etc/boa` among them, the stick
+  handlers' updater call commented out; 4,176 KB free). From `final` the `--dump` restore put back 284
+  files and links and `udisk_insert.sh` and made 10 directories (6,123 KB in about 2 minutes; the
+  tightest free-space check before a file had about 860 KB to spare), switched, removed OCBM's 7
+  programs and 22 scripts and settings, verified, and came up as stock sharing the stick. The restored
+  updater then ran a read-only survey stick: 888 of 891 entries identical to the dump in type, content,
+  mode and link target (the same three runtime entries), 1,728 KB free, the stock daemons running. One
+  owner gap is left: the 20 library symlinks the finish had deleted came back root's, where the image
+  has 1000:0, because the restore makes links with a bare `ln -s` (a symlink's owner changes nothing
+  here, but the image is the target). Carlink's builds still leave the confirm off
+  (`-Pcarlink.installConfirm`). The flash dump and an SPI programmer stay the last resort.
 
 ### UART console reference
 
