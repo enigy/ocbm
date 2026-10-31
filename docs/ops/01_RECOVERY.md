@@ -281,7 +281,13 @@ console, from one of the unit's own backups:
   `eir_info`, `hcid.conf` and `riddle.conf`; after a one-off stick removed the flag, a read-only survey
   found 879 of 891 entries identical to the dump: those four, the four directories `mkdir` made 755, a
   0755 `hostapd.conf` from an older go-back's plain copy, and three runtime entries (the DHCP leases,
-  the reboot log, the `/var/run` tmpfs). The flag, the directory modes and the copy are fixed since.
+  the reboot log, the `/var/run` tmpfs). The flag, the directory modes and the copy are fixed since
+  (`1ffc503`), and the whole round ran again with the fix the same afternoon: install, `--dump`
+  restore (182 files and 6 directories back, nothing kept by the radio guard), stock, survey. 883 of
+  891 entries now match the dump, the Bluetooth name files included after stock's first boot; what
+  differs is the three runtime entries and five modes left by the first round (the four
+  directories, `hostapd.conf`), since the restore compares content, not the modes of entries that
+  already exist.
   A tester took an IW416 unit from `final` back to full stock with these tools, a dump decoder
   of his own and a few hand steps (Oct 2026): the identity gate, the dry run, the switch order and
   `verify` behaved as documented, and a read-only survey found 669 files identical to the pre-install
