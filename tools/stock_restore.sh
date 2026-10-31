@@ -34,9 +34,15 @@
 # ============================== --profile onefile =======================================
 # For an adapter converted by the one-file install (ccpa/installer/), in its trial or after the
 # finish: there is no NCM, so everything runs over the OCBM console. INPUT: the stick's backup
-# folder OCBM_BACKUP/<adapter>/ (mtd0.bin mtd1.bin mtd2.bin SHA256SUMS) and the file-level archive
-# the adapter took of its own rootfs during the trial (--archive; default rootfs_files_trial.tgz in
-# that folder). The archive and the tree made from it hold the Wi-Fi passphrase and Bluetooth keys.
+# folder OCBM_BACKUP/<adapter>/ (mtd0.bin mtd1.bin mtd2.bin SHA256SUMS) and the stock rootfs, from
+# either
+#   --dump     that folder's own mtd2.bin, decoded on this Mac (tools/jffs2_extract.py). From the
+#              first install's dump this is the factory rootfs, the extras the install pruned
+#              included, and it needs nothing else. The better source, and the only one for an
+#              adapter that never wrote an archive
+#   --archive  a file-level archive the adapter took of its own rootfs during the trial (default
+#              rootfs_files_trial.tgz in that folder). It has no extras
+# Either source and the tree made from it hold the Wi-Fi passphrase and Bluetooth keys.
 #   preflight  backup checksums; the adapter on OCBM; mtd0 + mtd1 match the dump; the mode is trial
 #              or final, the start script is OCBM's dispatcher, no finish pending; same
 #              software_version as the archive; room in /tmp
@@ -50,13 +56,16 @@
 #   stock      gated: restart; the adapter must enumerate as stock 1314:1520/1521,
 #              or 1d6b:a4a5 when stock shares a stick in the adapter
 #   all        preflight, stage, plan, apply, verify, stock
-# The extras the install pruned (HiCar, the Android Mirror helper, the web pages) are not in the
-# archive: once stock is back, Carlinkit's own 2025.10.15.1127 image on a stick restores them.
+# The extras the install pruned (HiCar, the Android Mirror helper, the web pages, the unit's HiCar
+# identity) come back only from a dump that holds them. Carlinkit's own 2025.10.15.1127 image does
+# NOT restore them all: it ships no etc/hichain identity, and its web pages land only if
+# etc/boa/www exists (the tree always has it now; restores before 31 Oct left it deleted).
 #
 # ============================== USAGE ===================================================
 #   tools/stock_restore.sh --backup DIR dryrun     # safe any time; the adapter must be on this Mac
 #   tools/stock_restore.sh --backup DIR all
 #   tools/stock_restore.sh --backup DIR <phase>...
+#   tools/stock_restore.sh --profile onefile --backup OCBM_BACKUP/<adapter> --dump dryrun|all|<phase>...
 #   tools/stock_restore.sh --profile onefile --backup OCBM_BACKUP/<adapter> [--archive FILE] dryrun|all|<phase>...
 # Options: --yes (skip the two gates), --run-dir DIR (reports; default scratchpad/stockrestore_<stamp>)
 # Run under Homebrew bash, like the other installers.
@@ -70,6 +79,7 @@ BOXSH="$REPO/tools/boxsh.py"
 NCM_IP=192.168.50.2
 BACKUP=""
 ARCHIVE=""
+DUMP=0
 PROFILE=ncm
 RUN_DIR=""
 ASSUME_YES=0
@@ -79,6 +89,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --backup) BACKUP="$2"; shift 2 ;;
     --archive) ARCHIVE="$2"; shift 2 ;;
+    --dump) DUMP=1; shift ;;
     --profile) PROFILE="$2"; shift 2 ;;
     --run-dir) RUN_DIR="$2"; shift 2 ;;
     --yes|-y) ASSUME_YES=1; shift ;;
@@ -91,10 +102,15 @@ done
 [ -n "$BACKUP" ] || { echo "--backup DIR is required (the backup folder of THIS adapter)" >&2; exit 2; }
 case "$PROFILE" in ncm|onefile) ;; *) echo "--profile is ncm or onefile" >&2; exit 2 ;; esac
 BACKUP="$(cd "$BACKUP" && pwd)"
-if [ "$PROFILE" = onefile ]; then
+if [ "$PROFILE" = onefile ] && [ "$DUMP" = 1 ]; then
+  [ -z "$ARCHIVE" ] || { echo "--dump and --archive are two sources: pick one" >&2; exit 2; }
+  [ -s "$BACKUP/mtd2.bin" ] || { echo "no mtd2.bin in $BACKUP for --dump" >&2; exit 2; }
+elif [ "$PROFILE" = onefile ]; then
   [ -n "$ARCHIVE" ] || ARCHIVE="$BACKUP/rootfs_files_trial.tgz"
-  [ -s "$ARCHIVE" ] || { echo "no trial archive at $ARCHIVE (--archive FILE)" >&2; exit 2; }
+  [ -s "$ARCHIVE" ] || { echo "no trial archive at $ARCHIVE (--archive FILE, or --dump for the stick's mtd2.bin)" >&2; exit 2; }
   ARCHIVE="$(cd "$(dirname "$ARCHIVE")" && pwd)/$(basename "$ARCHIVE")"
+elif [ "$DUMP" = 1 ]; then
+  echo "--dump is for --profile onefile" >&2; exit 2
 fi
 BOXENV="PROFILE=$PROFILE"
 [ -n "$RUN_DIR" ] || RUN_DIR="$REPO/scratchpad/stockrestore_$(date +%Y%m%d_%H%M%S)"
@@ -107,6 +123,12 @@ die()  { printf '[stock-restore] ABORT: %s\n' "$*" >&2; exit 1; }
 # passphrase and Bluetooth keys, so it goes on any exit, a die included.
 STAGE_WORK=""
 trap '[ -z "$STAGE_WORK" ] || rm -rf "$STAGE_WORK"' EXIT
+# The box's step lines from the ($3+1)-th on. On the first polls the log has none yet: a grep that
+# finds nothing must not end this script under pipefail, which it did, silently, right after
+# "=== apply", leaving the user blind through the switch (a tester, Oct 2026).
+new_steps() {  # $1 log text, $2 step pattern, $3 lines already shown
+  printf '%s\n' "$1" | tr -d '\r' | { grep -E "$2" || true; } | tail -n +$(($3 + 1))
+}
 gate() {
   [ "$ASSUME_YES" = 1 ] && return 0
   printf '[stock-restore] %s [type yes] ' "$1"; read -r a
@@ -305,7 +327,7 @@ phase_apply() {
     sleep 5
     log="$(run 'cat /tmp/rsw/apply.log 2>/dev/null' 30 2>/dev/null || true)"
     if [ -z "$log" ] && ! ssh_ok; then telnet_ok && VIA=telnet; fi
-    printf '%s\n' "$log" | tr -d '\r' | grep -E '^\[restore\] [0-9]/6|^RESTORE_' | tail -n +$((seen + 1)) | while IFS= read -r l; do say "box: $l"; done
+    new_steps "$log" '^\[restore\] [0-9]/6|^RESTORE_' "$seen" | while IFS= read -r l; do say "box: $l"; done
     seen=$(printf '%s\n' "$log" | tr -d '\r' | grep -c -E '^\[restore\] [0-9]/6|^RESTORE_' || true)
     if printf '%s' "$log" | grep -q RESTORE_DONE; then break; fi
     if printf '%s' "$log" | grep -q RESTORE_ABORT; then
@@ -341,7 +363,12 @@ phase_preflight_onefile() {
   for f in mtd0.bin mtd1.bin SHA256SUMS; do [ -s "$BACKUP/$f" ] || die "backup is missing $f ($BACKUP)"; done
   ( cd "$BACKUP" && shasum -a 256 -c SHA256SUMS >/dev/null 2>&1 ) || die "backup checksums do not verify; do not restore from it"
   say "backup checksums verify: $BACKUP"
-  say "trial archive: $ARCHIVE (md5 $(md5 -q "$ARCHIVE"))"
+  if [ "$DUMP" = 1 ]; then
+    grep -q ' mtd2\.bin$' "$BACKUP/SHA256SUMS" || die "SHA256SUMS in $BACKUP does not cover mtd2.bin"
+    say "source: the flash dump $BACKUP/mtd2.bin (md5 $(md5 -q "$BACKUP/mtd2.bin"))"
+  else
+    say "source: the trial archive $ARCHIVE (md5 $(md5 -q "$ARCHIVE"))"
+  fi
   need_ocbm
   say "adapter: on OCBM (console over USB)"
 
@@ -363,9 +390,13 @@ phase_preflight_onefile() {
     *) die "no one-file install mode on the adapter" ;;
   esac
 
-  want_sw="$(gzip -dc "$ARCHIVE" | tar -xOf - ./etc/software_version etc/software_version 2>/dev/null | head -1 | tr -d '\r' || true)"
+  if [ "$DUMP" = 1 ]; then
+    want_sw="$(python3 -I "$REPO/tools/jffs2_extract.py" --cat "$BACKUP/mtd2.bin" /etc/software_version 2>/dev/null | head -1 | tr -d '\r' || true)"
+  else
+    want_sw="$(gzip -dc "$ARCHIVE" | tar -xOf - ./etc/software_version etc/software_version 2>/dev/null | head -1 | tr -d '\r' || true)"
+  fi
   sw="$(run 'cat /etc/software_version' 20 | tr -d '\r' | grep -E '^[0-9]{4}\.' | tail -1 || true)"
-  [ -n "$want_sw" ] && [ "$sw" = "$want_sw" ] || die "software_version on the box is '$sw', the archive's is '${want_sw:-missing}'"
+  [ -n "$want_sw" ] && [ "$sw" = "$want_sw" ] || die "software_version on the box is '$sw', the source's is '${want_sw:-missing}'"
   say "software_version: $sw"
   tmpfree="$(run "df -k /tmp | awk 'NR>1{f=\$4} END{print f+0}'" 20 | tr -d '\r' | grep -E '^[0-9]+$' | tail -1 || true)"
   [ "${tmpfree:-0}" -ge 30000 ] || die "only ${tmpfree:-?} KB free in /tmp; staging needs about 30 MB"
@@ -381,9 +412,14 @@ phase_stage_onefile() {
   # which sits under the repo and keeps the run's reports.
   STAGE_WORK="$(mktemp -d "${TMPDIR:-/tmp}/stock_restore.XXXXXX")" || die "could not make a private temp dir for the stock tree"
   tree="$STAGE_WORK/tree"; tgz="$STAGE_WORK/tree.tgz"
-  sh "$TREE_TOOL" "$ARCHIVE" "$tree" 2>&1 | tee "$RUN_DIR/tree.out" | grep -q TREE_OK || die "could not make the stock tree; see $RUN_DIR/tree.out"
-  # Only the tree's own files go to the box: --pack keeps macOS tar's ._ AppleDouble entries out (the
-  # 28 Oct dry run planned 702 of them) and refuses a pack that is not exactly the tree.
+  if [ "$DUMP" = 1 ]; then
+    sh "$TREE_TOOL" --dump "$BACKUP/mtd2.bin" "$tree" 2>&1 | tee "$RUN_DIR/tree.out" | grep -q TREE_OK || die "could not make the stock tree; see $RUN_DIR/tree.out"
+  else
+    sh "$TREE_TOOL" "$ARCHIVE" "$tree" 2>&1 | tee "$RUN_DIR/tree.out" | grep -q TREE_OK || die "could not make the stock tree; see $RUN_DIR/tree.out"
+  fi
+  # Only the tree's own files go to the box, owned as on the adapter: --pack (tools/pack_tree.py)
+  # writes no ._ AppleDouble entry (the 28 Oct dry run planned 702) and refuses a pack that is not
+  # exactly the tree.
   sh "$TREE_TOOL" --pack "$tree" "$tgz" 2>&1 | tee -a "$RUN_DIR/tree.out" | grep -q PACK_OK || die "could not pack the stock tree; see $RUN_DIR/tree.out"
   rm -rf "$tree"
   push "$PAYLOAD" /tmp/stock_restore_box.sh
@@ -408,7 +444,7 @@ phase_apply_onefile() {
   while [ $SECONDS -lt $end ]; do
     sleep 5
     log="$(run 'cat /tmp/rsw/apply.log 2>/dev/null' 30 2>/dev/null || true)"
-    printf '%s\n' "$log" | tr -d '\r' | grep -E '^\[restore\] [0-9]/5|^RESTORE_' | tail -n +$((seen + 1)) | while IFS= read -r l; do say "box: $l"; done
+    new_steps "$log" '^\[restore\] [0-9]/5|^RESTORE_' "$seen" | while IFS= read -r l; do say "box: $l"; done
     seen=$(printf '%s\n' "$log" | tr -d '\r' | grep -c -E '^\[restore\] [0-9]/5|^RESTORE_' || true)
     if printf '%s' "$log" | grep -q RESTORE_DONE; then break; fi
     if printf '%s' "$log" | grep -q RESTORE_ABORT; then
@@ -428,12 +464,18 @@ phase_stock_onefile() {
   say "=== stock — restart on the Carlinkit stack"
   need_ocbm
   gate "Restart now? The adapter comes back as stock Carlinkit; OCBM's console goes away."
-  run 'sync; (sleep 1; /sbin/reboot) >/dev/null 2>&1 & echo REBOOTING' 20 >/dev/null || true
+  # /etc/carplay is OCBM's bond store, and the OCBM still running may have written it again since
+  # apply removed it; stock has none (the restore tree says so).
+  run '[ -d /tmp/rs/etc ] && [ ! -e /tmp/rs/etc/carplay ] && rm -rf /etc/carplay; sync; (sleep 1; /sbin/reboot) >/dev/null 2>&1 & echo REBOOTING' 20 >/dev/null || true
   local end=$(( SECONDS + 240 )) seen
   while [ $SECONDS -lt $end ]; do
     if seen="$(stock_seen)"; then
       say "the adapter enumerates as $seen"
-      say "done. To put back HiCar, the Android Mirror helper and the web pages, put Carlinkit's 2025.10.15.1127 A15W_Update.img on a FAT32 stick and plug it in on a USB charger."
+      if [ "$DUMP" = 1 ]; then
+        say "done: the rootfs is the dump's. Check it with a read-only survey stick (tools/stock_survey.sh)."
+      else
+        say "done. HiCar, the Android Mirror helper and the web pages are not in a trial archive: restore from the first install's dump (--dump) to have them back."
+      fi
       return 0
     fi
     sleep 5

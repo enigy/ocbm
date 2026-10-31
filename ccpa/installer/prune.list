@@ -2,6 +2,9 @@
 # OCBM while stock CarPlay and Android Auto stay as the fallback. One path or glob per line,
 # relative to /. Every match still goes through once.sh's is_radio() guard.
 # Paths come from the factory survey of 2026-10-27 (scratchpad/stock_survey_20261027/).
+# A directory is emptied, never deleted (dir/*): Carlinkit's own image unpacks its web pages INTO
+# etc/boa/www (`rm -rf /etc/boa/www/*; tar -xvf www.tar.gz -C /etc/boa/www/`) and leaves them out,
+# silently, when the directory is gone (a tester, Oct 2026).
 
 # HiCar: exactly the set phone_link_deamon.sh stages for a HiCar session, and only for one.
 # The CarPlay and Android Auto branches use none of it, and no always-running process maps it.
@@ -16,7 +19,7 @@ usr/lib/libauthagent.so
 usr/lib/libnearby.so
 usr/lib/libhicar.so
 etc/udhcpd_hicar_ap.conf
-etc/hichain
+etc/hichain/*
 
 # Android Mirror: the helper app start_accessory_mass_storage.sh offers an Android phone.
 etc/BoxHelper.apk
@@ -35,8 +38,8 @@ lib/libpcprofile.so
 
 # Web UI pages. usr/sbin/boa, etc/boa/boa.conf and etc/mime.types stay: start_main_service.sh
 # brings the Wi-Fi AP up from inside its `test -e /usr/sbin/boa` block.
-etc/boa/www
-etc/boa/cgi-bin
-etc/boa/images
+etc/boa/www/*
+etc/boa/cgi-bin/*
+etc/boa/images/*
 
 # Kept on purpose: the car and brand logos (~40 KB on flash) may be read by packed vendor binaries.

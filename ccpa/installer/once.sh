@@ -99,7 +99,8 @@ abort() {  # past the prune: stock still boots, the extras are gone
   say "STOPPED: $1"
   result "STOPPED" "$1" "" "The adapter still starts stock CarPlay and Android Auto." \
     "To make room, HiCar, the Android Mirror helper and the web pages were removed (listed in" \
-    "/etc/ocbm/pruned.txt). Carlinkit's own $WANT_FW image puts them back." \
+    "/etc/ocbm/pruned.txt). Carlinkit's own $WANT_FW image puts back what it ships; all of it," \
+    "this unit's HiCar identity included, is in the flash backup on this stick." \
     "Remove the stick, then unplug the adapter and plug it back in."
   park stopped
   exit 1

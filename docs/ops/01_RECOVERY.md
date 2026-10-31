@@ -153,58 +153,120 @@ way back, and five things call it:
 - `MGMT_GO_STOCK` from the app, or `ocbm-host install stock` on the bench;
 - by hand over the OCBM console: `/script/ocbm_revert.sh "why"`.
 
-It puts `/etc/hostapd.conf` back from `/etc/ocbm/identity.tgz`, records `reverted version=<VERSION>`
+It puts `/etc/hostapd.conf` back from `/etc/ocbm/identity.tgz`, and the unit's HiCar identity
+(`/etc/hichain`, archived by installs since 31 Oct) with it, records `reverted version=<VERSION>`
 in `/etc/ocbm/last_result.txt` (a stick install then refuses that version unless the stick holds
 `OCBM_RETRY`, which an install that uses it renames `OCBM_RETRY.used`; an install over USB from the
 app is not checked, since each one is a press of Convert),
 removes `/script/ocbm_mode` and restarts. The start script then hands every boot to the
 kept `start_main_service.stock.sh`, and the report lands on the next stick plugged in as
-`OCBM_RESULT.txt`. HiCar, the Android Mirror helper and the web pages stay deleted; Carlinkit's own
-2025.10.15.1127 image puts them back.
+`OCBM_RESULT.txt`. HiCar, the Android Mirror helper and the web pages stay deleted. Carlinkit's own
+2025.10.15.1127 image puts back what it ships, but not all of it lands: it unpacks its web pages INTO
+`/etc/boa/www` (`rm -rf /etc/boa/www/*; tar -xvf www.tar.gz -C /etc/boa/www/`), which an install
+before 31 Oct deleted, so the tar failed silently and the web UI stayed blank; and it ships only an
+empty `/etc/hichain`, so the unit's HiCar identity (`hks_keystore`, `info1.data`, `info2.data`) can
+only come from a backup (a tester, Oct 2026). Since 31 Oct the prune empties those directories instead
+of deleting them, and the go-back makes them again where an older install deleted them. The
+toolchain leftovers and `test_mic.sh` the prune also deletes are not in Carlinkit's image either;
+they are harmless. Everything the prune took is in the first install's flash dump, which the restore
+below can write back.
 
 In `final` there is no stock left and `ocbm_revert.sh` refuses. Carlinkit's image cannot rebuild it
-either: it omits files the finish deletes, its own decrypter `ARMimg_maker` among them. The way back
-without an SPI programmer is `tools/stock_restore.sh --profile onefile`, over the OCBM console, from a
-file-level archive the unit took of its own rootfs during its trial (`rootfs_files_trial.tgz`, kept
-with the stick's `OCBM_BACKUP/<serial>/` folder):
+either: the finish deletes the stock updater that would run it (`update_box.sh` and
+`update_box_ota.sh` in `ocbm_finish.sh`'s `SCRIPT_A`, and the updater call in the stick handlers).
+(This read "its own decrypter `ARMimg_maker` among them" until 31 Oct: `ARMimg_maker` is in
+`ncm_base_install.sh`'s `SBIN_B`, which only the deep NCM strip removes, and the finish uses
+`SBIN_A`; a tester's `final` adapter still had it, and the stick updater worked after the restore.)
+The way back without an SPI programmer is `tools/stock_restore.sh --profile onefile`, over the OCBM
+console, from one of the unit's own backups:
 
-    tools/stock_restore.sh --profile onefile --backup OCBM_BACKUP/<serial> dryrun   # flash untouched
-    tools/stock_restore.sh --profile onefile --backup OCBM_BACKUP/<serial> all
+    tools/stock_restore.sh --profile onefile --backup OCBM_BACKUP/<serial> --dump dryrun   # flash untouched
+    tools/stock_restore.sh --profile onefile --backup OCBM_BACKUP/<serial> --dump all
+    tools/stock_restore.sh --profile onefile --backup OCBM_BACKUP/<serial> [--archive FILE] all
 
-- **The target.** `tools/stock_restore_onefile_tree.sh` makes stock of the trial's rootfs: OCBM's
-  payload (`make_ocbm_installer.sh --list`), `/etc/ocbm/`, `/script/ocbm_mode` and OCBM's runtime files
-  dropped, `/etc/hostapd.conf` from the identity archive (as `ocbm_revert.sh` does), and
-  `start_main_service.stock.sh` back as `start_main_service.sh`. The pruned extras are not in it.
-  The tree holds the Wi-Fi passphrase and Bluetooth keys, so the stage step makes it in a private temp
-  dir that goes on any exit. Its `--pack` runs `tar` with `COPYFILE_DISABLE=1` and refuses a pack that
-  is not exactly the tree: macOS `tar` otherwise adds a `._` AppleDouble entry per file with extended
-  attributes, and the factory adapter's first dry run (28 Oct) planned 702 of them as writes.
-- **The order** (`PROFILE=onefile` in `tools/stock_restore_box.sh`). The dispatcher keeps booting OCBM
-  while every stock file goes back (`.rsnew`, md5-checked, renamed, free space checked first) and no
-  OCBM file is touched; a check then stops the run if anything but the start script and OCBM's own
-  files still differs; one rename of the stock start script over the dispatcher is the switch; OCBM's
-  files go after it, each through `is_radio()` (the `radio_*.sh` seam stays, inert). Every stopping
-  point boots OCBM, where the restore runs again, or complete stock.
+- **The source.** `--dump` decodes the stick's own `OCBM_BACKUP/<serial>/mtd2.bin` on the Mac
+  (`tools/jffs2_extract.py`), so nothing beyond what every install writes to its stick is needed. The
+  first install dumps the flash before it changes anything, so its dump is the factory rootfs, the
+  pruned extras and the HiCar identity included: the way back to full stock, and the only one for a
+  `final` adapter that never had an archive (nothing in the repo writes one). `--archive` takes a
+  file-level archive the unit took of its own rootfs during its trial (`rootfs_files_trial.tgz`); it
+  never has the extras. A dump taken by a later install holds stock plus a dormant OCBM and is treated
+  like an archive.
+- **The decoder.** Carlinkit's 3.14.52 kernel stores most data nodes with compression type 22
+  (`jffs2_zlib_decompress_aesmykey`, `0x80129ffc` in lvalen91/CPC200-CCPA_resources
+  `custom/kernel_dumps/`): swap the bytes `0x32` and `0x60` in the payload, then plain zlib. zlib's
+  adler32 is the proof the swap is right: a raw inflate can come out the right length with the wrong
+  bytes, and `jefferson` writes type-22 data out raw. A few nodes are rtime (type 2), decoded in the
+  tool itself. Every node's header, node and data CRC is checked; the highest version of each entry
+  wins; a file is written only when every node it needs decodes, else the restore refuses the dump.
+  From a tester's `ccpa_jffs2_extract.py`, which decoded all 2303 type-22 nodes of an IW416 unit. On the
+  factory adapter's 28 Oct dump (31 Oct): 2,255 type-22, 5 rtime and 2,350 plain nodes, no bad CRC,
+  409 files, 433 links and 61 directories; against the read-only survey of 27 Oct, 859 of 879 entries
+  identical, and the 20 others (`riddle.conf`, `hostapd.conf`, the Bluetooth and Wi-Fi names, the
+  pairing records, the logos, `shadow`) byte-identical to the trial archive of 28 Oct, so changed by
+  use between the two days, not by the decoder.
+- **The target.** `tools/stock_restore_onefile_tree.sh` makes stock of the source: from a trial's
+  rootfs, OCBM's payload (`make_ocbm_installer.sh --list`), `/etc/ocbm/`, `/etc/carplay/` (OCBM's bond
+  store), `/script/ocbm_mode` and OCBM's runtime files dropped, `/etc/hostapd.conf` from the identity
+  archive (as `ocbm_revert.sh` does), and `start_main_service.stock.sh` back as `start_main_service.sh`;
+  a dump from before any install is taken as it is. The tree always has `etc/boa/www`,
+  `etc/boa/cgi-bin`, `etc/boa/images` and `etc/hichain`, so a restored unit takes Carlinkit's image
+  whole. It holds the Wi-Fi passphrase and Bluetooth keys, so the stage step makes it in a private temp
+  dir that goes on any exit.
+- **The pack.** `tools/pack_tree.py` packs the tree with each entry owned as on the adapter, from the
+  source: Carlinkit's image leaves most of the rootfs to uid 1000 (1000:0 and 1000:1000, a few root,
+  three files 501:20). A plain `tar` from the Mac recorded the Mac's user, and the box, unpacking as
+  root and copying with `cp -p`, put 502:20 on flash (a tester, Oct 2026). It writes no `._`
+  AppleDouble entry (macOS `tar` adds one per file with extended attributes; the factory adapter's
+  first dry run, 28 Oct, planned 702 of them as writes) and refuses a pack that is not exactly the tree
+  or not owned as it says.
+- **The order** (`PROFILE=onefile` in `tools/stock_restore_box.sh`). First room: OCBM's programs other
+  than `ocbmd`, which carries the console, go (a trial has stock and OCBM on flash, about 1.3 MB free,
+  and the extras need about 1.8 MB to come back; this frees about 2 MB, and OCBM still boots its
+  console from the start script, `ocbm_boot.sh` and `ocbmd`). Then every stock file goes back
+  (`.rsnew`, md5-checked, renamed, free space checked first); a check stops the run if anything but the
+  start script and OCBM's own files still differs; one rename of the stock start script over the
+  dispatcher is the switch; OCBM's files go after it, each through `is_radio()` except OCBM's own
+  radio seam (`radio_ap_up.sh`, `radio_detect.sh`, `radio_hal.sh`: stock has none, and without OCBM
+  they are dead files; the radio guard still keeps every file of the unit's own), and then
+  `/etc/carplay`. The OCBM still running (`ocbmd` carries the console until the restart) can write
+  `/etc/carplay/bt_link_keys` again: verify tolerates it, and the `stock` phase removes it once more
+  right before the restart. Every stopping point boots OCBM, where the restore runs again, or complete
+  stock.
+- **The monitor.** `apply` starts the box side under `nohup` and polls its log. Under
+  `set -euo pipefail`, a poll that found no step line yet ended the script silently right after
+  `=== apply`, the box side running on through the switch unwatched and `verify` and `stock` never run
+  (a tester, Oct 2026); the step filter (`new_steps`) cannot fail that way now.
 - **Refusals**, before anything changes: the start script is not OCBM's dispatcher, `ocbmd` or
   `ocbm_boot.sh` is missing, the mode is not `trial` or `final` (a `confirmed` trial finishes when its
   session ends), a finish is pending, or `ocbm_mode.lock` is held (`ocbm_revert.sh` and
   `ocbm_finish.sh` take the same lock). The identity gate (`mtd0`/`mtd1` against the stick's dump) and
-  `software_version` against the archive's are checked first.
+  `software_version` against the source's are checked first; a dump that does not decode cleanly is
+  refused.
 - **Rehearsal.** In `trial` the same restore works with stock still on the unit; afterwards a stick
-  with the installer converts it again. The kept `radio_*.sh` are replaced by the install like the rest
-  of the payload: until 29 Oct `once.sh` refused on them ("already has /script/radio_ap_up.sh"), because
-  with `/etc/ocbm` gone it took them for a stranger's files. The stock updater is back, so Carlinkit's
-  2025.10.15.1127 image then restores the pruned extras too.
+  with the installer converts it again. The `radio_*.sh` a restore before 31 Oct kept are replaced by
+  the install like the rest of the payload: until 29 Oct `once.sh` refused on them ("already has
+  /script/radio_ap_up.sh"), because with `/etc/ocbm` gone it took them for a stranger's files.
 - **Tests.** `tools/stock_restore_test.sh` finishes a synthetic trial with the real `ocbm_finish.sh`
-  and restores it: OCBM kept until the switch, the check before the switch, the room shortfall, the
-  re-run that converges, every refusal, the rehearsal and the pack check, under `sh` and `dash`.
+  and restores it: the tree from an archive and from dumps (a trial's and a factory one, written as
+  JFFS2 images by `tools/jffs2_extract_test.py`), the pack and its owners, room first, the check
+  before the switch, the room shortfall, the re-run that converges, the seam and `/etc/carplay`, every
+  refusal, the rehearsal, and the driver's monitor under `pipefail`, under `sh` and `dash`.
+  `tools/jffs2_extract_test.py` builds JFFS2 images node by node: every compression type, deletions,
+  renames, truncation, hard links, bad CRCs, obsolete nodes, unsafe names, and a type-22 node that was
+  never swapped.
 - **On an adapter** (28 Oct): the dry run on the factory adapter, in its trial on `153df7f`, passed
   every preflight check with flash unchanged; it found the AppleDouble writes above. The rehearsal then
   ran there (`c15209d`, `all`): `RESTORE_DONE` (the switch, 7 programs and 18 scripts and settings
   removed, the 3 `radio_*.sh` kept) and verify "rootfs matches the backup". With a stick in the
   adapter, stock comes up sharing it as 1d6b:a4a5 rather than 1314:1520, which the `stock` step now
-  accepts. Until a confirm, finish and restore have run on it, no adapter is confirmed
-  (`MGMT_INSTALL_CONFIRM`). The flash dump and an SPI programmer stay the last resort.
+  accepts. A tester took an IW416 unit from `final` back to full stock with these tools, a dump decoder
+  of his own and a few hand steps (Oct 2026): the identity gate, the dry run, the switch order and
+  `verify` behaved as documented, and a read-only survey found 669 files identical to the pre-install
+  flash; the fixes of 31 Oct are the five problems he found on the way (the silent monitor, 502:20
+  owners, `/etc/carplay` left over, the pruned directories, the `ARMimg_maker` claim). Until a
+  confirm, finish and restore have run on it, no adapter is confirmed (`MGMT_INSTALL_CONFIRM`). The
+  flash dump and an SPI programmer stay the last resort.
 
 ### UART console reference
 

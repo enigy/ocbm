@@ -50,12 +50,27 @@ log "going back to stock from $mode (${ver:-unknown version}): $why"
 
 t="$RUN/ocbm_revert.$$"
 mkdir -p "$t"
-if gzip -dc "$EO/identity.tgz" 2>/dev/null | (cd "$t" && tar -xf - etc/hostapd.conf 2>/dev/null) \
-   && [ -s "$t/etc/hostapd.conf" ]; then
+gzip -dc "$EO/identity.tgz" 2>/dev/null | (cd "$t" && tar -xf - 2>/dev/null)
+if [ -s "$t/etc/hostapd.conf" ]; then
   cp "$t/etc/hostapd.conf" "$ROOT/etc/hostapd.conf.new" && mv -f "$ROOT/etc/hostapd.conf.new" "$ROOT/etc/hostapd.conf" \
     && log "put back /etc/hostapd.conf"
 fi
-rm -rf "$t"   # it held the Wi-Fi passphrase
+# The unit's HiCar identity: the prune empties etc/hichain with HiCar, and Carlinkit's own image ships
+# only an empty etc/hichain, so it comes back from here or not at all. Only files that are missing.
+if [ -d "$t/etc/hichain" ]; then
+  mkdir -p "$ROOT/etc/hichain"
+  n=0
+  for f in "$t/etc/hichain"/* "$t/etc/hichain"/.[!.]*; do
+    [ -f "$f" ] && [ ! -e "$ROOT/etc/hichain/${f##*/}" ] && cp -p "$f" "$ROOT/etc/hichain/" && n=$((n + 1))
+  done
+  [ "$n" -gt 0 ] && log "put back the HiCar identity in /etc/hichain ($n files)"
+fi
+rm -rf "$t"   # it held the Wi-Fi passphrase and Bluetooth keys
+# An install before 31 Oct deleted these directories with their contents, and Carlinkit's own image
+# unpacks its web pages INTO etc/boa/www, silently doing nothing when it is gone.
+for d in etc/boa/www etc/boa/cgi-bin etc/boa/images etc/hichain; do
+  [ -d "$ROOT/$d" ] || { mkdir -p "$ROOT/$d" && log "made /$d again, for Carlinkit's own image"; }
+done
 
 { echo "uptime ${up:-?}s, mode $mode: $why"; echo "reverted version=$ver"; } >> "$EO/last_result.txt"
 {
@@ -64,7 +79,8 @@ rm -rf "$t"   # it held the Wi-Fi passphrase
   echo
   echo "The adapter went back to stock CarPlay: $why."
   echo "Stock CarPlay and Android Auto work as before. HiCar, the Android Mirror helper and the web"
-  echo "pages stay removed; Carlinkit's own 2025.10.15.1127 image puts them back."
+  echo "pages stay removed. Carlinkit's own 2025.10.15.1127 image puts back what it ships; this unit's"
+  echo "HiCar identity is back already, and all of it is in the flash backup on the install's stick."
   echo "To try OCBM again, put the installer on the stick together with an empty file named OCBM_RETRY."
   echo
   echo "--- self-test"; cat "$RUN/ocbm_selftest.txt" 2>/dev/null

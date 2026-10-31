@@ -15,3 +15,6 @@ etc/manufacture_date
 etc/.manufacture_date_sign
 etc/uuid_sign
 var/lib/lockdown
+# The unit's HiCar identity (keystore and device info). The prune empties etc/hichain with HiCar,
+# and Carlinkit's own image ships only an empty etc/hichain: ocbm_revert.sh puts it back from here.
+etc/hichain

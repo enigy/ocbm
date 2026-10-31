@@ -37,23 +37,32 @@
 # An adapter converted by the one-file install (ccpa/installer/) has no NCM to fall back on, and
 # after ocbm_finish.sh no stock either: the way back is this profile, over the OCBM console. SRC is
 # the tree tools/stock_restore_onefile_tree.sh makes from the file-level archive the adapter took
-# of its own rootfs during the trial (stock plus OCBM, OCBM's files dropped). The OCBM dispatcher
-# (/script/start_main_service.sh, mode `final` or `trial`) keeps booting OCBM until ONE rename puts
-# the stock start script over it, so every stopping point boots either OCBM, where this can be run
-# again, or complete stock:
-#   1. create missing directories
+# of its own rootfs during the trial, or from the flash dump on its stick (stock plus OCBM, OCBM's
+# files dropped; from the first install's dump, the factory rootfs with the pruned extras). The OCBM
+# dispatcher (/script/start_main_service.sh, mode `final` or `trial`) keeps booting OCBM until ONE
+# rename puts the stock start script over it, so every stopping point boots either OCBM with its
+# console, where this can be run again, or complete stock:
+#   1. room: remove OCBM's programs other than ocbmd, which carries the console (each through
+#      is_radio()). A trial has stock AND OCBM on flash, about 1.3 MB free, and the extras the
+#      install pruned need about 1.8 MB to come back; this frees about 2 MB. OCBM still boots: the
+#      start script, ocbm_boot.sh, ocbmd and the self-test need none of them. Then create missing
+#      directories
 #   2. restore every file and link except the start script (written .rsnew, md5-checked, renamed;
-#      free space checked before each). No OCBM file is touched yet, so OCBM still boots
+#      free space checked before each)
 #   3. check: anything other than the start script and OCBM's own files still differing stops here
 #   4. THE SWITCH: the stock start script, written as .rsnew, checked, renamed over the dispatcher
-#   5. remove OCBM's files (each through is_radio(): the radio seam's radio_*.sh stay, inert), then
-#      directories left empty; verify
+#   5. remove OCBM's files (each through is_radio(), except OCBM's own radio seam, radio_*.sh in
+#      /script: stock has none, and without OCBM they are dead files), then directories left empty,
+#      then /etc/carplay, OCBM's bond store; verify. The OCBM processes still running (ocbmd carries
+#      the console until the restart) can write /etc/carplay again: verify tolerates it, and
+#      tools/stock_restore.sh removes it once more right before the restart into stock
 # It REFUSES, changing nothing, unless the start script is OCBM's dispatcher, ocbmd and ocbm_boot.sh
 # are there, the mode is `trial` or `final` (a `confirmed` trial finishes when its session ends), no
 # finish is pending, and SRC's start script is stock. It takes ocbm_mode.lock, as ocbm_revert.sh and
 # ocbm_finish.sh do, so none of the three interleave.
 # Test hooks (tools/stock_restore_test.sh): RUN (the lock's directory), STOP_AT=switch (exit 99
-# right before the switch), SKIP_WRITE=<path> (a write that did not land).
+# right before the switch), SKIP_WRITE=<path> (a write that did not land), RECREATE=<path> (a file
+# the running OCBM writes again after step 5).
 set -u
 
 MODE="${1:-plan}"
@@ -70,6 +79,9 @@ export LC_ALL=C
 BOOT_SET="script/custom_init.sh etc/mdev/udisk_insert.sh script/start_main_service.sh etc/init.d/rcS etc/inittab"
 LOGIN_SET="etc/passwd etc/passwd- etc/shadow etc/shadow- etc/dropbear/dropbear_rsa_host_key etc/dropbear/dropbear_dss_host_key root/.ssh/authorized_keys"
 PROTECT="script/ncm_only script/ncm_wifi"
+CONSOLE="usr/sbin/ocbmd"                          # onefile: the program the restore's own console needs
+SEAM="script/radio_ap_up.sh script/radio_detect.sh script/radio_hal.sh"   # OCBM's radio seam, payload
+OCBM_STATE="etc/carplay"                          # OCBM's Bluetooth bond store, written while it runs
 
 say() { echo "[restore] $*"; }
 die() { echo "[restore] ABORT: $*"; echo "RESTORE_ABORT"; exit 1; }
@@ -312,11 +324,12 @@ onefile_refusals() {  # each one stops before anything changes
   return 0
 }
 
-remove_guarded() {  # $1 list of paths, $2 label: as remove_list, but a radio file stays
-  n=0; k=0
+remove_guarded() {  # $1 list of paths, $2 label, $3 paths to leave: as remove_list, but a radio file
+  n=0; k=0           # stays (OCBM's own seam excepted)
   while IFS= read -r p; do
     in_list "$p" "$PROTECT" && continue
-    if is_radio "/$p"; then k=$((k + 1)); continue; fi
+    in_list "$p" "${3:-}" && continue
+    if is_radio "/$p" && ! in_list "$p" "$SEAM"; then k=$((k + 1)); continue; fi
     if [ -L "$ROOT/$p" ] || [ -e "$ROOT/$p" ]; then
       [ -d "$ROOT/$p" ] && [ ! -L "$ROOT/$p" ] && continue
       rm -f "$ROOT/$p" || die "could not remove $p"
@@ -331,6 +344,8 @@ do_apply_onefile() {
   onefile_refusals
   mkdir "$RUN/ocbm_mode.lock" 2>/dev/null || die "a go-back or a finish holds $RUN/ocbm_mode.lock"
   MODE_LOCKED=1
+  remove_guarded "$W/extra_payload" "1/5 room: OCBM programs other than the console's ocbmd" "$CONSOLE"
+  sync
   n=0
   while IFS= read -r p; do mkdir -p "$ROOT/$p" || die "mkdir failed: $p"; n=$((n + 1)); done < "$W/mkdir"
   say "1/5 directories: $n created"
@@ -355,6 +370,10 @@ do_apply_onefile() {
   remove_guarded "$W/extra_late" "5/5 OCBM scripts and settings"
   sort -r "$W/extra_dirs" | while IFS= read -r p; do rmdir "$ROOT/$p" 2>/dev/null && echo x; done > "$W/rmdir.done"
   say "5/5 directories: $(count "$W/rmdir.done") removed (non-empty ones kept)"
+  if [ ! -e "$SRC/$OCBM_STATE" ] && [ -e "$ROOT/$OCBM_STATE" ]; then
+    rm -rf "${ROOT%/}/$OCBM_STATE" && say "5/5 /$OCBM_STATE removed: OCBM's bond store"
+  fi
+  if [ -n "${RECREATE:-}" ]; then mkdir -p "$ROOT/$(dirname "$RECREATE")"; echo "written again" > "$ROOT/$RECREATE"; fi
   sync
 }
 
@@ -362,7 +381,11 @@ remaining() {  # $1 out: differences that still count (not the NCM flags; onefil
   : > "$1"
   while IFS="$TAB" read -r act typ key p; do
     in_list "$p" "$PROTECT" && continue
-    [ "$PROFILE" = onefile ] && [ "$act" = extra ] && is_radio "/$p" && continue
+    if [ "$PROFILE" = onefile ] && [ "$act" = extra ]; then
+      is_radio "/$p" && ! in_list "$p" "$SEAM" && continue
+      # Written again by the OCBM still running; the restart into stock comes after its removal.
+      case "$p" in "$OCBM_STATE"|"$OCBM_STATE"/*) [ -e "$SRC/$OCBM_STATE" ] || continue ;; esac
+    fi
     printf '%s\t%s\t%s\t%s\n' "$act" "$typ" "$key" "$p" >> "$1"
   done < "$W/actions"
 }

@@ -129,9 +129,12 @@ for sh in ${SHELLS:-sh dash}; do
     "nothing is removed beyond prune.list"
   changed="$(comm -23 <(sort "$d/before") <(sort "$d/after") | sed 's/ .*//' | grep -vxF -f "$d/removed")"
   check '[ "$changed" = "./script/start_main_service.sh" ]' "the only rewritten stock file is start_main_service.sh"
-  check '[ "$(wc -l < "$d/root/etc/ocbm/pruned.txt" | tr -d " ")" = 20 ] && grep -qx /etc/boa/www "$d/root/etc/ocbm/pruned.txt"' "pruned.txt records the deletions"
+  check '[ "$(wc -l < "$d/root/etc/ocbm/pruned.txt" | tr -d " ")" = 21 ] && grep -qx /etc/boa/www/index.html "$d/root/etc/ocbm/pruned.txt"' "pruned.txt records the deletions"
+  check '( for x in etc/boa/www etc/boa/cgi-bin etc/boa/images etc/hichain; do [ -d "$d/root/$x" ] && [ -z "$(ls -A "$d/root/$x")" ] || exit 1; done )' \
+    "the prune empties etc/boa/www, cgi-bin, images and etc/hichain but keeps them: Carlinkit's own image unpacks into etc/boa/www"
   check 'gzip -dc "$d/root/etc/ocbm/identity.tgz" | tar -tf - | grep -qx etc/riddle.conf && gzip -dc "$d/root/etc/ocbm/identity.tgz" | tar -tf - | grep -q "^var/lib/lockdown/root_key.pem" && grep -q "^hci0=11:22" "$d/root/etc/ocbm/addresses.txt"' \
     "identity.tgz holds riddle.conf, pairing records and the addresses"
+  check 'gzip -dc "$d/root/etc/ocbm/identity.tgz" | tar -tf - | grep -qx etc/hichain/hks_keystore' "identity.tgz holds the unit's HiCar identity (etc/hichain)"
   B="$d/stick/OCBM_BACKUP/ABCDEF0123456789"
   check '( for n in 0 1 2; do cmp -s "$d/dev/mtd$n" "$B/mtd$n.bin" || exit 1; done; cd "$B" && sha256sum -c SHA256SUMS >/dev/null 2>&1 )' \
     "mtd0-2 are on the stick and verify"
@@ -171,11 +174,15 @@ for sh in ${SHELLS:-sh dash}; do
   done
 
   echo "== $sh: same-version guard after ocbm_revert.sh, and a retry keeps the real stock script"
-  r="$T/$sh-again"; make_box "$r"; run_once "$sh" "$r" >/dev/null; mkdir -p "$r/run"
+  r="$T/$sh-again"; make_box "$r"; hk="$(cksum < "$r/root/etc/hichain/hks_keystore")"; run_once "$sh" "$r" >/dev/null; mkdir -p "$r/run"
   echo 'wpa_passphrase=ocbm' > "$r/root/etc/hostapd.conf"
+  rm -rf "$r/root/etc/boa/www"    # as an install before 31 Oct left it
   env ROOT="$r/root" RUN="$r/run" "$sh" "$r/root/script/ocbm_revert.sh" --no-reboot "test" > "$r/revert.out" 2>&1; rc=$?
   check '[ $rc = 0 ] && [ ! -e "$r/root/script/ocbm_mode" ] && grep -qxF "reverted version=$VER" "$r/root/etc/ocbm/last_result.txt" && grep -qx "wpa_passphrase=secret" "$r/root/etc/hostapd.conf"' \
     "the installed ocbm_revert.sh records the version and puts hostapd.conf back from identity.tgz"
+  check '[ "$(cksum < "$r/root/etc/hichain/hks_keystore")" = "$hk" ] && grep -q "put back the HiCar identity" "$r/revert.out"' \
+    "it puts the unit's HiCar identity back from identity.tgz"
+  check '[ -d "$r/root/etc/boa/www" ] && grep -q "made /etc/boa/www again" "$r/revert.out"' "it makes etc/boa/www again where an older install deleted it"
   echo 2 > "$r/root/etc/ocbm/boot_attempts"
   refresh "$r"; run_once "$sh" "$r"; rc=$?
   check '[ $rc = 1 ] && grep -q "OCBM_RETRY" "$r/stick/OCBM_RESULT.txt"' "an undone version is refused without OCBM_RETRY"

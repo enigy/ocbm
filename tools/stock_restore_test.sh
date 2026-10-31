@@ -120,6 +120,7 @@ make_trial() {  # $1 dir: an adapter in its one-file trial — stock kept, OCBM 
   (cd "$r/id" && tar -cf - etc/hostapd.conf) | gzip -c > "$r/etc/ocbm/identity.tgz"; rm -rf "$r/id"
   echo 'wpa_passphrase=ocbm-rewritten' > "$r/etc/hostapd.conf"
   echo "ccpa-1234" > "$r/etc/carplay_ident"
+  mkdir -p "$r/etc/carplay"; echo "bond: phone A (OCBM)" > "$r/etc/carplay/bt_link_keys"
   echo "crash"     > "$r/script/box_crash.log"
   echo 77          > "$r/var/run/ocbmd.pid"
 }
@@ -164,6 +165,12 @@ onefile_tests() {  # $1 shell
   check '[ $left_ocbm -eq 0 ]' "tree: every path of make_ocbm_installer.sh --list is dropped"
   check '[ "$(cat "$T/tree/etc/hostapd.conf")" = "wpa_passphrase=stock-original" ]' "tree: hostapd.conf comes from the identity archive"
   check '[ ! -e "$T/tree/proc/version" ] && [ -x "$T/tree/usr/sbin/ARMadb-driver" ]' "tree: stock programs kept"
+  check '[ ! -e "$T/tree/etc/carplay" ]' "tree: /etc/carplay, OCBM's bond store, is dropped"
+  check '[ -d "$T/tree/etc/boa/www" ] && [ -d "$T/tree/etc/hichain" ] && [ -d "$T/tree/etc/boa/images" ] && [ -d "$T/tree/etc/boa/cgi-bin" ] && grep -q "deleted, back (empty)" "$T/out"' \
+    "tree: the stock directories an older install deleted are back, for Carlinkit's own image"
+  me="$(id -u)"
+  check 'grep -q "^$me	[0-9]*	usr/sbin/ARMadb-driver$" "$T/tree.owners" && grep -q "^1000	1000	etc/hichain$" "$T/tree.owners"' \
+    "tree: owners come from the archive, a directory made back is 1000:1000 as in the factory image"
   rm -rf "$T/bad"; cp -pR "$T/trial" "$T/bad"; cp "$T/bad/script/start_main_service.stock.sh" "$T/bad/script/start_main_service.sh"
   archive_of "$T/bad" "$T/bad.tgz"; rm -rf "$T/badtree"
   "$SH1" "$TREE" "$T/bad.tgz" "$T/badtree" > "$T/out" 2>&1; rc=$?
@@ -173,18 +180,18 @@ onefile_tests() {  # $1 shell
   "$SH1" "$TREE" "$T/bad.tgz" "$T/badtree" > "$T/out" 2>&1; rc=$?
   check '[ $rc -ne 0 ] && grep -q "no start_main_service.stock.sh" "$T/out"' "tree: refuses an archive without the stock start script"
 
-  # The pack for the box: exactly the tree. macOS tar adds a ._ AppleDouble entry per file that has
-  # extended attributes unless COPYFILE_DISABLE is set (the Mac's dry run of 28 Oct planned 702); this
-  # host's tar never does, so a tar that notes its environment shows the pack sets it.
-  rm -rf "$T/fakebin" "$T/tar.env" "$T/pack.tgz"; mkdir -p "$T/fakebin"
-  printf '#!/bin/sh\necho "COPYFILE_DISABLE=${COPYFILE_DISABLE:-unset} $1" >> "%s"\nexec %s "$@"\n' "$T/tar.env" "$(command -v tar)" > "$T/fakebin/tar"
-  chmod 755 "$T/fakebin/tar"
-  PATH="$T/fakebin:$PATH" "$SH1" "$TREE" --pack "$T/tree" "$T/pack.tgz" > "$T/out" 2>&1; rc=$?
+  # The pack for the box (tools/pack_tree.py): exactly the tree, no AppleDouble entry, each entry owned
+  # as on the adapter. A plain tar from the Mac made restored files 502:20 (a tester, Oct 2026).
+  rm -f "$T/pack.tgz"
+  command -v xattr >/dev/null 2>&1 && xattr -w com.ocbm.test 1 "$T/tree/etc/inittab" 2>/dev/null
+  "$SH1" "$TREE" --pack "$T/tree" "$T/pack.tgz" > "$T/out" 2>&1; rc=$?
   check '[ $rc -eq 0 ] && grep -q PACK_OK "$T/out" && grep -q "exactly the tree" "$T/out"' "pack: the tree packs, entry for entry"
-  check '[ "$(head -1 "$T/tar.env")" = "COPYFILE_DISABLE=1 -czf" ]' "pack: tar packs with COPYFILE_DISABLE=1"
-  check '[ "$(gzip -dc "$T/pack.tgz" | tar -tf - | grep -c "start_main_service.sh")" -eq 1 ] && ! gzip -dc "$T/pack.tgz" | tar -tf - | grep -q "/\._"' "pack: the stock start script is in it, no AppleDouble entry"
-  # The bad packs below are made with COPYFILE_DISABLE=1 and without ._ names, so they hold the same
-  # entries whatever the host's tar (macOS tar treats ._ names its own way; 28 Oct, the Mac).
+  check '[ "$(gzip -dc "$T/pack.tgz" | tar -tf - | grep -c "start_main_service.sh")" -eq 1 ] && ! gzip -dc "$T/pack.tgz" | tar -tf - | grep -q "\._"' \
+    "pack: the stock start script is in it, no AppleDouble entry (even for a file with extended attributes)"
+  check '[ "$(python3 -I -c "import tarfile,sys; m=tarfile.open(sys.argv[1]).getmember(\"./usr/sbin/ARMadb-driver\"); print(m.uid, m.uname or \"-\")" "$T/pack.tgz")" = "$me -" ]' \
+    "pack: each entry carries its owner from TREE.owners, numeric only"
+  # The bad packs below are made with this host's tar, which records this host's user: refused on
+  # owners too, which is the 502:20 case.
   rm -rf "$T/mac"; cp -pR "$T/tree" "$T/mac"; echo "not stock" > "$T/mac/bin/extra"
   (cd "$T/mac" && COPYFILE_DISABLE=1 tar -czf "$T/mac.tgz" .)
   "$SH1" "$TREE" --check "$T/tree" "$T/mac.tgz" > "$T/out" 2>&1; rc=$?
@@ -193,20 +200,54 @@ onefile_tests() {  # $1 shell
   (cd "$T/mac" && COPYFILE_DISABLE=1 tar -czf "$T/mac.tgz" .)
   "$SH1" "$TREE" --check "$T/tree" "$T/mac.tgz" > "$T/out" 2>&1; rc=$?
   check '[ $rc -ne 0 ] && grep -q "not in the pack: 1, first etc/inittab" "$T/out"' "pack: refuses a pack missing a file of the tree"
-  # AppleDouble files in the tree itself (made on a FAT or exFAT volume): refused whether tar packs
-  # them or leaves them out, the second by a tar that skips ._ names.
+  rm -rf "$T/mac"; cp -pR "$T/tree" "$T/mac"
+  (cd "$T/mac" && COPYFILE_DISABLE=1 tar -czf "$T/mac.tgz" .)
+  printf '0\t0\t%s\n' $(cd "$T/mac" && find . | sed '1d; s#^\./##') > "$T/mac.owners"
+  "$SH1" "$TREE" --check "$T/mac" "$T/mac.tgz" > "$T/out" 2>&1; rc=$?
+  if [ "$me" != 0 ]; then
+    check '[ $rc -ne 0 ] && grep -q "owned otherwise than on the adapter" "$T/out" && [ ! -e "$T/mac.tgz" ]' "pack: refuses a pack owned by this Mac's user where the adapter's owner is root"
+  fi
+  rm -f "$T/mac.owners"
+  # AppleDouble files in the tree itself (made on a FAT or exFAT volume): refused when packed, and
+  # when a pack leaves them out.
   rm -rf "$T/mac"; cp -pR "$T/tree" "$T/mac"; echo "AppleDouble" > "$T/mac/etc/._inittab"
   "$SH1" "$TREE" --pack "$T/mac" "$T/mac.tgz" > "$T/out" 2>&1; rc=$?
   check '[ $rc -ne 0 ] && grep -q "AppleDouble files: 1, first etc/._inittab" "$T/out" && [ ! -e "$T/mac.tgz" ]' "pack: refuses AppleDouble files in the tree itself (a FAT or exFAT volume)"
-  rm -rf "$T/skipbin"; mkdir -p "$T/skipbin"
-  printf '#!/bin/sh\ncase "$1" in -c*) exec %s --exclude="._*" "$@" ;; esac\nexec %s "$@"\n' "$(command -v tar)" "$(command -v tar)" > "$T/skipbin/tar"
-  chmod 755 "$T/skipbin/tar"
-  PATH="$T/skipbin:$PATH" "$SH1" "$TREE" --pack "$T/mac" "$T/mac.tgz" > "$T/out" 2>&1; rc=$?
+  (cd "$T/mac" && COPYFILE_DISABLE=1 tar -czf "$T/mac.tgz" --exclude="._*" .)
+  "$SH1" "$TREE" --check "$T/mac" "$T/mac.tgz" > "$T/out" 2>&1; rc=$?
   check '[ $rc -ne 0 ] && grep -q "AppleDouble files: 1, first etc/._inittab" "$T/out" && grep -q "not in the pack: 1, first etc/._inittab" "$T/out" && [ ! -e "$T/mac.tgz" ]' \
-    "pack: refuses them too when tar leaves them out of the pack"
-  rm -rf "$T/mac" "$T/mac.tgz" "$T/pack.tgz" "$T/fakebin" "$T/skipbin" "$T/tar.env"
+    "pack: refuses them too when the pack leaves them out"
+  rm -rf "$T/mac" "$T/mac.tgz" "$T/pack.tgz"
+
+  # The stock tree from a flash dump (--dump): tools/jffs2_extract_test.py writes a tree as an image
+  # the way Carlinkit's kernel stores it (type-22 nodes, uid 1000).
+  python3 -I "$HERE/jffs2_extract_test.py" --make-image "$T/trial" "$T/trial.bin"
+  rm -rf "$T/dtree" "$T/dtree.owners"
+  "$SH1" "$TREE" --dump "$T/trial.bin" "$T/dtree" > "$T/out" 2>&1; rc=$?
+  check '[ $rc -eq 0 ] && grep -q TREE_OK "$T/out" && [ "$(cat "$T/dtree/script/start_main_service.sh")" = "stock start_main_service" ]' "dump of a trial: the stock tree, start script back"
+  check '[ ! -e "$T/dtree/usr/sbin/ocbmd" ] && [ ! -e "$T/dtree/etc/ocbm" ] && [ ! -e "$T/dtree/etc/carplay" ] && [ "$(cat "$T/dtree/etc/hostapd.conf")" = "wpa_passphrase=stock-original" ]' \
+    "dump of a trial: OCBM, /etc/ocbm and /etc/carplay dropped, hostapd.conf from the identity archive"
+  check 'cmp -s "$T/dtree/usr/sbin/ARMadb-driver" "$T/tree/usr/sbin/ARMadb-driver" && grep -q "^1000	0	usr/sbin/ARMadb-driver$" "$T/dtree.owners"' \
+    "dump of a trial: the same files as the archive gives, owned as in the image (1000)"
+  # A dump from before any install: the factory rootfs, extras included, taken as it is.
+  rm -rf "$T/stock"; cp -pR "$T/dtree" "$T/stock"; blob "$T/stock/usr/sbin/ARMHiCar" 30000; chmod 755 "$T/stock/usr/sbin/ARMHiCar"
+  echo "hichain identity" > "$T/stock/etc/hichain/hks_keystore"
+  python3 -I "$HERE/jffs2_extract_test.py" --make-image "$T/stock" "$T/stock.bin"
+  rm -rf "$T/ftree" "$T/ftree.owners"
+  "$SH1" "$TREE" --dump "$T/stock.bin" "$T/ftree" > "$T/out" 2>&1; rc=$?
+  check '[ $rc -eq 0 ] && grep -q "before any install" "$T/out" && cmp -s "$T/ftree/usr/sbin/ARMHiCar" "$T/stock/usr/sbin/ARMHiCar" && [ -s "$T/ftree/etc/hichain/hks_keystore" ]' \
+    "dump from before any install: taken as it is, the extras included"
+  rm -rf "$T/bad"; cp -pR "$T/stock" "$T/bad"; blob "$T/bad/usr/sbin/ocbmd" 100
+  python3 -I "$HERE/jffs2_extract_test.py" --make-image "$T/bad" "$T/bad.bin"; rm -rf "$T/badtree"
+  "$SH1" "$TREE" --dump "$T/bad.bin" "$T/badtree" > "$T/out" 2>&1; rc=$?
+  check '[ $rc -ne 0 ] && grep -q "OCBM.s programs but a stock start script" "$T/out"' "dump: refuses OCBM's programs behind a stock start script"
+  head -c 70000 /dev/urandom > "$T/bad.bin"; rm -rf "$T/badtree"
+  "$SH1" "$TREE" --dump "$T/bad.bin" "$T/badtree" > "$T/out" 2>&1; rc=$?
+  check '[ $rc -ne 0 ] && grep -q "did not decode cleanly" "$T/out"' "dump: refuses one that does not decode"
+  rm -rf "$T/bad" "$T/badtree" "$T/bad.bin"
 
   rm -rf "$T/box"; cp -pR "$T/fin" "$T/box"
+  blob "$T/box/lib/firmware/nxp/added_after.bin" 300    # a radio file of the unit's, added after the archive
   before=$(tree_sum "$T/box")
   run_onefile "$SH1" plan "$T/box"; rc=$?
   check '[ $rc -eq 0 ] && grep -q RESTORE_PLAN_OK "$T/out" && grep -q "switch      :" "$T/out"' "plan succeeds and names the switch"
@@ -216,7 +257,10 @@ onefile_tests() {  # $1 shell
   run_onefile "$SH1" apply "$T/box" STOP_AT=switch; rc=$?
   check '[ $rc -eq 99 ] && grep -q "3/5 check" "$T/out"' "apply reaches the check before the switch"
   check 'cmp -s "$T/tree/usr/sbin/ARMadb-driver" "$T/box/usr/sbin/ARMadb-driver" && [ "$(readlink "$T/box/usr/lib/libssl.so")" = libssl.so.1.1 ]' "before the switch: the Carlinkit stack is back"
-  check 'is_dispatcher "$T/box" && [ -x "$T/box/usr/sbin/ocbmd" ] && [ -f "$T/box/script/ocbm_boot.sh" ] && [ "$(cat "$T/box/script/ocbm_mode")" = final ]' "OCBM kept until the switch"
+  check 'is_dispatcher "$T/box" && [ -x "$T/box/usr/sbin/ocbmd" ] && [ -f "$T/box/script/ocbm_boot.sh" ] && [ "$(cat "$T/box/script/ocbm_mode")" = final ]' \
+    "OCBM still boots with its console until the switch: the start script, ocbmd, ocbm_boot.sh, the mode"
+  check '[ ! -e "$T/box/usr/sbin/carplayd" ] && [ ! -e "$T/box/usr/sbin/iap2d" ] && awk "/1\/5 room/{a=NR} /2\/5 files/{b=NR} END{exit !(a && a<b)}" "$T/out"' \
+    "room first: OCBM's other programs go before any stock file is written"
   check '[ ! -e "$T/run1/ocbm_mode.lock" ]' "the mode lock is released after a stop"
 
   run_onefile "$SH1" apply "$T/box"; rc=$?
@@ -224,12 +268,18 @@ onefile_tests() {  # $1 shell
   check 'awk "/2\/5 files/{a=NR} /3\/5 check/{b=NR} /4\/5 switch/{c=NR} /5\/5 OCBM programs/{d=NR} END{exit !(a<b && b<c && c<d)}" "$T/out"' "order: stock files, check, switch, then OCBM's files"
   check '[ "$(cat "$T/box/script/start_main_service.sh")" = "stock start_main_service" ]' "the stock start script is in place"
   check '[ ! -e "$T/box/usr/sbin/ocbmd" ] && [ ! -e "$T/box/etc/ocbm" ] && [ ! -e "$T/box/script/ocbm_mode" ] && [ ! -e "$T/box/script/ocbm_boot.sh" ]' "OCBM's files removed after the switch"
-  check '[ -e "$T/box/script/radio_hal.sh" ] && grep -q "kept by the radio guard" "$T/out"' "the radio guard keeps the radio seam"
+  check '[ ! -e "$T/box/script/radio_hal.sh" ] && [ ! -e "$T/box/script/radio_detect.sh" ] && [ ! -e "$T/box/script/radio_ap_up.sh" ]' "OCBM's radio seam goes with OCBM: stock has none"
+  check '[ -e "$T/box/lib/firmware/nxp/added_after.bin" ] && grep -q "1 kept by the radio guard" "$T/out"' "the radio guard still keeps the unit's own radio files"
+  check '[ ! -e "$T/box/etc/carplay" ] && grep -q "/etc/carplay removed" "$T/out"' "/etc/carplay, OCBM's bond store, is removed"
   check 'grep -q "^/script/update_box.sh" "$T/box/etc/mdev/udisk_insert.sh"' "the stick handler calls the stock updater again"
   check '[ "$(cat "$T/box/etc/hostapd.conf")" = "wpa_passphrase=stock-original" ] && [ "$(cat "$T/box/etc/bluetooth/keys")" = "bond: phone A" ]' "Wi-Fi settings and bonds as in the trial archive"
   check '[ -z "$(find "$T/box" -name "*.rsnew")" ] && [ ! -e "$T/run1/ocbm_mode.lock" ]' "no .rsnew and no lock left behind"
   run_onefile "$SH1" verify "$T/box"; rc=$?
   check '[ $rc -eq 0 ] && grep -q RESTORE_VERIFIED "$T/out"' "verify passes after apply"
+  mkdir -p "$T/box/etc/carplay"; echo "written again" > "$T/box/etc/carplay/bt_link_keys"
+  run_onefile "$SH1" verify "$T/box"; rc=$?
+  check '[ $rc -eq 0 ] && grep -q RESTORE_VERIFIED "$T/out"' "verify tolerates /etc/carplay written again by the OCBM still running"
+  rm -rf "$T/box/etc/carplay"
   before=$(tree_sum "$T/box")
   run_onefile "$SH1" apply "$T/box"; rc=$?
   check '[ $rc -ne 0 ] && grep -q "not OCBM.s dispatcher" "$T/out" && [ "$(tree_sum "$T/box")" = "$before" ]' "refusal without the OCBM start script, nothing changed"
@@ -244,7 +294,8 @@ onefile_tests() {  # $1 shell
   rm -rf "$T/box"; cp -pR "$T/fin" "$T/box"
   run_onefile "$SH1" apply "$T/box" FAKE_FREE_KB=10; rc=$?
   check '[ $rc -ne 0 ] && grep -q "no room for" "$T/out" && grep -q RESTORE_ABORT "$T/out"' "too little flash aborts"
-  check 'is_dispatcher "$T/box" && [ "$(cat "$T/box/script/ocbm_mode")" = final ] && [ -z "$(find "$T/box" -name "*.rsnew")" ]' "the abort leaves OCBM booting and no partial file"
+  check 'is_dispatcher "$T/box" && [ -x "$T/box/usr/sbin/ocbmd" ] && [ "$(cat "$T/box/script/ocbm_mode")" = final ] && [ -z "$(find "$T/box" -name "*.rsnew")" ]' \
+    "the abort leaves OCBM booting with its console, and no partial file"
   run_onefile "$SH1" apply "$T/box"; rc=$?
   check '[ $rc -eq 0 ] && grep -q RESTORE_DONE "$T/out"' "a re-run after the shortfall converges"
 
@@ -267,6 +318,19 @@ onefile_tests() {  # $1 shell
     check '[ $rc -ne 0 ] && grep -q "$want" "$T/out" && [ "$(tree_sum "$T/box")" = "$before" ]' "refuses ($case_), nothing changed"
   done
   rm -rf "$T/run1" "$T/tree2"
+
+  # The OCBM still running writes its bond store again after step 5: apply still ends RESTORE_DONE.
+  rm -rf "$T/box"; cp -pR "$T/fin" "$T/box"
+  run_onefile "$SH1" apply "$T/box" RECREATE=etc/carplay/bt_link_keys; rc=$?
+  check '[ $rc -eq 0 ] && grep -q RESTORE_DONE "$T/out"' "apply tolerates /etc/carplay written again after its removal (a tester, Oct 2026)"
+
+  # From the factory dump onto a trial: the extras the install pruned come back, OCBM goes.
+  rm -rf "$T/box"; cp -pR "$T/trial" "$T/box"
+  run_onefile "$SH1" apply "$T/box" SRC="$T/ftree"; rc=$?
+  check '[ $rc -eq 0 ] && grep -q RESTORE_DONE "$T/out" && cmp -s "$T/box/usr/sbin/ARMHiCar" "$T/ftree/usr/sbin/ARMHiCar" && [ -s "$T/box/etc/hichain/hks_keystore" ]' \
+    "a trial restored from the factory dump gets the pruned extras and the HiCar identity back"
+  check '[ ! -e "$T/box/usr/sbin/ocbmd" ] && [ ! -e "$T/box/script/radio_hal.sh" ] && [ ! -e "$T/box/etc/carplay" ] && [ "$(cat "$T/box/script/start_main_service.sh")" = "stock start_main_service" ]' \
+    "and nothing of OCBM's is left"
 
   # The rehearsal: the same restore from a trial that was never finished.
   rm -rf "$T/box"; cp -pR "$T/trial" "$T/box"
@@ -333,6 +397,15 @@ for SH in $SHELLS; do
 
   onefile_tests "$SH"
 done
+
+echo "=== the driver's apply monitor (tools/stock_restore.sh) under set -euo pipefail"
+DRIVER="$HERE/stock_restore.sh"
+out_=$(bash -c 'set -euo pipefail; eval "$(sed -n "/^new_steps() {/,/^}/p" "$1")"; new_steps "staging, no step yet" "^\[restore\] [0-9]/5|^RESTORE_" 0 | wc -l | tr -d " "; echo survived' _ "$DRIVER" 2>&1)
+check '[ "$out_" = "0
+survived" ]' "a log with no step lines yet does not end the driver (it did, silently, right after === apply)"
+out_=$(bash -c 'set -euo pipefail; eval "$(sed -n "/^new_steps() {/,/^}/p" "$1")"; new_steps "$(printf "[restore] 1/5 room\n[restore] x\n[restore] 2/5 files\nRESTORE_DONE\n")" "^\[restore\] [0-9]/5|^RESTORE_" 1' _ "$DRIVER" 2>&1)
+check '[ "$out_" = "[restore] 2/5 files
+RESTORE_DONE" ]' "it shows only the step lines not yet shown"
 
 echo
 if [ "$fails" -eq 0 ]; then echo "stock_restore_test: all passed"; exit 0; fi

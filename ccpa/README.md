@@ -69,20 +69,22 @@ runs it end to end against synthetic stock trees.
 |---|---|
 | `once.sh` | Stage A, run by the stock updater before its copy step: checks (refuse = nothing changed; a payload file already on the adapter is refused unless `/etc/ocbm` exists, except the `radio_*.sh` seam a restore keeps), flash backup to the stick + `/etc/ocbm/identity.tgz`, `prune.list`, place the payload, keep `start_main_service.stock.sh`, then rename the dispatcher over `start_main_service.sh` as the one boot-critical write |
 | `finish.sh` | writes `OCBM_RESULT.txt` (once.sh keeps the one before as `OCBM_RESULT.prev.txt`), parks the stick image, restarts into the trial |
-| `prune.list` | what goes to make room while stock CarPlay/AA stay as the fallback: HiCar, Android Mirror helper, test leftovers, web UI pages. Every match still passes `is_radio()` |
-| `identity.list` | unit identity archived before anything changes (holds secrets: never log or commit it) |
+| `prune.list` | what goes to make room while stock CarPlay/AA stay as the fallback: HiCar, Android Mirror helper, test leftovers, web UI pages. Every match still passes `is_radio()`; a directory is emptied, never deleted (Carlinkit's own image unpacks its web pages into `etc/boa/www`) |
+| `identity.list` | unit identity archived before anything changes, the HiCar identity in `etc/hichain` included (holds secrets: never log or commit it) |
 | `ocbm_dispatch.sh` | Stage B, installed as `/script/start_main_service.sh` (carries `# OCBM_DISPATCH`). No `/script/ocbm_mode`: `exec` the kept `start_main_service.stock.sh`, and copy a pending revert report to the next stick. `trial`/`confirmed`: count the start (two in a row without a passing self-test go back to stock), create `/tmp/not_change_mass_storage` so the stock stick handler leaves the USB port alone, run `ocbm_boot.sh`, respawn `ocbmd` and the supervisor in loops of its own (the install leaves `/etc/inittab` alone), run the self-test, watch the stick for `OCBM_RESTORE`. `final`: OCBM only |
 | `ocbm_selftest.sh` | passes when, within 30 s, the gadget is the OCBM accessory (`1314:2d00`), `/dev/usb_accessory` exists, `ocbmd` runs and `radio_detect.sh` resolves this unit's own radio bring-up. No car or app needed. In `confirmed`, a pass runs `ocbm_finish.sh` |
-| `ocbm_revert.sh` | back to stock: puts `/etc/hostapd.conf` back from `identity.tgz`, appends the reason and `reverted version=<VERSION>` to `/etc/ocbm/last_result.txt` (once.sh's same-version guard, stick installs only), writes the stick report, removes `/script/ocbm_mode`, restarts. Refuses in `final` |
+| `ocbm_revert.sh` | back to stock: puts `/etc/hostapd.conf` and the HiCar identity (`/etc/hichain`) back from `identity.tgz`, makes the directories an older prune deleted again, appends the reason and `reverted version=<VERSION>` to `/etc/ocbm/last_result.txt` (once.sh's same-version guard, stick installs only), writes the stick report, removes `/script/ocbm_mode`, restarts. Refuses in `final` |
 | `ocbm_finish.sh` | Stage C: once an app that offers the way back has sent `MGMT_INSTALL_CONFIRM` and that session is over (`ocbmd` starts it on host-gone with a 60 s grace a reconnecting app cancels; the start script runs it after a passing self-test if the power was cut first), it writes `final` + `/etc/ocbm/finish_pending`, removes `ncm_base_install.sh`'s strip set (a test keeps the lists equal; every candidate through `is_radio()`, libraries only when no surviving file names them), comments the updater call out of the stick handlers, and clears `finish_pending`. A start in `final` that finds `finish_pending` resumes it. Shares a lock with `ocbm_revert.sh` |
 
 Tested on the host by `tools/ocbm_installer_test.sh` (Stage A) and `tools/ocbm_stageb_test.sh` (Stages B
 and C). On the bench, `ocbm-host install [vid pid] info|confirm|stock` stands in for the app.
 
 After `final` there is no `ocbm_revert.sh` way back. `tools/stock_restore.sh --profile onefile` restores
-stock over the OCBM console from the archive the unit took of its rootfs during the trial, keeping the
-dispatcher booting OCBM until one rename of the stock start script (docs/ops/01_RECOVERY.md, "Back to
-stock from a one-file install"; tested by `tools/stock_restore_test.sh`).
+stock over the OCBM console, keeping the dispatcher booting OCBM until one rename of the stock start
+script, from the stick's own flash dump (`--dump`: `OCBM_BACKUP/<serial>/mtd2.bin`, decoded by
+`tools/jffs2_extract.py`; the first install's dump is the factory rootfs, the pruned extras included)
+or from an archive the unit took of its rootfs during a trial (docs/ops/01_RECOVERY.md, "Back to stock
+from a one-file install"; tested by `tools/stock_restore_test.sh` and `tools/jffs2_extract_test.py`).
 
 ## Daemons — `ocbmd/`, `iap2d/`, `carplayd/` (shipped, hardware-validated) + `mfid/` (bring-up only)
 
