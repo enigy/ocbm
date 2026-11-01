@@ -316,9 +316,11 @@ console, from one of the unit's own backups:
   `tar` had left that tree's links root's too; since then each link takes its owner from
   `/tmp/rs.links` (see the pack, above), not yet run on an adapter. A one-off stick set the dev
   adapter's 20 to 1000:0 that night: its owners then matched the dump in 889 of 891 entries (the other
-  two are runtime, `/var/run` and the DHCP lease file) and its survey in 888, as before. After each
-  survey stick, a failed update on purpose, the adapter stayed off USB, its stick share included, until
-  the next power cycle, as `tools/stock_survey.sh` says of stock after a failed update. Carlink's builds still leave the confirm off
+  two are runtime, `/var/run` and the DHCP lease file) and its survey in 888, as before. After that
+  survey stick and the one before it, both failed updates on purpose, the adapter showed as stock for
+  a second and then stayed off USB, its stick share included, until the next power cycle; after the
+  one earlier that day it stayed on USB as `1314:1520` with CarPlay down, which is what
+  `tools/stock_survey.sh` describes. Why it differs is not known. Carlink's builds still leave the confirm off
   (`-Pcarlink.installConfirm`). The flash dump and an SPI programmer stay the last resort.
 
 ### UART console reference
