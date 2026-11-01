@@ -322,7 +322,10 @@ console, from one of the unit's own backups:
   way back (status 0; Settings › Adapter then read "Removed when this drive ends"). Stopping the
   emulator ended the session at the USB level, and `ocbmd` exited for respawn on the read error
   without starting the finish, so the adapter stayed `confirmed`; `ocbmd` now starts it on that exit
-  too, not yet run on an adapter (see `ccpa/README.md`, `ocbm_finish.sh`). The next power-on ran the finish from the start script once the self-test had
+  too (`609b9d2`, see `ccpa/README.md`, `ocbm_finish.sh`). The same night the route ran again on
+  `609b9d2`: Carlink's confirm, the emulator stopped, and `ocbmd` logged "the confirmed session
+  ended" on its way out; after its grace the finish removed the same 105 entries with no replug, and
+  the `--dump` restore took the adapter from `final` to stock once more. The next power-on ran the finish from the start script once the self-test had
   passed: the same 105 entries, 4,244 KB free. From `final` the `--dump` restore then gave every link
   it made its owner: straight after it the owners matched the dump in 889 of 891 entries and the
   survey in 888, with 1,732 KB free and no one-off stick. A survey stick fails the update on
