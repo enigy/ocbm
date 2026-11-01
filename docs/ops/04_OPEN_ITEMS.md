@@ -93,11 +93,17 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
      `CT_PHONE_IDENT.deviceID == B`. **Benched 2026-11-01 on the dev adapter (IW416, installer
      6affefc) with ONE iPhone only:** `CAP_PHONE_SWITCH` advertised (caps `0x7ff`); pairing, a
      wireless session and a reconnect `btd` paged out all ran on the new `btd` with no hold logged;
-     Carlink's Connect stays disabled on the projecting phone's row. The switch itself is unmeasured
-     until a second iPhone is on the bench. Watch three things then: `btd` re-entering
-     `run_active_session` in-process (a CCPA has no arbiter, so `btd` runs standalone and has never
-     done it); the dropped iPhone rejoining over Wi-Fi during the hold, which gates Bluetooth only;
-     and the teardown plus the new phone's bring-up fitting inside the 45 s.
+     Carlink's Connect stays disabled on the projecting phone's row. **Two iPhones the same afternoon:
+     it switches on Bluetooth and fails on Wi-Fi.** `btd` re-entered `run_active_session` in-process
+     (the bring-up redone in 2.6 s) and paged only phone B, identified 9 s after the tap. But phone A
+     stayed on the AP: the new `carplayd`'s browse loop dialled A's `_carplay-ctrl` first
+     (`ccpa/carplayd/src/discovery.rs` dials every phone it resolves) and A projected again; B's
+     control connection then preempted it (`main.rs` accept thread, "hijack: new control connection
+     preempts the current session"), and B's session ended 15 s later, leaving neither. With A's
+     Wi-Fi off, B held. The fix, handed to the remote agent: `btd` tells `carplayd` which phone it
+     serves, and `carplayd` dials and keeps only that phone; optionally the dropped phone is
+     deauthenticated from the AP for the hold. Until it lands, no adapter, the truck's included,
+     should get `3d492a2` or newer.
   3. **"Phone drop on host re-SUBSCRIBE" (`PROJ_MODE NONE` then `SESSION_EVENT PHONE_ABSENT` after
      an app relaunch) — NOT reproduced, 2026-09-25.** Three timelines, all wired, the phone never
      left the bus in any: (a) kill-without-STOP relaunch (`adb install -r`): SUBSCRIBE → stale
