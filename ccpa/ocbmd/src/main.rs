@@ -1611,6 +1611,14 @@ fn start_install_finish() {
         .spawn();
 }
 
+/// A host is gone: a confirmed trial's session is over, so start the finish. `go_idle` and the
+/// transport-loss exits ([`clear_session_state_for_exit`]) both decide here.
+fn finish_if_confirmed(mode_file: &str, start: impl FnOnce()) {
+    if install_mode(mode_file) == "confirmed" {
+        start();
+    }
+}
+
 // --- Updating OCBM in place (ccpa/installer/ocbm_update.sh, MGMT_UPDATE): the host pushes a package
 // to UPDATE_PACKAGE over CH_FILE and names its SHA-256; the script places it as a trial that the
 // dispatcher keeps or undoes at the next start. The journal and the last outcome live in /etc/ocbm.
@@ -2233,9 +2241,7 @@ impl Daemon {
             self.conns.clear();
         }
         // The one-file install: the session after the confirm is over, so stock goes now.
-        if install_mode(INSTALL_MODE_FILE) == "confirmed" {
-            start_install_finish();
-        }
+        finish_if_confirmed(INSTALL_MODE_FILE, start_install_finish);
     }
 
     /// Watchdog: called each poll tick. If subscribed but the last heartbeat is older than the grace,
@@ -4327,7 +4333,12 @@ fn acquire_pid_lock(path: &str) -> std::io::Result<RawFd> {
 /// It exists because the hang this file's [`BtProbe`] fixes had NO outward symptom the supervisor
 /// could see: the process was alive and holding its pid lock, `/tmp/host_present` still read 1, and
 /// it never exited, so nothing respawned it for >5 minutes. A pid is not liveness.
+#[cfg(not(test))]
 const ALIVE_FILE: &str = "/tmp/ocbmd_alive";
+/// A test runs the transport-loss exits' cleanup, which deletes this file: under the real name a
+/// `cargo test` on the box would make a live ocbmd look gone to the supervisor.
+#[cfg(test)]
+const ALIVE_FILE: &str = "/tmp/ocbmd_selftest_alive";
 
 /// Rate limit on [`touch_alive_file`]: the dispatch loop wakes thousands of times/sec during A/V and
 /// the supervisor polls at ~1 Hz, so more than 1 Hz here is pure syscall overhead.
@@ -4350,7 +4361,13 @@ fn touch_alive_file() {
 /// supervisor believed a host was attached with nothing left to talk to. Replays exactly the pure
 /// file effects `go_idle` and `main()`'s startup perform; the `SEV_HOST_GONE` frame is deliberately
 /// NOT sent, because the accessory fd that would carry it is precisely what just died.
-fn clear_session_state_for_exit() {
+///
+/// It also replays `go_idle`'s last step, the one-file install's finish: without it a confirmed
+/// adapter whose USB link dropped kept stock until its next start (the dev adapter, 31 Oct: the
+/// emulator stopped, ocbmd exited here, and the respawned ocbmd had no session to end). The finish
+/// starts last, once the presence flag reads 0, because its grace ends at once on a 1. The callers
+/// pass `INSTALL_MODE_FILE` and `start_install_finish`; they are parameters so a test can watch that.
+fn clear_session_state_for_exit(mode_file: &str, start_finish: impl FnOnce()) {
     write_flag_atomic(HOST_PRESENT_FLAG, false);
     clear_cfg_file();
     let _ = std::fs::remove_file(RADIO_OFF_FLAG);
@@ -4358,6 +4375,7 @@ fn clear_session_state_for_exit() {
     // Only reached after the file was created; the earlier exits (duplicate instance, ACC_DEV,
     // required listener) must NOT remove it, one of them because a LIVE instance owns it.
     let _ = std::fs::remove_file(ALIVE_FILE);
+    finish_if_confirmed(mode_file, start_finish);
 }
 
 fn main() {
@@ -4692,7 +4710,7 @@ fn main() {
                             // (A host-app quit does NOT trigger this: it stops reading bulk but leaves the
                             // gadget bound; only a real cable/gadget teardown HUPs this fd.)
                             eprintln!("[ocbmd] accessory POLLHUP/POLLERR — USB transport gone; exiting for respawn");
-                            clear_session_state_for_exit();
+                            clear_session_state_for_exit(INSTALL_MODE_FILE, start_install_finish);
                             std::process::exit(1);
                         }
                     }
@@ -4714,7 +4732,7 @@ fn main() {
                             eprintln!(
                                 "[ocbmd] accessory EOF on read — USB transport gone; exiting for respawn"
                             );
-                            clear_session_state_for_exit();
+                            clear_session_state_for_exit(INSTALL_MODE_FILE, start_install_finish);
                             std::process::exit(1);
                         }
                         Ok(n) => {
@@ -4735,7 +4753,7 @@ fn main() {
                             eprintln!(
                                 "[ocbmd] accessory read error ({e}) — USB transport gone; exiting for respawn"
                             );
-                            clear_session_state_for_exit();
+                            clear_session_state_for_exit(INSTALL_MODE_FILE, start_install_finish);
                             std::process::exit(1);
                         }
                     }
@@ -5114,6 +5132,39 @@ mod tests {
         let _ = std::fs::remove_file(&f);
         assert!(confirm_install(&f).is_err());
         assert!(!std::path::Path::new(&f).exists(), "a refused confirm creates no mode file");
+    }
+
+    #[test]
+    fn a_gone_host_starts_the_finish_only_for_a_confirmed_trial() {
+        let f = install_tmp("gone");
+        for (body, want) in [("confirmed\n", true), ("trial\n", false), ("final\n", false)] {
+            std::fs::write(&f, body).unwrap();
+            let mut started = false;
+            finish_if_confirmed(&f, || started = true);
+            assert_eq!(started, want, "{body:?}");
+        }
+        let _ = std::fs::remove_file(&f);
+        let mut started = false;
+        finish_if_confirmed(&f, || started = true);
+        assert!(!started, "no one-file install: nothing to finish");
+    }
+
+    #[test]
+    fn a_transport_loss_exit_starts_the_finish_once_presence_reads_gone() {
+        // The exits for respawn leave without go_idle, so a confirmed adapter whose USB link dropped kept
+        // stock until its next start (the dev adapter, 31 Oct). The finish's grace ends at once on a 1.
+        let _flag = presence_flag_lock(); // shares HOST_PRESENT_FLAG with every other presence test
+        let f = install_tmp("exit");
+        std::fs::write(&f, "confirmed\n").unwrap();
+        write_flag_atomic(HOST_PRESENT_FLAG, true);
+        let mut flag_at_start = None;
+        clear_session_state_for_exit(&f, || flag_at_start = std::fs::read_to_string(HOST_PRESENT_FLAG).ok());
+        assert_eq!(flag_at_start.as_deref(), Some("0"), "the finish starts, and only once presence reads 0");
+        std::fs::write(&f, "trial\n").unwrap();
+        let mut started = false;
+        clear_session_state_for_exit(&f, || started = true);
+        assert!(!started, "a trial nobody confirmed is not finished");
+        let _ = std::fs::remove_file(&f);
     }
 
     #[test]
