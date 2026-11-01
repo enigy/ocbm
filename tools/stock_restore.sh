@@ -10,7 +10,8 @@
 #   preflight  backup checksums; the box answers; mtd0 + mtd1 on the box are byte-identical to the
 #              backup's (proves the backup is THIS unit's and the boot stack was never touched);
 #              same software_version; room in /tmp
-#   stage      push tools/stock_restore_box.sh + rootfs.tar.gz, unpack the backup to /tmp/rs (RAM)
+#   stage      push tools/stock_restore_box.sh + rootfs.tar.gz, unpack the backup to /tmp/rs (RAM),
+#              with each link's owner beside it in /tmp/rs.links (busybox tar sets none)
 #   plan       read-only on the box: what would change and whether it fits (stock_restore_box.sh plan)
 #   dryrun     preflight + stage + plan, then clean /tmp. Works over the OCBM console, so the box
 #              stays on OCBM and nothing on flash changes
@@ -47,7 +48,8 @@
 #              or final, the start script is OCBM's dispatcher, no finish pending; same
 #              software_version as the archive; room in /tmp
 #   stage      make the stock tree on this Mac (tools/stock_restore_onefile_tree.sh), push it and
-#              the payload, unpack to /tmp/rs; the local tree is deleted once it is on the box
+#              the payload, unpack to /tmp/rs, each link's owner in /tmp/rs.links; the local tree
+#              is deleted once it is on the box
 #   plan       read-only on the box (PROFILE=onefile)
 #   apply      gated: every stock file back while OCBM still boots, the check, ONE rename of the
 #              stock start script over the dispatcher, then OCBM's files go. Before the switch a
@@ -269,12 +271,24 @@ phase_preflight() {
   run 'df -k / | tail -1' 20 | tr -d '\r' | sed 's/^/[stock-restore] rootfs: /' | tail -1
 }
 
+# busybox tar sets no symlink's owner when it unpacks, so the links in /tmp/rs are root's whatever the
+# adapter had: a restore from `final` put the 20 library links it made back on flash as root's, where
+# Carlinkit's image has 1000:0 (the dev adapter, 31 Oct). Each link's owner goes beside the tree, read
+# from the archive's own headers, and stock_restore_box.sh gives every link it makes that owner.
+push_links() {  # $1 the archive unpacked into /tmp/rs
+  python3 -I "$REPO/tools/pack_tree.py" links "$1" > "$RUN_DIR/links.owners" \
+    && [ -s "$RUN_DIR/links.owners" ] || die "could not list the owners of the links in $1"
+  push "$RUN_DIR/links.owners" /tmp/rs.links
+  [ "$(md5 -q "$RUN_DIR/links.owners")" = "$(box_md5 /tmp/rs.links)" ] || die "the link owners did not arrive intact"
+}
+
 phase_stage() {
   say "=== stage — backup tree into RAM on the box"
   detect
   [ "$VIA" != stock ] && [ -n "$VIA" ] || die "no control channel to the adapter"
   push "$PAYLOAD" /tmp/stock_restore_box.sh
   push "$BACKUP/rootfs.tar.gz" /tmp/rootfs.tar.gz
+  push_links "$BACKUP/rootfs.tar.gz"
   local want got
   want="$(md5 -q "$BACKUP/rootfs.tar.gz")"; got="$(box_md5 /tmp/rootfs.tar.gz)"
   [ "$want" = "$got" ] || die "rootfs.tar.gz did not arrive intact (box $got, host $want)"
@@ -293,11 +307,12 @@ phase_plan() {
   grep -E '^\[restore\]' "$RUN_DIR/plan.out" | grep -v -E 'full plan' || true
   grep -q RESTORE_PLAN_OK "$RUN_DIR/plan.out" || die "plan failed; see $RUN_DIR/plan.out"
   grep -q 'CONFLICTS' "$RUN_DIR/plan.out" && die "the plan has type conflicts; apply would refuse. See $RUN_DIR/plan.out"
+  grep -q 'LINK OWNERS' "$RUN_DIR/plan.out" && die "a link the plan makes has no owner in /tmp/rs.links; apply would refuse. See $RUN_DIR/plan.out"
   say "full plan saved: $RUN_DIR/plan.txt"
 }
 
 phase_cleanup() {
-  run 'rm -rf /tmp/rs /tmp/rsw /tmp/rs_plan.out /tmp/stock_restore_box.sh /tmp/rootfs.tar.gz; echo CLEAN' 60 | grep -q CLEAN \
+  run 'rm -rf /tmp/rs /tmp/rs.links /tmp/rsw /tmp/rs_plan.out /tmp/stock_restore_box.sh /tmp/rootfs.tar.gz; echo CLEAN' 60 | grep -q CLEAN \
     && say "cleaned /tmp on the box" || warn "could not clean /tmp on the box (it is RAM; a reboot clears it)"
 }
 
@@ -318,7 +333,7 @@ phase_apply() {
   need_ncm
   run '[ -e /script/ncm_only ] || [ -e /script/ncm_wifi ]; echo flag=$?' 20 | grep -q 'flag=0' \
     || die "no NCM flag on the box; refusing (it would boot an OCBM box without OCBM)"
-  run '[ -d /tmp/rs ] && [ -s /tmp/stock_restore_box.sh ] && echo READY' 20 | grep -q READY || phase_stage
+  run '[ -d /tmp/rs ] && [ -s /tmp/rs.links ] && [ -s /tmp/stock_restore_box.sh ] && echo READY' 20 | grep -q READY || phase_stage
   gate "Apply now? This deletes OCBM and restores the Carlinkit files on the adapter."
   run 'mkdir -p /tmp/rsw; rm -f /tmp/rsw/apply.log; (nohup sh /tmp/stock_restore_box.sh apply > /tmp/rsw/apply.log 2>&1 &) ; echo STARTED' 20 \
     | grep -q STARTED || die "could not start apply on the box"
@@ -343,7 +358,7 @@ phase_apply() {
 phase_verify() {
   say "=== verify"
   detect
-  run '[ -d /tmp/rs ] && [ -s /tmp/stock_restore_box.sh ] && echo READY' 20 | grep -q READY || { if [ "$PROFILE" = onefile ]; then phase_stage_onefile; else phase_stage; fi; }
+  run '[ -d /tmp/rs ] && [ -s /tmp/rs.links ] && [ -s /tmp/stock_restore_box.sh ] && echo READY' 20 | grep -q READY || { if [ "$PROFILE" = onefile ]; then phase_stage_onefile; else phase_stage; fi; }
   run "$BOXENV sh /tmp/stock_restore_box.sh verify > /tmp/rs_verify.out 2>&1; echo rc=\$?" 900 >/dev/null || true
   pull /tmp/rs_verify.out "$RUN_DIR/verify.out"
   grep -q RESTORE_VERIFIED "$RUN_DIR/verify.out" || { sed -n '1,30p' "$RUN_DIR/verify.out"; die "the rootfs does not match the backup"; }
@@ -424,6 +439,7 @@ phase_stage_onefile() {
   rm -rf "$tree"
   push "$PAYLOAD" /tmp/stock_restore_box.sh
   push "$tgz" /tmp/rootfs.tar.gz
+  push_links "$tgz"
   want="$(md5 -q "$tgz")"; got="$(box_md5 /tmp/rootfs.tar.gz)"
   rm -rf "$STAGE_WORK"; STAGE_WORK=""
   [ "$want" = "$got" ] || die "the stock tree did not arrive intact (box $got, host $want)"
@@ -436,7 +452,7 @@ phase_stage_onefile() {
 phase_apply_onefile() {
   say "=== apply — stock back while OCBM still boots, then the switch"
   need_ocbm
-  run '[ -d /tmp/rs ] && [ -s /tmp/stock_restore_box.sh ] && echo READY' 20 | grep -q READY || phase_stage_onefile
+  run '[ -d /tmp/rs ] && [ -s /tmp/rs.links ] && [ -s /tmp/stock_restore_box.sh ] && echo READY' 20 | grep -q READY || phase_stage_onefile
   gate "Apply now? Stock goes back on while OCBM keeps booting; then one rename makes the next start stock, and OCBM's files are removed."
   run "mkdir -p /tmp/rsw; rm -f /tmp/rsw/apply.log; (PROFILE=onefile nohup sh /tmp/stock_restore_box.sh apply > /tmp/rsw/apply.log 2>&1 &) ; echo STARTED" 20 \
     | grep -q STARTED || die "could not start apply on the box"

@@ -9,17 +9,26 @@
                                                   OWNERS for TREE on stdout, from SOURCE: a trial
                                                   archive (.tgz) or a dump's report.tsv
                                                   (tools/jffs2_extract.py); FROM's owner goes to TO
+    tools/pack_tree.py links TGZ                  each symlink in TGZ (a pack, or an NCM backup's
+                                                  rootfs.tar.gz) with the owner its header gives,
+                                                  as OWNERS lines on stdout: the box's LINKS
 
 OWNERS: one line per entry, "UID<TAB>GID<TAB>PATH" with PATH relative to the tree. An entry it does
 not list is root's (0:0).
 
 The box unpacks the pack as root and stock_restore_box.sh copies with `cp -p`, so the owners in the
-pack are the owners on flash. A tree unpacked on this Mac belongs to the Mac's user, and a plain
-`tar -czf` packed it that way: restored files came out 502:20 (a tester, Oct 2026). Carlinkit's own
-image is not all root's either: most of its rootfs is uid 1000 (some 1000:1000, three files 501:20),
-so the owners come from the source, not a blanket root. Python's tarfile writes no "._" entries
-whatever the files' extended attributes; names are kept numeric only (no user or group names), so the
-box's busybox tar sets exactly these ids.
+pack are the owners on flash, for files and directories. Not for symlinks: busybox tar sets no
+symlink's owner when it unpacks (data_extract_all.c skips the step for links), so the tree in /tmp/rs
+has root's links, and the links the restore made back came out root's (the dev adapter's 20 library
+links, 31 Oct; 1000:0 in Carlinkit's image). So `links` goes to the box beside the pack, and
+stock_restore_box.sh gives each link it makes its owner from there.
+
+A tree unpacked on this Mac belongs to the Mac's user, and a plain `tar -czf` packed it that way:
+restored files came out 502:20 (a tester, Oct 2026). Carlinkit's own image is not all root's either:
+most of its rootfs is uid 1000 (some 1000:1000, three files 501:20), so the owners come from the
+source, not a blanket root. Python's tarfile writes no "._" entries whatever the files' extended
+attributes; names are kept numeric only (no user or group names), so the box's busybox tar sets
+exactly these ids.
 """
 import os
 import sys
@@ -122,6 +131,13 @@ def owners_from(source, tree, renames):
         sys.stdout.write("%d\t%d\t%s\n" % (uid, gid, rel))
 
 
+def links(tgz):
+    with tarfile.open(tgz, "r:*") as t:
+        for m in t:
+            if m.issym():
+                sys.stdout.write("%d\t%d\t%s\n" % (m.uid, m.gid, norm(m.name.lstrip("/"))))
+
+
 def main(argv):
     if len(argv) >= 4 and argv[1] in ("pack", "check") and len(argv) <= 5:
         tree, tgz = os.path.abspath(argv[2]), os.path.abspath(argv[3])
@@ -152,6 +168,9 @@ def main(argv):
             renames.append(rest[1])
             rest = rest[2:]
         owners_from(argv[2], os.path.abspath(argv[3]), renames)
+        return 0
+    if len(argv) == 3 and argv[1] == "links":
+        links(argv[2])
         return 0
     print(__doc__.split("\n\n")[0], file=sys.stderr)
     return 2

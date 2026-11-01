@@ -227,16 +227,22 @@ console, from one of the unit's own backups:
   root and copying with `cp -p`, put 502:20 on flash (a tester, Oct 2026). It writes no `._`
   AppleDouble entry (macOS `tar` adds one per file with extended attributes; the factory adapter's
   first dry run, 28 Oct, planned 702 of them as writes) and refuses a pack that is not exactly the tree
-  or not owned as it says.
+  or not owned as it says. The box's busybox `tar` sets no symlink's owner when it unpacks, though (it
+  skips the step for links), so the links in `/tmp/rs` are root's whatever the image has: the stage
+  sends each link's owner beside the tree as `/tmp/rs.links`, read from the archive's own headers
+  (`pack_tree.py links`; the NCM profile reads its `rootfs.tar.gz` the same way), and the restore gives
+  every link it makes that owner with `chown -h`. `plan` names, and `apply` refuses before changing
+  anything, a link the list gives no owner for.
 - **The order** (`PROFILE=onefile` in `tools/stock_restore_box.sh`). First room: OCBM's programs other
   than `ocbmd`, which carries the console, go (a trial has stock and OCBM on flash, about 1.3 MB free,
   and the extras need about 1.8 MB to come back; this frees about 2 MB, and OCBM still boots its
   console from the start script, `ocbm_boot.sh` and `ocbmd`). Then every stock file goes back
   (`.rsnew`, md5-checked, renamed, free space checked first; a directory made back takes the tree's
   mode and owner, where a bare `mkdir` left the dev adapter's `etc/boa/www`, `cgi-bin`, `images` and
-  `etc/hichain` 755 instead of 775, 31 Oct); a check stops the run if anything but the
-  start script and OCBM's own files still differs; one rename of the stock start script over the
-  dispatcher is the switch; OCBM's files go after it, each through `is_radio()` except OCBM's own
+  `etc/hichain` 755 instead of 775, 31 Oct, and a link the owner `/tmp/rs.links` gives, where a bare
+  `ln -s` left the dev adapter's 20 library links root's that evening); a check stops the run if
+  anything but the start script and OCBM's own files still differs; one rename of the stock start
+  script over the dispatcher is the switch; OCBM's files go after it, each through `is_radio()` except OCBM's own
   radio seam (`radio_ap_up.sh`, `radio_detect.sh`, `radio_hal.sh`: stock has none, and without OCBM
   they are dead files; the radio guard still keeps every file of the unit's own) and the seam's
   Bluetooth name flag, `/etc/.custom_bluetooth_name` while it holds `ccpa-<4 hex>` (its name matches
@@ -304,9 +310,12 @@ console, from one of the unit's own backups:
   programs and 22 scripts and settings, verified, and came up as stock sharing the stick. The restored
   updater then ran a read-only survey stick: 888 of 891 entries identical to the dump in type, content,
   mode and link target (the same three runtime entries), 1,728 KB free, the stock daemons running. One
-  owner gap is left: the 20 library symlinks the finish had deleted came back root's, where the image
-  has 1000:0, because the restore makes links with a bare `ln -s` (a symlink's owner changes nothing
-  here, but the image is the target). Carlink's builds still leave the confirm off
+  owner gap was left: the 20 library symlinks the finish had deleted came back root's, where the image
+  has 1000:0 (a symlink's owner changes nothing here, but the image is the target). The restore made
+  links with a bare `ln -s`, and the tree it worked from could not have said otherwise, since busybox
+  `tar` had left that tree's links root's too; since then each link takes its owner from
+  `/tmp/rs.links` (see the pack, above), not yet run on an adapter. The dev adapter's 20 wait on a
+  one-off stick that sets them to 1000:0. Carlink's builds still leave the confirm off
   (`-Pcarlink.installConfirm`). The flash dump and an SPI programmer stay the last resort.
 
 ### UART console reference

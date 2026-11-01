@@ -79,6 +79,8 @@ tree_sum() { ( cd "$1" && find . -print | sort | while IFS= read -r p; do
   if [ -L "$p" ]; then echo "L $p $(readlink "$p")"; elif [ -f "$p" ]; then echo "F $p $(md5sum < "$p" | cut -c1-32)"; else echo "D $p"; fi
 done ) | md5sum | cut -c1-32; }
 
+grp() { stat -f %g "$1" 2>/dev/null || stat -c %g "$1"; }   # the group of $1 itself, a link not followed
+
 run_payload() {  # $1 shell, $2 mode, $3 root, rest: env
   sh_="$1" mode_="$2" root_="$3"; shift 3
   env "$@" SRC="$T/src" ROOT="$root_" WORK="$T/work.$$" "$sh_" "$PAYLOAD" "$mode_" > "$T/out" 2>&1
@@ -152,6 +154,13 @@ run_onefile() {  # $1 shell, $2 mode, $3 root, rest: env. The lock lives in $T/r
 
 is_dispatcher() { grep -q '^# OCBM_DISPATCH' "$1/script/start_main_service.sh"; }
 
+# LINKS beside a tree ($1.links), as the stage makes it: from the tree's pack (tools/pack_tree.py links).
+links_from_pack() {  # $1 tree
+  rm -f "$1.lp.tgz"
+  "$SH1" "$TREE" --pack "$1" "$1.lp.tgz" > /dev/null 2>&1 && python3 -I "$HERE/pack_tree.py" links "$1.lp.tgz" > "$1.links"
+  rm -f "$1.lp.tgz"
+}
+
 onefile_tests() {  # $1 shell
   SH1="$1"
   echo "=== onefile profile under $SH1"
@@ -203,6 +212,9 @@ onefile_tests() {  # $1 shell
     "pack: the stock start script is in it, no AppleDouble entry (even for a file with extended attributes)"
   check '[ "$(python3 -I -c "import tarfile,sys; m=tarfile.open(sys.argv[1]).getmember(\"./usr/sbin/ARMadb-driver\"); print(m.uid, m.uname or \"-\")" "$T/pack.tgz")" = "$me -" ]' \
     "pack: each entry carries its owner from TREE.owners, numeric only"
+  python3 -I "$HERE/pack_tree.py" links "$T/pack.tgz" > "$T/tree.links"; rc=$?
+  check '[ $rc -eq 0 ] && [ "$(wc -l < "$T/tree.links" | tr -d " ")" = "$(find "$T/tree" -type l | wc -l | tr -d " ")" ] && grep -q "^$me	[0-9]*	usr/lib/libssl.so$" "$T/tree.links"' \
+    "pack: links gives each link of the pack with the owner in its header, for the box (busybox tar sets none)"
   # The bad packs below are made with this host's tar, which records this host's user: refused on
   # owners too, which is the 502:20 case.
   rm -rf "$T/mac"; cp -pR "$T/tree" "$T/mac"; echo "not stock" > "$T/mac/bin/extra"
@@ -244,6 +256,9 @@ onefile_tests() {  # $1 shell
     "dump of a trial: the seam's Bluetooth name flag dropped, the name from the identity archive"
   check 'cmp -s "$T/dtree/usr/sbin/ARMadb-driver" "$T/tree/usr/sbin/ARMadb-driver" && grep -q "^1000	0	usr/sbin/ARMadb-driver$" "$T/dtree.owners"' \
     "dump of a trial: the same files as the archive gives, owned as in the image (1000)"
+  links_from_pack "$T/dtree"
+  check 'grep -q "^1000	0	usr/lib/libssl.so$" "$T/dtree.links" && ! grep -q "^$me	" "$T/dtree.links"' \
+    "dump of a trial: links gives the image's owner for each link (1000:0, as the dev adapter's 20), not this Mac's user"
   # A dump from before any install: the factory rootfs, extras included, taken as it is.
   rm -rf "$T/stock"; cp -pR "$T/dtree" "$T/stock"; blob "$T/stock/usr/sbin/ARMHiCar" 30000; chmod 755 "$T/stock/usr/sbin/ARMHiCar"
   echo "hichain identity" > "$T/stock/etc/hichain/hks_keystore"
@@ -252,6 +267,7 @@ onefile_tests() {  # $1 shell
   "$SH1" "$TREE" --dump "$T/stock.bin" "$T/ftree" > "$T/out" 2>&1; rc=$?
   check '[ $rc -eq 0 ] && grep -q "before any install" "$T/out" && cmp -s "$T/ftree/usr/sbin/ARMHiCar" "$T/stock/usr/sbin/ARMHiCar" && [ -s "$T/ftree/etc/hichain/hks_keystore" ]' \
     "dump from before any install: taken as it is, the extras included"
+  links_from_pack "$T/ftree"
   rm -rf "$T/bad"; cp -pR "$T/stock" "$T/bad"; blob "$T/bad/usr/sbin/ocbmd" 100
   python3 -I "$HERE/jffs2_extract_test.py" --make-image "$T/bad" "$T/bad.bin"; rm -rf "$T/badtree"
   "$SH1" "$TREE" --dump "$T/bad.bin" "$T/badtree" > "$T/out" 2>&1; rc=$?
@@ -320,7 +336,7 @@ onefile_tests() {  # $1 shell
   rm -rf "$T/tree2"; cp -pR "$T/tree" "$T/tree2"
   for case_ in confirmed pending lock noocbmd noboot srcdispatch srcocbm; do
     rm -rf "$T/box"; cp -pR "$T/fin" "$T/box"; rm -rf "$T/run1"; mkdir -p "$T/run1"
-    rm -rf "$T/tree2"; cp -pR "$T/tree" "$T/tree2"
+    rm -rf "$T/tree2"; cp -pR "$T/tree" "$T/tree2"; cp "$T/tree.links" "$T/tree2.links"
     case "$case_" in
       confirmed)   echo confirmed > "$T/box/script/ocbm_mode"; want="is confirmed" ;;
       pending)     : > "$T/box/etc/ocbm/finish_pending"; want="finish was interrupted" ;;
@@ -334,7 +350,32 @@ onefile_tests() {  # $1 shell
     run_onefile "$SH1" apply "$T/box" SRC="$T/tree2"; rc=$?
     check '[ $rc -ne 0 ] && grep -q "$want" "$T/out" && [ "$(tree_sum "$T/box")" = "$before" ]' "refuses ($case_), nothing changed"
   done
-  rm -rf "$T/run1" "$T/tree2"
+  rm -rf "$T/run1" "$T/tree2" "$T/tree2.links"
+
+  # A link the box lacks, as the finish deleted the dev adapter's 20 library links (31 Oct): it comes
+  # back with the owner LINKS gives, on the link and not on its target. Without root the owner shown
+  # is one of this user's groups other than the one a new file gets, which chown -h may set.
+  rm -rf "$T/box"; cp -pR "$T/fin" "$T/box"; rm -f "$T/box/usr/lib/libssl.so"
+  g0=$(grp "$T/box/usr/lib"); g1=""
+  for g in $(id -G); do [ "$g" != "$g0" ] && [ "$g" != "$(grp "$T/tree/usr/lib/libssl.so.1.1")" ] && { g1=$g; break; }; done
+  if [ -n "$g1" ]; then
+    awk -F '\t' -v OFS='\t' -v g="$g1" '$3 == "usr/lib/libssl.so" { $2 = g } 1' "$T/tree.links" > "$T/tree.g1"
+    run_onefile "$SH1" apply "$T/box" LINKS="$T/tree.g1"; rc=$?
+    check '[ $rc -eq 0 ] && grep -q RESTORE_DONE "$T/out" && [ "$(readlink "$T/box/usr/lib/libssl.so")" = libssl.so.1.1 ] && [ "$(grp "$T/box/usr/lib/libssl.so")" = "$g1" ] && [ "$(grp "$T/box/usr/lib/libssl.so.1.1")" != "$g1" ]' \
+      "a link made back takes its owner from LINKS, on the link itself (a bare ln -s left the dev adapter's 20 root's, 31 Oct)"
+  else
+    echo "  skip a link's owner from LINKS: this user is in no second group"
+  fi
+  rm -f "$T/tree.g1"
+  # No owner in LINKS for a link to make back: plan says so, apply refuses and changes nothing.
+  grep -v '	usr/lib/libssl.so$' "$T/tree.links" > "$T/tree.nolink"
+  rm -rf "$T/box"; cp -pR "$T/fin" "$T/box"; rm -f "$T/box/usr/lib/libssl.so"; before=$(tree_sum "$T/box")
+  run_onefile "$SH1" plan "$T/box" LINKS="$T/tree.nolink"; rc=$?
+  check '[ $rc -eq 0 ] && grep -q "LINK OWNERS : .*usr/lib/libssl.so" "$T/out"' "plan names a link LINKS gives no owner for"
+  run_onefile "$SH1" apply "$T/box" LINKS="$T/tree.nolink"; rc=$?
+  check '[ $rc -ne 0 ] && grep -q "names no owner for the link usr/lib/libssl.so" "$T/out" && [ "$(tree_sum "$T/box")" = "$before" ] && [ ! -e "$T/run1/ocbm_mode.lock" ]' \
+    "apply refuses it, nothing changed"
+  rm -f "$T/tree.nolink"
 
   # The OCBM still running writes its bond store again after step 5: apply still ends RESTORE_DONE.
   rm -rf "$T/box"; cp -pR "$T/fin" "$T/box"
@@ -382,6 +423,9 @@ for SH in $SHELLS; do
   "$SH" -n "$PAYLOAD" && ok "parses" || bad "parses"
   rm -rf "$T/src" "$T/box"
   make_src "$T/src"; make_box "$T/src" "$T/box"
+  # LINKS as the stage makes it, from the backup's own archive (tools/pack_tree.py links)
+  (cd "$T/src" && COPYFILE_DISABLE=1 tar -czf "$T/src.tgz" .) && python3 -I "$HERE/pack_tree.py" links "$T/src.tgz" > "$T/src.links"
+  check '[ "$(cut -f3 "$T/src.links" | sort | tr "\n" " ")" = "bin/ls bin/sh usr/lib/libssl.so usr/lib/libz.so " ]' "links gives the backup's four links"
 
   before=$(tree_sum "$T/box")
   run_payload "$SH" plan "$T/box"; rc=$?
@@ -429,6 +473,17 @@ for SH in $SHELLS; do
   run_payload "$SH" apply "$T/box"; rc=$?
   check '[ $rc -ne 0 ] && grep -q "type conflicts" "$T/out"' "type conflict refuses"
   check '[ "$(tree_sum "$T/box")" = "$before" ]' "refusal changes nothing"
+
+  # A link to make back that LINKS names no owner for: plan says so, apply refuses, nothing changed.
+  rm -rf "$T/box"; make_box "$T/src" "$T/box"
+  grep -v '	usr/lib/libssl.so$' "$T/src.links" > "$T/src.nolink"
+  run_payload "$SH" plan "$T/box" LINKS="$T/src.nolink"; rc=$?
+  check '[ $rc -eq 0 ] && grep -q "LINK OWNERS : .*usr/lib/libssl.so" "$T/out"' "plan names a link LINKS gives no owner for"
+  before=$(tree_sum "$T/box")
+  run_payload "$SH" apply "$T/box" LINKS="$T/src.nolink"; rc=$?
+  check '[ $rc -ne 0 ] && grep -q "names no owner for the link usr/lib/libssl.so" "$T/out" && [ "$(tree_sum "$T/box")" = "$before" ]' \
+    "apply refuses it, nothing changed (busybox tar sets no link's owner, 31 Oct)"
+  rm -f "$T/src.nolink" "$T/src.tgz"
 
   onefile_tests "$SH"
 done

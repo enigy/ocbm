@@ -31,7 +31,10 @@
 #
 # apply REFUSES on a live rootfs unless an NCM flag is set, for the reason above: get there first
 # with `tools/ocbm_install.sh revert`. File modes come from the backup via `cp -p`; a file whose
-# content already matches keeps its current mode (modes are not compared).
+# content already matches keeps its current mode (modes are not compared). A link made back takes
+# its owner from LINKS (tools/pack_tree.py links, beside the tree), because busybox tar sets no
+# link's owner when it unpacks the backup; apply refuses, changing nothing, while LINKS names no
+# owner for a link it would make. Owners are not compared either.
 #
 # ============================== PROFILE=onefile ==========================================
 # An adapter converted by the one-file install (ccpa/installer/) has no NCM to fall back on, and
@@ -68,6 +71,7 @@ set -u
 
 MODE="${1:-plan}"
 SRC="${SRC:-/tmp/rs}"
+LINKS="${LINKS:-${SRC%/}.links}"   # each link's owner in the backup: UID <tab> GID <tab> PATH
 ROOT="${ROOT:-/}"
 W="${WORK:-/tmp/rsw}"
 RESERVE_KB="${RESERVE_KB:-384}"
@@ -238,6 +242,8 @@ report() {
   say "remove      : $(count "$W/extra_payload") payload files (${freed} KB), $(count "$W/extra_late") script/etc files (${freed_late} KB), $(count "$W/extra_dirs") dirs if empty"
   [ -s "$W/protected" ] && say "kept        : $(tr '\n' ' ' < "$W/protected")(NCM mode flags are never removed)"
   say "flash       : ${free_now} KB free now; about $(( free_now + freed - need )) KB after, by uncompressed sizes (JFFS2 compresses, so the real figure is higher)"
+  u=$(unowned_link)
+  [ -n "$u" ] && say "LINK OWNERS : $LINKS names no owner for the link $u, so it would come back root's; apply will refuse"
   if [ -s "$W/conflict" ]; then
     say "CONFLICTS (a directory on one side only; apply will refuse):"
     sed 's/^/    /' "$W/conflict"
@@ -272,11 +278,30 @@ put_file() {  # $1 relative path
   mv -f "$new" "$dst" || die "rename failed: $1"
 }
 
+# A link made back takes its owner from LINKS, as `cp -p` gives a file the backup's: SRC's links are
+# root's whatever the adapter had, because busybox tar sets no link's owner when it unpacks, and a
+# bare ln -s left the 20 library links the finish had deleted root's, where Carlinkit's image has
+# 1000:0 (the dev adapter, 31 Oct). As in mkdir_like, a chown this host's user may not make (the
+# host-side test) is let go.
 put_link() {  # $1 relative path, $2 target
   dst="$ROOT/$1"
   if [ -L "$dst" ] || [ -f "$dst" ]; then rm -f "$dst"
   elif [ -e "$dst" ]; then die "$1 is a directory on the box"; fi
   ln -s "$2" "$dst" || die "link failed: $1"
+  _o=$(awk -F "$TAB" -v p="$1" '$3 == p { print $1 ":" $2; exit }' "$LINKS" 2>/dev/null)
+  [ -n "$_o" ] && chown -h "$_o" "$dst" 2>/dev/null
+  return 0
+}
+
+unowned_link() {  # the first link the work lists would make that LINKS names no owner for
+  _l="$LINKS"; [ -f "$_l" ] || _l=/dev/null
+  awk -F "$TAB" 'FILENAME == ARGV[1] { own[$3] = 1; next } $1 == "link" && !($3 in own) { print $3; exit }' \
+    "$_l" "$W/main" "$W/boot" "$W/login" "$W/switch"
+}
+
+refuse_unowned() {
+  u=$(unowned_link)
+  [ -z "$u" ] || die "$LINKS names no owner for the link $u, so it would come back root's (busybox tar sets no link's owner); stage again with tools/stock_restore.sh"
 }
 
 walk() {  # $1 work list of ACTION KEY PATH, $2 label
@@ -308,6 +333,7 @@ do_apply() {
     [ -e /script/ncm_only ] || [ -e /script/ncm_wifi ] \
       || die "no NCM flag: this box would boot OCBM with OCBM removed. Run 'tools/ocbm_install.sh revert' first"
   fi
+  refuse_unowned
   remove_list "$W/extra_payload" "1/6 payload extras"
   sync
   n=0
@@ -364,6 +390,7 @@ remove_guarded() {  # $1 list of paths, $2 label, $3 paths to leave: as remove_l
 do_apply_onefile() {
   [ -s "$W/conflict" ] && { sed 's/^/    /' "$W/conflict"; die "type conflicts in the plan; resolve them by hand first"; }
   onefile_refusals
+  refuse_unowned
   mkdir "$RUN/ocbm_mode.lock" 2>/dev/null || die "a go-back or a finish holds $RUN/ocbm_mode.lock"
   MODE_LOCKED=1
   remove_guarded "$W/extra_payload" "1/5 room: OCBM programs other than the console's ocbmd" "$CONSOLE"
