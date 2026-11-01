@@ -476,6 +476,10 @@ fn process_one(
             // signalled while we were writing 0x5703, spawning here would race the teardown and orphan
             // carplayd. The main loop also joins this thread before teardown_av_layer(), so
             // this guard is belt-and-suspenders against that ordering.
+            //
+            // Name this phone first: carplayd serves only the phone btd hands off (its phone gate), so
+            // a phone a switch dropped, still on the AP, cannot take the session back.
+            crate::av::expect_phone(*SESSION_PEER.lock().unwrap_or_else(|e| e.into_inner()));
             crate::av::ensure_av_layer();
         }
         return !sent;

@@ -10,7 +10,8 @@ use std::collections::HashMap;
 use std::io::{Cursor, IoSlice, Read, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
-use portable_atomic::{AtomicU64};
+// Re-exported: a delegate that wraps another (carplayd's phone gate) names it in `last_activity`.
+pub use portable_atomic::AtomicU64;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -294,6 +295,18 @@ fn publish_phone_identity(d: &Dictionary) {
     {
         eprintln!("[session] phone identity: {json}");
     }
+}
+
+/// The phone a phase-1 SETUP names: its `deviceID`, the BR/EDR MAC [`publish_phone_identity`] reads.
+/// `None` for a phase-2 SETUP (it carries `streams`) or a plist that does not parse; `Some(None)` for a
+/// phase 1 without a `deviceID`. For a receiver that serves one phone only (carplayd's phone gate, the
+/// two-iPhone bench of 2026-11-01), which must decide before the session publishes who the phone is.
+pub fn phase1_device_id(request_plist: &[u8]) -> Option<Option<String>> {
+    let dict = parse_control_plist(request_plist)?.into_dictionary()?;
+    if dict.contains_key("streams") {
+        return None;
+    }
+    Some(dict.get("deviceID").and_then(|v| v.as_string()).map(str::to_string))
 }
 
 /// A SETUP bind/setup failure. Carries no data — the caller (`server.rs`) only needs to know whether

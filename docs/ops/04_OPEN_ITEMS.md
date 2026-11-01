@@ -103,7 +103,20 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
      Wi-Fi off, B held. The fix, handed to the remote agent: `btd` tells `carplayd` which phone it
      serves, and `carplayd` dials and keeps only that phone; optionally the dropped phone is
      deauthenticated from the AP for the hold. Until it lands, no adapter, the truck's included,
-     should get `3d492a2` or newer.
+     should get `3d492a2` or newer. **Landed 2026-11-01, NOT yet benched** (`ccpa/carplayd/src/
+     phone_gate.rs`): at each 0x5703 `btd` writes the phone's BR/EDR address to
+     `/tmp/carplay_expect_phone` and passes that path to the wireless `carplayd`
+     (`CARPLAY_EXPECT_PHONE_FILE`; a file, because a latched `carplayd` outlives one phone's link).
+     A phase-1 SETUP whose `deviceID` is another phone gets 500 and its address is refused (dropped
+     on accept, not dialled) until `btd` names another phone; while the named phone's session is up
+     another address does not preempt it. Discovery logs each `_carplay-ctrl` TXT record, and a
+     phone leaving now forgets only its own dialled addresses. Not done: deauthenticating the
+     dropped phone (fix 2) — first check whether the unit's `hostapd` has a control interface
+     (`hostapd_cli`, `ctrl_interface=` in `/etc/hostapd.conf`). The same push: forgetting an idle
+     phone while another is live drops only its bond through `btd` (no restart; the AirPlay
+     pairings and the restart wait for no session, `FORGET_PENDING_FLAG`), and `ocbmd` re-sends
+     `/tmp/phone_identity` when `carplayd` rewrites it, so a fresh host learns the same phone
+     reconnected.
   3. **"Phone drop on host re-SUBSCRIBE" (`PROJ_MODE NONE` then `SESSION_EVENT PHONE_ABSENT` after
      an app relaunch) — NOT reproduced, 2026-09-25.** Three timelines, all wired, the phone never
      left the bus in any: (a) kill-without-STOP relaunch (`adb install -r`): SUBSCRIBE → stale

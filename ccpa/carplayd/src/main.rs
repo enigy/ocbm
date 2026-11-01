@@ -11,6 +11,7 @@
 //! `MfiSigner` trait, proving the remote→local redirection and the crate reuse compile + work.
 
 mod discovery;
+mod phone_gate;
 
 use mfi::auth_client::MfiSigner;
 use pairing::setup::PeerSaver;
@@ -1506,7 +1507,14 @@ fn run_pairing_server() -> io::Result<()> {
     // listening. It is handed the identity rather than re-deriving it: the advertised deviceid/pi
     // must equal the ones `Identity` above verifies with, and two processes reading the same env
     // vars was the only thing that ever kept them in step.
-    discovery::start(device_id().to_string(), pairing_identity().to_string());
+    // The one phone this carplayd serves (`phone_gate`): btd names it at each Wi-Fi handoff. Discovery
+    // leaves alone a phone refused at SETUP; the accept thread drops its connections, and does not let
+    // another address preempt the named phone's session.
+    let gate = std::sync::Arc::new(phone_gate::PhoneGate::from_env());
+    if gate.armed() {
+        println!("[carplayd] phone gate armed: serving only the phone btd names");
+    }
+    discovery::start(device_id().to_string(), pairing_identity().to_string(), gate.clone());
 
     // SESSION HIJACK (critical QC finding). The old loop served ONE control connection at a time,
     // blocking in serve_connection, so a second (preempting) phone starved in the TCP backlog until the
@@ -1526,6 +1534,7 @@ fn run_pairing_server() -> io::Result<()> {
     let current: std::sync::Arc<std::sync::Mutex<Option<(u64, TcpStream)>>> =
         std::sync::Arc::new(std::sync::Mutex::new(None));
     let accept_current = current.clone();
+    let accept_gate = gate.clone();
     std::thread::spawn(move || {
         let mut generation = 0u64;
         for conn in listener.incoming() {
@@ -1536,6 +1545,26 @@ fn run_pairing_server() -> io::Result<()> {
                     continue;
                 }
             };
+            // Before it may preempt anything: the phone gate turns away a phone refused at SETUP, and a
+            // newcomer from another address while the named phone's session is up.
+            if let Ok(peer) = stream.peer_addr() {
+                match accept_gate.on_connection(peer.ip()) {
+                    phone_gate::Admit::Accept => {}
+                    phone_gate::Admit::Refused => {
+                        eprintln!("[carplayd] phone gate: {peer} was refused at SETUP; dropping its connection");
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                        continue;
+                    }
+                    phone_gate::Admit::Holding(served) => {
+                        eprintln!(
+                            "[carplayd] phone gate: the named phone's session ({served}) holds; dropping a connection \
+                             from {peer} instead of letting it preempt"
+                        );
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                        continue;
+                    }
+                }
+            }
             generation += 1;
             {
                 let mut cur = plock(&accept_current);
@@ -1556,6 +1585,7 @@ fn run_pairing_server() -> io::Result<()> {
     // Clear `current` only if it is still OUR registration — a newer connection may already have
     // replaced it while this session was tearing down.
     let unregister = |generation: u64| {
+        gate.session_ended(generation);
         let mut cur = plock(&current);
         if cur.as_ref().map(|(g, _)| *g) == Some(generation) {
             *cur = None;
@@ -1638,6 +1668,18 @@ fn run_pairing_server() -> io::Result<()> {
             } else {
                 Box::new(av)
             };
+        // Behind the phone gate when btd named a phone: a phase-1 SETUP from another phone is refused
+        // before the session publishes who it is.
+        let session: Box<dyn receiver::session::SessionDelegate> = match stream.peer_addr() {
+            Ok(peer) if gate.armed() => Box::new(phone_gate::GatedSession::new(
+                session,
+                gate.clone(),
+                generation,
+                peer.ip(),
+                stream.try_clone().ok(),
+            )),
+            _ => session,
+        };
         let mut session = session;
         session.set_resolution(dev.display_width, dev.display_height, dev.max_fps);
         let mut server = ControlServer::new(&identity, b"3939".to_vec(), peers.clone(), signer, info)

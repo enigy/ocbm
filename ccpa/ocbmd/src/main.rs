@@ -594,7 +594,11 @@ struct Daemon {
     pairing_code: Option<String>,
     /// Last phone identity JSON forwarded, so only CHANGES go on the wire. None = not yet read.
     phone_ident: Option<String>,
+    /// When carplayd last wrote `/tmp/phone_identity`: a rewrite is a new session, even with the same phone.
+    phone_ident_written: Option<std::time::SystemTime>,
     last_phone_ident_check: Option<std::time::Instant>,
+    /// When [`Daemon::forget_pending_tick`] last looked.
+    last_forget_check: Option<Instant>,
     /// Last BT phase forwarded, so only CHANGES go on the wire.
     bt_phase: Option<u8>,
     /// Last `CT_BOX_HEALTH` bitmask sent. None until the first tick, and reset on a fresh SUBSCRIBE
@@ -978,16 +982,21 @@ fn is_mac(mac: &str) -> bool {
 /// and read are each capped at 250 ms) because this runs on the dispatch thread that also carries the
 /// host heartbeats. True when btd answered `"ok":true`.
 fn btd_round_trip(line: &str) -> bool {
+    btd_reply(line).is_some_and(|reply| reply.contains("\"ok\":true"))
+}
+
+/// [`btd_round_trip`]'s exchange, returning btd's reply line; None when btd could not be asked.
+fn btd_reply(line: &str) -> Option<String> {
     let Some(mut s) = connect_seam(WIRELESS_CONTROL_ADDR, Duration::from_millis(250)) else {
         eprintln!("[ocbmd] device policy: btd control port {WIRELESS_CONTROL_ADDR} unreachable");
-        return false;
+        return None;
     };
     let _ = s.set_nonblocking(false);
     let _ = s.set_write_timeout(Some(Duration::from_millis(250)));
     let _ = s.set_read_timeout(Some(Duration::from_millis(250)));
     if let Err(e) = s.write_all(line.as_bytes()) {
         eprintln!("[ocbmd] device policy: write to btd failed: {e}");
-        return false;
+        return None;
     }
     let mut buf = [0u8; 512];
     let mut got = Vec::new();
@@ -997,13 +1006,84 @@ fn btd_round_trip(line: &str) -> bool {
             Ok(n) => got.extend_from_slice(&buf[..n]),
             Err(e) => {
                 eprintln!("[ocbmd] device policy: no answer from btd: {e}");
-                return false;
+                return None;
             }
         }
     }
-    let reply = String::from_utf8_lossy(&got);
-    eprintln!("[ocbmd] device policy: btd -> {}", reply.trim());
-    reply.contains("\"ok\":true")
+    let reply = String::from_utf8_lossy(&got).trim().to_string();
+    eprintln!("[ocbmd] device policy: btd -> {reply}");
+    Some(reply)
+}
+
+/// btd's live wireless session: whether one is live and its phone (`AA:BB:..`, empty when unknown).
+/// None when btd could not be asked.
+fn btd_session() -> Option<(bool, String)> {
+    let reply = btd_reply("{\"cmd\":\"status\"}\n")?;
+    let active = reply.contains("\"active\":true");
+    let address = reply
+        .split("\"address\":\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .unwrap_or("")
+        .to_string();
+    Some((active, address))
+}
+
+/// Set while a forget waits for no session to be live: its AirPlay pairings clear and btd restarts then.
+const FORGET_PENDING_FLAG: &str = "/tmp/ocbm_forget_pending";
+
+/// How a forget goes, given btd's live session ([`btd_session`]) and the phone forgotten.
+#[derive(Debug, PartialEq, Eq)]
+enum ForgetWay {
+    /// No session live, the forgotten phone's own, one btd can't name, or btd not answering: the bond,
+    /// every AirPlay pairing and a wireless restart, as before.
+    Now,
+    /// Another phone's session is live: btd drops the bond in place; the pairings and the restart wait.
+    KeepLive,
+}
+
+fn forget_way(
+    session: Option<(bool, String)>,
+    mac: &str,
+) -> ForgetWay {
+    match session {
+        Some((true, live)) if !live.is_empty() && !live.eq_ignore_ascii_case(mac) => ForgetWay::KeepLive,
+        _ => ForgetWay::Now,
+    }
+}
+
+/// MGMT_FORGET_DEVICE. Forgetting the idle phone used to end the live phone's session and clear its
+/// AirPlay pairing too (2026-11-01 bench: a btd restart, and both phones redid pair-setup). Now, with
+/// another phone's session live, btd drops the bond in place (no restart: the forgotten phone is no
+/// longer paged and is refused the Wi-Fi details), and [`forget_pending_tick`] clears the AirPlay
+/// pairings and restarts btd once no session is live. The pairings still go all at once: the store is
+/// keyed by each phone's AirPlay pairing identity, not its address (see [`forget_airplay_peers`]).
+fn forget_device(mac: &str) -> bool {
+    let way = forget_way(btd_session(), mac);
+    eprintln!("[ocbmd] mgmt: forget {mac}: {way:?}");
+    match way {
+        ForgetWay::KeepLive => {
+            let Some(line) = forget_request(mac) else {
+                return false;
+            };
+            let ok = btd_round_trip(&line);
+            let _ = std::fs::write(FORGET_PENDING_FLAG, "1");
+            ok
+        }
+        ForgetWay::Now => {
+            let ok = forget_one_bond(mac);
+            forget_airplay_peers();
+            request_wireless_restart();
+            let _ = std::fs::remove_file(FORGET_PENDING_FLAG);
+            ok
+        }
+    }
+}
+
+/// btd's `{"cmd":"forget"}` line for an `AA:BB:CC:DD:EE:FF` address; None for anything else.
+fn forget_request(mac: &str) -> Option<String> {
+    let mac = mac.trim();
+    is_mac(mac).then(|| format!("{{\"cmd\":\"forget\",\"address\":\"{mac}\"}}\n"))
 }
 
 /// The cross-process host-presence flag carplayd read to gate the session (docs/carplay/02_SESSION_LIFECYCLE.md).
@@ -1014,6 +1094,20 @@ fn btd_round_trip(line: &str) -> bool {
 const HOST_PRESENT_FLAG: &str = "/tmp/host_present";
 #[cfg(test)]
 const HOST_PRESENT_FLAG: &str = "/tmp/ocbmd_selftest_host_present";
+
+/// Whether `/tmp/phone_identity` (text `now`, written at `written`) goes to the host, which was last sent
+/// `sent` (written at `sent_written`); `sent` None = a fresh host, which is always told. New text goes, and
+/// so does the same text rewritten: carplayd rewrites the file at each session's SETUP, so a rewrite is a
+/// new session even for the same phone. An empty file is not a session.
+fn phone_ident_due(
+    now: &str,
+    written: Option<std::time::SystemTime>,
+    sent: Option<&str>,
+    sent_written: Option<std::time::SystemTime>,
+) -> bool {
+    let rewritten = !now.is_empty() && written.is_some() && written != sent_written;
+    Some(now) != sent || (rewritten && sent.is_some())
+}
 
 /// The wireless SSP Numeric-Comparison code the ssp_agent publishes during pairing (absent = none).
 const PAIRING_CODE_FILE: &str = "/tmp/pairing_code";
@@ -2317,6 +2411,7 @@ impl Daemon {
         self.bt_phase_tick(now);
         self.proj_mode_tick(now);
         self.phone_ident_tick(now);
+        self.forget_pending_tick(now);
         self.box_health_tick(now);
         self.log_tick(now);
         self.health_tick(now);
@@ -2455,6 +2550,11 @@ impl Daemon {
     /// say WHICH bonded phone from `MGMT_INFO` is the live one. Same discipline as the other mirrors:
     /// changes only, throttled once latched, and never forwarded torn (carplayd renames it into
     /// place, so a read either sees the whole document or the previous one).
+    ///
+    /// A rewrite counts as a change even when the document is the same (2026-11-01 bench): the file
+    /// outlives its session, so a fresh host is first replayed the LAST session's phone, and when that
+    /// same phone then connected the unchanged text sent nothing — the host never learned it was live.
+    /// carplayd rewrites the file at every session's SETUP, so its modification time marks a new session.
     fn phone_ident_tick(&mut self, now_t: std::time::Instant) {
         if !self.subscribed {
             return;
@@ -2475,15 +2575,39 @@ impl Daemon {
         if now.len() > 1024 {
             return;
         }
-        if Some(&now) != self.phone_ident.as_ref() {
+        let written = std::fs::metadata(PHONE_IDENT_FILE).and_then(|m| m.modified()).ok();
+        if phone_ident_due(&now, written, self.phone_ident.as_deref(), self.phone_ident_written) {
             let replay = self.phone_ident.is_none();
             self.phone_ident = Some(now.clone());
+            self.phone_ident_written = written;
             let mut a = Vec::with_capacity(1 + now.len());
             a.push(p::CT_PHONE_IDENT);
             a.extend_from_slice(now.as_bytes());
             self.send(p::CH_CTRL, mirror_flags(replay), &a);
             eprintln!("[ocbmd] phone identity -> host: {now}");
         }
+    }
+
+    /// A forget made while another phone's session was live ([`forget_device`]): once no session is
+    /// live, clear the AirPlay pairings and restart btd, as a forget does at once otherwise. Asked every 5 s,
+    /// only while one waits.
+    fn forget_pending_tick(&mut self, now_t: Instant) {
+        if let Some(prev) = self.last_forget_check {
+            if now_t.duration_since(prev) < Duration::from_secs(5) {
+                return;
+            }
+        }
+        self.last_forget_check = Some(now_t);
+        if !std::path::Path::new(FORGET_PENDING_FLAG).exists() {
+            return;
+        }
+        if matches!(btd_session(), Some((true, _))) {
+            return;
+        }
+        eprintln!("[ocbmd] mgmt: no session live; finishing the earlier forget (AirPlay pairings, wireless restart)");
+        forget_airplay_peers();
+        request_wireless_restart();
+        let _ = std::fs::remove_file(FORGET_PENDING_FLAG);
     }
 
     /// Mirror the ssp_agent's `/tmp/pairing_code` flag to the host as a `CT_PAIRING_CODE` message on each
@@ -3699,9 +3823,7 @@ impl Daemon {
             }
             p::MGMT_FORGET_DEVICE => {
                 let mac = std::str::from_utf8(&pl[1..]).unwrap_or("").trim();
-                let ok = forget_one_bond(mac);
-                forget_airplay_peers();
-                request_wireless_restart();
+                let ok = forget_device(mac);
                 self.mgmt_ack(verb, u8::from(!ok));
             }
             p::MGMT_RESTART_WIRELESS => {
@@ -4556,7 +4678,9 @@ fn main() {
         rearm_deadline: None,
         present_cleared_at: None,
         phone_ident: None,
+        phone_ident_written: None,
         last_phone_ident_check: None,
+        last_forget_check: None,
         host_replaced: false,
         cfg: Vec::new(),
         input_sock: None,
@@ -5038,6 +5162,36 @@ mod tests {
     }
 
     #[test]
+    fn the_phone_identity_goes_again_when_its_file_is_rewritten() {
+        // 2026-11-01 bench: a fresh Carlink was replayed the last session's phone; when that same phone
+        // then connected, the unchanged text sent nothing and the app never learned it was live.
+        let t0 = std::time::UNIX_EPOCH + Duration::from_secs(1_000);
+        let t1 = t0 + Duration::from_secs(17);
+        let id = r#"{"name":"iPhone","deviceID":"68:A7:29:00:25:10"}"#;
+        assert!(phone_ident_due(id, Some(t0), None, None), "a fresh host is told");
+        assert!(!phone_ident_due(id, Some(t0), Some(id), Some(t0)), "nothing new");
+        assert!(phone_ident_due(id, Some(t1), Some(id), Some(t0)), "the same phone, a new session");
+        assert!(phone_ident_due("{}", Some(t0), Some(id), Some(t0)), "another phone");
+        assert!(!phone_ident_due("", None, Some(""), Some(t0)), "no file, still none");
+    }
+
+    #[test]
+    fn forgetting_the_idle_phone_leaves_the_live_one_alone() {
+        // 2026-11-01 bench: Forget on the idle phone restarted btd and ended the live phone's session.
+        let live = |mac: &str| Some((true, mac.to_string()));
+        assert_eq!(forget_way(live("68:A7:29:00:25:10"), "AA:BB:CC:00:6A:DE"), ForgetWay::KeepLive);
+        assert_eq!(forget_way(live("68:A7:29:00:25:10"), "68:a7:29:00:25:10"), ForgetWay::Now, "the live phone itself");
+        assert_eq!(forget_way(live(""), "AA:BB:CC:00:6A:DE"), ForgetWay::Now, "a session btd can't name");
+        assert_eq!(forget_way(Some((false, String::new())), "AA:BB:CC:00:6A:DE"), ForgetWay::Now);
+        assert_eq!(forget_way(None, "AA:BB:CC:00:6A:DE"), ForgetWay::Now, "btd not answering");
+        assert_eq!(
+            forget_request(" AA:BB:CC:00:6A:DE ").as_deref(),
+            Some("{\"cmd\":\"forget\",\"address\":\"AA:BB:CC:00:6A:DE\"}\n")
+        );
+        assert!(forget_request("\",\"cmd\":\"policy").is_none());
+    }
+
+    #[test]
     fn switch_request_needs_a_mac() {
         assert_eq!(
             switch_request(" aa:BB:cc:DD:ee:01 ").as_deref(),
@@ -5115,7 +5269,9 @@ mod tests {
             rearm_deadline: None,
             present_cleared_at: None,
             phone_ident: None,
+            phone_ident_written: None,
             last_phone_ident_check: None,
+            last_forget_check: None,
             host_replaced: false,
             cfg: Vec::new(),
             input_sock: None,

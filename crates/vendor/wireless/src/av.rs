@@ -62,6 +62,31 @@ static AV_AIRPLAYD_PID: AtomicU32 = AtomicU32::new(0);
 
 /// Installed daemon paths. Overridable via env for dev (`/tmp` builds) without a rebuild.
 const AIRPLAYD_BIN_DEFAULT: &str = "/usr/sbin/carplayd";
+
+/// Where btd names the phone it serves, for carplayd's phone gate (`ccpa/carplayd/src/phone_gate.rs`,
+/// two-iPhone bench 2026-11-01: a switch's dropped phone, still on the AP, was dialled and hijacked the
+/// session). Only the carplayd spawned below is told the path; the wired one never gates.
+pub const EXPECT_PHONE_FILE: &str = "/tmp/carplay_expect_phone";
+
+/// Name `peer` (its BR/EDR address) as the phone carplayd serves, or no phone: then the gate lets every
+/// phone through, as before. Called at each Wi-Fi handoff, before the AV layer is ensured, so a carplayd
+/// latched from an earlier phone follows the one that just handed off. Written whole, through a rename.
+pub fn expect_phone(peer: Option<[u8; 6]>) {
+    match peer {
+        Some(a) => {
+            let tmp = format!("{EXPECT_PHONE_FILE}.tmp");
+            let named = std::fs::write(&tmp, crate::control::fmt_addr(&a))
+                .and_then(|_| std::fs::rename(&tmp, EXPECT_PHONE_FILE));
+            if let Err(e) = named {
+                println!("[av] could not name the phone for carplayd ({e}); it serves any phone");
+                let _ = std::fs::remove_file(EXPECT_PHONE_FILE);
+            }
+        }
+        None => {
+            let _ = std::fs::remove_file(EXPECT_PHONE_FILE);
+        }
+    }
+}
 const WLAN_IFACE: &str = "wlan0";
 /// The AP gateway hostapd/udhcpd serve on `wlan0` — the address the iPhone reaches carplayd at, and
 /// the A record rx-connect advertises. Matches `start_bluetooth_wifi.sh` (WLANIP default).
@@ -194,6 +219,7 @@ pub fn teardown_av_layer() {
     // `_airplay._tcp` advertiser with it, and a stray second advertiser on the wrong
     // interface/identity is no longer constructible.
     let _ = std::fs::remove_file("/tmp/carplay_transport");
+    let _ = std::fs::remove_file(EXPECT_PHONE_FILE);
     AV_AIRPLAYD_PID.store(0, Ordering::Release);
     AV_LAYER_UP.store(false, Ordering::Release);
     println!("[av] wireless A/V layer torn down (carplayd stopped, discovery with it)");
@@ -398,6 +424,8 @@ fn ensure_av_layer_timed() {
             // Apple's own validated-feature-key cluster while iAPChannelInfo is NOT, so isolating
             // them is what makes it possible to tell which one (if either) is the real gate.
             ("CARPLAY_SESSION_MGMT", "1"),
+            // The phone gate: serve only the phone this file names (`expect_phone`).
+            ("CARPLAY_EXPECT_PHONE_FILE", EXPECT_PHONE_FILE),
         ];
         // cornerMask experiment (Phase 1): opt-in via the on-box flag file /tmp/cornermask_test (tmpfs,
         // so a reboot disarms it — same gate the wired supervisor uses). When present, advertise

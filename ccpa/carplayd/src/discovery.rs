@@ -139,9 +139,9 @@ fn dialable(ip: IpAddr, port: u16, scope: u32) -> SocketAddr {
 /// failure in main.rs ("exiting IS the repair, not a crash loop" — both spawners back off).
 ///
 /// The thread (rather than inline) is for the blocking browse/dial loop, not for isolation.
-pub fn start(device_id: String, pairing_identity: String) {
+pub fn start(device_id: String, pairing_identity: String, gate: std::sync::Arc<crate::phone_gate::PhoneGate>) {
     std::thread::spawn(move || {
-        if let Err(e) = run(&device_id, &pairing_identity) {
+        if let Err(e) = run(&device_id, &pairing_identity, &gate) {
             eprintln!("[rx] discovery failed: {e}");
             eprintln!(
                 "[carplayd] FATAL: mDNS discovery is down — a receiver no phone can find is not a \
@@ -152,7 +152,11 @@ pub fn start(device_id: String, pairing_identity: String) {
     });
 }
 
-fn run(dev_id: &str, pi: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn run(
+    dev_id: &str,
+    pi: &str,
+    gate: &crate::phone_gate::PhoneGate,
+) -> Result<(), Box<dyn std::error::Error>> {
     let dev_dec = mac_to_dec(dev_id);
     let iface = std::env::var("RX_IFACE").unwrap_or_else(|_| "ncm0".to_string());
     let adv_addr = std::env::var("RX_ADDR").unwrap_or_default(); // "" => addr-auto
@@ -204,6 +208,8 @@ fn run(dev_id: &str, pi: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     let browse = mdns.browse("_carplay-ctrl._tcp.local.")?;
     let mut dialed: HashSet<String> = HashSet::new();
+    // The addresses dialed for each phone's service, so a phone that leaves forgets only its own.
+    let mut dialed_by: HashMap<String, Vec<String>> = HashMap::new();
     while let Ok(ev) = browse.recv() {
         match ev {
             ServiceEvent::ServiceResolved(info) => {
@@ -216,6 +222,12 @@ fn run(dev_id: &str, pi: &str) -> Result<(), Box<dyn std::error::Error>> {
                     "[rx] resolved _carplay-ctrl {} -> {host}:{port} addrs={addrs:?} scope={iface}({scope})",
                     info.get_fullname()
                 );
+                // What the phone puts in its TXT record (2026-11-01 bench ask): whether anything in it
+                // names the phone, so discovery could dial only the one btd serves. The phone gate refuses
+                // another phone at SETUP either way.
+                let txt: Vec<String> =
+                    info.get_properties().iter().map(|p| format!("{}={}", p.key(), p.val_str())).collect();
+                println!("[rx] _carplay-ctrl TXT: {}", txt.join(" "));
                 // Dial the resolved ADDRESS(es), not the hostname (box has no .local resolver). Mark a
                 // peer dialed only on SUCCESS, retrying transient failures with a short backoff (the
                 // source address can lag the mDNS resolve by a few seconds right after association).
@@ -232,9 +244,16 @@ fn run(dev_id: &str, pi: &str) -> Result<(), Box<dyn std::error::Error>> {
                         if dialed.contains(&sa.to_string()) {
                             continue;
                         }
+                        // A phone the gate refused at SETUP: the one a switch dropped, still on the AP.
+                        // Not marked dialed, so a carplayd later told to serve that phone still dials it.
+                        if gate.is_refused(*ip) {
+                            println!("[rx] {sa}: its phone was refused at SETUP; not dialling it");
+                            continue;
+                        }
                         tried = true;
                         if connect_out(sa, dev_dec) {
                             dialed.insert(sa.to_string());
+                            dialed_by.entry(info.get_fullname().to_string()).or_default().push(sa.to_string());
                             break 'rounds;
                         }
                     }
@@ -250,13 +269,18 @@ fn run(dev_id: &str, pi: &str) -> Result<(), Box<dyn std::error::Error>> {
                     std::thread::sleep(Duration::from_secs(1));
                 }
             }
-            // The iPhone's control service went away (Wi-Fi drop / sleep). Clear the dial memory so it
-            // gets re-dialed when it reappears — otherwise `dialed` pins the old address forever and the
-            // phone can never reconnect without restarting the daemon. Single-phone box, so clearing the
-            // whole set on any removal is correct and simplest.
-            ServiceEvent::ServiceRemoved(_ty, fullname) if !dialed.is_empty() => {
-                println!("[rx] _carplay-ctrl removed ({fullname}) — clearing dial memory");
-                dialed.clear();
+            // The iPhone's control service went away (Wi-Fi drop / sleep). Forget the addresses dialed for
+            // it so it gets re-dialed when it reappears — otherwise `dialed` pins the old address forever
+            // and the phone can never reconnect without restarting the daemon. ONLY its own: this was
+            // the whole set while the box was taken for single-phone, and with a second phone on the AP
+            // (the 2026-11-01 switch bench) one leaving would make discovery dial the other again.
+            ServiceEvent::ServiceRemoved(_ty, fullname) => {
+                if let Some(addrs) = dialed_by.remove(&fullname) {
+                    println!("[rx] _carplay-ctrl removed ({fullname}) — forgetting its {} dialed address(es)", addrs.len());
+                    for a in addrs {
+                        dialed.remove(&a);
+                    }
+                }
             }
             _ => {}
         }
