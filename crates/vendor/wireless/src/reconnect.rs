@@ -855,7 +855,9 @@ pub fn run(
         }
         last_manual_log = false;
 
-        // A named request is tried alone and first. Anything else walks the policy order.
+        // A named request is tried alone and first. While a phone switch holds the box, only the
+        // phone it holds for is paged, round after round, until it connects or the hold lapses
+        // (`Control::request_switch`). Anything else walks the policy order.
         let targets: Vec<[u8; 6]> = match request {
             Some(Some(addr)) => {
                 if bonds.contains(&addr) {
@@ -871,7 +873,13 @@ pub fn run(
                     Vec::new()
                 }
             }
-            _ => bonds.clone(),
+            _ => match ctrl.held_for() {
+                Some(held) if bonds.contains(&held) => {
+                    log(&format!("switch hold -- paging only {}", control::fmt_addr(&held)));
+                    vec![held]
+                }
+                _ => bonds.clone(),
+            },
         };
 
         let mut ran = false;

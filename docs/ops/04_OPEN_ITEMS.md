@@ -78,7 +78,10 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
      `SEV_PHONE_PRESENT`, no re-arm during the hold-off, the phone reconnects on its own afterwards;
      wireless session, same press → `BT_PHASE IDLE`, `PROJ_MODE NONE`, hostapd and hci stay up
      (no `wireless_down` in the supervisor log), the phone re-pages after the hold-off.
-  2. **`MGMT_CONNECT_DEVICE [ascii MAC]` — targeted connect.** Problem: a Phones-tab card tap used
+  2. **LANDED: `MGMT_CONNECT_DEVICE 0x08` (targeted connect) and, 2026-11-01, `MGMT_SWITCH_DEVICE
+     0x0D` (`CAP_PHONE_SWITCH`), which ends ANOTHER phone's wireless session and holds the box 45 s
+     for the phone asked for — the wireless half of item 1's need, for switching rather than plain
+     disconnecting (see the protocol doc's MGMT row).** Original problem: a Phones-tab card tap used
      to send `MGMT_RESTART_WIRELESS` (wrong with two bonds, a radio bounce for a wired phone); the
      cards are information-only until this exists. Evidence: btd's control port already has
      `{"cmd":"connect","address":..}` (`crates/vendor/wireless/src/control.rs:36`, dispatch `:499`)

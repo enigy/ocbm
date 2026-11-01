@@ -957,10 +957,21 @@ fn connect_request(mac: &str) -> Option<String> {
     if mac.is_empty() {
         return Some("{\"cmd\":\"connect\"}\n".to_string());
     }
-    let ok = mac.len() == 17
+    is_mac(mac).then(|| format!("{{\"cmd\":\"connect\",\"address\":\"{mac}\"}}\n"))
+}
+
+/// `MGMT_SWITCH_DEVICE` body (a MAC) -> btd's `{"cmd":"switch"..}` line. The address is required:
+/// unlike a connect, a switch naming no phone would end a session for no one. None for anything else.
+fn switch_request(mac: &str) -> Option<String> {
+    let mac = mac.trim();
+    is_mac(mac).then(|| format!("{{\"cmd\":\"switch\",\"address\":\"{mac}\"}}\n"))
+}
+
+/// `AA:BB:CC:DD:EE:FF` hex, so nothing but an address reaches btd's JSON.
+fn is_mac(mac: &str) -> bool {
+    mac.len() == 17
         && mac.split(':').count() == 6
-        && mac.split(':').all(|o| o.len() == 2 && o.bytes().all(|b| b.is_ascii_hexdigit()));
-    ok.then(|| format!("{{\"cmd\":\"connect\",\"address\":\"{mac}\"}}\n"))
+        && mac.split(':').all(|o| o.len() == 2 && o.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// One request/response round trip with btd's control port, bounded at every step (connect, write
@@ -3730,6 +3741,17 @@ impl Daemon {
                 };
                 self.mgmt_ack(verb, u8::from(!ok));
             }
+            p::MGMT_SWITCH_DEVICE => {
+                let mac = std::str::from_utf8(&pl[1..]).unwrap_or("");
+                let ok = match switch_request(mac) {
+                    Some(line) => btd_round_trip(&line),
+                    None => {
+                        eprintln!("[ocbmd] device policy: refused MGMT_SWITCH_DEVICE for {mac:?} (not a MAC)");
+                        false
+                    }
+                };
+                self.mgmt_ack(verb, u8::from(!ok));
+            }
             // The one-file install (ccpa/installer/). Only an app that offers the way back confirms.
             p::MGMT_INSTALL_CONFIRM => {
                 // A confirmed trial finishes when its session ends; an update in its trial settles first.
@@ -3945,7 +3967,7 @@ impl Daemon {
                     }
                     let mut caps =
                         p::CAP_CONSOLE | p::CAP_ECHO | p::CAP_IP | p::CAP_FILE | p::CAP_ETH | p::CAP_PHONE_POLICY | p::CAP_PAIR_WINDOW
-                        | p::CAP_INSTALL;
+                        | p::CAP_INSTALL | p::CAP_PHONE_SWITCH;
                     if self.mfi.is_some() {
                         caps |= p::CAP_MFI;
                     }
@@ -5013,6 +5035,17 @@ mod tests {
         assert!(connect_request("AA:BB:CC:DD:EE").is_none());
         assert!(connect_request("AA:BB:CC:DD:EE:0G").is_none());
         assert!(connect_request("\",\"cmd\":\"forget").is_none());
+    }
+
+    #[test]
+    fn switch_request_needs_a_mac() {
+        assert_eq!(
+            switch_request(" aa:BB:cc:DD:ee:01 ").as_deref(),
+            Some("{\"cmd\":\"switch\",\"address\":\"aa:BB:cc:DD:ee:01\"}\n")
+        );
+        assert!(switch_request("").is_none(), "a switch must name the phone");
+        assert!(switch_request("AA:BB:CC:DD:EE").is_none());
+        assert!(switch_request("\",\"cmd\":\"forget").is_none());
     }
 
     // -----------------------------------------------------------------------------------------

@@ -62,8 +62,8 @@ pub fn try_claim(sock_path: &str) -> std::io::Result<ClaimResult> {
 }
 
 /// Block until the arbiter pushes `"preempt\n"` (wired claimed), the connection drops (arbiter
-/// restarted), or `shutdown` is set. Any of these means the caller should tear down its wireless
-/// session.
+/// restarted), `shutdown` is set, or `restart` says so (a phone switch, `Control::request_switch`). Any
+/// of these means the caller should tear down its wireless session.
 ///
 /// BUG FIX (live-reproduced 2026-07-07): this used to block on a plain `read_line()` with no
 /// timeout, so a process kill/SIGTERM had no way to unblock it -- with wired never claiming during a
@@ -71,13 +71,20 @@ pub fn try_claim(sock_path: &str) -> std::io::Result<ClaimResult> {
 /// by PID. Matches the SO_RCVTIMEO + shutdown-flag-poll discipline already used by every other
 /// blocking loop in this crate (ssp_agent.rs, sdp_server.rs, rfcomm.rs) -- this was the one place
 /// that didn't follow it.
-pub fn wait_for_preempt(reader: &mut BufReader<UnixStream>, shutdown: &AtomicBool) {
+pub fn wait_for_preempt(
+    reader: &mut BufReader<UnixStream>,
+    shutdown: &AtomicBool,
+    restart: &dyn Fn() -> bool,
+) {
     let _ = reader
         .get_ref()
         .set_read_timeout(Some(Duration::from_secs(1)));
     let mut line = String::new();
     loop {
         if shutdown.load(Ordering::Relaxed) {
+            return;
+        }
+        if restart() {
             return;
         }
         line.clear();

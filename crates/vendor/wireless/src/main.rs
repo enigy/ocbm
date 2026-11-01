@@ -408,6 +408,15 @@ fn run_active_session(
         }
         match rfcomm_accept(RFCOMM_CHANNEL, &t) {
             Ok(Some((sock, peer))) => {
+                // A phone switch holds the box for the phone asked for: the phone it dropped re-dials
+                // at once, and taking it here would undo the switch (`Control::request_switch`).
+                if !accept_ctrl.admits(peer) {
+                    log(&format!(
+                        "RFCOMM client {} refused -- a switch holds the box for another phone",
+                        control::fmt_addr(&peer)
+                    ));
+                    continue;
+                }
                 log("RFCOMM client connected -- starting iAP2 handshake");
                 // Claim the single-session slot ATOMICALLY (compare_exchange, not a plain store) so the
                 // accept path and the Model-B reconnect path can never run two concurrent bt_driver::run
@@ -483,6 +492,10 @@ fn run_active_session(
                             "AA: RFCOMM client ..{:02X}:{:02X} is not bonded with this box -- dropping it (pair it through the app's Add phone first)",
                             peer[1], peer[0]
                         ));
+                        continue;
+                    }
+                    if !aa_ctrl.admits(peer) {
+                        log("AA: a switch holds the box for another phone -- dropping inbound connect");
                         continue;
                     }
                     let Some(_claim) =
@@ -637,16 +650,24 @@ fn run_active_session(
         reconnect::run(&rc_name, &rc_shutdown, &rc_active, &rc_ctrl);
     });
 
+    // A phone switch (MGMT_SWITCH_DEVICE, `Control::request_switch`) ends the session here too, through
+    // the same go-quiet teardown as a preempt: the one way out of a live session that is proven to
+    // leave nothing behind. `main`'s claim loop then re-enters with a fresh session, whose reconnect
+    // loop pages the phone asked for while the hold keeps every other phone out.
+    let restart = || ctrl.restart_requested();
     match arbiter {
-        Some(mut reader) => arbiter_client::wait_for_preempt(&mut reader, shutdown),
+        Some(mut reader) => arbiter_client::wait_for_preempt(&mut reader, shutdown, &restart),
         None => {
-            // Standalone: no arbiter to preempt us -- hold until SIGTERM.
-            while !shutdown.load(Ordering::Relaxed) {
+            // Standalone: no arbiter to preempt us -- hold until SIGTERM or a switch.
+            while !shutdown.load(Ordering::Relaxed) && !restart() {
                 thread::sleep(Duration::from_secs(1));
             }
         }
     }
 
+    if ctrl.take_restart() {
+        log("switching phones -- ending this session so the phone asked for can connect");
+    }
     log("going quiet");
     ssp_shutdown.store(true, Ordering::Relaxed);
     sdp_shutdown.store(true, Ordering::Relaxed);

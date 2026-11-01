@@ -377,6 +377,14 @@ pub const MGMT_GO_STOCK: u8 = 0x0B;
 /// MGMT_INFO's "update" (`none`, `installing`, `trial`, `committed`, `rolled_back`, `refused`) and
 /// "update_result" (one line, with the reason). Only on a box with CAP_UPDATE.
 pub const MGMT_UPDATE: u8 = 0x0C;
+/// [MGMT_SWITCH_DEVICE][ascii MAC "AA:BB:.."] -> btd `{"cmd":"switch"}`: make that bonded phone the
+/// projecting one, the device screen's Connect while another phone projects (owner 2026-11-01). With
+/// ANOTHER phone's wireless session live, btd ends it through the go-quiet teardown an arbiter preempt
+/// takes, pages the named phone, and for 45 s (btd `control::SWITCH_HOLD`) refuses every other phone,
+/// so the one just dropped cannot re-dial in first. Idle, or already that phone's session, it is
+/// MGMT_CONNECT_DEVICE. Never ends a wired session: btd has none live then. MGMT_ACK status 1 = not a
+/// MAC, not bonded, or btd unreachable. Only on a box with CAP_PHONE_SWITCH.
+pub const MGMT_SWITCH_DEVICE: u8 = 0x0D;
                                             //   Box->host:
 pub const MGMT_INFO: u8 = 0x81; // [MGMT_INFO][utf8 JSON] — identity + health + bonded-device snapshot
 pub const MGMT_ACK: u8 = 0x82; // [MGMT_ACK][verb u8][status u8] — 0 ok / 1 error, echoing the request verb
@@ -396,6 +404,7 @@ pub const CAP_PHONE_POLICY: u32 = 0x0000_0040; // box takes MGMT_SET_POLICY / MG
 pub const CAP_PAIR_WINDOW: u32 = 0x0000_0080; // box takes MGMT_PAIR_WINDOW and gates pairing behind it
 pub const CAP_INSTALL: u32 = 0x0000_0100; // box takes MGMT_INSTALL_CONFIRM / MGMT_GO_STOCK and reports "install" in MGMT_INFO
 pub const CAP_UPDATE: u32 = 0x0000_0200; // box takes MGMT_UPDATE and reports "update" in MGMT_INFO
+pub const CAP_PHONE_SWITCH: u32 = 0x0000_0400; // box takes MGMT_SWITCH_DEVICE: Connect may end another phone's wireless session
 
 // OCBM_CH_IP stream-mux sub-frame types. Payload = [type u8][conn_id u16 LE][data].
 // AAOS has no NCM, so L3 is done in userspace over this channel (no kernel TUN needed).

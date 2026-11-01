@@ -34,6 +34,9 @@
 //!   {"cmd":"list"}     -> {"ok":true,"devices":[{"address":"AA:BB:CC:DD:EE:FF","name":"","bonded":true,"connected":false}]}
 //!   {"cmd":"status"}   -> {"ok":true,"active":false,"address":"","autoConnect":true}
 //!   {"cmd":"connect","address":"AA:BB:.."} -> {"ok":true}    // address optional: omit = first-to-connect
+//!   {"cmd":"switch","address":"AA:BB:.."}  -> {"ok":true,"ending":true}  // make that bonded phone the
+//!                                                            // projecting one: ends another phone's
+//!                                                            // session ("ending"), see request_switch
 //!   {"cmd":"policy","autoConnect":false,"order":["AA:BB:.."]} -> {"ok":true}
 //!   {"cmd":"forget","address":"AA:BB:.."}  -> {"ok":true}
 //!   {"cmd":"pair_answer","accept":true}    -> {"ok":true}    // the head unit's yes/no for the
@@ -68,7 +71,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::ssp_agent;
 
@@ -81,6 +84,13 @@ const CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A request line longer than this is not a request we understand. Bounded before allocation.
 const MAX_REQUEST_BYTES: usize = 8 * 1024;
+
+/// How long a switch holds the box for the phone asked for ([`Control::request_switch`]), from the request:
+/// the session teardown and Bluetooth bring-up come out of it before the first page. The phone
+/// just dropped re-dials within seconds; a bonded phone in range answers a page in one to five. Past
+/// this the hold lapses, so a phone that is not in the vehicle cannot lock the box: every phone may
+/// connect again, in the usual order.
+pub const SWITCH_HOLD: Duration = Duration::from_secs(45);
 
 /// `@<unix_ms> ` write-time stamp (docs/carplay/01_OCBM_PROTOCOL.md CH_LOG): the box.log tailer
 /// parses this prefix and uses it instead of the millisecond it happened to READ the line at.
@@ -300,6 +310,12 @@ pub struct Control {
     /// The pairing window (security plan H1), PROCESS-lifetime for the same reason as
     /// `pair_answer`: "Add phone" arrives before the phone does. Read by the SSP agent's mgmt loop.
     pair_window: Arc<ssp_agent::PairWindow>,
+    /// A switch in progress: the phone asked for, and until when only it may start a session.
+    /// Set by [`Control::request_switch`], ended when that phone's session is claimed or it lapses.
+    switch_hold: Mutex<Option<([u8; 6], Instant)>>,
+    /// The live session must end so a switch can page its phone. `run_active_session` polls it and
+    /// leaves through the same go-quiet teardown an arbiter preempt takes.
+    restart: AtomicBool,
 }
 
 impl Control {
@@ -360,6 +376,91 @@ impl Control {
         self.pending.lock().map(|p| p.is_some()).unwrap_or(false)
     }
 
+    /// Make `addr` the projecting phone (MGMT_SWITCH_DEVICE, the app's Connect on a phone while another
+    /// one projects). `bonded` is the bond list; an unbonded `addr` is refused (`None`), since it could
+    /// never connect and the live session would be ended for nothing.
+    ///
+    /// With ANOTHER phone's session live this asks for `addr`, holds the box for it ([`SWITCH_HOLD`]),
+    /// and flags the session to end (`Some(true)`). The hold is what makes the switch stick: the phone
+    /// just dropped re-dials at once and would otherwise win the race. With no session live, or
+    /// `addr`'s own, it is a plain connect request (`Some(false)`): nothing is ended.
+    ///
+    /// btd owns only WIRELESS sessions. A wired phone holds the arbiter, so btd has none live and this
+    /// never ends a wired session; the app does not offer it then.
+    pub fn request_switch(
+        &self,
+        addr: [u8; 6],
+        bonded: &[[u8; 6]],
+    ) -> Option<bool> {
+        self.request_switch_at(addr, bonded, Instant::now())
+    }
+
+    fn request_switch_at(
+        &self,
+        addr: [u8; 6],
+        bonded: &[[u8; 6]],
+        now: Instant,
+    ) -> Option<bool> {
+        if !bonded.contains(&addr) {
+            return None;
+        }
+        self.request_connect(Some(addr));
+        let ending = self.session_active() && self.session_peer() != Some(addr);
+        if ending {
+            if let Ok(mut h) = self.switch_hold.lock() {
+                *h = Some((addr, now + SWITCH_HOLD));
+            }
+            self.restart.store(true, Ordering::Release);
+        }
+        Some(ending)
+    }
+
+    /// Whether the live session should end for a switch. Peeks: the session's wait loop polls it.
+    pub fn restart_requested(&self) -> bool {
+        self.restart.load(Ordering::Acquire)
+    }
+
+    /// Clear the restart flag; true when it was set.
+    pub fn take_restart(&self) -> bool {
+        self.restart.swap(false, Ordering::AcqRel)
+    }
+
+    /// The phone a switch holds the box for, while the hold lasts.
+    pub fn held_for(&self) -> Option<[u8; 6]> {
+        self.held_for_at(Instant::now())
+    }
+
+    fn held_for_at(&self, now: Instant) -> Option<[u8; 6]> {
+        let mut h = self.switch_hold.lock().ok()?;
+        match *h {
+            Some((addr, until)) if now < until => Some(addr),
+            Some(_) => {
+                *h = None;
+                log("switch hold lapsed -- every bonded phone may connect again");
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// May `peer` start a session now? Any phone, except while a switch holds the box for another.
+    pub fn admits(&self, peer: [u8; 6]) -> bool {
+        self.admits_at(peer, Instant::now())
+    }
+
+    fn admits_at(&self, peer: [u8; 6], now: Instant) -> bool {
+        !matches!(self.held_for_at(now), Some(held) if held != peer)
+    }
+
+    /// The phone a switch asked for has its session: the hold has done its job.
+    fn end_hold_for(&self, peer: Option<[u8; 6]>) {
+        if let (Some(p), Ok(mut h)) = (peer, self.switch_hold.lock()) {
+            if h.is_some_and(|(addr, _)| addr == p) {
+                *h = None;
+            }
+        }
+    }
+
     pub fn request_connect(&self, addr: Option<[u8; 6]>) {
         if let Ok(mut p) = self.pending.lock() {
             *p = Some(addr);
@@ -406,6 +507,7 @@ impl<'a> SessionClaim<'a> {
         flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .ok()?;
         ctrl.set_session_peer(peer);
+        ctrl.end_hold_for(peer);
         Some(Self { flag, ctrl })
     }
 }
@@ -522,6 +624,24 @@ pub fn handle_request(ctrl: &Control, line: &str) -> String {
                 .collect();
             format!(r#"{{"ok":true,"devices":[{}]}}"#, items.join(","))
         }
+        "switch" => match json_str(line, "address").as_deref().and_then(parse_addr) {
+            Some(a) => match ctrl.request_switch(a, &ssp_agent::bonded_addrs()) {
+                Some(ending) => {
+                    if ending {
+                        log(&format!(
+                            "switch to {} requested -- ending the live session, holding the box for it {}s",
+                            fmt_addr(&a),
+                            SWITCH_HOLD.as_secs()
+                        ));
+                    } else {
+                        log(&format!("switch to {} requested -- no other session live, connecting", fmt_addr(&a)));
+                    }
+                    format!(r#"{{"ok":true,"ending":{ending}}}"#)
+                }
+                None => r#"{"ok":false,"error":"not bonded"}"#.to_string(),
+            },
+            None => r#"{"ok":false,"error":"bad address"}"#.to_string(),
+        },
         "status" => {
             let peer = ctrl.session_peer();
             format!(
@@ -831,6 +951,73 @@ mod tests {
         assert!(handle_request(&c, r#"{"cmd":"connect","address":"66:55:44:33:22:11"}"#)
             .contains("\"ok\":true"));
         assert_eq!(c.take_request(), Some(Some([0x11, 0x22, 0x33, 0x44, 0x55, 0x66])));
+    }
+
+    const PHONE_A: [u8; 6] = [0x10, 0x25, 0x00, 0x29, 0xA7, 0x68];
+    const PHONE_B: [u8; 6] = [0xDE, 0x6A, 0x00, 0x00, 0x00, 0x00];
+
+    /// A Control with `peer`'s session live, as `SessionClaim` leaves it.
+    fn live(peer: [u8; 6]) -> Control {
+        let c = Control::new(Arc::new(AtomicBool::new(false)));
+        c.session_active.store(true, Ordering::Release);
+        c.set_session_peer(Some(peer));
+        c
+    }
+
+    #[test]
+    fn a_switch_ends_another_phones_session_and_holds_the_box_for_the_one_asked_for() {
+        // Owner 2026-11-01: a second iPhone connected and the owner's could not get in.
+        let c = live(PHONE_B);
+        let now = Instant::now();
+        assert_eq!(c.request_switch_at(PHONE_A, &[PHONE_A, PHONE_B], now), Some(true));
+        assert!(c.restart_requested(), "the live session is told to end");
+        assert_eq!(c.take_request(), Some(Some(PHONE_A)), "the phone asked for is paged first");
+        assert!(!c.admits_at(PHONE_B, now + Duration::from_secs(1)), "the dropped phone may not re-dial in");
+        assert!(c.admits_at(PHONE_A, now + Duration::from_secs(1)));
+        assert!(c.admits_at(PHONE_B, now + SWITCH_HOLD), "a phone not in the vehicle cannot lock the box");
+        assert_eq!(c.held_for_at(now + SWITCH_HOLD), None);
+        assert!(c.take_restart());
+        assert!(!c.take_restart(), "taken once");
+    }
+
+    #[test]
+    fn the_hold_ends_once_the_phone_asked_for_has_its_session() {
+        let flag = AtomicBool::new(false);
+        let c = live(PHONE_B);
+        c.request_switch_at(PHONE_A, &[PHONE_A, PHONE_B], Instant::now());
+        c.session_active.store(false, Ordering::Release);
+        c.set_session_peer(None);
+        let claim = SessionClaim::try_claim(&flag, &c, Some(PHONE_A));
+        assert!(claim.is_some());
+        assert_eq!(c.held_for(), None);
+        drop(claim);
+        assert!(c.admits(PHONE_B), "after the switched-to session, every phone again");
+    }
+
+    #[test]
+    fn a_switch_with_no_other_session_is_a_plain_connect() {
+        let idle = Control::new(Arc::new(AtomicBool::new(false)));
+        assert_eq!(idle.request_switch_at(PHONE_A, &[PHONE_A], Instant::now()), Some(false));
+        assert!(!idle.restart_requested());
+        assert_eq!(idle.held_for(), None);
+        assert_eq!(idle.take_request(), Some(Some(PHONE_A)));
+
+        let same = live(PHONE_A);
+        assert_eq!(same.request_switch_at(PHONE_A, &[PHONE_A], Instant::now()), Some(false), "already projecting");
+        assert!(!same.restart_requested());
+    }
+
+    #[test]
+    fn a_switch_to_an_unbonded_phone_ends_nothing() {
+        let c = live(PHONE_B);
+        assert_eq!(c.request_switch_at(PHONE_A, &[PHONE_B], Instant::now()), None);
+        assert!(!c.restart_requested());
+        assert_eq!(c.take_request(), None);
+        // Over the socket: no link keys in a test run, so any address is unbonded.
+        assert!(handle_request(&c, r#"{"cmd":"switch","address":"68:A7:29:00:25:10"}"#).contains("not bonded"));
+        assert!(handle_request(&c, r#"{"cmd":"switch","address":"nope"}"#).contains("bad address"));
+        assert!(handle_request(&c, r#"{"cmd":"switch"}"#).contains("\"ok\":false"));
+        assert!(!c.restart_requested());
     }
 
     #[test]
