@@ -90,7 +90,14 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
      to btd, `MGMT_ACK` 1 when the MAC is not bonded. App hook waiting: re-add
      `CarlinkManager.connectToDevice(mac)` → `mgmtAction(MGMT_CONNECT_DEVICE, mac)` and the card's
      `onTap`. Acceptance: two bonded phones in range, tap B → `BT_PHASE LINK_UP` →
-     `CT_PHONE_IDENT.deviceID == B`.
+     `CT_PHONE_IDENT.deviceID == B`. **Benched 2026-11-01 on the dev adapter (IW416, installer
+     6affefc) with ONE iPhone only:** `CAP_PHONE_SWITCH` advertised (caps `0x7ff`); pairing, a
+     wireless session and a reconnect `btd` paged out all ran on the new `btd` with no hold logged;
+     Carlink's Connect stays disabled on the projecting phone's row. The switch itself is unmeasured
+     until a second iPhone is on the bench. Watch three things then: `btd` re-entering
+     `run_active_session` in-process (a CCPA has no arbiter, so `btd` runs standalone and has never
+     done it); the dropped iPhone rejoining over Wi-Fi during the hold, which gates Bluetooth only;
+     and the teardown plus the new phone's bring-up fitting inside the 45 s.
   3. **"Phone drop on host re-SUBSCRIBE" (`PROJ_MODE NONE` then `SESSION_EVENT PHONE_ABSENT` after
      an app relaunch) — NOT reproduced, 2026-09-25.** Three timelines, all wired, the phone never
      left the bus in any: (a) kill-without-STOP relaunch (`adb install -r`): SUBSCRIBE → stale

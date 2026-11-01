@@ -426,7 +426,9 @@ because BT attach waits for WLAN on this part, Bluetooth with it. Both forms now
   the app's pairing screen read `CarLink-0264`, because it asks before `wlan0` exists and
   `bt_name_from()` fell back to the serial. `bt_name_from()`'s caller now takes `wlan0`'s MAC from the
   one-file installer's `/etc/ocbm/addresses.txt` while `wlan0` is absent, so `MGMT_INFO`'s name is
-  what `btd` advertises whenever `btd` brings Bluetooth up with `wlan0` present. The seam's own name
+  what `btd` advertises whenever `btd` brings Bluetooth up with `wlan0` present. Measured on the same
+  adapter 1 Nov (installer 6affefc): `MGMT_INFO` read `CarLink-fd6c` with no `wlan0` and `hci0`
+  down, and Carlink's pairing screen and Settings › Phones showed that name too. The seam's own name
   and the BT-only role still differ.
 * The startup decode transient described in §6b.
 * **Broadcom is entirely untested** and is the known-hardest case: `wlan0` there does not exist
