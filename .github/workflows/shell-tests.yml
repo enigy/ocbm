@@ -28,8 +28,16 @@ jobs:
         run: brew install dash
       - name: Shell suites under sh and dash
         run: |
-          fail=0
-          run() { echo "=== $1"; shift; "$@" || fail=1; }
+          # Each suite's output is kept, so the end of the log names what failed.
+          logs=$(mktemp -d)
+          failed=""
+          run() {
+            n=$1; shift
+            echo "=== $n"
+            rc=0; "$@" > "$logs/$n.log" 2>&1 || rc=$?
+            cat "$logs/$n.log"
+            [ "$rc" -eq 0 ] || failed="$failed $n"
+          }
           run "stock-restore"  sh   tools/stock_restore_test.sh
           run "jffs2-extract"  python3 -I tools/jffs2_extract_test.py
           run "ocbm-installer" bash tools/ocbm_installer_test.sh
@@ -37,5 +45,12 @@ jobs:
           run "ocbm-update"    bash tools/ocbm_update_test.sh
           run "radio-detect"   bash tools/radio_detect_test.sh
           run "update-img"     bash tools/make_update_img_test.sh
-          [ "$fail" -eq 0 ] || { echo "FAILURES"; exit 1; }
+          if [ -n "$failed" ]; then
+            echo "FAILURES:$failed"
+            for n in $failed; do
+              echo "--- $n"
+              grep -E '^ *FAIL |: [0-9]+ (FAILED|failed)$' "$logs/$n.log" || tail -n 15 "$logs/$n.log"
+            done
+            exit 1
+          fi
           echo "all shell suites passed"

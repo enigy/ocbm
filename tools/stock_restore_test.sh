@@ -488,14 +488,25 @@ for SH in $SHELLS; do
   onefile_tests "$SH"
 done
 
-echo "=== the driver's apply monitor (tools/stock_restore.sh) under set -euo pipefail"
-DRIVER="$HERE/stock_restore.sh"
-out_=$(bash -c 'set -euo pipefail; eval "$(sed -n "/^new_steps() {/,/^}/p" "$1")"; new_steps "staging, no step yet" "^\[restore\] [0-9]/5|^RESTORE_" 0 | wc -l | tr -d " "; echo survived' _ "$DRIVER" 2>&1)
-check '[ "$out_" = "0
+# new_steps is cut out here and handed in: macOS's bash 3.2 brace-expands "{/,/^}" inside a quoted "$(...)",
+# so cutting it out inside the bash -c gave sed two broken scripts. CI's runner has that bash, and both checks
+# failed there from 07c94df on. The driver runs under whichever bash env finds, so the checks run under each.
+DRIVER="${STOCK_RESTORE_DRIVER:-$HERE/stock_restore.sh}"   # override to mutation-test the test
+NEW_STEPS=$(sed -n '/^new_steps() {/,/^}/p' "$DRIVER")
+BASHES=""
+for B in /bin/bash "$(command -v bash)"; do
+  [ -x "$B" ] || continue
+  case " $BASHES " in *" $B "*) ;; *) BASHES="$BASHES $B" ;; esac
+done
+for B in $BASHES; do
+  echo "=== the driver's apply monitor (tools/stock_restore.sh) under $B, set -euo pipefail"
+  out_=$("$B" -c 'set -euo pipefail; eval "$1"; new_steps "staging, no step yet" "^\[restore\] [0-9]/5|^RESTORE_" 0 | wc -l | tr -d " "; echo survived' _ "$NEW_STEPS" 2>&1)
+  check '[ "$out_" = "0
 survived" ]' "a log with no step lines yet does not end the driver (it did, silently, right after === apply)"
-out_=$(bash -c 'set -euo pipefail; eval "$(sed -n "/^new_steps() {/,/^}/p" "$1")"; new_steps "$(printf "[restore] 1/5 room\n[restore] x\n[restore] 2/5 files\nRESTORE_DONE\n")" "^\[restore\] [0-9]/5|^RESTORE_" 1' _ "$DRIVER" 2>&1)
-check '[ "$out_" = "[restore] 2/5 files
+  out_=$("$B" -c 'set -euo pipefail; eval "$1"; new_steps "$(printf "[restore] 1/5 room\n[restore] x\n[restore] 2/5 files\nRESTORE_DONE\n")" "^\[restore\] [0-9]/5|^RESTORE_" 1' _ "$NEW_STEPS" 2>&1)
+  check '[ "$out_" = "[restore] 2/5 files
 RESTORE_DONE" ]' "it shows only the step lines not yet shown"
+done
 
 echo
 if [ "$fails" -eq 0 ]; then echo "stock_restore_test: all passed"; exit 0; fi
