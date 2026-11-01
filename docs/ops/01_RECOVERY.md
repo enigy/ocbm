@@ -314,14 +314,24 @@ console, from one of the unit's own backups:
   has 1000:0 (a symlink's owner changes nothing here, but the image is the target). The restore made
   links with a bare `ln -s`, and the tree it worked from could not have said otherwise, since busybox
   `tar` had left that tree's links root's too; since then each link takes its owner from
-  `/tmp/rs.links` (see the pack, above), not yet run on an adapter. A one-off stick set the dev
-  adapter's 20 to 1000:0 that night: its owners then matched the dump in 889 of 891 entries (the other
-  two are runtime, `/var/run` and the DHCP lease file) and its survey in 888, as before. After that
-  survey stick and the one before it, both failed updates on purpose, the adapter showed as stock for
-  a second and then stayed off USB, its stick share included, until the next power cycle; after the
-  one earlier that day it stayed on USB as `1314:1520` with CarPlay down, which is what
-  `tools/stock_survey.sh` describes. Why it differs is not known. Carlink's builds still leave the confirm off
-  (`-Pcarlink.installConfirm`). The flash dump and an SPI programmer stay the last resort.
+  `/tmp/rs.links` (see the pack, above). A one-off stick set the dev adapter's 20 to 1000:0 that
+  night: its owners then matched the dump in 889 of 891 entries (the other two are runtime,
+  `/var/run` and the DHCP lease file) and its survey in 888, as before.
+  Later that night the confirm came from Carlink itself, once: a bench build with it on (`4484e28`,
+  `-Pcarlink.installConfirm=true`) sent `MGMT_INSTALL_CONFIRM` as soon as its welcome card showed the
+  way back (status 0; Settings › Adapter then read "Removed when this drive ends"). Stopping the
+  emulator ended the session at the USB level, and `ocbmd` exited for respawn on the read error
+  without starting the finish, so the adapter stayed `confirmed` (see `ccpa/README.md`,
+  `ocbm_finish.sh`). The next power-on ran the finish from the start script once the self-test had
+  passed: the same 105 entries, 4,244 KB free. From `final` the `--dump` restore then gave every link
+  it made its owner: straight after it the owners matched the dump in 889 of 891 entries and the
+  survey in 888, with 1,732 KB free and no one-off stick. A survey stick fails the update on
+  purpose, and after it the adapter went two ways: after the evening's survey and the link-owner
+  stick it showed as stock for a second and then stayed off USB, its stick share included, until the
+  next power cycle; after one earlier that day and this last one it stayed on USB as `1314:1520`, as
+  `tools/stock_survey.sh` describes (CarPlay down until a power cycle). Why is not known.
+  Every other Carlink build still leaves the confirm off (`-Pcarlink.installConfirm`). The flash dump
+  and an SPI programmer stay the last resort.
 
 ### UART console reference
 
