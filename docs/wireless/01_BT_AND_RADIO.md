@@ -421,7 +421,13 @@ because BT attach waits for WLAN on this part, Bluetooth with it. Both forms now
   `radio_hal.sh bt_on` the controller ends up advertising `CarLink-<suffix>` rather than the seam's
   `ccpa-<4hex>`. In the BT-only bridge role the suffixes can differ too, not just the prefixes.
   Closing it means the Rust side reading the ident file first — a behaviour change, so it is listed
-  here rather than done.
+  here rather than done. **31 Oct 2026, the dev adapter (IW416):** the iPhone listed `btd`'s
+  `CarLink-fd6c`, `wlan0`'s suffix; the ident file and the SSID read `ccpa-fe01`, from `sta0`; and
+  the app's pairing screen read `CarLink-0264`, because it asks before `wlan0` exists and
+  `bt_name_from()` fell back to the serial. `bt_name_from()`'s caller now takes `wlan0`'s MAC from the
+  one-file installer's `/etc/ocbm/addresses.txt` while `wlan0` is absent, so `MGMT_INFO`'s name is
+  what `btd` advertises whenever `btd` brings Bluetooth up with `wlan0` present. The seam's own name
+  and the BT-only role still differ.
 * The startup decode transient described in §6b.
 * **Broadcom is entirely untested** and is the known-hardest case: `wlan0` there does not exist
   until it is explicitly created on top of `sta0` (`iw dev sta0 interface add wlan0 type

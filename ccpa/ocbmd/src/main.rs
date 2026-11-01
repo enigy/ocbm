@@ -1429,8 +1429,10 @@ fn mirror_flags(replay: bool) -> u8 {
     }
 }
 
-/// The advertised accessory name derived like `iap2-core::accessory_name`: `CarLink-<last-4-hex>` of the
-/// Wi-Fi MAC (matching the SSID), else the serial; `CarLink` if neither is readable.
+/// The advertised accessory name derived like `iap2-core::accessory_name`, which `btd` gives Bluetooth:
+/// `CarLink-<last-4-hex>` of the Wi-Fi MAC, else the serial; `CarLink` if neither is readable. (Not the
+/// SSID's suffix on every unit: the radio seam names the AP from the first wireless interface, which on
+/// the dev adapter is `sta0`, where `wlan0` gives this name.)
 fn bt_name_from(wifi_mac: &str, serial: &str) -> String {
     let sfx = |s: &str| -> Option<String> {
         let hex: String = s.chars().filter(|c| c.is_ascii_hexdigit()).collect();
@@ -1440,6 +1442,28 @@ fn bt_name_from(wifi_mac: &str, serial: &str) -> String {
         Some(s) => format!("CarLink-{s}"),
         None => "CarLink".to_string(),
     }
+}
+
+/// The one-file installer's record of this adapter's radio addresses, read from stock before the
+/// install changed anything (`ccpa/installer/once.sh`): `wlan0=<MAC>` and `hci0=<MAC>`, one per line.
+/// A box converted the older way has none. The `cfg(test)` path because a test writes it.
+#[cfg(not(test))]
+const INSTALL_ADDRESSES: &str = "/etc/ocbm/addresses.txt";
+#[cfg(test)]
+const INSTALL_ADDRESSES: &str = "/tmp/ocbmd_selftest_addresses.txt";
+
+/// The Wi-Fi MAC the adapter's name comes from: `wlan0`'s (`live`), which exists only once the radios
+/// are up, else the `wlan0=` line of the installer's record (`addresses`). The app asks at SUBSCRIBE,
+/// before the radios are up, so from the live address alone its pairing screen said CarLink-0264, the
+/// serial's suffix, while the iPhone listed `btd`'s CarLink-fd6c (the dev adapter, 31 Oct).
+fn name_wifi_mac(live: &str, addresses: &str) -> String {
+    if !live.is_empty() {
+        return live.to_string();
+    }
+    addresses
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("wlan0="))
+        .map_or_else(String::new, |m| m.trim().to_string())
 }
 
 /// Bonded BR/EDR devices as uppercase MAC strings. The 25-byte record's bdaddr is little-endian, so it
@@ -3782,7 +3806,9 @@ impl Daemon {
         // the reader. Worst case it returns "" mid-teardown.
         let bt_mac = read_trim("/sys/class/bluetooth/hci0/address");
         let serial = read_trim("/etc/serial_number");
-        let name = bt_name_from(&wifi_mac, &serial); // hex-filtered, so a raw serial is fine here
+        // The name `btd` advertises, from the first request on: `wifi_mac` above stays the live address.
+        let name_mac = name_wifi_mac(&wifi_mac, &read_trim(INSTALL_ADDRESSES));
+        let name = bt_name_from(&name_mac, &serial); // hex-filtered, so a raw serial is fine here
         let transport = json_escape(&read_trim("/tmp/carplay_transport"));
         let phone = read_trim("/tmp/phone_present") == "1";
         // The `bt_probe` thread's atomics, exactly what box_health_tick reads — the two must not be
@@ -5165,6 +5191,27 @@ mod tests {
         clear_session_state_for_exit(&f, || started = true);
         assert!(!started, "a trial nobody confirmed is not finished");
         let _ = std::fs::remove_file(&f);
+    }
+
+    #[test]
+    fn the_adapter_name_is_btds_from_the_first_request() {
+        // The app reads MGMT_INFO at SUBSCRIBE, before wlan0 exists: the live address alone gave the serial's
+        // suffix (CarLink-0264) while btd named Bluetooth from wlan0 (CarLink-fd6c, the dev adapter, 31 Oct).
+        let saved = "wlan0=00:e0:4c:99:fd:6c\nhci0=38:ba:b0:1d:0c:64\n";
+        let serial = "2025.10.15.11270264";
+        assert_eq!(bt_name_from(&name_wifi_mac("", saved), serial), "CarLink-fd6c", "radios down: the installer's record");
+        assert_eq!(bt_name_from(&name_wifi_mac("00:e0:4c:99:aa:bb", saved), serial), "CarLink-aabb", "radios up: wlan0 itself");
+        assert_eq!(
+            bt_name_from(&name_wifi_mac("", "wlan0=\nhci0=38:ba:b0:1d:0c:64\n"), serial),
+            "CarLink-0264",
+            "no Wi-Fi address saved: the serial, as btd falls back"
+        );
+        assert_eq!(bt_name_from(&name_wifi_mac("", ""), serial), "CarLink-0264", "no record: a box converted the older way keeps its name");
+        // And MGMT_INFO uses it (on a host with no wlan0, as before the radios are up).
+        std::fs::write(INSTALL_ADDRESSES, saved).unwrap();
+        let info = td().box_info_json();
+        let _ = std::fs::remove_file(INSTALL_ADDRESSES);
+        assert!(info.contains("\"name\":\"CarLink-fd6c\""), "{info}");
     }
 
     #[test]
