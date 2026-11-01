@@ -247,7 +247,9 @@ console, from one of the unit's own backups:
   they are dead files; the radio guard still keeps every file of the unit's own) and the seam's
   Bluetooth name flag, `/etc/.custom_bluetooth_name` while it holds `ccpa-<4 hex>` (its name matches
   the guard's `*bluetooth*`, so the dev adapter's restore of 31 Oct kept it and verify passed it by;
-  a name set on stock is not `ccpa-<4 hex>` and stays), and then `/etc/carplay`. The OCBM still running (`ocbmd` carries the console until the restart) can write
+  a name set on stock is not `ccpa-<4 hex>` and stays), and then `/etc/carplay`, whole: its files skip
+  that pass, where the guard took `bt_link_keys` (`bt_*`) for a radio file and logged it as kept
+  although the next step removed it (the dev adapter, 1 Nov). The OCBM still running (`ocbmd` carries the console until the restart) can write
   `/etc/carplay/bt_link_keys` again: verify tolerates it, and the `stock` phase removes it once more
   right before the restart. Every stopping point boots OCBM, where the restore runs again, or complete
   stock.

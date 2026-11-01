@@ -56,10 +56,10 @@
 #   4. THE SWITCH: the stock start script, written as .rsnew, checked, renamed over the dispatcher
 #   5. remove OCBM's files (each through is_radio(), except OCBM's own radio seam, radio_*.sh in
 #      /script: stock has none, and without OCBM they are dead files, and the seam's Bluetooth name
-#      flag, see ocbm_bt_flag), then directories left empty, then /etc/carplay, OCBM's bond store;
-#      verify. The OCBM processes still running (ocbmd carries the console until the restart) can
-#      write /etc/carplay again: verify tolerates it, and tools/stock_restore.sh removes it once more
-#      right before the restart into stock
+#      flag, see ocbm_bt_flag), then directories left empty, then /etc/carplay, OCBM's bond store,
+#      whole (its files skip that pass); verify. The OCBM processes still running (ocbmd carries the
+#      console until the restart) can write /etc/carplay again: verify tolerates it, and
+#      tools/stock_restore.sh removes it once more right before the restart into stock
 # It REFUSES, changing nothing, unless the start script is OCBM's dispatcher, ocbmd and ocbm_boot.sh
 # are there, the mode is `trial` or `final` (a `confirmed` trial finishes when its session ends), no
 # finish is pending, and SRC's start script is stock. It takes ocbm_mode.lock, as ocbm_revert.sh and
@@ -377,6 +377,10 @@ remove_guarded() {  # $1 list of paths, $2 label, $3 paths to leave: as remove_l
   while IFS= read -r p; do
     in_list "$p" "$PROTECT" && continue
     in_list "$p" "${3:-}" && continue
+    # OCBM's bond store goes whole after this pass, so its files are left to that step and not counted:
+    # the guard took bt_link_keys (bt_*) for a radio file, and the log said "1 kept by the radio guard"
+    # of a file the next line removed (the dev adapter, 1 Nov).
+    case "$p" in "$OCBM_STATE"/*) [ -e "$SRC/$OCBM_STATE" ] || continue ;; esac
     if is_radio "/$p" && ! in_list "$p" "$SEAM" && ! ocbm_bt_flag "$p"; then k=$((k + 1)); continue; fi
     if [ -L "$ROOT/$p" ] || [ -e "$ROOT/$p" ]; then
       [ -d "$ROOT/$p" ] && [ ! -L "$ROOT/$p" ] && continue

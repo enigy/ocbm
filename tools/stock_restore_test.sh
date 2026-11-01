@@ -302,6 +302,8 @@ onefile_tests() {  # $1 shell
   check '[ ! -e "$T/box/script/radio_hal.sh" ] && [ ! -e "$T/box/script/radio_detect.sh" ] && [ ! -e "$T/box/script/radio_ap_up.sh" ]' "OCBM's radio seam goes with OCBM: stock has none"
   check '[ -e "$T/box/lib/firmware/nxp/added_after.bin" ] && grep -q "1 kept by the radio guard" "$T/out"' "the radio guard still keeps the unit's own radio files"
   check '[ ! -e "$T/box/etc/carplay" ] && grep -q "/etc/carplay removed" "$T/out"' "/etc/carplay, OCBM's bond store, is removed"
+  check 'grep -q "5/5 OCBM scripts and settings: [0-9]* removed, 0 kept by the radio guard" "$T/out"' \
+    "the bond store's bt_link_keys is not counted as kept by the radio guard: the next step removes it (the dev adapter, 1 Nov)"
   check '[ ! -e "$T/box/etc/.custom_bluetooth_name" ] && [ ! -e "$T/box/etc/carplay_peers.bin" ] && [ "$(cat "$T/box/etc/bluetooth_name")" = carlink ]' \
     "the seam's Bluetooth name flag goes despite the radio guard (the dev adapter, 31 Oct), with OCBM's peer store; the name is stock's"
   check 'grep -q "^/script/update_box.sh" "$T/box/etc/mdev/udisk_insert.sh"' "the stick handler calls the stock updater again"
