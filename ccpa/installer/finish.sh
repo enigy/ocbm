@@ -21,8 +21,10 @@ REBOOT_DELAY="${REBOOT_DELAY:-3}"
   echo "If OCBM fails its start-up self-test, the adapter goes back to stock CarPlay by itself."
   if [ -n "$BACKUP" ]; then
     echo
-    echo "A full flash backup is in ${BACKUP#$STICK/} on this stick. It holds the adapter's Wi-Fi"
-    echo "password and Bluetooth keys: keep the stick private."
+    echo "A full flash backup is in ${BACKUP#$STICK/} on this stick. From the adapter's first install it"
+    echo "is the factory flash, and the only copy of it: keep this stick, or copy OCBM_BACKUP to a computer."
+    echo "A later install onto another stick backs up the adapter as it is then, not as it came."
+    echo "The backup holds the adapter's Wi-Fi password and Bluetooth keys: keep the stick private."
   fi
   [ "${1:-0}" = 0 ] || echo "(the stock copy step reported status $1; it had nothing to copy)"
   echo

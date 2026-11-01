@@ -142,6 +142,8 @@ for sh in ${SHELLS:-sh dash}; do
   check '[ "$(cd "$d/update" && find . -type f)" = "./tmp/finish.sh" ]' "/tmp/update holds only tmp/finish.sh"
   run_finish "$sh" "$d"
   check 'grep -q "INSTALLED (trial)" "$d/stick/OCBM_RESULT.txt" && grep -q "keep the stick private" "$d/stick/OCBM_RESULT.txt"' "finish.sh writes the result to the stick"
+  check 'grep -q "is the factory flash, and the only copy of it: keep this stick, or copy OCBM_BACKUP" "$d/stick/OCBM_RESULT.txt" && grep -q "backs up the adapter as it is then, not as it came" "$d/stick/OCBM_RESULT.txt"' \
+    "the result says the first install's backup is the factory flash, and a later one on another stick is not (the truck, 29 Oct)"
   check 'grep -q "started 4242 s after power-on" "$d/stick/OCBM_RESULT.txt" && grep -q "^\[ocbm\] == backup (+0 s)" "$d/stick/OCBM_RESULT.txt" && grep -q "^\[ocbm\] installer took 0 s" "$d/stick/OCBM_RESULT.txt"' \
     "the result's log times each step from power-on"
   check '[ ! -e "$d/stick/A15W_Update.img" ] && [ -e "$d/stick/A15W_Update.img.installed" ]' "finish.sh parks the image as .installed"
