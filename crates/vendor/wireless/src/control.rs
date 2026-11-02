@@ -130,8 +130,10 @@ fn now_ms() -> u64 {
 /// Milliseconds of `CLOCK_MONOTONIC`: system-wide, so a deadline written by one btd means the same to the
 /// next, and unmoved by the host's `CT_SETTIME`, which sets the wall clock at every connect.
 fn mono_ms() -> u64 {
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    // SAFETY: `ts` is a valid, writable timespec for the duration of the call.
+    // Zeroed, not a literal: the libc crate's 32-bit musl `timespec` can carry padding fields
+    // (ocbmd's settime fallback does the same).
+    // SAFETY: an all-zero timespec is valid, and `ts` is writable for the duration of the call.
+    let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
     (ts.tv_sec as u64) * 1000 + (ts.tv_nsec as u64) / 1_000_000
 }

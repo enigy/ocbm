@@ -35,7 +35,8 @@ const RTSP_INGEST_ADDR: &str = "127.0.0.1:9106";
 /// What a pollfd slot represents, so the poll loop can dispatch after `poll()`.
 #[derive(Clone, Copy)]
 enum Kind {
-    Acc,
+    Acc,    // the reader thread's pipe: what the host sent ([`start_acc_relay`])
+    AccOut, // the writer thread's pipe: room for output, or POLLERR once that thread has ended
     Pty,
     Conn(u16),
     Eth,
@@ -490,6 +491,8 @@ impl Mfi {
 }
 
 struct Daemon {
+    /// Where frames go to the host: the writer thread's pipe, which it copies onto `/dev/usb_accessory`
+    /// ([`start_acc_relay`]); non-blocking, with a real POLLOUT. `/dev/null` in the tests.
     acc: File,
     seq: u32,
     mfi: Option<Mfi>,
@@ -2014,7 +2017,7 @@ impl Daemon {
             self.drain();
             // FAST PATH (opt #1): on a true frame boundary — the fd is not mid-frame AND this stream's
             // queue is empty (the common case, since each A/V stream is gated to one in-flight frame) —
-            // write [header][payload] STRAIGHT to the accessory fd with writev, skipping the copy of the
+            // write [header][payload] STRAIGHT to the accessory's output pipe with writev, skipping the copy of the
             // payload into the out-queue. That copy is a ~64 KiB memcpy per chunk at dual 4K@60 and buys
             // nothing here (there is never a second frame to coalesce with). A partial write spills the
             // remainder into the queue + owns the wire, so drain() finishes it exactly as a queued frame;
@@ -2196,7 +2199,7 @@ impl Daemon {
         step!(self.out_log.drain_to(&mut self.acc), Wire::Log);
         step!(self.out_lo.drain_to(&mut self.acc), Wire::Lo);
     }
-    /// Bounded wait for the accessory fd to accept bytes — used by the paced flush loops so a
+    /// Bounded wait for the accessory's output pipe to accept bytes — used by the paced flush loops so a
     /// backpressured fd is WAITED on (poll POLLOUT) instead of busy-spun on EAGAIN at 100% CPU.
     /// Capped at 100 ms per call so the caller's own deadline check stays live; errors and POLLERR
     /// just return (the caller's next drain()/deadline handles them).
@@ -4058,9 +4061,11 @@ impl Daemon {
                     // out_log for the same reason: it can rest mid-frame, and `wire_owner` is
                     // cleared below.
                     self.out_log.clear();
-                    // Every queue was just emptied, so nothing can still be mid-frame on the wire.
-                    // Leaving a stale owner here would make the next drain() try to "finish" a queue
-                    // that no longer has the frame it was writing.
+                    // Every queue was just emptied, so no queue is still mid-frame. Leaving a stale
+                    // owner here would make the next drain() try to "finish" a queue that no longer
+                    // has the frame it was writing. A frame the relay pipe already holds part of goes
+                    // out cut short (`start_acc_relay`): the host drops everything before HELLO_ACK,
+                    // its reassembler resyncs on the next header, and it re-sends HELLO every 500 ms.
                     self.wire_owner = None;
                     // Fresh session, fresh flow-control state: a stale `lo_resync` would silently
                     // drop the new session's bulk frames until the next F_SOM, and stale
@@ -4548,6 +4553,111 @@ fn clear_session_state_for_exit(mode_file: &str, start_finish: impl FnOnce()) {
     finish_if_confirmed(mode_file, start_finish);
 }
 
+/// The accessory as the poll loop sees it ([`start_acc_relay`]).
+struct AccRelay {
+    /// What the host sent: the reader thread's pipe, non-blocking. EOF = that thread ended.
+    from_host: File,
+    /// Frames for the host: the writer thread's pipe, non-blocking. POLLERR = that thread ended.
+    to_host: File,
+}
+
+/// Read and write the accessory on two threads of their own, each through a pipe, so the poll loop
+/// never waits on the USB link.
+///
+/// This kernel's accessory function (`g_android_accessory`, kernel 3.14) blocks in `acc_read` until the
+/// host writes and in `acc_write` until the host reads, O_NONBLOCK or not, and its `_acc_poll` calls the
+/// device readable and writable whenever it is up. So the loop, told the fd was ready, sat inside one of
+/// the two (bench 2026-11-02): idle with no host app it slept in `acc_read` (wchan) until the supervisor
+/// took it for wedged and restarted it, once a minute for an hour; in a CarPlay session a host that
+/// stopped reading for a moment left it in `acc_write` (dmesg: the last line before each gap), reading
+/// no heartbeat, and the host called the link dead: three 19 s stalls in 40 minutes. A pipe has a real
+/// poll and a real O_NONBLOCK, so the queues, the read gate, the backpressure and
+/// [`Daemon::wait_acc_writable`] now work as they were written to. Bytes keep their order: one thread
+/// per direction, and the loop alone writes the output pipe, a whole frame at a time or the rest of one.
+///
+/// A relay thread whose read or write of the device fails ends and closes its end of the pipe; the loop
+/// sees EOF or POLLERR and exits for a fresh fd, as it did on the device's own hangup.
+fn start_acc_relay(dev: File) -> std::io::Result<AccRelay> {
+    let dev = std::sync::Arc::new(dev);
+    let (from_host, host_bytes) = cloexec_pipe()?;
+    let (frames, to_host) = cloexec_pipe()?;
+    set_nonblocking(&from_host);
+    set_nonblocking(&to_host);
+    let reader = dev.clone();
+    std::thread::Builder::new()
+        .name("acc-read".into())
+        .stack_size(RELAY_STACK)
+        // ≤ 16 KiB a read: the driver's request size.
+        .spawn(move || {
+            let why = relay(&*reader, host_bytes, 16 * 1024);
+            eprintln!("[ocbmd] accessory reader stopped: {why}");
+        })?;
+    let writer = dev.clone();
+    std::thread::Builder::new()
+        .name("acc-write".into())
+        .stack_size(RELAY_STACK)
+        .spawn(move || {
+            let why = relay(frames, &*writer, p::HDR_LEN + p::MAX_PAYLOAD);
+            eprintln!("[ocbmd] accessory writer stopped: {why}");
+        })?;
+    Ok(AccRelay { from_host, to_host })
+}
+
+/// Each relay thread's stack: a copy loop over a heap buffer needs little.
+const RELAY_STACK: usize = 128 * 1024;
+
+/// Copy `from` to `to`, in order, until `from` ends or either side fails; says why it stopped. A relay
+/// thread's whole body, apart so a test can run it on pipes.
+fn relay(
+    mut from: impl Read,
+    mut to: impl Write,
+    buf_len: usize,
+) -> String {
+    let mut buf = vec![0u8; buf_len];
+    loop {
+        let n = match from.read(&mut buf) {
+            Ok(0) => return "end of stream".to_string(),
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return format!("read failed: {e}"),
+        };
+        // write_all retries EINTR itself.
+        if let Err(e) = to.write_all(&buf[..n]) {
+            return format!("write failed: {e}");
+        }
+    }
+}
+
+/// A pipe as (read end, write end), close-on-exec so the console's shell never holds an end open.
+fn cloexec_pipe() -> std::io::Result<(File, File)> {
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: `fds` has room for the two descriptors pipe(2) writes.
+    #[cfg(target_os = "linux")]
+    let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+    // No pipe2 on macOS, where the host-side tests build: set the flag after.
+    #[cfg(not(target_os = "linux"))]
+    let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: pipe(2) just created both descriptors, and nothing else owns them.
+    let ends = unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) };
+    #[cfg(not(target_os = "linux"))]
+    for f in [&ends.0, &ends.1] {
+        // SAFETY: F_SETFD on a descriptor `ends` owns.
+        unsafe { libc::fcntl(f.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+    }
+    Ok(ends)
+}
+
+fn set_nonblocking(f: &File) {
+    // SAFETY: F_GETFL/F_SETFL on a descriptor this File owns.
+    unsafe {
+        let fl = libc::fcntl(f.as_raw_fd(), libc::F_GETFL);
+        libc::fcntl(f.as_raw_fd(), libc::F_SETFL, fl | libc::O_NONBLOCK);
+    }
+}
+
 fn main() {
     // Singleton guard BEFORE anything with a side effect — see [`PID_LOCK_FILE`]. The fd is held
     // (never closed) for the process lifetime; the kernel releases the lock when we exit.
@@ -4579,8 +4689,9 @@ fn main() {
         std::process::id(),
         env!("CARGO_PKG_VERSION")
     );
-    // The one extra thread this daemon runs. Started here — after the singleton guard, so a losing
-    // duplicate never touches the controller — and never joined; see [`BtProbe`].
+    // The Bluetooth probe thread. Started here — after the singleton guard, so a losing duplicate
+    // never touches the controller — and never joined; see [`BtProbe`]. The other two extra threads
+    // are the accessory relay's, below ([`start_acc_relay`]).
     let bt = bt_probe_start();
     let acc = OpenOptions::new()
         .read(true)
@@ -4602,12 +4713,13 @@ fn main() {
             let _ = m.rd(0x00, &mut v);
         }
     }
-    unsafe {
-        // non-blocking accessory fd so a stalled host reader can never wedge the daemon
-        let fd = acc.as_raw_fd();
-        let fl = libc::fcntl(fd, libc::F_GETFL);
-        libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK);
-    }
+    // The accessory is read and written by two relay threads through pipes; this loop only ever touches
+    // the pipes, which poll and refuse to block as asked. O_NONBLOCK on the device itself never worked:
+    // see [`start_acc_relay`].
+    let AccRelay { from_host, to_host } = start_acc_relay(acc).unwrap_or_else(|e| {
+        eprintln!("[ocbmd] accessory relay could not start ({e}) — exiting");
+        std::process::exit(1);
+    });
     // Local A/V seam listeners: the box session forwards video->:9001, media audio->:9002; ocbmd
     // muxes each onto its OCBM channel. Non-blocking so they slot into the poll loop.
     // A failed bind used to be dropped SILENTLY by a `filter_map(...ok())`, which is how a second
@@ -4641,7 +4753,7 @@ fn main() {
         std::process::exit(1);
     }
     let mut d = Daemon {
-        acc,
+        acc: to_host,
         seq: 0,
         mfi,
         ptm: None,
@@ -4738,22 +4850,34 @@ fn main() {
     let mut fds: Vec<libc::pollfd> = Vec::new();
     let mut kinds: Vec<Kind> = Vec::new();
     loop {
-        // rebuild the pollfd set each pass: accessory (+POLLOUT if backlog) + PTY + live conns
+        // rebuild the pollfd set each pass: the accessory relay's two pipes (+POLLOUT if backlog) and the
+        // device itself (hangup only) + PTY + live conns
         let want_out = !d.out_hi.is_empty()
             || !d.out_video.is_empty()
             || !d.out_alt_video.is_empty()
             || !d.out_audio.is_empty()
             || !d.out_console.is_empty()   // audit B3: without this, console-only backlog never arms POLLOUT → the tail freezes when unsubscribed (poll blocks -1)
+            || !d.out_log.is_empty()       // same for the log tail, now that the poll can really sleep
             || !d.out_lo.is_empty();
         fds.clear();
         kinds.clear();
-        let acc_ev = libc::POLLIN | if want_out { libc::POLLOUT } else { 0 };
         fds.push(libc::pollfd {
-            fd: d.acc.as_raw_fd(),
-            events: acc_ev,
+            fd: from_host.as_raw_fd(),
+            events: libc::POLLIN,
             revents: 0,
         });
         kinds.push(Kind::Acc);
+        // Always in the set, so the writer thread's end (POLLERR) is seen even with nothing to send.
+        fds.push(libc::pollfd {
+            fd: d.acc.as_raw_fd(),
+            events: if want_out { libc::POLLOUT } else { 0 },
+            revents: 0,
+        });
+        kinds.push(Kind::AccOut);
+        // The device itself is not polled: the reader thread is inside `acc_read` all the time, and the
+        // driver's `_acc_poll` is not something to run beside it. A torn-down gadget fails that read
+        // (EIO), the thread ends, and its pipe's EOF ends this daemon for a fresh fd, as the device's
+        // own POLLHUP did.
         if let Some(ptm) = d.ptm.as_ref() {
             fds.push(libc::pollfd {
                 fd: ptm.as_raw_fd(),
@@ -4874,13 +4998,15 @@ fn main() {
                         }
                         Kind::AvConn(idx) => av_close.push(idx),
                         Kind::AvListen(_) => {} // a listen socket hangup shouldn't occur; nothing to drop
-                        Kind::Acc => {
-                            // The USB accessory transport itself hung up. It can't be dropped + reopened
-                            // in place, and POLLHUP stays ready forever, so continuing would log-flood +
-                            // 100% CPU spin. Exit so run_ocbmd.sh (inittab respawn) restarts us with a
-                            // fresh accessory fd once USB is back — the daemon's designed recovery path.
+                        Kind::Acc | Kind::AccOut => {
+                            // The USB accessory transport itself is gone: a relay thread ended because
+                            // its read or write of the device failed (a torn-down gadget fails both),
+                            // and its pipe end closed. It can't be dropped + reopened in place,
+                            // and POLLHUP stays ready forever, so continuing would log-flood + 100% CPU
+                            // spin. Exit so run_ocbmd.sh (inittab respawn) restarts us with a fresh
+                            // accessory fd once USB is back — the daemon's designed recovery path.
                             // (A host-app quit does NOT trigger this: it stops reading bulk but leaves the
-                            // gadget bound; only a real cable/gadget teardown HUPs this fd.)
+                            // gadget bound, and the writer thread just waits.)
                             eprintln!("[ocbmd] accessory POLLHUP/POLLERR — USB transport gone; exiting for respawn");
                             clear_session_state_for_exit(INSTALL_MODE_FILE, start_install_finish);
                             std::process::exit(1);
@@ -4898,8 +5024,9 @@ fn main() {
                     // progress, no exit, and poll returns instantly forever. That is the exact 100%-CPU
                     // wedge the guard above exists to prevent, on the one fd that matters most.
                     // Treat Ok(0) (EOF) and any non-WouldBlock error as transport death, taking the
-                    // same exit-for-respawn path.
-                    match d.acc.read(&mut rbuf) {
+                    // same exit-for-respawn path. This reads the reader thread's pipe: EOF there means
+                    // the thread's read of the device failed and it ended (see `start_acc_relay`).
+                    match (&from_host).read(&mut rbuf) {
                         Ok(0) => {
                             eprintln!(
                                 "[ocbmd] accessory EOF on read — USB transport gone; exiting for respawn"
@@ -5078,6 +5205,8 @@ fn main() {
                         Err(_) => av_close.push(idx),
                     }
                 }
+                // Never asked for POLLIN: the output pipe is polled for room only.
+                Kind::AccOut => {}
             }
         }
         // drop closed A/V connections (reverse index order keeps the rest valid)
@@ -6793,5 +6922,76 @@ mod tests {
         assert!(!proc_name_matches("ocbmd", "ocbmd", "carplayd"));
         assert!(!proc_name_matches("run_ocbmd.sh", "run_ocbmd.sh", "ocbmd"));
         assert!(!proc_name_matches("", "", "ocbmd"));
+    }
+
+    #[test]
+    fn a_relay_copies_every_byte_in_order_and_stops_at_the_end() {
+        let (src_r, mut src_w) = cloexec_pipe().unwrap();
+        let (mut dst_r, dst_w) = cloexec_pipe().unwrap();
+        // A buffer smaller than what is sent, so the copy takes many reads.
+        let copier = std::thread::spawn(move || relay(src_r, dst_w, 7));
+        let data: Vec<u8> = (0..10_000u32).map(|i| (i * 31 % 251) as u8).collect();
+        src_w.write_all(&data).unwrap();
+        drop(src_w);
+        assert_eq!(copier.join().unwrap(), "end of stream");
+        let mut got = Vec::new();
+        dst_r.read_to_end(&mut got).unwrap();
+        assert_eq!(got, data);
+    }
+
+    #[test]
+    fn a_relay_whose_far_side_is_gone_stops_and_says_so() {
+        let (src_r, mut src_w) = cloexec_pipe().unwrap();
+        let (dst_r, dst_w) = cloexec_pipe().unwrap();
+        drop(dst_r);
+        src_w.write_all(b"frame").unwrap();
+        let why = relay(src_r, dst_w, 64);
+        assert!(why.starts_with("write failed"), "{why}");
+    }
+
+    /// What the loop can read from `f` (non-blocking) within two seconds, up to `n` bytes.
+    fn read_up_to(
+        mut f: &File,
+        n: usize,
+    ) -> Vec<u8> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut got = Vec::new();
+        let mut buf = [0u8; 256];
+        while got.len() < n && Instant::now() < deadline {
+            match f.read(&mut buf) {
+                Ok(k) => got.extend_from_slice(&buf[..k]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(5)),
+                Err(e) => panic!("{e}"),
+            }
+        }
+        got
+    }
+
+    #[test]
+    fn the_accessory_relay_carries_both_ways_and_never_blocks_the_loop() {
+        // Bench 2026-11-02: the device blocks in read and write, so the loop sat in one of them. A
+        // socketpair stands in for it here: it blocks the same way when nobody reads or writes.
+        let (dev_side, host) = std::os::unix::net::UnixStream::pair().unwrap();
+        let acc = start_acc_relay(File::from(std::os::fd::OwnedFd::from(dev_side))).unwrap();
+        let mut buf = [0u8; 64];
+        let idle = (&acc.from_host).read(&mut buf).unwrap_err();
+        assert_eq!(idle.kind(), std::io::ErrorKind::WouldBlock, "no host bytes: the loop is not held");
+
+        (&host).write_all(b"heartbeat").unwrap();
+        assert_eq!(read_up_to(&acc.from_host, 9), b"heartbeat");
+
+        (&acc.to_host).write_all(b"frame").unwrap();
+        let mut out = [0u8; 5];
+        (&host).read_exact(&mut out).unwrap();
+        assert_eq!(&out, b"frame");
+
+        // A host that stops reading: the writer thread blocks on the device, the pipe fills, and the
+        // loop's write says WouldBlock instead of waiting with it.
+        let chunk = vec![0u8; 64 * 1024];
+        let held = (0..512).find_map(|_| match (&acc.to_host).write(&chunk) {
+            Ok(_) => None,
+            Err(e) => Some(e.kind()),
+        });
+        assert_eq!(held, Some(std::io::ErrorKind::WouldBlock));
     }
 }

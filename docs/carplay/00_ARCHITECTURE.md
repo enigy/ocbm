@@ -404,6 +404,19 @@ USB drops, no software recovery) → **power-cycle only**. Safe practice: post t
 writing; **revert via `reboot -f`, never `echo 0`**; wrap on-box experiments in a cancelable
 reboot-watchdog `(sleep N; [ -e /tmp/keep ] || reboot -f) &` so any hang self-recovers.
 
+### `/dev/usb_accessory` blocks, whatever O_NONBLOCK says
+
+Measured 2026-11-02 on the dev adapter (kernel `3.14.52+g94d07bb`, module `g_android_accessory`):
+`acc_read` sleeps until the host writes and `acc_write` until the host reads, and O_NONBLOCK changes
+neither. The module has `_acc_poll` (it logs `_acc_poll POLLHUP!` when the gadget is torn down) but no
+`acc_poll`, and it reports the device readable and writable whenever it is up, so poll never says
+wait. An ocbmd idle with no host app slept in `acc_read` (wchan, every 2 s for 5 min) until the
+supervisor restarted it as wedged, once a minute; in CarPlay sessions where the host stopped reading,
+the last kernel line before each 16-19 s gap was an `acc_write`, and the host's heartbeats went
+unread. So ocbmd reads and writes the device on two relay threads through pipes
+(`start_acc_relay`, `ccpa/ocbmd/src/main.rs`), and its poll loop touches only the pipes. Anything
+else that opens the device must do the same: a single-threaded poll loop on this fd will block.
+
 ### The two physical ports
 
 - **`ci_hdrc.1`** = host-facing **MALE** USB-A cable (Type-C female on some models). CCPA is

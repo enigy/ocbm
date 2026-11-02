@@ -60,6 +60,20 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
   The app hooks exist and are capability-gated; NOTHING below is implemented box-side, and no verb
   id is assigned — the proposed shapes are in
   [../carplay/01_OCBM_PROTOCOL.md](../carplay/01_OCBM_PROTOCOL.md) ("Proposed MGMT verbs").
+- **USB link stalls and the idle "wedged" restarts — one cause, fixed 2026-11-02, NOT yet benched.**
+  The two-iPhone bench of `b2c92d9` saw three link stalls in ~40 min of CarPlay (Carlink's heartbeat
+  writes timed out 5 times, the adapter declared the host gone and tore the wireless stack down), and
+  an ocbmd idle with no app was L2-restarted by the supervisor about once a minute for an hour. Both are
+  the accessory device blocking: `acc_read` with no host writing, `acc_write` with no host reading,
+  O_NONBLOCK notwithstanding, and its poll always says ready
+  ([../carplay/00_ARCHITECTURE.md](../carplay/00_ARCHITECTURE.md), "`/dev/usb_accessory` blocks").
+  ocbmd now reads and writes it on two relay threads through pipes (`start_acc_relay`), so the poll
+  loop keeps running, reading heartbeats and touching `/tmp/ocbmd_alive` while the host is not reading.
+  Carlink `bench-1102` stops its own USB read thread waiting more than 1.5 s on a stuck decoder or
+  audio track (the likely reason the host stopped reading) and logs a stall snapshot at the first
+  failed heartbeat. To bench: 40+ min of CarPlay with no stall, no "ocbmd wedged" at idle, and the
+  reconnect after a Carlink restart (a frame the pipe holds part of at a new HELLO goes out cut short;
+  the host resyncs and its next HELLO is answered).
   1. **`MGMT_DISCONNECT_PHONE`, transport-aware, plus a capability bit.** Problem: the app's
      Disconnect Phone has no honest verb to send — OCBM's six MGMT verbs are
      `crates/ocbm-proto/src/lib.rs:334-346`, dispatched at `ccpa/ocbmd/src/main.rs:3397-3446`; the
