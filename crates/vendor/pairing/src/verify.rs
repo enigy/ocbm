@@ -33,6 +33,14 @@ impl Identity {
 /// Looks up the Ed25519 long-term public key of a previously-paired controller.
 pub trait PeerStore {
     fn find_peer(&self, id: &[u8]) -> Option<[u8; 32]>;
+
+    /// Every long-term key on record for `id`; pair-verify accepts a signature from any of them. Two
+    /// iPhones can present the same pairing identifier with different keys (bench 2026-11-02), and a
+    /// store keyed by the identifier alone then kept only the last one paired. Defaults to
+    /// [`PeerStore::find_peer`]'s one key.
+    fn find_peers(&self, id: &[u8]) -> Vec<[u8; 32]> {
+        self.find_peer(id).into_iter().collect()
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -165,8 +173,10 @@ impl<'a> PairVerifyServer<'a> {
             .ok_or(PairError::MalformedTlv)?;
 
         let result = (|| {
-            let peer_ed = peers.find_peer(&peer_id).ok_or(PairError::UnknownPeer)?;
-            let vk = VerifyingKey::from_bytes(&peer_ed).map_err(|_| PairError::BadSignature)?;
+            let keys = peers.find_peers(&peer_id);
+            if keys.is_empty() {
+                return Err(PairError::UnknownPeer);
+            }
             let sig = ed25519_dalek::Signature::from_slice(&sig)
                 .map_err(|_| PairError::BadSignature)?;
             // controller signed peerCurvePK ‖ controllerID ‖ ourCurvePK
@@ -174,7 +184,11 @@ impl<'a> PairVerifyServer<'a> {
             signed.extend_from_slice(&self.peer_curve_pk);
             signed.extend_from_slice(&peer_id);
             signed.extend_from_slice(&self.our_curve_pk);
-            vk.verify(&signed, &sig).map_err(|_| PairError::BadSignature)
+            keys.iter()
+                .filter_map(|k| VerifyingKey::from_bytes(k).ok())
+                .any(|vk| vk.verify(&signed, &sig).is_ok())
+                .then_some(())
+                .ok_or(PairError::BadSignature)
         })();
 
         match result {

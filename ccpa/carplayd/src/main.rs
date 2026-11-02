@@ -352,11 +352,31 @@ fn plock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// Path via `PEERSTORE_PATH` (default `/etc/carplay_peers.bin`). If the path isn't writable the store
 /// still works in-memory (logs a warning) — degrades to the old re-pair-each-boot behavior, never fails.
 /// File format: repeated `[u8 id_len][id][32 LTPK]`.
+///
+/// SEVERAL KEYS PER ID (bench 2026-11-02). Two iPhones paired one after the other and both saved under
+/// the same 36-byte pairing identifier, so the second save replaced the first: the file held one entry,
+/// and every change of phone meant a failed pair-verify and a full pair-setup (9 of 10 sessions on one
+/// bench), one of which the phone abandoned. Each id now keeps up to [`KEYS_PER_PEER_ID`] keys, the
+/// most recent first, and pair-verify accepts any of them. The file format is unchanged; an id simply
+/// appears once per key, and an older carplayd reading it keeps the last entry per id, as before.
 #[derive(Clone)]
 struct DiskPeers {
-    map: Arc<Mutex<HashMap<Vec<u8>, [u8; 32]>>>,
+    map: Arc<Mutex<PeerKeys>>,
     path: Arc<std::path::PathBuf>,
 }
+
+/// How many long-term keys one pairing identifier keeps (see [`DiskPeers`]); the oldest goes past it.
+const KEYS_PER_PEER_ID: usize = 8;
+
+/// Pairing identifier → its long-term keys, the most recent first ([`DiskPeers`]).
+type PeerKeys = HashMap<Vec<u8>, Vec<[u8; 32]>>;
+
+/// A short, stable tag for an id or a key in the log: `sha256:` and the digest's first 6 bytes, enough to
+/// tell two apart or match one to a store entry without writing the identifier itself into box.log.
+fn short_tag(b: &[u8]) -> String {
+    format!("sha256:{}", pairing::crypto::short_digest_hex(b))
+}
+
 impl DiskPeers {
     fn new() -> Self {
         let path = std::path::PathBuf::from(
@@ -366,13 +386,18 @@ impl DiskPeers {
         match std::fs::read(&path) {
             Ok(bytes) => {
                 let n = Self::load_into(&bytes, &mut map);
-                eprintln!("[carplayd] peerstore: loaded {n} known device(s) from {}", path.display());
+                eprintln!(
+                    "[carplayd] peerstore: loaded {n} known key(s) under {} pairing id(s) from {}",
+                    map.len(),
+                    path.display()
+                );
             }
             Err(_) => eprintln!("[carplayd] peerstore: none at {} (fresh)", path.display()),
         }
         DiskPeers { map: Arc::new(Mutex::new(map)), path: Arc::new(path) }
     }
-    fn load_into(mut b: &[u8], map: &mut HashMap<Vec<u8>, [u8; 32]>) -> usize {
+    /// Read entries into `map` in file order (each id's keys most recent first); returns how many keys.
+    fn load_into(mut b: &[u8], map: &mut PeerKeys) -> usize {
         let mut n = 0;
         while !b.is_empty() {
             let idl = b[0] as usize;
@@ -382,23 +407,45 @@ impl DiskPeers {
             let id = b[1..1 + idl].to_vec();
             let mut ltpk = [0u8; 32];
             ltpk.copy_from_slice(&b[1 + idl..1 + idl + 32]);
-            map.insert(id, ltpk);
+            let keys = map.entry(id).or_default();
+            if !keys.contains(&ltpk) && keys.len() < KEYS_PER_PEER_ID {
+                keys.push(ltpk);
+                n += 1;
+            }
             b = &b[1 + idl + 32..];
-            n += 1;
         }
         n
     }
-    /// Atomically dump the whole map (write `.tmp` + rename) — small, few peers, so rewrite-all is simplest.
-    fn persist(&self, map: &HashMap<Vec<u8>, [u8; 32]>) {
+    /// `ltpk` becomes `id`'s most recent key: moved to the front if known, else added there, with the
+    /// oldest past [`KEYS_PER_PEER_ID`] dropped.
+    fn remember(
+        map: &mut PeerKeys,
+        id: &[u8],
+        ltpk: [u8; 32],
+    ) {
+        let keys = map.entry(id.to_vec()).or_default();
+        keys.retain(|k| *k != ltpk);
+        keys.insert(0, ltpk);
+        keys.truncate(KEYS_PER_PEER_ID);
+    }
+    /// The file's bytes for `map`: one `[id_len][id][LTPK]` entry per key, each id's most recent first.
+    fn encode(map: &PeerKeys) -> Vec<u8> {
         let mut out = Vec::new();
-        for (id, ltpk) in map {
+        for (id, keys) in map {
             if id.len() > 255 {
                 continue;
             }
-            out.push(id.len() as u8);
-            out.extend_from_slice(id);
-            out.extend_from_slice(ltpk);
+            for ltpk in keys {
+                out.push(id.len() as u8);
+                out.extend_from_slice(id);
+                out.extend_from_slice(ltpk);
+            }
         }
+        out
+    }
+    /// Atomically dump the whole map (write `.tmp` + rename) — small, few peers, so rewrite-all is simplest.
+    fn persist(&self, map: &PeerKeys) {
+        let out = Self::encode(map);
         if let Some(dir) = self.path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
@@ -428,7 +475,17 @@ impl DiskPeers {
 }
 impl PeerStore for DiskPeers {
     fn find_peer(&self, id: &[u8]) -> Option<[u8; 32]> {
-        plock(&self.map).get(id).copied()
+        plock(&self.map).get(id).and_then(|keys| keys.first().copied())
+    }
+    fn find_peers(&self, id: &[u8]) -> Vec<[u8; 32]> {
+        let keys = plock(&self.map).get(id).cloned().unwrap_or_default();
+        eprintln!(
+            "[carplayd] pair-verify: pairing id {} has {} key(s) on record{}",
+            short_tag(id),
+            keys.len(),
+            keys.iter().map(|k| format!(" {}", short_tag(k))).collect::<String>()
+        );
+        keys
     }
 }
 impl PeerSaver for DiskPeers {
@@ -436,8 +493,14 @@ impl PeerSaver for DiskPeers {
         // Insert + snapshot under the lock, then persist outside it (no file I/O while holding the map).
         let snapshot = {
             let mut m = plock(&self.map);
-            m.insert(id.to_vec(), ltpk);
-            eprintln!("[carplayd] pair-setup: peer saved ({}-byte id) → persisting", id.len());
+            Self::remember(&mut m, id, ltpk);
+            eprintln!(
+                "[carplayd] pair-setup: peer saved ({}-byte id {}, key {}; {} key(s) under that id) → persisting",
+                id.len(),
+                short_tag(id),
+                short_tag(&ltpk),
+                m.get(id).map_or(0, Vec::len)
+            );
             m.clone()
         };
         self.persist(&snapshot);
@@ -1805,5 +1868,62 @@ fn main() {
             eprintln!("[carplayd] pairing server failed: {e}");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ID: &[u8] = b"0D4C5E7A-1111-2222-3333-444455556666";
+
+    #[test]
+    fn two_phones_under_one_pairing_id_keep_both_keys() {
+        // Bench 2026-11-02: the second phone's pair-setup replaced the first phone's key.
+        let mut map = HashMap::new();
+        DiskPeers::remember(&mut map, ID, [1; 32]);
+        DiskPeers::remember(&mut map, ID, [2; 32]);
+        assert_eq!(map[ID], vec![[2; 32], [1; 32]], "both kept, the most recent first");
+        DiskPeers::remember(&mut map, ID, [1; 32]);
+        assert_eq!(map[ID], vec![[1; 32], [2; 32]], "pairing again moves a key to the front, once");
+    }
+
+    #[test]
+    fn an_id_keeps_its_most_recent_keys_only() {
+        let mut map = HashMap::new();
+        for k in 0..KEYS_PER_PEER_ID as u8 + 3 {
+            DiskPeers::remember(&mut map, ID, [k; 32]);
+        }
+        assert_eq!(map[ID].len(), KEYS_PER_PEER_ID);
+        assert_eq!(map[ID][0], [KEYS_PER_PEER_ID as u8 + 2; 32]);
+    }
+
+    #[test]
+    fn the_store_file_round_trips_every_key_in_order() {
+        let mut map = HashMap::new();
+        DiskPeers::remember(&mut map, ID, [1; 32]);
+        DiskPeers::remember(&mut map, ID, [2; 32]);
+        DiskPeers::remember(&mut map, b"another-phone", [3; 32]);
+        let bytes = DiskPeers::encode(&map);
+        assert_eq!(bytes.len(), 2 * (1 + ID.len() + 32) + (1 + 13 + 32), "one entry per key");
+        let mut back = HashMap::new();
+        assert_eq!(DiskPeers::load_into(&bytes, &mut back), 3);
+        assert_eq!(back, map);
+    }
+
+    #[test]
+    fn a_store_written_before_several_keys_per_id_loads_as_it_did() {
+        let mut old = vec![ID.len() as u8];
+        old.extend_from_slice(ID);
+        old.extend_from_slice(&[7; 32]);
+        let mut map = HashMap::new();
+        assert_eq!(DiskPeers::load_into(&old, &mut map), 1);
+        assert_eq!(map[ID], vec![[7; 32]]);
+    }
+
+    #[test]
+    fn a_log_tag_is_the_sha256_prefix_and_tells_ids_apart() {
+        assert_eq!(short_tag(b"abc"), "sha256:ba7816bf8f01");
+        assert_ne!(short_tag(ID), short_tag(b"another-phone"));
     }
 }

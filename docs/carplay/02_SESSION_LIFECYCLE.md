@@ -895,7 +895,12 @@ Two different kinds of state were being conflated; separated, both rules hold cl
   known device. This is dictated by the AirPlay/CarPlay model itself: pair-setup (the expensive SRP
   exchange) runs **once** per device; every later connection is a pair-verify (Curve25519 ECDH) against the
   stored record. This is the "streamlined known-device" path, and it is what the original RiddleBox firmware
-  kept in its `/etc/` data folders.
+  kept in its `/etc/` data folders. The record is keyed by the controller's pairing identifier, and two
+  iPhones can present the same one with different keys, even on different Apple accounts (bench
+  2026-11-02: `/etc/carplay_peers.bin` held one entry after both phones paired, so every change of phone
+  redid pair-setup). carplayd logs `sha256:` plus the first 6 bytes of the digest of each identifier and
+  key at pair-setup and pair-verify, so this can be confirmed against the file. Since then each identifier
+  keeps up to 8 keys and pair-verify accepts any of them (`DiskPeers`, `PeerStore::find_peers`).
 
 **The fast known-device reconnect comes entirely from persistent pairing, not persistent config.** A known
 device skips the crypto handshake cost, then the app re-pushes its (cheap) config fresh. Config persistence

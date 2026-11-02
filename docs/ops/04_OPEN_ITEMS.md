@@ -181,7 +181,21 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
      `carplayd` clears that flag when a session ends, so with no session live it took the wired-owned
      branch and spared `carplayd`. It now spares it only while the wired arm is ARMED or `carplayd`
      reports a wired peer (`wired_carplayd_live`). The shell suites do not cover the supervisor: bench
-     only.
+     only. **Benched 2026-11-02, 13:23-13:56 (`a19a694`, Carlink `bench-1102`, two iPhones):** a phone
+     keeps its address over app restarts (udhcpd ACKed each rejoining phone's request from the kept
+     lease file, no DISCOVER); the identity is cleared at every session end and at a SUBSCRIBE with no
+     session; Carlink covers the last frame on every drop; the app leaving with no session took the
+     COMPLETE teardown and left no `carplayd`; `usb_has` found the adapter at `ioreg` line 355 of 485.
+     Not exercised: `carplay_lost`, which needs CarPlay to drop with Bluetooth up (turning Wi-Fi off
+     drops both; the address flip that did it is fixed). Found, fixed the same day, NOT yet benched: the
+     AirPlay peer store kept one key per pairing identifier and both iPhones present the same one, so
+     every change of phone redid pair-setup (one switch failed when the phone abandoned it after M3);
+     it now keeps up to 8 keys per identifier ([../carplay/02_SESSION_LIFECYCLE.md](../carplay/02_SESSION_LIFECYCLE.md)).
+     And an iPhone 7 on iOS 15 tore down its screen stream about 30 ms after setting it up in 2 of 5
+     sessions (4 of 5 on the bench before), leaving media and no video for minutes; when no new screen
+     stream follows within 3 s, `carplayd` now sends `requestUI` again (`AvSession::nudge_screen_back`).
+     Why iOS 15 tears it down is not known; the failing sessions sent one more `modesChanged` before the
+     screen SETUP than the good ones.
   3. **"Phone drop on host re-SUBSCRIBE" (`PROJ_MODE NONE` then `SESSION_EVENT PHONE_ABSENT` after
      an app relaunch) — NOT reproduced, 2026-09-25.** Three timelines, all wired, the phone never
      left the bus in any: (a) kill-without-STOP relaunch (`adb install -r`): SUBSCRIBE → stale

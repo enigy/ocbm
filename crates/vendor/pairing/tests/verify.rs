@@ -130,3 +130,68 @@ fn pair_verify_rejects_unknown_controller() {
         pairing::verify::PairError::BadState
     );
 }
+
+/// Two iPhones presenting one pairing identifier with different keys (bench 2026-11-02).
+struct SharedId {
+    id: Vec<u8>,
+    keys: Vec<[u8; 32]>,
+}
+impl PeerStore for SharedId {
+    fn find_peer(&self, id: &[u8]) -> Option<[u8; 32]> {
+        self.find_peers(id).first().copied()
+    }
+    fn find_peers(&self, id: &[u8]) -> Vec<[u8; 32]> {
+        if id == self.id {
+            self.keys.clone()
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+/// Run M1..M4 as a controller signing with `ctrl_ed` under `ctrl_id`; returns M4's items.
+fn verify_as(peers: &impl PeerStore, ctrl_ed: &SigningKey, ctrl_id: &[u8]) -> Vec<(u8, Vec<u8>)> {
+    let acc = Identity::new(b"acc".to_vec(), [1u8; 32]);
+    let mut server = PairVerifyServer::new(&acc);
+    let ctrl_sk = StaticSecret::from([5u8; 32]);
+    let ctrl_pk = PublicKey::from(&ctrl_sk).to_bytes();
+    let m1 = tlv::encode(&[(tlv_type::STATE, &[1]), (tlv_type::PUBLIC_KEY, &ctrl_pk)]);
+    let (m2, _) = server.exchange(&m1, peers).unwrap();
+    let m2i = tlv::decode(&m2).unwrap();
+    let acc_pk: [u8; 32] = first(&m2i, tlv_type::PUBLIC_KEY).unwrap().try_into().unwrap();
+    let shared = ctrl_sk.diffie_hellman(&PublicKey::from(acc_pk)).to_bytes();
+    let key: [u8; 32] =
+        hkdf_sha512(&shared, b"Pair-Verify-Encrypt-Salt", b"Pair-Verify-Encrypt-Info");
+    let mut to_sign = Vec::new();
+    to_sign.extend_from_slice(&ctrl_pk);
+    to_sign.extend_from_slice(ctrl_id);
+    to_sign.extend_from_slice(&acc_pk);
+    let sig = ctrl_ed.sign(&to_sign).to_bytes();
+    let m3sub = tlv::encode(&[(tlv_type::IDENTIFIER, ctrl_id), (tlv_type::SIGNATURE, &sig)]);
+    let m3 = tlv::encode(&[
+        (tlv_type::STATE, &[3]),
+        (tlv_type::ENCRYPTED_DATA, &chacha_encrypt(&key, b"PV-Msg03", &m3sub)),
+    ]);
+    let (m4, done) = server.exchange(&m3, peers).unwrap();
+    assert!(done);
+    tlv::decode(&m4).unwrap()
+}
+
+#[test]
+fn pair_verify_accepts_any_key_on_record_for_the_controller_id() {
+    let first_phone = SigningKey::from_bytes(&[3u8; 32]);
+    let second_phone = SigningKey::from_bytes(&[4u8; 32]);
+    let id = b"0D4C5E7A-shared-pairing-identifier".to_vec();
+    let peers = SharedId {
+        id: id.clone(),
+        keys: vec![second_phone.verifying_key().to_bytes(), first_phone.verifying_key().to_bytes()],
+    };
+    for phone in [&first_phone, &second_phone] {
+        let m4 = verify_as(&peers, phone, &id);
+        assert_eq!(first(&m4, tlv_type::STATE).unwrap(), vec![4]);
+        assert!(first(&m4, tlv_type::ERROR).is_none(), "either phone's key verifies");
+    }
+    let stranger = SigningKey::from_bytes(&[8u8; 32]);
+    let m4 = verify_as(&peers, &stranger, &id);
+    assert_eq!(first(&m4, tlv_type::ERROR).unwrap(), vec![0x02], "a key not on record does not");
+}

@@ -409,7 +409,7 @@ pub struct AvSession {
     /// keying on it would break re-SETUP superseding and reintroduce the #406/#413 thread
     /// accumulation on the retry path — which one archived session shows firing 15 times.
     /// A/V streams pass an empty string and keep their supersede-by-type behaviour exactly.
-    av_streams: Mutex<HashMap<(i64, String), Arc<AtomicBool>>>,
+    av_streams: Arc<StreamFlags>,
     /// `enabledFeatures` echoed at the last phase-1 SETUP — kept only to fold into the phase-2
     /// consolidated "SETUP negotiated" troubleshooting line (features and streams land in two
     /// separate RTSP requests, so phase 2 has no other way to name what phase 1 already negotiated).
@@ -421,6 +421,18 @@ pub struct AvSession {
 
 /// How often stream threads wake from a blocking socket read to check the session-liveness flag.
 const SHUTDOWN_POLL: Duration = Duration::from_millis(500);
+
+/// How long after the phone tears down its screen stream we wait for it to set one up again before
+/// asking for its UI ([`AvSession::nudge_screen_back`]).
+const SCREEN_NUDGE_AFTER: Duration = Duration::from_secs(3);
+
+/// Per-stream liveness flags keyed by `(stream type, channelID)` ([`AvSession`]'s `av_streams`).
+type StreamFlags = Mutex<HashMap<(i64, String), Arc<AtomicBool>>>;
+
+/// Whether a main-screen (type 110) stream is live in `streams`.
+fn screen_stream_live(streams: &StreamFlags) -> bool {
+    crate::plock(streams).keys().any(|(ty, _)| *ty == 110)
+}
 
 /// A socket read/accept that returned because its timeout elapsed (not a real error).
 fn is_timeout(e: &std::io::Error) -> bool {
@@ -478,7 +490,7 @@ impl AvSession {
             peer_addr: None,
             alive: Arc::new(AtomicBool::new(true)),
             activity: Arc::new(AtomicU64::new(0)),
-            av_streams: Mutex::new(HashMap::new()),
+            av_streams: Arc::new(Mutex::new(HashMap::new())),
             negotiated_features: Vec::new(),
             resolution: (0, 0, 0),
         }
@@ -504,6 +516,32 @@ impl AvSession {
         let flag = Arc::new(AtomicBool::new(true));
         m.insert((ty, channel), flag.clone());
         flag
+    }
+
+    /// The phone tore down its screen stream: if it has not set up another within [`SCREEN_NUDGE_AFTER`],
+    /// send `requestUI` once, as RECORD does, so iOS brings its UI back and sets the screen up again.
+    ///
+    /// Bench 2026-11-02: an iPhone 7 on iOS 15 set up its screen stream and tore it down about 30 ms
+    /// later in 2 of 5 sessions (4 of 5 on the bench before), then never set up another. The session
+    /// stayed up with media and no video for minutes. iOS 27 never did. A teardown it follows with a
+    /// new screen SETUP within the wait gets no nudge.
+    fn nudge_screen_back(&self) {
+        let streams = self.av_streams.clone();
+        let alive = self.alive.clone();
+        let spawned = thread::Builder::new().name("screen-nudge".into()).spawn(move || {
+            thread::sleep(SCREEN_NUDGE_AFTER);
+            if !alive.load(Ordering::Acquire) || screen_stream_live(&streams) {
+                return;
+            }
+            let sent = crate::events::send_request_ui();
+            eprintln!(
+                "[session] no screen stream {} s after the phone tore it down — asked for its UI again (requestUI={sent})",
+                SCREEN_NUDGE_AFTER.as_secs()
+            );
+        });
+        if let Err(e) = spawned {
+            eprintln!("[session] screen nudge not started: {e}");
+        }
     }
 
     /// Stop all spawned stream threads and reset per-session global state (event channel, mic uplink,
@@ -1803,6 +1841,9 @@ impl SessionDelegate for AvSession {
             eprintln!(
                 "[session] partial TEARDOWN reason=host-request — stopped streams {stopped:?}, session kept"
             );
+            if stopped.contains(&110) {
+                self.nudge_screen_back();
+            }
             // The mic uplink is the INPUT leg of the type-100 MainAudio stream, so it dies WITH that
             // stream — not only at session end (`reset()`, which was the sole `clear()` caller).
             // Apple reaches `_TearDownStream` from this same partial path
@@ -3181,6 +3222,28 @@ mod tests {
         let alt = s.stream_flag(111);
         let _ = s.stream_flag(110);
         assert!(alt.load(Ordering::Acquire));
+    }
+
+    /// The phone tearing down its screen stream (iOS 15, bench 2026-11-02) leaves none live, which is
+    /// what the nudge checks for before asking for the UI again; the other streams stay.
+    #[test]
+    fn a_partial_teardown_of_the_screen_leaves_no_screen_stream_live() {
+        let mut s = AvSession::new();
+        assert!(!screen_stream_live(&s.av_streams));
+        let _screen = s.stream_flag(110);
+        let _alt = s.stream_flag(111);
+        assert!(screen_stream_live(&s.av_streams));
+        let mut stream = Dictionary::new();
+        stream.insert("type".into(), Value::Integer(110.into()));
+        let mut req = Dictionary::new();
+        req.insert("streams".into(), Value::Array(vec![Value::Dictionary(stream)]));
+        let mut body = Vec::new();
+        Value::Dictionary(req).to_writer_binary(&mut body).unwrap();
+        s.teardown(&body);
+        assert!(!screen_stream_live(&s.av_streams), "the screen went");
+        assert!(crate::plock(&s.av_streams).keys().any(|(t, _)| *t == 111), "the alt screen stayed");
+        // The session ends here, so the nudge thread finds it gone and sends nothing.
+        s.alive.store(false, Ordering::Release);
     }
 
     /// Phase-1 SETUP is idempotent, per Apple's reference: `_ControlSetup` is guarded by

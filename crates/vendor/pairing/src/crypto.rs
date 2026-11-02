@@ -80,3 +80,18 @@ pub fn chacha_decrypt(key: &[u8; 32], nonce8: &[u8; 8], ct_and_tag: &[u8]) -> Op
         .decrypt(Nonce::from_slice(&n), Payload { msg: ct_and_tag, aad: &[] })
         .ok()
 }
+
+/// The first 6 bytes of SHA-256 over `b`, in hex: a short, stable tag that names a pairing identifier
+/// or a key in a log without writing it out (`sha256(id)[..6]` is how a store entry is matched by hand).
+pub fn short_digest_hex(b: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(b).iter().take(6).map(|x| format!("{x:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn short_digest_hex_is_the_sha256_prefix() {
+        assert_eq!(super::short_digest_hex(b"abc"), "ba7816bf8f01");
+    }
+}
