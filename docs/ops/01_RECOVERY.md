@@ -71,7 +71,8 @@ that closes behind itself.
    arms a trial with stock CarPlay kept: `/script/ocbm_mode` goes `trial` → `confirmed` (an app that
    offers the way back sends `MGMT_INSTALL_CONFIRM`) → `final` (the Carlinkit stack is removed once
    that session ends). The scripts and their contract are in [`../../ccpa/README.md`](../../ccpa/README.md)
-   `installer/`; first proven on a factory unit 2026-10-28.
+   `installer/`; first proven on a factory unit 2026-10-28. A unit installed the live-overlay way
+   reaches it through stock: [`../../MIGRATING.md`](../../MIGRATING.md), first done 2026-11-01.
 
 The partition layout is fixed by the vendor kernel/U-Boot (`mtd0` 256 K uboot / `mtd1` 3328 K
 kernel / `mtd2` 12800 K rootfs); you control everything inside `mtd2`. See

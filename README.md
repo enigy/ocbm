@@ -57,6 +57,7 @@ Everything above the kernel is rewritten open-source.
 |---|---|
 | Build the box daemons and the host CLI | `./build.sh` — detail in [`docs/ops/00_BUILD_AND_DEPLOY.md`](docs/ops/00_BUILD_AND_DEPLOY.md) |
 | Commission a fresh adapter | `tools/ncm_base_install.sh`, then `tools/ocbm_install.sh` — its `manifest()` is the authoritative file set |
+| Move a hand-installed adapter to the one-file install (over-the-air updates) | [`MIGRATING.md`](MIGRATING.md) |
 | Run the macOS host app | Xcode project at `host/MacHost/carlink_macOS` — [`docs/host/00_MACOS_HOST_APP.md`](docs/host/00_MACOS_HOST_APP.md) |
 | Recover a wedged or bricked box | [`docs/ops/01_RECOVERY.md`](docs/ops/01_RECOVERY.md) |
 | Verify a change before committing | `tools/docs_check.py`, `tools/proto_check.py`, and the test plans in [`docs/ops/02_TESTING.md`](docs/ops/02_TESTING.md) |
