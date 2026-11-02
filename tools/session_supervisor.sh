@@ -325,6 +325,9 @@ kill_session() {
   # brief SIGKILL fallback so a stuck carplayd can't double-bind :5000 on the next ARM
   sleep 1
   pkill -9 -f carplayd 2>/dev/null
+  # A killed carplayd cannot clear the phone identity its session published; with no session the file
+  # names no live phone, and a host connecting next must not be told one is (bench 2026-11-02).
+  rm -f /tmp/phone_identity
   release_carplay_owner
 }
 
@@ -1088,6 +1091,8 @@ wireless_down() {
       # /tmp/bt_phase after the synchronous outer unlink used to run (audit 3.3: last-write-wins,
       # no other unlink point).
       rm -f /tmp/bt_phase
+      # The phone identity goes too: no session is left for it to name (bench 2026-11-02).
+      rm -f /tmp/phone_identity
       sh /script/radio_hal.sh wifi_ap_off >/tmp/wlan_off.log 2>&1
       # docs/carplay/04_CAPABILITIES_AND_CONFIG.md radio gating: POWER the BT radio off (page/inquiry dead, ACLs dropped), not just
       # noscan — an app-less box must not keep the iPhone BT-connected. Through the SEAM bt_off

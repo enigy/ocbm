@@ -2555,9 +2555,13 @@ impl Daemon {
     /// place, so a read either sees the whole document or the previous one).
     ///
     /// A rewrite counts as a change even when the document is the same (2026-11-01 bench): the file
-    /// outlives its session, so a fresh host is first replayed the LAST session's phone, and when that
+    /// outlived its session then, so a fresh host was first replayed the LAST session's phone, and when that
     /// same phone then connected the unchanged text sent nothing — the host never learned it was live.
     /// carplayd rewrites the file at every session's SETUP, so its modification time marks a new session.
+    ///
+    /// Since 2026-11-02 the file goes when its session does (carplayd clears it at the session's end, and
+    /// whatever kills carplayd clears it too), so the host is sent an empty identity, "no phone", then; and
+    /// a host connecting between sessions is no longer told the last phone is live.
     fn phone_ident_tick(&mut self, now_t: std::time::Instant) {
         if !self.subscribed {
             return;

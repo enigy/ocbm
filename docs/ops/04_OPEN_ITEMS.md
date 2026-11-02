@@ -60,7 +60,7 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
   The app hooks exist and are capability-gated; NOTHING below is implemented box-side, and no verb
   id is assigned — the proposed shapes are in
   [../carplay/01_OCBM_PROTOCOL.md](../carplay/01_OCBM_PROTOCOL.md) ("Proposed MGMT verbs").
-- **USB link stalls and the idle "wedged" restarts — one cause, fixed 2026-11-02, NOT yet benched.**
+- **USB link stalls and the idle "wedged" restarts — one cause, fixed 2026-11-02, benched the same day: pass.**
   The two-iPhone bench of `b2c92d9` saw three link stalls in ~40 min of CarPlay (Carlink's heartbeat
   writes timed out 5 times, the adapter declared the host gone and tore the wireless stack down), and
   an ocbmd idle with no app was L2-restarted by the supervisor about once a minute for an hour. Both are
@@ -71,9 +71,9 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
   loop keeps running, reading heartbeats and touching `/tmp/ocbmd_alive` while the host is not reading.
   Carlink `bench-1102` stops its own USB read thread waiting more than 1.5 s on a stuck decoder or
   audio track (the likely reason the host stopped reading) and logs a stall snapshot at the first
-  failed heartbeat. To bench: 40+ min of CarPlay with no stall, no "ocbmd wedged" at idle, and the
-  reconnect after a Carlink restart (a frame the pipe holds part of at a new HELLO goes out cut short;
-  the host resyncs and its next HELLO is answered).
+  failed heartbeat. Benched 2026-11-02 (`e9bb7c8`): 41 min of CarPlay with no stall, no "ocbmd
+  wedged" in 10 min idle, and video 15.1 s after a Carlink restart (a frame the pipe holds part of at
+  a new HELLO goes out cut short; the host resyncs and its next HELLO is answered).
   1. **`MGMT_DISCONNECT_PHONE`, transport-aware, plus a capability bit.** Problem: the app's
      Disconnect Phone has no honest verb to send — OCBM's six MGMT verbs are
      `crates/ocbm-proto/src/lib.rs:334-346`, dispatched at `ccpa/ocbmd/src/main.rs:3397-3446`; the
@@ -160,6 +160,22 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
      is `sta0`, not the `wlan0` `btd` passes). Fix 2: the unit's `hostapd` takes
      `ctrl_interface=/tmp/hostapd_ctrl` (probed RAM-only with the AP up), but there is no
      `hostapd_cli`, so `btd` would speak the control socket itself.
+     **Benched 2026-11-02, 09:40-11:20 (`e9bb7c8`, Carlink `bench-1102`, two iPhones): the relay
+     threads pass.** Idle 10 min with no app: no "ocbmd wedged", no L2 restart, one pid. 41 min of
+     CarPlay with 16 switches (13-18 s each, each to the phone asked for): no stall, and `carplayd`
+     left its live phone alone every time it advertised again. Carlink restart to video 15.1 s. The
+     same bench found four more, fixed the same day, NOT yet benched: (a) after an AP restart a phone's
+     address changed under its CarPlay session (the leases were deleted; see
+     [../wireless/01_BT_AND_RADIO.md](../wireless/01_BT_AND_RADIO.md), "DHCP leases survive"); (b) when
+     a phone's CarPlay ended outside a switch and the phone never advertised again, `btd` held its
+     Bluetooth link with no CarPlay for 2+ min. `carplayd` now clears `/tmp/phone_identity` when the
+     session ends, and `Control::carplay_lost` ends a session whose phone reached CarPlay and has been
+     without it for 20 s, holding the box for that phone as a switch does: it is paged for a fresh
+     handoff, and passed over (fix 6) if that does not reach CarPlay either. The cleared identity also
+     stops a fresh host being told the last session's phone is live; (c) Carlink kept a frozen frame
+     when a session dropped before its first media (Carlink `bench-1102`); (d)
+     `tools/stock_restore.sh`'s `usb_has` read "not on USB" under pipefail (`grep -q` SIGPIPEd
+     `ioreg`).
   3. **"Phone drop on host re-SUBSCRIBE" (`PROJ_MODE NONE` then `SESSION_EVENT PHONE_ABSENT` after
      an app relaunch) — NOT reproduced, 2026-09-25.** Three timelines, all wired, the phone never
      left the bus in any: (a) kill-without-STOP relaunch (`adb install -r`): SUBSCRIBE → stale

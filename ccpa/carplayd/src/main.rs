@@ -1489,12 +1489,34 @@ fn clear_transport_flag() {
     let _ = std::fs::remove_file(TRANSPORT_FLAG);
 }
 
+/// When the phone's identity (`receiver::session::PHONE_IDENT_FILE`) was last written; `None` = no file.
+fn phone_ident_written() -> Option<std::time::SystemTime> {
+    std::fs::metadata(receiver::session::PHONE_IDENT_FILE).and_then(|m| m.modified()).ok()
+}
+
+/// A session ended: the identity it published goes with it, so the file names a phone only while that
+/// phone's session is live. `before` is the file's write time when the session began; a file this session
+/// did not write is left alone. ocbmd tells the host the phone is gone (an empty `CT_PHONE_IDENT`), and btd
+/// sees CarPlay end on a Bluetooth link that is still up (`Control::carplay_lost`, bench 2026-11-02).
+fn clear_phone_ident_from(before: Option<std::time::SystemTime>) {
+    let now = phone_ident_written();
+    if now.is_some() && now != before {
+        let _ = std::fs::remove_file(receiver::session::PHONE_IDENT_FILE);
+        println!("[carplayd] session over: phone identity cleared");
+    }
+}
+
 fn run_pairing_server() -> io::Result<()> {
     let identity = Identity::new(pairing_identity().as_bytes().to_vec(), accessory_ed_seed());
 
     let peers = DiskPeers::new();
     let listen = "[::]:5000";
     let listener = TcpListener::bind(listen)?;
+    // Bound, so no other carplayd is serving: an identity on file was left by one that was killed, and
+    // names no live phone (`clear_phone_ident_from`).
+    if std::fs::remove_file(receiver::session::PHONE_IDENT_FILE).is_ok() {
+        println!("[carplayd] cleared a phone identity left from before this carplayd");
+    }
     println!(
         "[carplayd] pairing server on {listen} · device 'CarLink' ({}) · setup 3939 · \
          config {} (per-connection)",
@@ -1605,6 +1627,7 @@ fn run_pairing_server() -> io::Result<()> {
         }
         let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
         println!("[carplayd] ── control connection from {peer} ──");
+        let ident_before = phone_ident_written();
         // Already registered as the current (hijackable) session by the accept thread; publish the
         // bearer here, before the per-connection setup (config read, MFi open). The registration is
         // cleared on EVERY exit below (serve end or the signer-open early-out), but only if it is
@@ -1689,6 +1712,7 @@ fn run_pairing_server() -> io::Result<()> {
         let result = serve_connection(stream, &mut server);
         unregister(generation);
         clear_transport_flag();
+        clear_phone_ident_from(ident_before);
         match result {
             Ok(()) => match server.session_secret() {
                 // Do NOT log the secret's bytes: it's the pair-verify ECDH shared secret that seeds every

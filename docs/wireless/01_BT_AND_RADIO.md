@@ -189,6 +189,15 @@ AP). So the script name and every verb must avoid `carplayd`, `rx-connect`, `btd
 so testing it for existence proves the file is there, not that it is ours — and running the
 vendor copy is the destructive case in §3.
 
+**The AP's DHCP leases survive an AP restart (2026-11-02).** `radio_ap_up.sh` used to delete
+`/var/lib/udhcpd.leases`, as the vendor script does, and `wifi_ap_off` stops the AP's `udhcpd`
+(v0.9.9-pre) with SIGTERM, which writes nothing. An iPhone rejoining a network it knows keeps its
+old address and asks for it again (INIT-REBOOT); this `udhcpd` stays silent on that request from a
+client it has no lease for, so on the bench the phone ran CarPlay on `.101`, gave up asking, was
+handed `.100`, and the session died. Now `wifi_ap_off` sends SIGUSR1 first (the lease file is
+written) and `radio_ap_up.sh` keeps the file. A power cut skips `wifi_ap_off`, so the file then
+holds the leases from the last AP restart, or from `udhcpd`'s own periodic write.
+
 ### 5. Hardware-validated results (RTL8822CS, 2026-08-15)
 
 Detection and mapping, on a chipset with **no repo backend**:

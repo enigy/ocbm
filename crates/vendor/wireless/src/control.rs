@@ -104,9 +104,15 @@ const SWITCH_WIFI_FLOOR: Duration = Duration::from_secs(20);
 /// and kept off the accept path, so the phones that can project get the box first.
 const PASS_OVER: Duration = SWITCH_HOLD;
 
+/// How long CarPlay may stay gone from a session whose phone had it before btd starts that phone's handoff
+/// again ([`Control::carplay_lost`]). On the 2 Nov bench a phone whose session dropped was back in 6 s when
+/// it advertised again; when it did not, its Bluetooth link was held with no CarPlay for over 2 minutes.
+const CARPLAY_LOST_GRACE: Duration = Duration::from_secs(20);
+
 /// Where carplayd names the phone whose SETUP it took (`receiver::session::PHONE_IDENT_FILE`). It is
 /// written only for a SETUP the phone gate let through, so a switched-to phone that never appears here
-/// never reached CarPlay over Wi-Fi.
+/// never reached CarPlay over Wi-Fi; and it is cleared when that session ends, so a phone that has
+/// left it has lost CarPlay ([`Control::carplay_lost`]).
 const PHONE_IDENT_FILE: &str = "/tmp/phone_identity";
 
 /// Where a switch hold is kept while it lasts ([`Control::keeping_holds_in`]): `<address> <deadline>`, the
@@ -375,6 +381,8 @@ pub struct Control {
     switch_watch: Mutex<Option<SwitchWatch>>,
     /// A switched-to phone that never reached CarPlay, and until when it is passed over.
     passed_over: Mutex<Option<([u8; 6], Instant)>>,
+    /// The live session's CarPlay, from its claim to its end ([`Control::carplay_lost`]).
+    carplay_watch: Mutex<Option<CarPlayWatch>>,
     /// Where the switch hold is kept while it lasts ([`Control::keeping_holds_in`]); `None` keeps it in
     /// memory only, as the tests do.
     hold_file: Option<PathBuf>,
@@ -387,6 +395,18 @@ struct SwitchWatch {
     addr: [u8; 6],
     until: Instant,
     before: Ident,
+}
+
+/// A live session's CarPlay on watch ([`Control::carplay_lost`]).
+#[derive(Clone, Copy)]
+struct CarPlayWatch {
+    addr: [u8; 6],
+    /// `/tmp/phone_identity` when the session started: a file that named the phone then is a leftover.
+    before: Ident,
+    /// carplayd took a SETUP from the phone in this session.
+    reached: bool,
+    /// Since when the phone's CarPlay has been gone, while it is.
+    gone_since: Option<Instant>,
 }
 
 /// `/tmp/phone_identity` as last written: when, and the phone its `deviceID` names. `None` = no file.
@@ -637,11 +657,27 @@ impl Control {
     /// [`SWITCH_WIFI_FLOOR`] after it started) and carplayd has not taken a SETUP from it. That phone is
     /// then passed over for [`PASS_OVER`], and the caller ends the session, so the box goes back to its
     /// call order. A wireless Android Auto session counts as projecting: it never writes the CarPlay
-    /// identity. Polled by `run_active_session`'s wait loop; reads files only at the deadline.
+    /// identity. A phone that reached CarPlay and has lost it again is not stranded: [`Control::carplay_lost`]
+    /// starts its handoff again. Polled by `run_active_session`'s wait loop; reads files only at the deadline.
     pub fn switch_stranded(&self) -> bool {
         self.switch_stranded_at(Instant::now(), |w| {
-            flags::owner() == ProjectionOwner::WirelessAa || carplay_reached(w, read_ident())
+            flags::owner() == ProjectionOwner::WirelessAa || self.switch_projected(w, read_ident())
         })
+    }
+
+    /// Whether a switched-to phone reached CarPlay: carplayd names it `now`, or did earlier in its session.
+    fn switch_projected(
+        &self,
+        w: &SwitchWatch,
+        now: Ident,
+    ) -> bool {
+        carplay_reached(w, now)
+            || self
+                .carplay_watch
+                .lock()
+                .ok()
+                .and_then(|c| *c)
+                .is_some_and(|c| c.addr == w.addr && c.reached)
     }
 
     fn switch_stranded_at(
@@ -688,6 +724,71 @@ impl Control {
             }
             None => None,
         }
+    }
+
+    /// A session was claimed for `peer`: watch its CarPlay ([`Control::carplay_lost`]).
+    fn watch_carplay(&self, peer: Option<[u8; 6]>) {
+        self.watch_carplay_with(peer, read_ident);
+    }
+
+    fn watch_carplay_with(
+        &self,
+        peer: Option<[u8; 6]>,
+        ident: impl FnOnce() -> Ident,
+    ) {
+        if let Ok(mut w) = self.carplay_watch.lock() {
+            *w = peer.map(|addr| CarPlayWatch { addr, before: ident(), reached: false, gone_since: None });
+        }
+    }
+
+    /// Bench 2026-11-02, 11:17: a phone's Wi-Fi session died outside a switch, the phone never advertised
+    /// CarPlay again, and btd kept its Bluetooth link with no CarPlay for anyone. Fix 6 covers only a
+    /// switched-to phone.
+    ///
+    /// True once, when the live session's phone reached CarPlay (carplayd named it in `/tmp/phone_identity`)
+    /// and its CarPlay has been gone for [`CARPLAY_LOST_GRACE`] (carplayd clears the file when a session ends).
+    /// The box is then held for that phone as for a switch, and the caller ends the session: the next one
+    /// pages the phone for a fresh handoff, and if that does not reach CarPlay either the phone is passed
+    /// over ([`Control::switch_stranded`]) and the others are called. Polled by `run_active_session`'s wait
+    /// loop, once a second.
+    pub fn carplay_lost(&self) -> bool {
+        self.carplay_lost_at(Instant::now(), read_ident)
+    }
+
+    fn carplay_lost_at(
+        &self,
+        now: Instant,
+        ident: impl FnOnce() -> Ident,
+    ) -> bool {
+        let Ok(mut l) = self.carplay_watch.lock() else { return false };
+        let Some(mut w) = *l else { return false };
+        if self.session_peer() != Some(w.addr) {
+            *l = None; // that session is over
+            return false;
+        }
+        let seen = ident();
+        let named = seen.is_some_and(|(_, phone)| phone == Some(w.addr));
+        if !w.reached {
+            w.reached = named && seen != w.before;
+        } else if named {
+            w.gone_since = None;
+        } else if now.duration_since(*w.gone_since.get_or_insert(now)) >= CARPLAY_LOST_GRACE {
+            *l = None;
+            drop(l);
+            log(&format!(
+                "CarPlay with {} has been gone {}s -- ending its Bluetooth session to start its handoff again",
+                fmt_addr(&w.addr),
+                CARPLAY_LOST_GRACE.as_secs()
+            ));
+            if let Ok(mut h) = self.switch_hold.lock() {
+                *h = Some((w.addr, now + SWITCH_HOLD));
+            }
+            self.keep_hold(Some((w.addr, SWITCH_HOLD)));
+            self.request_connect(Some(w.addr));
+            return true;
+        }
+        *l = Some(w);
+        false
     }
 
     /// `bonds` in the order a round pages them: as given, with a passed-over phone moved last.
@@ -748,6 +849,7 @@ impl<'a> SessionClaim<'a> {
             .ok()?;
         ctrl.set_session_peer(peer);
         ctrl.end_hold_for(peer);
+        ctrl.watch_carplay(peer);
         Some(Self { flag, ctrl })
     }
 }
@@ -1260,7 +1362,87 @@ mod tests {
 
     /// `switch_stranded` at `when`, with `now` in `/tmp/phone_identity` and no Android Auto session.
     fn stranded(c: &Control, when: Instant, now: Ident) -> bool {
-        c.switch_stranded_at(when, |w| carplay_reached(w, now))
+        c.switch_stranded_at(when, |w| c.switch_projected(w, now))
+    }
+
+    /// A Control with `peer`'s session live and its CarPlay on watch, `before` in `/tmp/phone_identity`.
+    fn watched(peer: [u8; 6], before: Ident) -> Control {
+        let c = live(peer);
+        c.watch_carplay_with(Some(peer), || before);
+        c
+    }
+
+    #[test]
+    fn carplay_that_ends_and_does_not_come_back_starts_the_phones_handoff_again() {
+        // Bench 2026-11-02, 11:17: the phone's Wi-Fi session died, it never advertised again, and btd held
+        // its Bluetooth link with no CarPlay for over 2 minutes.
+        let t0 = Instant::now();
+        let c = watched(PHONE_A, None);
+        assert!(!c.carplay_lost_at(t0, || ident(100, PHONE_A)), "CarPlay reached");
+        let gone = t0 + Duration::from_secs(40);
+        assert!(!c.carplay_lost_at(gone, || None));
+        assert!(!c.carplay_lost_at(gone + CARPLAY_LOST_GRACE - Duration::from_secs(1), || None));
+        assert!(c.carplay_lost_at(gone + CARPLAY_LOST_GRACE, || None));
+        assert!(!c.carplay_lost_at(gone + CARPLAY_LOST_GRACE, || None), "once");
+        assert_eq!(c.take_request(), Some(Some(PHONE_A)), "the same phone is paged again");
+        let next = gone + CARPLAY_LOST_GRACE + Duration::from_secs(1);
+        assert!(c.admits_at(PHONE_A, next));
+        assert!(!c.admits_at(PHONE_B, next), "held for it, as for a switch");
+    }
+
+    #[test]
+    fn carplay_that_comes_back_inside_the_grace_is_left_alone() {
+        // The 11:14 drop on the same bench: the phone advertised again and was back in 6 s.
+        let t0 = Instant::now();
+        let c = watched(PHONE_A, None);
+        assert!(!c.carplay_lost_at(t0, || ident(100, PHONE_A)));
+        let gone = t0 + Duration::from_secs(40);
+        assert!(!c.carplay_lost_at(gone, || None));
+        assert!(!c.carplay_lost_at(gone + Duration::from_secs(6), || ident(146, PHONE_A)), "back");
+        let again = gone + Duration::from_secs(30);
+        assert!(!c.carplay_lost_at(again, || None));
+        assert!(!c.carplay_lost_at(again + CARPLAY_LOST_GRACE - Duration::from_secs(1), || None), "the grace starts over");
+        assert!(c.carplay_lost_at(again + CARPLAY_LOST_GRACE, || None));
+    }
+
+    #[test]
+    fn a_session_that_never_reached_carplay_is_not_ended_for_losing_it() {
+        let t0 = Instant::now();
+        let c = watched(PHONE_A, ident(100, PHONE_A));
+        assert!(!c.carplay_lost_at(t0, || ident(100, PHONE_A)), "a leftover naming the phone is not CarPlay");
+        assert!(!c.carplay_lost_at(t0 + Duration::from_secs(1), || None));
+        assert!(!c.carplay_lost_at(t0 + CARPLAY_LOST_GRACE * 3, || None));
+        let other = watched(PHONE_A, None);
+        assert!(!other.carplay_lost_at(t0, || ident(100, PHONE_B)), "another phone's CarPlay is not this one's");
+        assert!(!other.carplay_lost_at(t0 + CARPLAY_LOST_GRACE * 3, || None));
+        assert_eq!(c.take_request(), None);
+        assert_eq!(other.take_request(), None);
+    }
+
+    #[test]
+    fn the_carplay_watch_goes_with_its_session() {
+        let t0 = Instant::now();
+        let c = watched(PHONE_A, None);
+        assert!(!c.carplay_lost_at(t0, || ident(100, PHONE_A)));
+        c.set_session_peer(None);
+        assert!(!c.carplay_lost_at(t0 + Duration::from_secs(1), || None));
+        c.set_session_peer(Some(PHONE_A));
+        assert!(!c.carplay_lost_at(t0 + CARPLAY_LOST_GRACE * 2, || None), "nothing left to end");
+    }
+
+    #[test]
+    fn a_switched_to_phone_that_lost_carplay_is_started_again_not_passed_over() {
+        let t0 = Instant::now();
+        let claimed = t0 + Duration::from_secs(6);
+        let c = switched(t0, claimed, None);
+        c.watch_carplay_with(Some(PHONE_A), || None);
+        assert!(!c.carplay_lost_at(claimed + Duration::from_secs(11), || ident(117, PHONE_A)), "reached");
+        let gone = t0 + Duration::from_secs(30);
+        assert!(!c.carplay_lost_at(gone, || None));
+        assert!(!stranded(&c, t0 + SWITCH_HOLD, None), "it reached CarPlay, so it is not stranded");
+        assert_eq!(c.passed_over(), None);
+        assert!(c.carplay_lost_at(gone + CARPLAY_LOST_GRACE, || None));
+        assert_eq!(c.held_for_at(gone + CARPLAY_LOST_GRACE), Some(PHONE_A));
     }
 
     #[test]

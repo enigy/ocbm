@@ -220,6 +220,8 @@ pub fn teardown_av_layer() {
     // interface/identity is no longer constructible.
     let _ = std::fs::remove_file("/tmp/carplay_transport");
     let _ = std::fs::remove_file(EXPECT_PHONE_FILE);
+    // carplayd clears the phone's identity when a session ends, but not when it is killed mid-session.
+    let _ = std::fs::remove_file("/tmp/phone_identity");
     AV_AIRPLAYD_PID.store(0, Ordering::Release);
     AV_LAYER_UP.store(false, Ordering::Release);
     println!("[av] wireless A/V layer torn down (carplayd stopped, discovery with it)");

@@ -145,7 +145,12 @@ gate() {
 # ------------------------------------------------------------------------------------------
 VIA=""
 OCBM_WARM=0
-usb_has() { ioreg -p IOUSB -w0 -l 2>/dev/null | grep -q "\"idProduct\" = $1\$"; }
+# A product id among the USB devices. awk reads ioreg to the end: `grep -q` stopped at the first match,
+# ioreg then died of SIGPIPE writing the rest, and under pipefail the check read "not on USB" whenever the
+# adapter was not the last device (two applies aborted "state: none" on the Mac, 2 Nov 2026).
+usb_has() {
+  ioreg -p IOUSB -w0 -l 2>/dev/null | awk -v p="$1" '/"idProduct" = / && $NF == p { found = 1 } END { exit !found }'
+}
 # A vendor's product: ioreg prints both ids, in decimal, in each entry's block under its "+-o" line.
 usb_has_id() {
   ioreg -p IOUSB -w0 -l 2>/dev/null | awk -v v="$1" -v p="$2" '

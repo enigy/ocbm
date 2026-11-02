@@ -371,7 +371,11 @@ EOS
   # "device 1314 not found" while the box side is perfectly healthy.
   local i=0 seen=0
   while [ $i -lt 40 ]; do
-    if ioreg -p IOUSB -w0 -l 2>/dev/null | grep -q '"idProduct" = 11520'; then seen=1; break; fi
+    # awk, not `grep -q`: an early exit SIGPIPEs ioreg, and under pipefail a device that is there reads
+    # as absent unless it is the last one listed (stock_restore.sh's usb_has, 2 Nov 2026).
+    if ioreg -p IOUSB -w0 -l 2>/dev/null | awk '/"idProduct" = / && $NF == 11520 { f = 1 } END { exit !f }'; then
+      seen=1; break
+    fi
     sleep 3; i=$((i+1))
   done
   [ "$seen" = 1 ] && say "  accessory enumerated (0x1314:0x2d00)" \

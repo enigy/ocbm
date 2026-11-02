@@ -479,7 +479,14 @@ do_wifi_ap_off() {
   # the management link - on a box with no UART that is the only way in, and it is exactly what
   # the vendor's close_bluetooth_wifi.sh does. Identify it by its CONFIG PATH, which is
   # unambiguous: the NCM server runs `busybox udhcpd -f /tmp/udhcpd_ncm.conf`.
-  for _p in $(ps 2>/dev/null | grep -v grep | grep "udhcpd .*etc/udhcpd.conf" | awk '{print $1}'); do
+  # SIGUSR1 FIRST: this udhcpd (v0.9.9-pre) writes its lease file on SIGUSR1 and not on SIGTERM, and
+  # radio_ap_up.sh keeps that file, so a phone rejoining after this restart gets the address it had
+  # (bench 2026-11-02: without its lease the phone's address changed under a live CarPlay session).
+  # The pause lets it write them before SIGTERM arrives.
+  _dhcp=$(ps 2>/dev/null | grep -v grep | grep "udhcpd .*etc/udhcpd.conf" | awk '{print $1}')
+  for _p in $_dhcp; do kill -USR1 "$_p" 2>/dev/null; done
+  [ -n "$_dhcp" ] && sleep 0.3
+  for _p in $_dhcp; do
     kill "$_p" 2>/dev/null
   done
   [ -e /var/run/udhcpd.pid ] && kill "$(cat /var/run/udhcpd.pid 2>/dev/null)" 2>/dev/null
