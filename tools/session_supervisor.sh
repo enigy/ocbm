@@ -175,6 +175,18 @@ phone_on_bus() {
   # SEV_PHONE_ABSENT — making the app's watchdog blank the video / say "waiting for phone" on a perfectly
   # live wireless screen. (Kept below the wired check so it can no longer mask a real cable.)
   wireless_owns_session && return 0
+  wired_phone_on_bus
+}
+
+# The wired half of phone_on_bus: a cable iPhone on the raw bus, or the phone-facing gadget CONFIGURED by
+# a projected one. It never reads /tmp/carplay_transport, so a caller that has just read that flag itself
+# (A2 and wireless_up's choke point: `! wireless_owns_session && wired_phone_on_bus`) gets ONE reading of
+# it per decision. Both used to ask `phone_on_bus && ! wireless_owns_session`, which reads the flag twice:
+# on the 2026-11-02 bench a phone switch cleared it between the two reads, so `phone_on_bus` answered true
+# through its wireless clause and the negation passed as well. A2 then saw a wired session that did not
+# exist, tore the radios down, restored them on the next tick, and that restart lost btd's switch hold.
+wired_phone_on_bus() {
+  wired_iphone_on_usb && return 0
   [ "$(cat /sys/class/android_usb/android0/state 2>/dev/null)" = "CONFIGURED" ]
 }
 
@@ -892,7 +904,7 @@ wireless_up() {
   # This is what actually delivers "wired => radios off". A2's teardown was already working — the
   # captured log shows it going quiet after two firings, which only happens when `wireless_stack_up`
   # reads false — and then a bring-up put hostapd, wlan0 and hci0 straight back.
-  if ! hot_handover_enabled && phone_on_bus && ! wireless_owns_session; then
+  if ! hot_handover_enabled && ! wireless_owns_session && wired_phone_on_bus; then
     echo "[sup] wireless_up SUPPRESSED — a WIRED session owns the box (Hot-Handover off)"
     return
   fi
@@ -1284,9 +1296,11 @@ while :; do
       # using it made A2 a self-cancelling oscillator: tear down on plug, then `projection_up.sh`
       # switches the gadget to 08e4, 05ac vanishes, the falling edge restores the radios for the rest
       # of the wired session. `phone_on_bus` was hardened in July for this same class of bug and
-      # covers both modes; its `wireless_owns_session` clause is unreachable under the negation below.
+      # covers both modes. A2 asks its wired half, `wired_phone_on_bus`, after ONE read of the transport
+      # flag: asking `phone_on_bus` read the flag a second time, and a switch clearing it in between made
+      # A2 see a wired session that was not there (bench 2026-11-02; see `wired_phone_on_bus`).
       _a2_want=0
-      if ! hot_handover_enabled && phone_on_bus && ! wireless_owns_session; then
+      if ! hot_handover_enabled && ! wireless_owns_session && wired_phone_on_bus; then
         _a2_want=1
       fi
       if [ "$_a2_want" != "${_a2_state:-0}" ]; then

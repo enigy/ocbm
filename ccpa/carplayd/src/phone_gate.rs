@@ -16,7 +16,8 @@
 //!
 //! With a phone named:
 //! - discovery dials only the phone whose `_carplay-ctrl` TXT `id` is that address ([`PhoneGate::wants`],
-//!   fix 1b); a TXT without an id is dialled as before;
+//!   fix 1b); a TXT without an id is dialled as before; and not while that phone's session is live here
+//!   ([`PhoneGate::serving`]), however its record's addresses change;
 //! - a phase-1 SETUP whose `deviceID` is another phone is refused (HTTP 500, connection closed), before
 //!   the session publishes who the phone is, and that peer address is refused for the rest of this
 //!   name: its connections are dropped and discovery no longer dials it;
@@ -165,6 +166,18 @@ impl PhoneGate {
         match (self.expected_now(&mut st), txt_id.and_then(normalize)) {
             (Some(expected), Some(id)) => id == expected,
             _ => true,
+        }
+    }
+
+    /// Whether the phone whose TXT `id` is `txt_id` already has its session here: it is the named phone,
+    /// its SETUP was let through, and that session has not ended. Discovery leaves it alone then. On the
+    /// 2026-11-02 bench a live phone's record gained two addresses mid-session; discovery dialled one of
+    /// them, the iPhone answered 200 OK, and the session that was showing video ended 29 s later.
+    pub fn serving(&self, txt_id: Option<&str>) -> bool {
+        let mut st = self.lock();
+        match (self.expected_now(&mut st), txt_id.and_then(normalize)) {
+            (Some(expected), Some(id)) => id == expected && st.serving.is_some(),
+            _ => false,
         }
     }
 }
@@ -330,6 +343,21 @@ mod tests {
         assert!(gate.wants(Some(OTHER)), "follows the phone btd serves now");
         let _ = std::fs::remove_file(path);
         assert!(gate.wants(Some(OWNER)), "no name, no gate");
+    }
+
+    #[test]
+    fn discovery_does_not_dial_the_named_phone_while_its_session_is_live() {
+        // 2026-11-02 bench: the record changed to [fe80::.., .100, .101] mid-session and .100 was dialled.
+        let (gate, path) = gate_naming(Some(OWNER));
+        assert!(!gate.serving(Some(OWNER)), "no session yet: dial it");
+        assert!(gate.on_setup(3, ip(101), Some(OWNER)));
+        assert!(gate.serving(Some("68:a7:29:00:25:10")), "its session is live: leave it alone");
+        assert!(!gate.serving(Some(OTHER)), "says nothing about another phone");
+        assert!(!gate.serving(None), "nor about a TXT without an id");
+        gate.session_ended(3);
+        assert!(!gate.serving(Some(OWNER)), "once the session ends it may be dialled again");
+        let _ = std::fs::remove_file(path);
+        assert!(!PhoneGate::new(None).serving(Some(OWNER)), "no gate: as before");
     }
 
     #[test]

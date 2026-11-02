@@ -131,7 +131,21 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
      go-quiet teardown; that phone is then last in the call order and refused on the accept path for
      45 s, or until the app asks for it again. Fix 1b (`PhoneGate::wants`): discovery skips a
      `_carplay-ctrl` whose TXT `id` is another phone than the one `btd` names; a TXT without an id
-     is dialled as before and the SETUP check still applies.
+     is dialled as before and the SETUP check still applies. **Benched 2026-11-02 with two iPhones
+     (Carlink 2.07 debug, emulator): both pass.** Both phones' TXT `id`s are their BR/EDR addresses
+     (no fallback needed); fix 6 ended a Wi-Fi-off phone's session at tap+45 s and the other phone
+     streamed at tap+58 s; switches went 4 of 5 and 3 of 3 (15-21 s tap to video) and no dropped
+     phone retook CarPlay. The same bench found three more, fixed the same day, NOT yet benched:
+     the supervisor's A2 radio gate read `/tmp/carplay_transport` twice per tick, so a switch
+     clearing it in between looked like a wired session and the radios were restarted, and the
+     restart lost the hold (A2 and `wireless_up` now read it once: `wired_phone_on_bus`); the hold
+     now outlives a `btd` restart (`/tmp/btd_switch_hold`, monotonic deadline,
+     `Control::keeping_holds_in`); and `carplayd` dialled the phone of its own live session again
+     when that phone's record gained addresses, which ended the session (`PhoneGate::serving`).
+     Link-local dials now take the scope of the interface holding the AP address (the bench unit's AP
+     is `sta0`, not the `wlan0` `btd` passes). Fix 2: the unit's `hostapd` takes
+     `ctrl_interface=/tmp/hostapd_ctrl` (probed RAM-only with the AP up), but there is no
+     `hostapd_cli`, so `btd` would speak the control socket itself.
   3. **"Phone drop on host re-SUBSCRIBE" (`PROJ_MODE NONE` then `SESSION_EVENT PHONE_ABSENT` after
      an app relaunch) — NOT reproduced, 2026-09-25.** Three timelines, all wired, the phone never
      left the bus in any: (a) kill-without-STOP relaunch (`adb install -r`): SUBSCRIBE → stale

@@ -759,7 +759,7 @@ fn main() {
     // {"ok":true}. Binding here also means the device screen works during bring-up and while the
     // WIRED transport holds the arbiter — which is exactly when a driver looks at it.
     let session_active = Arc::new(AtomicBool::new(false));
-    let ctrl = Arc::new(control::Control::new(session_active.clone()));
+    let ctrl = Arc::new(control::Control::new(session_active.clone()).keeping_holds_in(control::SWITCH_HOLD_FILE));
     control::serve(ctrl.clone());
 
     while !shutdown.load(Ordering::Relaxed) {

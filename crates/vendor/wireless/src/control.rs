@@ -69,6 +69,7 @@
 // method call resolves to `Iterator::take` and fails to compile against BufReader.
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
@@ -108,6 +109,11 @@ const PASS_OVER: Duration = SWITCH_HOLD;
 /// never reached CarPlay over Wi-Fi.
 const PHONE_IDENT_FILE: &str = "/tmp/phone_identity";
 
+/// Where a switch hold is kept while it lasts ([`Control::keeping_holds_in`]): `<address> <deadline>`, the
+/// deadline in milliseconds of `CLOCK_MONOTONIC`, which a restarted btd reads on the same clock. tmpfs, so
+/// a reboot forgets it, as it should.
+pub const SWITCH_HOLD_FILE: &str = "/tmp/btd_switch_hold";
+
 /// `@<unix_ms> ` write-time stamp (docs/carplay/01_OCBM_PROTOCOL.md CH_LOG): the box.log tailer
 /// parses this prefix and uses it instead of the millisecond it happened to READ the line at.
 fn log(m: &str) {
@@ -119,6 +125,36 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Milliseconds of `CLOCK_MONOTONIC`: system-wide, so a deadline written by one btd means the same to the
+/// next, and unmoved by the host's `CT_SETTIME`, which sets the wall clock at every connect.
+fn mono_ms() -> u64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: `ts` is a valid, writable timespec for the duration of the call.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    (ts.tv_sec as u64) * 1000 + (ts.tv_nsec as u64) / 1_000_000
+}
+
+/// [`SWITCH_HOLD_FILE`]'s one line for a hold on `addr` that lapses at `deadline_ms` (monotonic).
+fn hold_line(
+    addr: &[u8; 6],
+    deadline_ms: u64,
+) -> String {
+    format!("{} {deadline_ms}\n", fmt_addr(addr))
+}
+
+/// The hold [`hold_line`] wrote, and how much of it is left at `now_ms` (monotonic). `None` when it has
+/// lapsed, does not parse, or claims more than a whole [`SWITCH_HOLD`], which no hold this btd wrote can.
+fn parse_hold(
+    line: &str,
+    now_ms: u64,
+) -> Option<([u8; 6], Duration)> {
+    let mut parts = line.split_whitespace();
+    let addr = parse_addr(parts.next()?)?;
+    let deadline: u64 = parts.next()?.parse().ok()?;
+    let left = Duration::from_millis(deadline.checked_sub(now_ms)?);
+    (!left.is_zero() && left <= SWITCH_HOLD).then_some((addr, left))
 }
 
 // ---- address formatting ---------------------------------------------------------------------
@@ -337,6 +373,9 @@ pub struct Control {
     switch_watch: Mutex<Option<SwitchWatch>>,
     /// A switched-to phone that never reached CarPlay, and until when it is passed over.
     passed_over: Mutex<Option<([u8; 6], Instant)>>,
+    /// Where the switch hold is kept while it lasts ([`Control::keeping_holds_in`]); `None` keeps it in
+    /// memory only, as the tests do.
+    hold_file: Option<PathBuf>,
 }
 
 /// A switched-to phone's session on watch: whose, until when, and what `/tmp/phone_identity` held
@@ -376,6 +415,58 @@ impl Control {
             policy: RwLock::new(load_policy()),
             session_active,
             ..Default::default()
+        }
+    }
+
+    /// Keep a switch hold in `path` while it lasts, and take up the one a previous btd left there.
+    ///
+    /// Bench 2026-11-02: a switch to the second iPhone was lost when the supervisor restarted the radios
+    /// inside the hold. The hold lived only in this process, so the new btd paged the owner's phone first
+    /// and admitted it. Kept here, the hold outlives that restart: the new btd pages only the phone asked
+    /// for and refuses the others until the same deadline.
+    pub fn keeping_holds_in(
+        mut self,
+        path: &str,
+    ) -> Self {
+        let file = PathBuf::from(path);
+        let left = std::fs::read_to_string(&file).ok().and_then(|s| parse_hold(&s, mono_ms()));
+        match left {
+            Some((addr, left)) => {
+                log(&format!(
+                    "switch hold for {} taken up from the btd before this one -- {}s left",
+                    fmt_addr(&addr),
+                    left.as_secs()
+                ));
+                if let Ok(mut h) = self.switch_hold.lock() {
+                    *h = Some((addr, Instant::now() + left));
+                }
+                self.request_connect(Some(addr));
+            }
+            None => {
+                let _ = std::fs::remove_file(&file);
+            }
+        }
+        self.hold_file = Some(file);
+        self
+    }
+
+    /// Write the hold on `addr`, lapsing in `left`, to the hold file; or clear the file with `None`.
+    fn keep_hold(
+        &self,
+        hold: Option<([u8; 6], Duration)>,
+    ) {
+        let Some(file) = &self.hold_file else { return };
+        match hold {
+            Some((addr, left)) => {
+                let deadline = mono_ms() + left.as_millis() as u64;
+                let tmp = file.with_extension("tmp");
+                if std::fs::write(&tmp, hold_line(&addr, deadline)).is_err() || std::fs::rename(&tmp, file).is_err() {
+                    log("switch hold not kept on file -- a btd restart inside it would forget it");
+                }
+            }
+            None => {
+                let _ = std::fs::remove_file(file);
+            }
         }
     }
 
@@ -461,6 +552,7 @@ impl Control {
             if let Ok(mut h) = self.switch_hold.lock() {
                 *h = Some((addr, now + SWITCH_HOLD));
             }
+            self.keep_hold(Some((addr, SWITCH_HOLD)));
             self.restart.store(true, Ordering::Release);
         }
         Some(ending)
@@ -487,6 +579,7 @@ impl Control {
             Some((addr, until)) if now < until => Some(addr),
             Some(_) => {
                 *h = None;
+                self.keep_hold(None);
                 log("switch hold lapsed -- every bonded phone may connect again");
                 None
             }
@@ -524,6 +617,7 @@ impl Control {
             return;
         }
         *h = None;
+        self.keep_hold(None);
         if let Ok(mut w) = self.switch_watch.lock() {
             *w = Some(SwitchWatch {
                 addr,
@@ -1235,6 +1329,55 @@ mod tests {
         assert_eq!(c.passed_over(), Some(PHONE_A));
         c.request_connect(Some(PHONE_A));
         assert_eq!(c.passed_over(), None);
+    }
+
+    /// A hold file of this test's own, so parallel tests never share one.
+    fn hold_file(test: &str) -> String {
+        let p = std::env::temp_dir().join(format!("btd_switch_hold_{test}_{}", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        p.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn a_switch_hold_outlives_a_btd_restart() {
+        // Bench 2026-11-02: the supervisor restarted the radios inside a switch's hold, and the new btd
+        // paged and admitted the owner's phone instead of the one asked for.
+        let path = hold_file("restart");
+        let before = live(PHONE_B).keeping_holds_in(&path);
+        before.request_switch_at(PHONE_A, &[PHONE_A, PHONE_B], Instant::now());
+        drop(before);
+
+        let after = Control::new(Arc::new(AtomicBool::new(false))).keeping_holds_in(&path);
+        assert_eq!(after.held_for(), Some(PHONE_A), "the restarted btd holds the box for the same phone");
+        assert!(!after.admits(PHONE_B), "and the dropped phone still may not re-dial in");
+        assert_eq!(after.take_request(), Some(Some(PHONE_A)), "the phone asked for is paged first");
+
+        let flag = AtomicBool::new(false);
+        let claim = SessionClaim::try_claim(&flag, &after, Some(PHONE_A));
+        assert!(claim.is_some());
+        assert!(!std::path::Path::new(&path).exists(), "the hold is over once that phone has its session");
+        drop(claim);
+        let again = Control::new(Arc::new(AtomicBool::new(false))).keeping_holds_in(&path);
+        assert_eq!(again.held_for(), None);
+    }
+
+    #[test]
+    fn a_lapsed_or_unreadable_hold_file_holds_nothing() {
+        let line = hold_line(&PHONE_A, 50_000);
+        assert_eq!(parse_hold(&line, 40_000), Some((PHONE_A, Duration::from_secs(10))));
+        assert_eq!(parse_hold(&line, 50_000), None, "lapsed at its deadline");
+        assert_eq!(parse_hold(&line, 60_000), None);
+        assert_eq!(parse_hold(&hold_line(&PHONE_A, 46_001), 1_000), None, "more than a whole hold is not ours");
+        assert_eq!(parse_hold("68:A7:29:00:25:10", 0), None, "no deadline");
+        assert_eq!(parse_hold("not-an-address 5000", 0), None);
+        assert_eq!(parse_hold("", 0), None);
+
+        let path = hold_file("lapsed");
+        std::fs::write(&path, hold_line(&PHONE_A, mono_ms().saturating_sub(1))).unwrap();
+        let c = Control::new(Arc::new(AtomicBool::new(false))).keeping_holds_in(&path);
+        assert_eq!(c.held_for(), None);
+        assert_eq!(c.take_request(), None, "nothing is paged for a hold that has lapsed");
+        assert!(!std::path::Path::new(&path).exists(), "and its file is cleared");
     }
 
     #[test]

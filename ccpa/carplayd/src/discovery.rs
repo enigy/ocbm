@@ -15,15 +15,18 @@
 //! process in the double-spawn race, and one heap arena gone.
 //!
 //! Bearer selection is unchanged and still env-driven, so ONE build serves both:
-//!   RX_IFACE  (default "ncm0")  — interface whose index scopes IPv6 link-local dials.
+//!   RX_IFACE  (default "ncm0")  — interface whose index scopes IPv6 link-local dials, unless another
+//!                                 interface holds RX_ADDR (below).
 //!   RX_ADDR   (default unset)   — explicit advertised address; unset means addr-auto (all
 //!                                 interface addresses). Wireless AP: RX_IFACE=wlan0
-//!                                 RX_ADDR=192.168.43.1.
+//!                                 RX_ADDR=192.168.43.1. The interface holding it scopes link-local
+//!                                 dials: btd's `wlan0` is not the AP's name on every chip.
 
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use std::collections::{HashMap, HashSet};
+use std::ffi::CStr;
 use std::io::{Read as _, Write as _};
-use std::net::{IpAddr, SocketAddr, SocketAddrV6, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV6, TcpStream};
 use std::time::Duration;
 
 const PORT: u16 = 5000;
@@ -107,6 +110,36 @@ fn iface_scope(iface: &str) -> u32 {
         Err(_) => return 0,
     };
     unsafe { libc::if_nametoindex(c.as_ptr()) }
+}
+
+/// The interface holding the IPv4 `addr`, if any. Wireless carplayd advertises on the AP gateway
+/// (`RX_ADDR`), and the interface holding that address is the AP's, whatever the chip's bring-up named it:
+/// btd passes `RX_IFACE=wlan0`, but on the 2026-11-02 bench unit the AP was `sta0`, so link-local dials
+/// carried `wlan0`'s scope and failed with "Network unreachable", ten rounds at a time.
+fn iface_holding(addr: Ipv4Addr) -> Option<String> {
+    let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs fills `ifap` with a list this function frees below; every node is read only
+    // between the two calls, and `ifa_addr` is checked for null and AF_INET before it is read as IPv4.
+    unsafe {
+        if libc::getifaddrs(&mut ifap) != 0 {
+            return None;
+        }
+        let mut found = None;
+        let mut cur = ifap;
+        while !cur.is_null() {
+            let ifa = &*cur;
+            if !ifa.ifa_addr.is_null() && i32::from((*ifa.ifa_addr).sa_family) == libc::AF_INET {
+                let sin = &*(ifa.ifa_addr as *const libc::sockaddr_in);
+                if Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr)) == addr {
+                    found = Some(CStr::from_ptr(ifa.ifa_name).to_string_lossy().into_owned());
+                    break;
+                }
+            }
+            cur = ifa.ifa_next;
+        }
+        libc::freeifaddrs(ifap);
+        found
+    }
 }
 
 /// Turn a resolved mDNS IP into a dialable SocketAddr. The box has no `.local` resolver, so we dial
@@ -213,13 +246,16 @@ fn run(
     while let Ok(ev) = browse.recv() {
         match ev {
             ServiceEvent::ServiceResolved(info) => {
-                // Scope for IPv6 link-local dials, resolved NOW rather than once at startup.
-                let scope = iface_scope(&iface);
+                // Scope for IPv6 link-local dials, resolved NOW rather than once at startup: the
+                // interface holding the advertised AP address, else RX_IFACE.
+                let ap_iface = adv_addr.parse::<Ipv4Addr>().ok().and_then(iface_holding);
+                let scope_iface = ap_iface.as_deref().unwrap_or(&iface);
+                let scope = iface_scope(scope_iface);
                 let port = info.get_port();
                 let host = info.get_hostname().trim_end_matches('.').to_string();
                 let addrs: Vec<IpAddr> = info.get_addresses().iter().copied().collect();
                 println!(
-                    "[rx] resolved _carplay-ctrl {} -> {host}:{port} addrs={addrs:?} scope={iface}({scope})",
+                    "[rx] resolved _carplay-ctrl {} -> {host}:{port} addrs={addrs:?} scope={scope_iface}({scope})",
                     info.get_fullname()
                 );
                 // What the phone puts in its TXT record. Its `id` is its BR/EDR address (2026-11-01 bench),
@@ -239,6 +275,17 @@ fn run(
                         "[rx] {}: TXT id {} is another phone than btd serves; not dialling it",
                         info.get_fullname(),
                         txt_id.unwrap_or_default()
+                    );
+                    continue;
+                }
+                // The phone btd serves, with its session already live here: a record that changed
+                // addresses mid-session is the same phone, and dialling it again ends the session that
+                // is showing video (bench 2026-11-02: dialled at .101, the record grew .100, a second
+                // connect to .100 got 200 OK, and the session was torn down 29 s after video started).
+                if gate.serving(txt_id) {
+                    println!(
+                        "[rx] {}: its session is live here; not dialling it again at {addrs:?}",
+                        info.get_fullname()
                     );
                     continue;
                 }
@@ -336,5 +383,11 @@ mod tests {
         // ...and IPv4 (the wireless AP bearer) never does.
         let v4: IpAddr = "192.168.43.10".parse().unwrap();
         assert!(matches!(dialable(v4, 7000, 42), SocketAddr::V4(_)));
+    }
+
+    #[test]
+    fn the_interface_holding_an_address_is_found_by_the_address() {
+        assert_eq!(iface_holding(Ipv4Addr::LOCALHOST).as_deref(), Some("lo"));
+        assert_eq!(iface_holding(Ipv4Addr::new(192, 0, 2, 77)), None, "an address no interface holds");
     }
 }
