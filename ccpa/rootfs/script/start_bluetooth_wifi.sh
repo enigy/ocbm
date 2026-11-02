@@ -27,7 +27,8 @@ WLANIP=192.168.43.1
 [ -e /etc/wifi_ip ] && WLANIP=$(cat /etc/wifi_ip)
 base=${WLANIP%.*}
 sed -i "s/192\.168\.[0-9]*\.100/${base}.100/; s/192\.168\.[0-9]*\.200/${base}.200/" /etc/udhcpd.conf 2>/dev/null
-rm -f /var/lib/udhcpd.leases
+# The lease file is kept (bench 2026-11-02): udhcpd saves it at every ACK, and a phone whose lease was
+# deleted here lost its address under a live CarPlay session. radio_ap_up.sh has the detail.
 
 # The AP interface NAME is not a constant across the CCPA variants: it is an insmod parameter
 # (Realtek if2name=sta0, Broadcom iface_name=sta), and on Broadcom wlan0 does not exist until it

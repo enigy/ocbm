@@ -189,14 +189,18 @@ AP). So the script name and every verb must avoid `carplayd`, `rx-connect`, `btd
 so testing it for existence proves the file is there, not that it is ours — and running the
 vendor copy is the destructive case in §3.
 
-**The AP's DHCP leases survive an AP restart (2026-11-02).** `radio_ap_up.sh` used to delete
-`/var/lib/udhcpd.leases`, as the vendor script does, and `wifi_ap_off` stops the AP's `udhcpd`
-(v0.9.9-pre) with SIGTERM, which writes nothing. An iPhone rejoining a network it knows keeps its
-old address and asks for it again (INIT-REBOOT); this `udhcpd` stays silent on that request from a
-client it has no lease for, so on the bench the phone ran CarPlay on `.101`, gave up asking, was
-handed `.100`, and the session died. Now `wifi_ap_off` sends SIGUSR1 first (the lease file is
-written) and `radio_ap_up.sh` keeps the file. A power cut skips `wifi_ap_off`, so the file then
-holds the leases from the last AP restart, or from `udhcpd`'s own periodic write.
+**The AP's DHCP leases survive AP restarts and power cuts (2026-11-02).** `radio_ap_up.sh` (and the
+IW416 overlay's `start_bluetooth_wifi.sh`) deleted `/var/lib/udhcpd.leases` at every AP start, as the
+vendor script does. An iPhone rejoining a network it knows keeps its old address and asks for it again
+(INIT-REBOOT); the AP's `udhcpd` (v0.9.9-pre) stays silent on that request from a client it has no
+lease for (upstream udhcp's "else remain silent"), so on the bench the phone ran CarPlay on `.101`,
+gave up asking, was handed `.100`, and the session died. That deletion was the whole bug, and both
+scripts now keep the file. This `udhcpd` saves it at every ACK (`radio_ap_dhcp.log`: "save dhcp
+record", then "AP connection, save dhcp lease file"; 24 bytes per lease, the remaining time stored),
+and `/var/lib` is on the jffs2 root (only `/tmp` and `/var/run` are tmpfs), so the file is current
+through an AP restart and a power cut alike, and a phone keeps its address from one drive to the
+next. With a lease for the phone's MAC it ACKs a request for that address and NAKs any other. SIGTERM
+writes nothing, and need not: the file is as of the last ACK.
 
 ### 5. Hardware-validated results (RTL8822CS, 2026-08-15)
 
