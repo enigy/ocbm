@@ -175,7 +175,13 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
      stops a fresh host being told the last session's phone is live; (c) Carlink kept a frozen frame
      when a session dropped before its first media (Carlink `bench-1102`); (d)
      `tools/stock_restore.sh`'s `usb_has` read "not on USB" under pipefail (`grep -q` SIGPIPEd
-     `ioreg`).
+     `ioreg`). The stock restore before the next bench found one more: (e) the host-gone teardown left
+     the idle wireless `carplayd` running with no app (from 11:16 to the restore at 12:05, where its
+     deleted binary held 1.1 MB). `wireless_down` chose its branch from the transport flag alone, and
+     `carplayd` clears that flag when a session ends, so with no session live it took the wired-owned
+     branch and spared `carplayd`. It now spares it only while the wired arm is ARMED or `carplayd`
+     reports a wired peer (`wired_carplayd_live`). The shell suites do not cover the supervisor: bench
+     only.
   3. **"Phone drop on host re-SUBSCRIBE" (`PROJ_MODE NONE` then `SESSION_EVENT PHONE_ABSENT` after
      an app relaunch) — NOT reproduced, 2026-09-25.** Three timelines, all wired, the phone never
      left the bus in any: (a) kill-without-STOP relaunch (`adb install -r`): SUBSCRIBE → stale

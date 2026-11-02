@@ -230,6 +230,15 @@ wireless_owns_session() {
   [ "$(cat /tmp/carplay_transport 2>/dev/null)" = "wireless" ]
 }
 
+# A running carplayd is the WIRED arm's only while that arm is ARMED or carplayd says its peer is wired
+# (its own carplay_transport write). Any other is the wireless one, idle once its session has ended:
+# carplayd clears the transport flag then, so wireless_down, which spared every carplayd unless
+# wireless_owns_session, left it running with no app (bench 2026-11-02: a carplayd from 11:16 outlived
+# the 11:19 host-gone teardown, and its deleted binary held 1.1 MB through a stock restore).
+wired_carplayd_live() {
+  [ "$armed" = 1 ] || [ "$(cat /tmp/carplay_transport 2>/dev/null)" = "wired" ]
+}
+
 # The single projection OWNER across all transports (box_common::flags model, /tmp/projection_owner).
 # Prefers the unified flag and falls back to the legacy wireless-only /tmp/carplay_transport, so it is
 # byte-compatible with the existing wireless arbitration above. A 'wired-aa' owner is LIVENESS-checked:
@@ -1061,7 +1070,7 @@ wireless_down() {
              # crashed stack can leave hostapd beaconing / hci0 UP with all three daemons gone;
              # the early return must not skip the radio teardown in that stranded state)
   fi
-  if wireless_owns_session; then
+  if wireless_owns_session || ! wired_carplayd_live; then
     echo "[sup] $_wd_why -> tearing down COMPLETE wireless stack (advertiser + A/V children)"
     # Stop the CarLink advertiser + the A/V daemons + drop the AP (the WiFi beacon is the main drain).
     # BT end-state (docs/carplay/04_CAPABILITIES_AND_CONFIG.md radio gating): module stays ATTACHED (hciattach kept — re-attach is the
@@ -1110,8 +1119,8 @@ wireless_down() {
     saw_paired=0; saw_record=0; healthy=0; established_since=0; write_healthy 0
     [ "$(cat /tmp/carplay_transport 2>/dev/null)" = wireless ] && rm -f /tmp/carplay_transport
   else
-    # docs/wireless/00_WIRELESS_CARPLAY.md #1.4: carplayd are WIRED-owned right now (or nothing is running at all) — never
-    # kill them from here. Previously this function's pkill list had no such guard, so a CCPA-tab
+    # docs/wireless/00_WIRELESS_CARPLAY.md #1.4: the running carplayd is the WIRED arm's (wired_carplayd_live) — never
+    # kill it from here. Previously this function's pkill list had no such guard, so a CCPA-tab
     # "Restart wireless"/Forget action during a live WIRED session killed the wired carplayd too — a
     # real regression, not a wireless-only effect. Only the wireless-specific advertiser + radios are
     # ours to tear down in this case.
