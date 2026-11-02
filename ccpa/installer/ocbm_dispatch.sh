@@ -10,9 +10,11 @@
 #   trial, confirmed  OCBM, with stock kept as the fallback. Before anything starts, count the start:
 #                     two in a row that never passed the self-test go back to stock (hangs, reboot
 #                     loops). Then start OCBM, keep ocbmd and the session supervisor running, run
-#                     ocbm_selftest.sh (a failure goes back to stock), and watch the stick for a file
-#                     named OCBM_RESTORE (goes back to stock). In `confirmed` a passing self-test runs
-#                     ocbm_finish.sh: the confirming session was ended by the power going off.
+#                     ocbm_selftest.sh (a failure goes back to stock), watch that ocbmd answers a host
+#                     that talks to it (answer_watch: one it never answers goes back to stock), and
+#                     watch the stick for a file named OCBM_RESTORE (goes back to stock). In
+#                     `confirmed` a passing self-test runs ocbm_finish.sh: the confirming session was
+#                     ended by the power going off.
 #   final             OCBM only: ocbm_finish.sh removed the Carlinkit stack, so there is nothing to
 #                     go back to. A finish a power cut interrupted (finish_pending) is resumed.
 #
@@ -34,13 +36,14 @@
 # ocbm_install.sh gets from ::respawn.
 #
 # Test hooks (tools/ocbm_stageb_test.sh, tools/ocbm_update_test.sh): ROOT RUN STICK PROC POLL
-# STICK_WAIT REBOOT.
+# STICK_WAIT REBOOT ANSWER_SECS.
 ROOT="${ROOT:-}"
 RUN="${RUN:-/tmp}"
 STICK="${STICK:-/mnt/UPAN}"
 PROC="${PROC:-/proc}"
 POLL="${POLL:-2}"
 STICK_WAIT="${STICK_WAIT:-60}"
+ANSWER_SECS="${ANSWER_SECS:-120}"
 S="$ROOT/script"
 EO="$ROOT/etc/ocbm"
 SMS_STOCK="$S/start_main_service.stock.sh"
@@ -178,6 +181,34 @@ selftest() {
   fi
 }
 
+# A host that talks to ocbmd and never hears back. The truck adapter, 2 Nov: its accessory driver let
+# OCBM read and never write, the self-test passed with no host to ask, and the adapter sat on a dead
+# trial. ocbmd writes the uptime of a host's first HELLO to ocbmd_heard, and of its first other frame,
+# which a host sends only once it has our HELLO_ACK, to ocbmd_answered. Heard for ANSWER_SECS with no
+# answer goes back as a failed self-test does: to stock, or in an update's trial to the OCBM it replaced.
+answer_watch() {
+  while :; do
+    [ -e "$RUN/ocbmd_answered" ] && return
+    heard=$(cat "$RUN/ocbmd_heard" 2>/dev/null)
+    up=$(cut -d. -f1 "$PROC/uptime" 2>/dev/null)
+    case "$heard" in ''|*[!0-9]*) heard="" ;; esac
+    case "$up" in ''|*[!0-9]*) up="" ;; esac
+    # Asked again last: an answer written since the first look keeps the trial.
+    if [ -n "$heard" ] && [ -n "$up" ] && [ $((up - heard)) -ge "$ANSWER_SECS" ] && [ ! -e "$RUN/ocbmd_answered" ]; then
+      why="ocbmd heard the host for $((up - heard)) s and never answered it"
+      log "$why"
+      if [ "$update_trial" = 1 ]; then
+        update_rollback "$why"
+        sync; $REBOOT
+        return
+      fi
+      "$S/ocbm_revert.sh" "$why"
+      return
+    fi
+    sleep "$POLL"
+  done
+}
+
 restore_watch() {  # OCBM_RESTORE on a stick: back to stock
   while :; do
     if stick_in && [ -e "$STICK/OCBM_RESTORE" ]; then
@@ -230,9 +261,13 @@ respawn "$S/run_ocbmd.sh" </dev/null >/dev/null 2>&1 &
 respawn "$S/run_supervisor.sh" </dev/null >/dev/null 2>&1 &
 if [ "$mode" = final ]; then
   [ -e "$EO/finish_pending" ] && [ -x "$S/ocbm_finish.sh" ] && "$S/ocbm_finish.sh" </dev/null >> "$RUN/box.log" 2>&1 &
-  [ "$update_trial" = 1 ] && selftest </dev/null >/dev/null 2>&1 &
+  if [ "$update_trial" = 1 ]; then
+    selftest </dev/null >/dev/null 2>&1 &
+    answer_watch </dev/null >/dev/null 2>&1 &
+  fi
   exit 0
 fi
 selftest </dev/null >/dev/null 2>&1 &
+answer_watch </dev/null >/dev/null 2>&1 &
 restore_watch </dev/null >/dev/null 2>&1 &
 exit 0

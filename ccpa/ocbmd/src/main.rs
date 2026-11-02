@@ -11,6 +11,7 @@ use std::io::{IoSlice, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 const ACC_DEV: &str = "/dev/usb_accessory";
@@ -620,6 +621,9 @@ struct Daemon {
     last_proj_mode_check: Option<std::time::Instant>,
     /// Throttle for the periodic health line. See [`Daemon::health_tick`].
     last_health_log: Option<std::time::Instant>,
+    /// A host's HELLO has arrived ([`HEARD_FILE`]), and a frame after it ([`ANSWERED_FILE`]).
+    heard: bool,
+    answered: bool,
 }
 
 /// Host-presence heartbeat grace: if a subscribed host misses beats for this long, it is declared gone.
@@ -1097,6 +1101,31 @@ fn forget_request(mac: &str) -> Option<String> {
 const HOST_PRESENT_FLAG: &str = "/tmp/host_present";
 #[cfg(test)]
 const HOST_PRESENT_FLAG: &str = "/tmp/ocbmd_selftest_host_present";
+
+/// The uptime (seconds) when a host's first HELLO arrived, and when it first sent anything after it
+/// ([`Daemon::note_host_frame`]). The one-file install's dispatcher sends a trial back to stock when the
+/// first has been there two minutes without the second: an ocbmd that hears the host and never
+/// answers it (the truck adapter, 2 Nov, before [`AccIo::Direct`]). `cfg(test)` names for the reason
+/// [`HOST_PRESENT_FLAG`] has them.
+#[cfg(not(test))]
+const HEARD_FILE: &str = "/tmp/ocbmd_heard";
+#[cfg(test)]
+const HEARD_FILE: &str = "/tmp/ocbmd_selftest_heard";
+#[cfg(not(test))]
+const ANSWERED_FILE: &str = "/tmp/ocbmd_answered";
+#[cfg(test)]
+const ANSWERED_FILE: &str = "/tmp/ocbmd_selftest_answered";
+
+/// Write the system uptime, in whole seconds, to `path` (the clock is set by the host and jumps; the
+/// uptime does not).
+fn write_uptime_file(path: &str) {
+    let up = std::fs::read_to_string("/proc/uptime").unwrap_or_default();
+    let secs = up.split(['.', ' ']).next().unwrap_or("0");
+    let tmp = format!("{path}.tmp");
+    if std::fs::write(&tmp, format!("{secs}\n")).and_then(|_| std::fs::rename(&tmp, path)).is_err() {
+        eprintln!("[ocbmd] could not write {path}");
+    }
+}
 
 /// Whether `/tmp/phone_identity` (text `now`, written at `written`) goes to the host, which was last sent
 /// `sent` (written at `sent_written`); `sent` None = a fresh host, which is always told. New text goes, and
@@ -3997,7 +4026,21 @@ impl Daemon {
         )
     }
 
+    /// Note a host's first HELLO ([`HEARD_FILE`]) and the first frame of any other kind after it
+    /// ([`ANSWERED_FILE`]): a host sends nothing but HELLO until it has our HELLO_ACK, so that frame is
+    /// the proof this side was heard. Once each per process.
+    fn note_host_frame(&mut self, hello: bool) {
+        if hello && !self.heard {
+            self.heard = true;
+            write_uptime_file(HEARD_FILE);
+        } else if !hello && self.heard && !self.answered {
+            self.answered = true;
+            write_uptime_file(ANSWERED_FILE);
+        }
+    }
+
     fn handle(&mut self, ch: u16, flags: u8, pl: &[u8]) {
+        self.note_host_frame(ch == p::CH_CTRL && pl.first() == Some(&p::CT_HELLO));
         match ch {
             p::CH_CTRL => {
                 if pl.first() == Some(&p::CT_HELLO) {
@@ -4559,9 +4602,10 @@ fn clear_session_state_for_exit(mode_file: &str, start_finish: impl FnOnce()) {
 
 /// The accessory as the poll loop sees it ([`start_acc_relay`]).
 struct AccRelay {
-    /// What the host sent: the reader thread's pipe, non-blocking. EOF = that thread ended.
+    /// What the host sent: the reader thread's pipe, non-blocking (EOF = that thread ended), or under
+    /// [`AccIo::Direct`] the device itself.
     from_host: File,
-    /// Frames for the host: the writer thread's pipe, non-blocking. POLLERR = that thread ended.
+    /// Frames for the host: the writer thread's pipe, non-blocking (POLLERR = that thread ended), or the device.
     to_host: File,
 }
 
@@ -4581,30 +4625,239 @@ struct AccRelay {
 ///
 /// A relay thread whose read or write of the device fails ends and closes its end of the pipe; the loop
 /// sees EOF or POLLERR and exits for a fresh fd, as it did on the device's own hangup.
-fn start_acc_relay(dev: File) -> std::io::Result<AccRelay> {
+///
+/// Not every unit's driver allows this: see [`AccIo::Direct`]. The returned [`WriterWatch`] is what
+/// [`SerialCheck`] reads to tell.
+fn start_acc_relay(dev: File) -> std::io::Result<(AccRelay, std::sync::Arc<WriterWatch>)> {
     let dev = std::sync::Arc::new(dev);
+    let watch = std::sync::Arc::new(WriterWatch::default());
     let (from_host, host_bytes) = cloexec_pipe()?;
     let (frames, to_host) = cloexec_pipe()?;
     set_nonblocking(&from_host);
     set_nonblocking(&to_host);
     let reader = dev.clone();
+    let reads = watch.clone();
     std::thread::Builder::new()
         .name("acc-read".into())
         .stack_size(RELAY_STACK)
         // ≤ 16 KiB a read: the driver's request size.
         .spawn(move || {
-            let why = relay(&*reader, host_bytes, 16 * 1024);
+            let why = relay(Counted { dev: &reader, watch: &reads }, host_bytes, 16 * 1024);
             eprintln!("[ocbmd] accessory reader stopped: {why}");
         })?;
     let writer = dev.clone();
+    let writes = watch.clone();
     std::thread::Builder::new()
         .name("acc-write".into())
         .stack_size(RELAY_STACK)
         .spawn(move || {
-            let why = relay(frames, &*writer, p::HDR_LEN + p::MAX_PAYLOAD);
+            writes.tid.store(current_tid(), Ordering::Release);
+            let why = relay(frames, Watched { dev: &writer, watch: &writes }, p::HDR_LEN + p::MAX_PAYLOAD);
             eprintln!("[ocbmd] accessory writer stopped: {why}");
         })?;
-    Ok(AccRelay { from_host, to_host })
+    Ok((AccRelay { from_host, to_host }, watch))
+}
+
+/// How ocbmd reads and writes the accessory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AccIo {
+    /// Two relay threads ([`start_acc_relay`]): for a driver that blocks both ways but lets a read and a
+    /// write run at once, the dev adapter's.
+    Relay,
+    /// The poll loop itself, one call at a time, as up to e9bb7c8: for a driver that serializes them.
+    /// The truck adapter's `g_android_accessory` (2 Nov) takes one mutex in `acc_read` and holds it across
+    /// the wait for host data, and `acc_write` takes the same mutex first; with the relay threads the
+    /// parked reader kept the writer out for good, and ocbmd never answered a HELLO. The single loop ran
+    /// on that unit from 18 Oct to 2 Nov.
+    Direct,
+}
+
+impl AccIo {
+    /// `OCBMD_ACC_IO=direct|relay` (a bench lever) decides; otherwise Direct once [`SerialCheck`] has found
+    /// this unit's driver serializes (`flagged`, from [`ACC_DIRECT_FLAG`]), else Relay.
+    fn choose(
+        lever: Option<&str>,
+        flagged: bool,
+    ) -> AccIo {
+        match lever.map(str::trim) {
+            Some("direct") => AccIo::Direct,
+            Some("relay") => AccIo::Relay,
+            _ if flagged => AccIo::Direct,
+            _ => AccIo::Relay,
+        }
+    }
+}
+
+/// Set, on flash, when this unit's driver serializes reads and writes ([`AccIo::Direct`]); later starts
+/// go straight to Direct. A stock restore takes /etc/ocbm away whole. If flash refuses it,
+/// [`ACC_DIRECT_TMP_FLAG`] holds it until the next power-off.
+#[cfg(not(test))]
+const ACC_DIRECT_FLAG: &str = "/etc/ocbm/acc_direct_io";
+#[cfg(test)]
+const ACC_DIRECT_FLAG: &str = "/tmp/ocbmd_selftest_acc_direct_io";
+#[cfg(not(test))]
+const ACC_DIRECT_TMP_FLAG: &str = "/tmp/ocbmd_acc_direct_io";
+#[cfg(test)]
+const ACC_DIRECT_TMP_FLAG: &str = "/tmp/ocbmd_selftest_acc_direct_io_tmp";
+
+/// Open the accessory for the poll loop in `mode`. Direct hands the device itself to the loop, as both
+/// ends; Relay starts the threads and returns what [`SerialCheck`] watches.
+fn start_acc_io(
+    dev: File,
+    mode: AccIo,
+) -> std::io::Result<(AccRelay, Option<std::sync::Arc<WriterWatch>>)> {
+    match mode {
+        AccIo::Relay => start_acc_relay(dev).map(|(acc, watch)| (acc, Some(watch))),
+        AccIo::Direct => {
+            set_nonblocking(&dev);
+            let from_host = dev.try_clone()?;
+            Ok((AccRelay { from_host, to_host: dev }, None))
+        }
+    }
+}
+
+/// What the relay threads are doing, for [`SerialCheck`].
+#[derive(Default)]
+struct WriterWatch {
+    /// The writer thread's kernel task id, once it runs (`/proc/self/task/<tid>/stat`).
+    tid: AtomicI32,
+    /// [`mono_ms`] when the device write under way began; 0 = none.
+    busy_since: AtomicU64,
+    /// The reader's count when that write began.
+    reads_at_busy: AtomicU64,
+    /// A device write has completed: this driver lets the writer through while a read waits.
+    wrote: AtomicBool,
+    /// Device reads that brought host bytes.
+    reads: AtomicU64,
+}
+
+/// The reader thread's view of the device: counts each read that brought bytes.
+struct Counted<'a> {
+    dev: &'a File,
+    watch: &'a WriterWatch,
+}
+impl Read for Counted<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let r = (&*self.dev).read(buf);
+        if matches!(r, Ok(n) if n > 0) {
+            self.watch.reads.fetch_add(1, Ordering::AcqRel);
+        }
+        r
+    }
+}
+
+/// The writer thread's view of the device: marks each write while it is under way.
+struct Watched<'a> {
+    dev: &'a File,
+    watch: &'a WriterWatch,
+}
+impl Write for Watched<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.watch.reads_at_busy.store(self.watch.reads.load(Ordering::Acquire), Ordering::Release);
+        self.watch.busy_since.store(mono_ms(), Ordering::Release);
+        let r = (&*self.dev).write(buf);
+        self.watch.busy_since.store(0, Ordering::Release);
+        if matches!(r, Ok(n) if n > 0) {
+            self.watch.wrote.store(true, Ordering::Release);
+        }
+        r
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The calling thread's kernel task id; 0 where there is none to read (the host-side tests on macOS).
+fn current_tid() -> i32 {
+    #[cfg(target_os = "linux")]
+    // SAFETY: gettid takes no arguments and cannot fail.
+    return unsafe { libc::syscall(libc::SYS_gettid) } as i32;
+    #[cfg(not(target_os = "linux"))]
+    return 0;
+}
+
+/// The state letter of a `/proc/<pid>/task/<tid>/stat` line (`R`, `S`, `D`, ...): the field after the
+/// command name, which sits in parentheses and may hold spaces or parentheses itself.
+fn task_state(stat: &str) -> Option<char> {
+    stat.rsplit_once(')')?.1.trim_start().chars().next()
+}
+
+/// How long the relay's first device write must have been under way before [`SerialCheck`] looks.
+const SERIAL_BUSY_MS: u64 = 2_000;
+/// Samples in a row, at least [`SERIAL_SAMPLE_MS`] apart, of the writer asleep uninterruptibly.
+const SERIAL_D_SAMPLES: u32 = 4;
+const SERIAL_SAMPLE_MS: u64 = 250;
+
+/// Whether the evidence says the driver serializes reads and writes ([`AccIo::Direct`]): no device write
+/// has completed in this process, the first has been under way [`SERIAL_BUSY_MS`] with the writer asleep
+/// uninterruptibly ('D', a plain `mutex_lock`) on [`SERIAL_D_SAMPLES`] samples in a row, and the host
+/// sent twice or more meanwhile, so a host is there and reading. On the dev adapter's driver a writer
+/// waits for the host interruptibly ('S'), and a host that is sending HELLOs takes the HELLO_ACK at
+/// once, so its first write never stalls this way.
+fn serial_driver(
+    wrote: bool,
+    busy_for_ms: u64,
+    d_samples: u32,
+    reads_meanwhile: u64,
+) -> bool {
+    !wrote && busy_for_ms >= SERIAL_BUSY_MS && d_samples >= SERIAL_D_SAMPLES && reads_meanwhile >= 2
+}
+
+/// Looks for a driver that serializes reads and writes, from the poll loop, while the relay runs.
+struct SerialCheck {
+    watch: std::sync::Arc<WriterWatch>,
+    d_samples: u32,
+    last_sample: u64,
+}
+
+impl SerialCheck {
+    fn new(watch: std::sync::Arc<WriterWatch>) -> Self {
+        Self { watch, d_samples: 0, last_sample: 0 }
+    }
+
+    /// Called each pass of the loop; reads the writer's state at most every [`SERIAL_SAMPLE_MS`], and only
+    /// while its first write is stuck. True once [`serial_driver`] says so.
+    fn tick(
+        &mut self,
+        now: u64,
+    ) -> bool {
+        let w = &self.watch;
+        if w.wrote.load(Ordering::Acquire) {
+            return false;
+        }
+        let since = w.busy_since.load(Ordering::Acquire);
+        if since == 0 || now.saturating_sub(since) < SERIAL_BUSY_MS {
+            self.d_samples = 0;
+            return false;
+        }
+        if now.saturating_sub(self.last_sample) < SERIAL_SAMPLE_MS {
+            return false;
+        }
+        self.last_sample = now;
+        let tid = w.tid.load(Ordering::Acquire);
+        let state = std::fs::read_to_string(format!("/proc/self/task/{tid}/stat"))
+            .ok()
+            .and_then(|s| task_state(&s));
+        self.d_samples = if state == Some('D') { self.d_samples + 1 } else { 0 };
+        let reads = w.reads.load(Ordering::Acquire).saturating_sub(w.reads_at_busy.load(Ordering::Acquire));
+        serial_driver(false, now.saturating_sub(since), self.d_samples, reads)
+    }
+}
+
+/// Record that this unit's driver serializes reads and writes ([`ACC_DIRECT_FLAG`]), with the evidence.
+fn flag_direct_io(why: &str) {
+    let saved = std::path::Path::new(ACC_DIRECT_FLAG)
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|_| {
+            let tmp = format!("{ACC_DIRECT_FLAG}.tmp");
+            std::fs::write(&tmp, format!("{why}\n"))?;
+            std::fs::rename(&tmp, ACC_DIRECT_FLAG)
+        });
+    if let Err(e) = saved {
+        eprintln!("[ocbmd] could not keep {ACC_DIRECT_FLAG} ({e}); {ACC_DIRECT_TMP_FLAG} holds it until power-off");
+        let _ = std::fs::write(ACC_DIRECT_TMP_FLAG, format!("{why}\n"));
+    }
 }
 
 /// Each relay thread's stack: a copy loop over a heap buffer needs little.
@@ -4717,13 +4970,24 @@ fn main() {
             let _ = m.rd(0x00, &mut v);
         }
     }
-    // The accessory is read and written by two relay threads through pipes; this loop only ever touches
-    // the pipes, which poll and refuse to block as asked. O_NONBLOCK on the device itself never worked:
-    // see [`start_acc_relay`].
-    let AccRelay { from_host, to_host } = start_acc_relay(acc).unwrap_or_else(|e| {
-        eprintln!("[ocbmd] accessory relay could not start ({e}) — exiting");
+    // The accessory is read and written by two relay threads through pipes, where this unit's driver
+    // allows it; this loop then only ever touches the pipes, which poll and refuse to block as asked.
+    // O_NONBLOCK on the device itself never worked: see [`start_acc_relay`]. A driver that serializes
+    // reads and writes gets the loop itself instead ([`AccIo`]).
+    let flagged = std::path::Path::new(ACC_DIRECT_FLAG).exists() || std::path::Path::new(ACC_DIRECT_TMP_FLAG).exists();
+    let acc_io = AccIo::choose(std::env::var("OCBMD_ACC_IO").ok().as_deref(), flagged);
+    eprintln!(
+        "[ocbmd] accessory I/O: {}",
+        match acc_io {
+            AccIo::Relay => "relay threads",
+            AccIo::Direct => "single-threaded (this unit's driver serializes reads and writes)",
+        }
+    );
+    let (AccRelay { from_host, to_host }, writer_watch) = start_acc_io(acc, acc_io).unwrap_or_else(|e| {
+        eprintln!("[ocbmd] accessory I/O could not start ({e}) — exiting");
         std::process::exit(1);
     });
+    let mut serial_check = writer_watch.map(SerialCheck::new);
     // Local A/V seam listeners: the box session forwards video->:9001, media audio->:9002; ocbmd
     // muxes each onto its OCBM channel. Non-blocking so they slot into the poll loop.
     // A failed bind used to be dropped SILENTLY by a `filter_map(...ok())`, which is how a second
@@ -4815,6 +5079,8 @@ fn main() {
         proj_mode: None,
         last_proj_mode_check: None,
         last_health_log: None,
+        heard: false,
+        answered: false,
     };
     let mut reasm = p::Reassembler::new();
     let mut rbuf = vec![0u8; p::HDR_LEN + p::MAX_PAYLOAD];
@@ -4972,6 +5238,18 @@ fn main() {
             eprintln!("[ocbmd] poll error: {err} — backing off");
             std::thread::sleep(Duration::from_millis(100)); // avoid a tight 100% CPU spin on a hard error
             continue;
+        }
+        // A driver that keeps the relay's writer out for good ([`AccIo::Direct`]): keep that on flash and
+        // start again on the loop's own I/O. Nothing has reached the host yet, so there is no session to
+        // end; the respawned ocbmd answers the host's next HELLO.
+        if serial_check.as_mut().is_some_and(|c| c.tick(mono_ms())) {
+            let why = "the accessory writer slept uninterruptibly in its first write while the host kept \
+                       sending: this unit's driver serializes reads and writes";
+            eprintln!("[ocbmd] {why} — restarting with single-threaded I/O");
+            flag_direct_io(why);
+            write_flag_atomic(HOST_PRESENT_FLAG, false);
+            let _ = std::fs::remove_file(ALIVE_FILE);
+            std::process::exit(1);
         }
         let mut av_close: Vec<usize> = Vec::new();
         // Newly-accepted A/V producers are DEFERRED to after the dispatch loop: mutating `av_conns`
@@ -5423,6 +5701,8 @@ mod tests {
             proj_mode: None,
             last_proj_mode_check: None,
             last_health_log: None,
+            heard: false,
+            answered: false,
         }
     }
 
@@ -6976,7 +7256,7 @@ mod tests {
         // Bench 2026-11-02: the device blocks in read and write, so the loop sat in one of them. A
         // socketpair stands in for it here: it blocks the same way when nobody reads or writes.
         let (dev_side, host) = std::os::unix::net::UnixStream::pair().unwrap();
-        let acc = start_acc_relay(File::from(std::os::fd::OwnedFd::from(dev_side))).unwrap();
+        let (acc, _watch) = start_acc_relay(File::from(std::os::fd::OwnedFd::from(dev_side))).unwrap();
         let mut buf = [0u8; 64];
         let idle = (&acc.from_host).read(&mut buf).unwrap_err();
         assert_eq!(idle.kind(), std::io::ErrorKind::WouldBlock, "no host bytes: the loop is not held");
@@ -6997,5 +7277,79 @@ mod tests {
             Err(e) => Some(e.kind()),
         });
         assert_eq!(held, Some(std::io::ErrorKind::WouldBlock));
+    }
+
+    #[test]
+    fn accessory_io_is_the_relay_unless_this_driver_was_found_to_serialize() {
+        assert_eq!(AccIo::choose(None, false), AccIo::Relay);
+        assert_eq!(AccIo::choose(None, true), AccIo::Direct, "the truck adapter's driver, once found");
+        assert_eq!(AccIo::choose(Some("relay"), true), AccIo::Relay, "the bench lever wins");
+        assert_eq!(AccIo::choose(Some("direct"), false), AccIo::Direct);
+        assert_eq!(AccIo::choose(Some("sideways"), false), AccIo::Relay);
+    }
+
+    #[test]
+    fn a_task_state_is_read_past_the_command_name() {
+        assert_eq!(task_state("4711 (acc-write) D 1 4700 4700 0 -1"), Some('D'));
+        assert_eq!(task_state("4711 (odd) name) S 1"), Some('S'), "the name may hold ')'");
+        assert_eq!(task_state("garbage"), None);
+    }
+
+    #[test]
+    fn only_a_first_write_stuck_uninterruptibly_while_the_host_sends_reads_as_a_serializing_driver() {
+        // The truck adapter, 2 Nov: no HELLO_ACK ever left, the writer in mutex_lock, HELLOs kept coming.
+        assert!(serial_driver(false, SERIAL_BUSY_MS, SERIAL_D_SAMPLES, 2));
+        assert!(!serial_driver(true, 60_000, 99, 99), "a write got through: this driver lets the writer in");
+        assert!(!serial_driver(false, SERIAL_BUSY_MS - 1, SERIAL_D_SAMPLES, 2), "not yet");
+        assert!(!serial_driver(false, 60_000, SERIAL_D_SAMPLES - 1, 9), "asleep interruptibly: waiting on the host");
+        assert!(!serial_driver(false, 60_000, 99, 1), "no host sending: nothing to answer");
+    }
+
+    #[test]
+    fn single_threaded_io_hands_the_loop_the_device_itself() {
+        let (dev_side, host) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (acc, watch) = start_acc_io(File::from(std::os::fd::OwnedFd::from(dev_side)), AccIo::Direct).unwrap();
+        assert!(watch.is_none(), "no relay, nothing to watch");
+        let mut buf = [0u8; 64];
+        let idle = (&acc.from_host).read(&mut buf).unwrap_err();
+        assert_eq!(idle.kind(), std::io::ErrorKind::WouldBlock);
+        (&host).write_all(b"hello").unwrap();
+        assert_eq!(read_up_to(&acc.from_host, 5), b"hello");
+        (&acc.to_host).write_all(b"ack").unwrap();
+        let mut out = [0u8; 3];
+        (&host).read_exact(&mut out).unwrap();
+        assert_eq!(&out, b"ack");
+    }
+
+    #[test]
+    fn the_relay_writer_reports_reads_and_a_write_that_got_through() {
+        let (dev_side, host) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (acc, watch) = start_acc_relay(File::from(std::os::fd::OwnedFd::from(dev_side))).unwrap();
+        (&host).write_all(b"hello").unwrap();
+        assert_eq!(read_up_to(&acc.from_host, 5), b"hello");
+        assert!(watch.reads.load(Ordering::Acquire) >= 1);
+        (&acc.to_host).write_all(b"ack").unwrap();
+        let mut out = [0u8; 3];
+        (&host).read_exact(&mut out).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !watch.wrote.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(watch.wrote.load(Ordering::Acquire));
+        assert_eq!(watch.busy_since.load(Ordering::Acquire), 0, "no write under way");
+        let mut check = SerialCheck::new(watch);
+        assert!(!check.tick(mono_ms() + 60_000), "a driver that let a write through is never flagged");
+    }
+
+    #[test]
+    fn a_host_is_heard_at_its_hello_and_answered_at_its_next_frame() {
+        let mut d = td();
+        d.note_host_frame(false);
+        assert!(!d.answered, "nothing before a HELLO counts");
+        d.note_host_frame(true);
+        d.note_host_frame(true);
+        assert!(d.heard && !d.answered, "HELLOs alone: the host has not had our HELLO_ACK");
+        d.note_host_frame(false);
+        assert!(d.answered);
     }
 }

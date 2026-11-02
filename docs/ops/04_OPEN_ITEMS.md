@@ -60,7 +60,7 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
   The app hooks exist and are capability-gated; NOTHING below is implemented box-side, and no verb
   id is assigned — the proposed shapes are in
   [../carplay/01_OCBM_PROTOCOL.md](../carplay/01_OCBM_PROTOCOL.md) ("Proposed MGMT verbs").
-- **USB link stalls and the idle "wedged" restarts — one cause, fixed 2026-11-02, benched the same day: pass.**
+- **USB link stalls and the idle "wedged" restarts — one cause, fixed 2026-11-02, benched the same day: pass on the dev adapter, FAILED on the truck (see below).**
   The two-iPhone bench of `b2c92d9` saw three link stalls in ~40 min of CarPlay (Carlink's heartbeat
   writes timed out 5 times, the adapter declared the host gone and tore the wireless stack down), and
   an ocbmd idle with no app was L2-restarted by the supervisor about once a minute for an hour. Both are
@@ -73,7 +73,15 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
   audio track (the likely reason the host stopped reading) and logs a stall snapshot at the first
   failed heartbeat. Benched 2026-11-02 (`e9bb7c8`): 41 min of CarPlay with no stall, no "ocbmd
   wedged" in 10 min idle, and video 15.1 s after a Carlink restart (a frame the pipe holds part of at
-  a new HELLO goes out cut short; the host resyncs and its next HELLO is answered).
+  a new HELLO goes out cut short; the host resyncs and its next HELLO is answered). **But on the truck
+  adapter `9b2331d` never answered a HELLO (2 Nov, 17:06):** its accessory driver serializes reads and
+  writes ([../carplay/00_ARCHITECTURE.md](../carplay/00_ARCHITECTURE.md), "Not every unit's module
+  allows that"), the self-test passed with no host to ask, and the unit sat on a dead trial until
+  `OCBM_RESTORE` took it back; the truck is on `052fd04` again. Fixed the same day, NOT benched:
+  ocbmd falls back to the single-threaded loop on such a driver and keeps that on flash
+  (`AccIo::Direct`), and a trial whose `ocbmd` hears a host for two minutes without answering goes
+  back by itself (`answer_watch`, [01_RECOVERY.md](01_RECOVERY.md)). Only the truck has this driver,
+  so only the truck can bench it, and nothing new goes to the truck before that bench (Scott's OK).
   1. **`MGMT_DISCONNECT_PHONE`, transport-aware, plus a capability bit.** Problem: the app's
      Disconnect Phone has no honest verb to send — OCBM's six MGMT verbs are
      `crates/ocbm-proto/src/lib.rs:334-346`, dispatched at `ccpa/ocbmd/src/main.rs:3397-3446`; the

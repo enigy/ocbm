@@ -417,6 +417,20 @@ unread. So ocbmd reads and writes the device on two relay threads through pipes
 (`start_acc_relay`, `ccpa/ocbmd/src/main.rs`), and its poll loop touches only the pipes. Anything
 else that opens the device must do the same: a single-threaded poll loop on this fd will block.
 
+**Not every unit's module allows that.** The truck adapter's `g_android_accessory.ko` (116,920 B,
+from its own `/script/ko.tar.gz`; the dev adapter's is 119,352 B, both units on 2025.10.15.1127) takes
+one mutex in `acc_read` and holds it across the wait for host data, and `acc_write` takes the same
+mutex first (the Mac's disassembly, 2 Nov). With the relay threads the parked reader kept the writer
+out for good: `9b2331d` received every HELLO on the truck and answered none, while the single loop of
+`052fd04` had run there since 18 Oct. ocbmd now notices this the first time: no device write has
+completed, the first has been under way 2 s with the writer thread asleep uninterruptibly ('D' in
+`/proc/self/task/<tid>/stat`, a plain `mutex_lock`; a writer waiting for the host sleeps
+interruptibly), and the host sent twice or more meanwhile. It then writes `/etc/ocbm/acc_direct_io`
+and restarts, and from then on that unit's ocbmd reads and writes the device on its poll loop, one
+call at a time (`AccIo::Direct`). `wchan` cannot tell the two apart: the kernel skips the mutex
+functions there, so a writer waiting on the mutex reads `acc_write`, the same as one waiting for the
+host. `OCBMD_ACC_IO=direct|relay` overrides the choice on the bench.
+
 ### The two physical ports
 
 - **`ci_hdrc.1`** = host-facing **MALE** USB-A cable (Type-C female on some models). CCPA is

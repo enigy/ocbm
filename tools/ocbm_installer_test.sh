@@ -156,6 +156,10 @@ for sh in ${SHELLS:-sh dash}; do
   echo "0.9.0 ocbm older" > "$d/root/etc/ocbm/installed_version"; refresh "$d"; snap "$d/root" > "$d/b3"; run_once "$sh" "$d"; rc=$?
   check '[ $rc = 1 ] && grep -q "^OCBM install: REFUSED" "$d/stick/OCBM_RESULT.txt" && [ "$(snap "$d/root")" = "$(cat "$d/b3")" ] && [ -e "$d/stick/A15W_Update.img.refused" ]' \
     "another version installed: REFUSED, nothing changed, image parked as .refused"
+  touch "$d/stick/OCBM_RESTORE"; refresh "$d"; snap "$d/root" > "$d/b4"; run_once "$sh" "$d"; rc=$?
+  check '[ $rc = 1 ] && grep -q "^OCBM install: WAITING FOR THE RESTORE" "$d/stick/OCBM_RESULT.txt" && [ "$(snap "$d/root")" = "$(cat "$d/b4")" ] && [ -e "$d/stick/A15W_Update.img" ] && [ -e "$d/stick/OCBM_RESTORE" ]' \
+    "OCBM_RESTORE on the stick goes first: nothing changed, the image stays for the install after it (the truck, 2 Nov)"
+  rm -f "$d/stick/OCBM_RESTORE"
   for c in product firmware chip factory handmade stray damaged flash stick backup; do
     r="$T/$sh-$c"; make_box "$r"; extra=""
     case $c in

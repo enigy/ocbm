@@ -145,14 +145,29 @@ set, so that is the state it restores; removing the flag then boots the Carlinki
 ### Back to stock from a one-file install
 
 While stock is still on the unit (`trial` or `confirmed`), `ccpa/installer/ocbm_revert.sh` is the one
-way back, and five things call it:
+way back, and six things call it:
 
 - the start-up self-test failing (the gadget is not `1314:2d00`, no `/dev/usb_accessory`, no `ocbmd`,
   or `radio_detect.sh` finds no radio bring-up for this unit);
 - two starts in a row that never passed the self-test (a hang or a reboot loop), at the next start;
+- `ocbmd` hearing a host for two minutes without answering it (the dispatcher's `answer_watch`: a
+  host's first HELLO in `/tmp/ocbmd_heard` and no other frame from it in `/tmp/ocbmd_answered`). The
+  self-test runs with no host, so it passed on the truck adapter on 2 Nov while its accessory driver
+  kept `9b2331d`'s `ocbmd` from ever writing, and the unit sat on a dead trial;
 - a file named `OCBM_RESTORE` on a stick, at any time during the trial (renamed `.done` once used);
 - `MGMT_GO_STOCK` from the app, or `ocbm-host install stock` on the bench;
 - by hand over the OCBM console: `/script/ocbm_revert.sh "why"`.
+
+**`OCBM_RESTORE` and an image on the same stick** (the truck adapter, 2 Nov). The system's stick
+handler runs `A15W_Update.img` the moment a stick goes into a running trial, before `restore_watch`
+sees `OCBM_RESTORE`, and the installer refused the installed OCBM and parked the image as `.refused`.
+The revert then went ahead, but its restart shared the stick (`1d6b:a4a5`) instead of running the
+image, so the install needed the image renamed back and a cold start. Installers built since the
+commit after `9b2331d` stand aside while `OCBM_RESTORE` is on the stick ("WAITING FOR THE RESTORE")
+and leave the image in place: plug the stick in, let the adapter go back to stock and restart, then
+unplug the adapter and plug it back in with the stick in. With an older image (going back to
+`052fd04`, say), put `OCBM_RESTORE` on the stick alone first; after the revert, copy the image on and
+cold-start the adapter.
 
 It puts `/etc/hostapd.conf` back from `/etc/ocbm/identity.tgz`, and the unit's HiCar identity
 (`/etc/hichain`, archived by installs since 31 Oct) with it, and the Bluetooth name the seam rewrote

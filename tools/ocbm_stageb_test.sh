@@ -56,7 +56,7 @@ echo 'PASSED in 3 s'"
 # Carlinkit daemon names this host runs itself (macOS has its own usbmuxd): ocbm_finish.sh skips them.
 HOST_DAEMONS="$(for n in usbmuxd mdnsd boa; do pgrep -x "$n" >/dev/null 2>&1 && printf '%s ' "$n"; done)"
 boot() {  # $1 shell, $2 dir: one start of the adapter
-  env ROOT="$2/root" RUN="$2/run" STICK="$2/stick" PROC="$2/proc" POLL=1 STICK_WAIT=2 FINISH_IGNORE="$HOST_DAEMONS" \
+  env ROOT="$2/root" RUN="$2/run" STICK="$2/stick" PROC="$2/proc" POLL=1 STICK_WAIT=2 ANSWER_SECS=3 FINISH_IGNORE="$HOST_DAEMONS" \
       REBOOT="touch $2/rebooted" "$1" "$2/root/script/start_main_service.sh" > "$2/boot.out" 2>&1
 }
 restart() { reap; rm -rf "${1:?}/run"; mkdir -p "$1/run"; rm -f "$1"/m.* "$1/rebooted"; }  # power cycle: /tmp is gone
@@ -120,6 +120,21 @@ for sh in ${SHELLS:-sh dash}; do
   check '[ -e "$d/m.stock" ] && [ ! -e "$d/m.boot" ] && [ ! -e "$d/rebooted" ] && reverted "$d"' \
     "the third start goes straight to stock, without a restart"
   check 'grep -q "started 2 times in a row" "$d/root/etc/ocbm/last_result.txt"' "and says why"
+
+  echo "== $sh: a host ocbmd hears and never answers sends the trial back (the truck adapter, 2 Nov)"
+  d="$T/$sh-deaf"; make_box "$d" trial; boot "$sh" "$d"
+  check 'waitfor "grep -q PASSED $d/root/etc/ocbm/first_start.txt 2>/dev/null" 5' "the self-test passes: it has no host to ask"
+  echo 40 > "$d/run/ocbmd_heard"   # heard at uptime 40; the fake uptime reads 42
+  check '! waitfor "[ -e $d/rebooted ]" 2 && mode_is "$d" trial' "inside ANSWER_SECS of the first HELLO: the trial stays"
+  echo "90.00 80.00" > "$d/proc/uptime"
+  check 'waitfor "[ -e $d/rebooted ]" 5 && reverted "$d" && grep -q "ocbmd heard the host for 50 s and never answered it" "$d/root/etc/ocbm/last_result.txt"' \
+    "heard 50 s with no answer: back to stock, with the reason recorded"
+  d="$T/$sh-answered"; make_box "$d" trial; boot "$sh" "$d"
+  echo 11 > "$d/run/ocbmd_answered"; echo 10 > "$d/run/ocbmd_heard"; echo "500.00 80.00" > "$d/proc/uptime"
+  check '! waitfor "[ -e $d/rebooted ]" 3 && mode_is "$d" trial' "answered: the trial stays"
+  d="$T/$sh-deaf-final"; make_box "$d" final; boot "$sh" "$d"
+  echo 10 > "$d/run/ocbmd_heard"; echo "500.00 80.00" > "$d/proc/uptime"
+  check '! waitfor "[ -e $d/rebooted ]" 3 && mode_is "$d" final' "final has nothing to go back to: left alone"
 
   echo "== $sh: OCBM_RESTORE on a stick"
   d="$T/$sh-restore"; make_box "$d" trial; touch "$d/st.hang" "$d/stick/OCBM_RESTORE"; boot "$sh" "$d"
