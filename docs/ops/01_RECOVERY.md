@@ -237,7 +237,8 @@ console, from one of the unit's own backups:
 - **The order** (`PROFILE=onefile` in `tools/stock_restore_box.sh`). First room: OCBM's programs other
   than `ocbmd`, which carries the console, go (a trial has stock and OCBM on flash, about 1.3 MB free,
   and the extras need about 1.8 MB to come back; this frees about 2 MB, and OCBM still boots its
-  console from the start script, `ocbm_boot.sh` and `ocbmd`). Then every stock file goes back
+  console from the start script, `ocbm_boot.sh` and `ocbmd`), and any of them still running is
+  stopped, since a running program's blocks stay allocated until it exits. Then every stock file goes back
   (`.rsnew`, md5-checked, renamed, free space checked first; a directory made back takes the tree's
   mode and owner, where a bare `mkdir` left the dev adapter's `etc/boa/www`, `cgi-bin`, `images` and
   `etc/hichain` 755 instead of 775, 31 Oct, and a link the owner `/tmp/rs.links` gives, where a bare
@@ -270,8 +271,9 @@ console, from one of the unit's own backups:
   /script/radio_ap_up.sh"), because with `/etc/ocbm` gone it took them for a stranger's files.
 - **Tests.** `tools/stock_restore_test.sh` finishes a synthetic trial with the real `ocbm_finish.sh`
   and restores it: the tree from an archive and from dumps (a trial's and a factory one, written as
-  JFFS2 images by `tools/jffs2_extract_test.py`), the pack and its owners, room first, the check
-  before the switch, the room shortfall, the re-run that converges, the seam, its Bluetooth name flag
+  JFFS2 images by `tools/jffs2_extract_test.py`), the pack and its owners, room first, a program still
+  running from a removed file stopped (and `ocbmd` not), the check before the switch, the room
+  shortfall and its count, the re-run that converges, the seam, its Bluetooth name flag
   and `/etc/carplay`, every
   refusal, the rehearsal, and the driver's monitor under `pipefail`, under `sh` and `dash`.
   `tools/jffs2_extract_test.py` builds JFFS2 images node by node: every compression type, deletions,
@@ -338,6 +340,14 @@ console, from one of the unit's own backups:
   `tools/stock_survey.sh` describes (CarPlay down until a power cycle). Why is not known.
   Every other Carlink build still leaves the confirm off (`-Pcarlink.installConfirm`). The flash dump
   and an SPI programmer stay the last resort.
+  On 2 Nov the dev adapter went from its `e9bb7c8` trial back to stock before a bench. The first apply
+  wrote 173 of the 181 files and stopped for room (500 KB free, 621 KB needed): a `carplayd` left
+  running since the last session, with no app connected, kept the 1.1 MB of the file the room step had
+  removed. Stopping it freed the space, and a second apply finished (`RESTORE_DONE`, the rootfs
+  matching the backup, stock at `1d6b:a4a5`). The room step now stops whatever still runs from a
+  program it removed (`reap_removed`, never the console's `ocbmd`), and a room abort says how many
+  files it wrote. The same restore was the first real test of `usb_has` reading `ioreg` to the end:
+  the adapter was line 355 of 485, and every check found it.
 
 ### UART console reference
 

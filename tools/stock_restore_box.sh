@@ -46,7 +46,8 @@
 # rename puts the stock start script over it, so every stopping point boots either OCBM with its
 # console, where this can be run again, or complete stock:
 #   1. room: remove OCBM's programs other than ocbmd, which carries the console (each through
-#      is_radio()). A trial has stock AND OCBM on flash, about 1.3 MB free, and the extras the
+#      is_radio()), and stop any of them still running, whose blocks stay allocated until it exits
+#      (reap_removed). A trial has stock AND OCBM on flash, about 1.3 MB free, and the extras the
 #      install pruned need about 1.8 MB to come back; this frees about 2 MB. OCBM still boots: the
 #      start script, ocbm_boot.sh, ocbmd and the self-test need none of them. Then create missing
 #      directories
@@ -66,7 +67,7 @@
 # ocbm_finish.sh do, so none of the three interleave.
 # Test hooks (tools/stock_restore_test.sh): RUN (the lock's directory), STOP_AT=switch (exit 99
 # right before the switch), SKIP_WRITE=<path> (a write that did not land), RECREATE=<path> (a file
-# the running OCBM writes again after step 5).
+# the running OCBM writes again after step 5), PROC (a /proc of the test's making, for reap_removed).
 set -u
 
 MODE="${1:-plan}"
@@ -77,6 +78,9 @@ W="${WORK:-/tmp/rsw}"
 RESERVE_KB="${RESERVE_KB:-384}"
 PROFILE="${PROFILE:-ncm}"
 RUN="${RUN:-/tmp}"
+PROC="${PROC:-/proc}"
+WRITTEN=0                                         # files and links apply has written, and of how many
+TO_WRITE=0
 SWITCH="script/start_main_service.sh"
 TAB="$(printf '\t')"
 export LC_ALL=C
@@ -268,7 +272,7 @@ put_file() {  # $1 relative path
   src="$SRC/$1"; dst="$ROOT/$1"; new="$dst.rsnew"
   need=$(( $(size_kb "$src") + RESERVE_KB ))
   free=$(free_kb)
-  [ "$free" -ge "$need" ] || die "no room for $1: ${free} KB free, ${need} KB needed with reserve. Nothing half-written; re-run apply after freeing space"
+  [ "$free" -ge "$need" ] || die "no room for $1 after $WRITTEN of $TO_WRITE written: ${free} KB free, ${need} KB needed with reserve. Nothing half-written; re-run apply after freeing space"
   [ -d "$dst" ] && [ ! -L "$dst" ] && die "$1 is a directory on the box"
   rm -f "$new"
   cp -p "$src" "$new" || { rm -f "$new"; die "copy failed: $1"; }
@@ -309,7 +313,7 @@ walk() {  # $1 work list of ACTION KEY PATH, $2 label
   while IFS="$TAB" read -r act key p; do
     if [ -n "${SKIP_WRITE:-}" ] && [ "$p" = "$SKIP_WRITE" ]; then say "test hook: $p not written"; continue; fi
     if [ "$act" = file ]; then put_file "$p"; else put_link "$p" "$key"; fi
-    n=$((n + 1))
+    n=$((n + 1)); WRITTEN=$((WRITTEN + 1))
   done < "$1"
   say "$2: $n restored"
 }
@@ -327,6 +331,36 @@ remove_list() {  # $1 list of paths, $2 label
   say "$2: $n removed"
 }
 
+# A program removed while it runs keeps its blocks until it exits. On the dev adapter a carplayd left
+# from the last session held 1.1 MB through the room step, and apply stopped 8 files short of stock
+# (2 Nov). So each removal of programs is followed by this: whatever still runs from a file it removed
+# is stopped, and nothing can start it again, its file being gone. The console's ocbmd is never
+# stopped, even running from a file an update replaced. $1 the list removed from, $2 the step's label.
+reap_removed() {
+  : > "$W/reaped"
+  for _e in "$PROC"/[0-9]*/exe; do
+    _t=$(readlink "$_e" 2>/dev/null) || continue   # kernel threads have no exe
+    case "$_t" in *" (deleted)") ;; *) continue ;; esac
+    _f=${_t% (deleted)}
+    _r=${_f#"${ROOT%/}/"}
+    [ "$_r" != "$_f" ] || continue                  # not under ROOT
+    [ "$_r" = "$CONSOLE" ] && continue
+    grep -qxF -- "$_r" "$1" || continue
+    _p=${_e%/exe}; _p=${_p##*/}
+    kill "$_p" 2>/dev/null && printf '%s\t%s\n' "$_p" "$_r" >> "$W/reaped"
+  done
+  [ -s "$W/reaped" ] || return 0
+  _i=0
+  while [ "$_i" -lt 10 ]; do
+    _left=0
+    while IFS="$TAB" read -r _p _r; do kill -0 "$_p" 2>/dev/null && _left=1; done < "$W/reaped"
+    [ "$_left" = 0 ] && break
+    sleep 0.2; _i=$((_i + 1))
+  done
+  while IFS="$TAB" read -r _p _r; do kill -9 "$_p" 2>/dev/null; done < "$W/reaped"
+  say "$2: stopped $(count "$W/reaped") still running from a removed file: $(cut -f2 "$W/reaped" | tr '\n' ' ')"
+}
+
 do_apply() {
   [ -s "$W/conflict" ] && { sed 's/^/    /' "$W/conflict"; die "type conflicts in the plan; resolve them by hand first"; }
   if [ "$ROOT" = / ]; then
@@ -335,6 +369,7 @@ do_apply() {
   fi
   refuse_unowned
   remove_list "$W/extra_payload" "1/6 payload extras"
+  reap_removed "$W/extra_payload" "1/6 payload extras"
   sync
   n=0
   while IFS= read -r p; do mkdir_like "$p"; n=$((n + 1)); done < "$W/mkdir"
@@ -398,6 +433,7 @@ do_apply_onefile() {
   mkdir "$RUN/ocbm_mode.lock" 2>/dev/null || die "a go-back or a finish holds $RUN/ocbm_mode.lock"
   MODE_LOCKED=1
   remove_guarded "$W/extra_payload" "1/5 room: OCBM programs other than the console's ocbmd" "$CONSOLE"
+  reap_removed "$W/extra_payload" "1/5 room"
   sync
   n=0
   while IFS= read -r p; do mkdir_like "$p"; n=$((n + 1)); done < "$W/mkdir"
@@ -461,6 +497,7 @@ case "$MODE" in
     MODE_LOCKED=0
     trap 'rmdir "$W/lock" 2>/dev/null; [ "$MODE_LOCKED" = 1 ] && rmdir "$RUN/ocbm_mode.lock" 2>/dev/null' EXIT
     diff_trees; split_actions; report
+    TO_WRITE=$(( $(count "$W/main") + $(count "$W/boot") + $(count "$W/login") + $(count "$W/switch") ))
     if [ "$PROFILE" = onefile ]; then do_apply_onefile; else do_apply; fi
     diff_trees; split_actions; remaining "$W/left"
     [ -s "$W/left" ] && { say "$(count "$W/left") differences remain:"; head -20 "$W/left" | sed 's/^/    /'; die "apply finished with differences"; }

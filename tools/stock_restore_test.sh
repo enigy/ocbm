@@ -154,6 +154,13 @@ run_onefile() {  # $1 shell, $2 mode, $3 root, rest: env. The lock lives in $T/r
 
 is_dispatcher() { grep -q '^# OCBM_DISPATCH' "$1/script/start_main_service.sh"; }
 
+# A process that has exited. A zombie still answers kill -0, and a container's pid 1 may not reap the
+# orphans these are, so one that /proc shows as a zombie counts too (macOS has no /proc, and reaps).
+gone() {
+  kill -0 "$1" 2>/dev/null || return 0
+  [ "$(awk '{ print $3 }' "/proc/$1/stat" 2>/dev/null)" = Z ]
+}
+
 # LINKS beside a tree ($1.links), as the stage makes it: from the tree's pack (tools/pack_tree.py links).
 links_from_pack() {  # $1 tree
   rm -f "$1.lp.tgz"
@@ -329,10 +336,26 @@ onefile_tests() {  # $1 shell
   rm -rf "$T/box"; cp -pR "$T/fin" "$T/box"
   run_onefile "$SH1" apply "$T/box" FAKE_FREE_KB=10; rc=$?
   check '[ $rc -ne 0 ] && grep -q "no room for" "$T/out" && grep -q RESTORE_ABORT "$T/out"' "too little flash aborts"
+  check 'grep -q "no room for .* after 0 of [1-9][0-9]* written" "$T/out"' "the abort says how many of the files it wrote (the dev adapter, 2 Nov)"
   check 'is_dispatcher "$T/box" && [ -x "$T/box/usr/sbin/ocbmd" ] && [ "$(cat "$T/box/script/ocbm_mode")" = final ] && [ -z "$(find "$T/box" -name "*.rsnew")" ]' \
     "the abort leaves OCBM booting with its console, and no partial file"
   run_onefile "$SH1" apply "$T/box"; rc=$?
   check '[ $rc -eq 0 ] && grep -q RESTORE_DONE "$T/out"' "a re-run after the shortfall converges"
+
+  # A program the room step removes may still be running, and its blocks stay allocated until it exits:
+  # a carplayd from the last session held 1.1 MB on the dev adapter, and apply ran out of room (2 Nov).
+  # It is stopped. The console's ocbmd is not, even running from a file an update replaced.
+  rm -rf "$T/box" "$T/proc"; cp -pR "$T/fin" "$T/box"
+  ( sleep 300 & echo $! > "$T/live.pid" ); live_=$(cat "$T/live.pid")
+  ( sleep 300 & echo $! > "$T/con.pid" ); con_=$(cat "$T/con.pid")
+  mkdir -p "$T/proc/$live_" "$T/proc/$con_"
+  ln -s "$T/box/usr/sbin/carplayd (deleted)" "$T/proc/$live_/exe"
+  ln -s "$T/box/usr/sbin/ocbmd (deleted)" "$T/proc/$con_/exe"
+  run_onefile "$SH1" apply "$T/box" STOP_AT=switch PROC="$T/proc"; rc=$?
+  check '[ $rc -eq 99 ] && grep -q "1/5 room: stopped 1 still running from a removed file: usr/sbin/carplayd" "$T/out" && gone "$live_"' \
+    "room: an OCBM program still running from a file the room step removed is stopped (the dev adapter, 2 Nov)"
+  check '! gone "$con_"' "the console's ocbmd is never stopped, even running from a replaced file"
+  kill "$con_" "$live_" 2>/dev/null; rm -rf "$T/proc" "$T/live.pid" "$T/con.pid"
 
   # Refusals that change nothing.
   rm -rf "$T/tree2"; cp -pR "$T/tree" "$T/tree2"
