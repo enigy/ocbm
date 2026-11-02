@@ -222,12 +222,26 @@ fn run(
                     "[rx] resolved _carplay-ctrl {} -> {host}:{port} addrs={addrs:?} scope={iface}({scope})",
                     info.get_fullname()
                 );
-                // What the phone puts in its TXT record (2026-11-01 bench ask): whether anything in it
-                // names the phone, so discovery could dial only the one btd serves. The phone gate refuses
-                // another phone at SETUP either way.
+                // What the phone puts in its TXT record. Its `id` is its BR/EDR address (2026-11-01 bench),
+                // so another phone than the one btd serves is never dialled (fix 1b). Not marked dialed: a
+                // carplayd later told to serve that phone dials it at its next resolve. The phone gate still
+                // refuses another phone at SETUP, for a TXT without an id.
                 let txt: Vec<String> =
                     info.get_properties().iter().map(|p| format!("{}={}", p.key(), p.val_str())).collect();
                 println!("[rx] _carplay-ctrl TXT: {}", txt.join(" "));
+                let txt_id = info
+                    .get_properties()
+                    .iter()
+                    .find(|p| p.key().eq_ignore_ascii_case("id"))
+                    .map(|p| p.val_str());
+                if !gate.wants(txt_id) {
+                    println!(
+                        "[rx] {}: TXT id {} is another phone than btd serves; not dialling it",
+                        info.get_fullname(),
+                        txt_id.unwrap_or_default()
+                    );
+                    continue;
+                }
                 // Dial the resolved ADDRESS(es), not the hostname (box has no .local resolver). Mark a
                 // peer dialed only on SUCCESS, retrying transient failures with a short backoff (the
                 // source address can lag the mDNS resolve by a few seconds right after association).

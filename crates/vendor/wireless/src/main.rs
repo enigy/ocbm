@@ -653,8 +653,10 @@ fn run_active_session(
     // A phone switch (MGMT_SWITCH_DEVICE, `Control::request_switch`) ends the session here too, through
     // the same go-quiet teardown as a preempt: the one way out of a live session that is proven to
     // leave nothing behind. `main`'s claim loop then re-enters with a fresh session, whose reconnect
-    // loop pages the phone asked for while the hold keeps every other phone out.
-    let restart = || ctrl.restart_requested();
+    // loop pages the phone asked for while the hold keeps every other phone out. A switched-to phone
+    // whose session never reaches CarPlay is ended the same way once the hold is over (fix 6,
+    // `Control::switch_stranded`), and the next session calls the other phones first.
+    let restart = || ctrl.restart_requested() || ctrl.switch_stranded();
     match arbiter {
         Some(mut reader) => arbiter_client::wait_for_preempt(&mut reader, shutdown, &restart),
         None => {

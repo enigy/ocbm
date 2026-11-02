@@ -71,7 +71,9 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
+
+use box_common::flags::{self, ProjectionOwner};
 
 use crate::ssp_agent;
 
@@ -91,6 +93,20 @@ const MAX_REQUEST_BYTES: usize = 8 * 1024;
 /// this the hold lapses, so a phone that is not in the vehicle cannot lock the box: every phone may
 /// connect again, in the usual order.
 pub const SWITCH_HOLD: Duration = Duration::from_secs(45);
+
+/// The least a switched-to phone's session gets to reach CarPlay, however late in the hold it started
+/// ([`Control::switch_stranded`]). On the 1 Nov bench a paged phone was identified 3.5 s after the page
+/// and its SETUP arrived 11 s after it.
+const SWITCH_WIFI_FLOOR: Duration = Duration::from_secs(20);
+
+/// How long a switched-to phone that never reached CarPlay stays passed over: last in the call order
+/// and kept off the accept path, so the phones that can project get the box first.
+const PASS_OVER: Duration = SWITCH_HOLD;
+
+/// Where carplayd names the phone whose SETUP it took (`receiver::session::PHONE_IDENT_FILE`). It is
+/// written only for a SETUP the phone gate let through, so a switched-to phone that never appears here
+/// never reached CarPlay over Wi-Fi.
+const PHONE_IDENT_FILE: &str = "/tmp/phone_identity";
 
 /// `@<unix_ms> ` write-time stamp (docs/carplay/01_OCBM_PROTOCOL.md CH_LOG): the box.log tailer
 /// parses this prefix and uses it instead of the millisecond it happened to READ the line at.
@@ -316,6 +332,41 @@ pub struct Control {
     /// The live session must end so a switch can page its phone. `run_active_session` polls it and
     /// leaves through the same go-quiet teardown an arbiter preempt takes.
     restart: AtomicBool,
+    /// The switched-to phone's session, until it reaches CarPlay or its deadline passes
+    /// ([`Control::switch_stranded`]). Set when that session is claimed.
+    switch_watch: Mutex<Option<SwitchWatch>>,
+    /// A switched-to phone that never reached CarPlay, and until when it is passed over.
+    passed_over: Mutex<Option<([u8; 6], Instant)>>,
+}
+
+/// A switched-to phone's session on watch: whose, until when, and what `/tmp/phone_identity` held
+/// when it started.
+#[derive(Clone, Copy)]
+struct SwitchWatch {
+    addr: [u8; 6],
+    until: Instant,
+    before: Ident,
+}
+
+/// `/tmp/phone_identity` as last written: when, and the phone its `deviceID` names. `None` = no file.
+type Ident = Option<(SystemTime, Option<[u8; 6]>)>;
+
+fn read_ident() -> Ident {
+    let written = std::fs::metadata(PHONE_IDENT_FILE).and_then(|m| m.modified()).ok()?;
+    let named = std::fs::read_to_string(PHONE_IDENT_FILE).ok().and_then(|s| ident_device(&s));
+    Some((written, named))
+}
+
+/// Whether carplayd took a SETUP from `w`'s phone since its session started: the identity file was
+/// rewritten, and names it. A file that already named it then is a leftover, not proof.
+fn carplay_reached(w: &SwitchWatch, now: Ident) -> bool {
+    now != w.before && now.is_some_and(|(_, named)| named == Some(w.addr))
+}
+
+/// The `deviceID` of carplayd's identity document (hand-built JSON, `publish_phone_identity`).
+fn ident_device(json: &str) -> Option<[u8; 6]> {
+    let rest = json.split_once("\"deviceID\":\"")?.1;
+    parse_addr(rest.split('"').next()?)
 }
 
 impl Control {
@@ -443,25 +494,118 @@ impl Control {
         }
     }
 
-    /// May `peer` start a session now? Any phone, except while a switch holds the box for another.
+    /// May `peer` start a session now? Any phone, except while a switch holds the box for another, or
+    /// while `peer` is passed over ([`Control::switch_stranded`]).
     pub fn admits(&self, peer: [u8; 6]) -> bool {
         self.admits_at(peer, Instant::now())
     }
 
     fn admits_at(&self, peer: [u8; 6], now: Instant) -> bool {
         !matches!(self.held_for_at(now), Some(held) if held != peer)
+            && self.passed_over_at(now) != Some(peer)
     }
 
-    /// The phone a switch asked for has its session: the hold has done its job.
+    /// The phone a switch asked for has its session: the hold has done its job, and the session is
+    /// watched until it reaches CarPlay ([`Control::switch_stranded`]).
     fn end_hold_for(&self, peer: Option<[u8; 6]>) {
-        if let (Some(p), Ok(mut h)) = (peer, self.switch_hold.lock()) {
-            if h.is_some_and(|(addr, _)| addr == p) {
-                *h = None;
-            }
+        self.end_hold_for_at(peer, Instant::now(), read_ident);
+    }
+
+    fn end_hold_for_at(
+        &self,
+        peer: Option<[u8; 6]>,
+        now: Instant,
+        ident: impl FnOnce() -> Ident,
+    ) {
+        let Some(p) = peer else { return };
+        let Ok(mut h) = self.switch_hold.lock() else { return };
+        let Some((addr, until)) = *h else { return };
+        if addr != p {
+            return;
+        }
+        *h = None;
+        if let Ok(mut w) = self.switch_watch.lock() {
+            *w = Some(SwitchWatch {
+                addr,
+                until: until.max(now + SWITCH_WIFI_FLOOR),
+                before: ident(),
+            });
         }
     }
 
+    /// Fix 6 (bench 2026-11-01 night): a switch to a phone that never reaches Wi-Fi stranded the box. The
+    /// phone came up on Bluetooth ("Identified") and took the Wi-Fi details but never joined the AP, and btd
+    /// held its session for 3 minutes with no CarPlay for anyone.
+    ///
+    /// True once, when the switched-to phone's session is still live past the hold (and at least
+    /// [`SWITCH_WIFI_FLOOR`] after it started) and carplayd has not taken a SETUP from it. That phone is
+    /// then passed over for [`PASS_OVER`], and the caller ends the session, so the box goes back to its
+    /// call order. A wireless Android Auto session counts as projecting: it never writes the CarPlay
+    /// identity. Polled by `run_active_session`'s wait loop; reads files only at the deadline.
+    pub fn switch_stranded(&self) -> bool {
+        self.switch_stranded_at(Instant::now(), |w| {
+            flags::owner() == ProjectionOwner::WirelessAa || carplay_reached(w, read_ident())
+        })
+    }
+
+    fn switch_stranded_at(
+        &self,
+        now: Instant,
+        projecting: impl FnOnce(&SwitchWatch) -> bool,
+    ) -> bool {
+        let Ok(mut w) = self.switch_watch.lock() else { return false };
+        let Some(watch) = *w else { return false };
+        if self.session_peer() != Some(watch.addr) {
+            *w = None; // that session is over: nothing left to end
+            return false;
+        }
+        if now < watch.until {
+            return false;
+        }
+        *w = None;
+        if projecting(&watch) {
+            return false;
+        }
+        log(&format!(
+            "switch to {} never reached CarPlay over Wi-Fi -- ending its session; it waits {}s while the other phones are called",
+            fmt_addr(&watch.addr),
+            PASS_OVER.as_secs()
+        ));
+        if let Ok(mut p) = self.passed_over.lock() {
+            *p = Some((watch.addr, now + PASS_OVER));
+        }
+        true
+    }
+
+    /// The phone [`Control::switch_stranded`] ended, while it is passed over.
+    pub fn passed_over(&self) -> Option<[u8; 6]> {
+        self.passed_over_at(Instant::now())
+    }
+
+    fn passed_over_at(&self, now: Instant) -> Option<[u8; 6]> {
+        let mut p = self.passed_over.lock().ok()?;
+        match *p {
+            Some((addr, until)) if now < until => Some(addr),
+            Some(_) => {
+                *p = None;
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// `bonds` in the order a round pages them: as given, with a passed-over phone moved last.
+    pub fn call_order(&self, bonds: Vec<[u8; 6]>) -> Vec<[u8; 6]> {
+        pass_over_last(bonds, self.passed_over())
+    }
+
+    /// A connect request; one naming a passed-over phone ends its pass-over, since the app asked for it.
     pub fn request_connect(&self, addr: Option<[u8; 6]>) {
+        if let (Some(a), Ok(mut p)) = (addr, self.passed_over.lock()) {
+            if p.is_some_and(|(passed, _)| passed == a) {
+                *p = None;
+            }
+        }
         if let Ok(mut p) = self.pending.lock() {
             *p = Some(addr);
         }
@@ -535,6 +679,16 @@ pub fn order_bonds(bonds: &[[u8; 6]], order: &[[u8; 6]]) -> Vec<[u8; 6]> {
         }
     }
     out
+}
+
+/// `order` with `passed` moved to the end: still paged, if it is the only phone around, but after the
+/// rest ([`Control::call_order`]).
+fn pass_over_last(mut order: Vec<[u8; 6]>, passed: Option<[u8; 6]>) -> Vec<[u8; 6]> {
+    if let Some(i) = passed.and_then(|p| order.iter().position(|a| *a == p)) {
+        let a = order.remove(i);
+        order.push(a);
+    }
+    order
 }
 
 // ---- policy persistence ---------------------------------------------------------------------
@@ -992,6 +1146,103 @@ mod tests {
         assert_eq!(c.held_for(), None);
         drop(claim);
         assert!(c.admits(PHONE_B), "after the switched-to session, every phone again");
+    }
+
+    /// A Control after a switch to PHONE_A at `t0` whose session started at `claimed`, with `before`
+    /// in `/tmp/phone_identity` then.
+    fn switched(t0: Instant, claimed: Instant, before: Ident) -> Control {
+        let c = live(PHONE_B);
+        c.request_switch_at(PHONE_A, &[PHONE_A, PHONE_B], t0);
+        c.set_session_peer(Some(PHONE_A));
+        c.end_hold_for_at(Some(PHONE_A), claimed, || before);
+        c
+    }
+
+    fn ident(written: u64, phone: [u8; 6]) -> Ident {
+        Some((SystemTime::UNIX_EPOCH + Duration::from_secs(written), Some(phone)))
+    }
+
+    /// `switch_stranded` at `when`, with `now` in `/tmp/phone_identity` and no Android Auto session.
+    fn stranded(c: &Control, when: Instant, now: Ident) -> bool {
+        c.switch_stranded_at(when, |w| carplay_reached(w, now))
+    }
+
+    #[test]
+    fn a_switched_to_phone_projecting_android_auto_is_left_alone() {
+        let t0 = Instant::now();
+        let c = switched(t0, t0 + Duration::from_secs(6), None);
+        assert!(!c.switch_stranded_at(t0 + SWITCH_HOLD, |_| true));
+        assert_eq!(c.passed_over(), None);
+    }
+
+    #[test]
+    fn a_switched_to_phone_that_never_reaches_carplay_is_ended_after_the_hold_and_passed_over() {
+        // Bench 2026-11-01 night: the second iPhone took the Wi-Fi details, never joined the AP, and
+        // held the box for 3 minutes.
+        let t0 = Instant::now();
+        let c = switched(t0, t0 + Duration::from_secs(6), ident(100, PHONE_B));
+        let end = t0 + SWITCH_HOLD;
+        assert!(!stranded(&c, end - Duration::from_secs(1), ident(100, PHONE_B)), "not before the hold ends");
+        assert!(stranded(&c, end, ident(100, PHONE_B)));
+        assert!(!stranded(&c, end, ident(100, PHONE_B)), "once");
+        assert!(!c.admits_at(PHONE_A, end + Duration::from_secs(1)), "it may not dial straight back in");
+        assert!(c.admits_at(PHONE_B, end + Duration::from_secs(1)));
+        assert_eq!(c.call_order(vec![PHONE_A, PHONE_B]), vec![PHONE_B, PHONE_A], "still paged, but last");
+        assert!(c.admits_at(PHONE_A, end + PASS_OVER), "passed over for a while, not for good");
+        assert_eq!(c.call_order(vec![PHONE_A, PHONE_B]), vec![PHONE_A, PHONE_B]);
+    }
+
+    #[test]
+    fn a_switched_to_phone_whose_setup_arrived_is_left_alone() {
+        let t0 = Instant::now();
+        let c = switched(t0, t0 + Duration::from_secs(6), ident(100, PHONE_B));
+        assert!(!stranded(&c, t0 + SWITCH_HOLD, ident(117, PHONE_A)));
+        assert_eq!(c.passed_over(), None);
+        assert!(!stranded(&c, t0 + SWITCH_HOLD * 2, None), "watched once");
+    }
+
+    #[test]
+    fn an_identity_naming_the_phone_from_before_its_session_is_not_proof() {
+        let t0 = Instant::now();
+        let c = switched(t0, t0 + Duration::from_secs(6), ident(100, PHONE_A));
+        assert!(stranded(&c, t0 + SWITCH_HOLD, ident(100, PHONE_A)));
+    }
+
+    #[test]
+    fn a_session_that_ends_on_its_own_is_not_ended_again() {
+        let t0 = Instant::now();
+        let c = switched(t0, t0 + Duration::from_secs(6), None);
+        c.set_session_peer(None);
+        assert!(!stranded(&c, t0 + SWITCH_HOLD, None));
+        c.set_session_peer(Some(PHONE_A));
+        assert!(!stranded(&c, t0 + SWITCH_HOLD, None), "the watch went with that session");
+    }
+
+    #[test]
+    fn a_session_that_starts_late_in_the_hold_still_gets_the_floor() {
+        let t0 = Instant::now();
+        let claimed = t0 + SWITCH_HOLD - Duration::from_secs(2);
+        let c = switched(t0, claimed, None);
+        assert!(!stranded(&c, t0 + SWITCH_HOLD, None));
+        assert!(stranded(&c, claimed + SWITCH_WIFI_FLOOR, None));
+    }
+
+    #[test]
+    fn asking_for_a_passed_over_phone_ends_its_pass_over() {
+        let t0 = Instant::now();
+        let c = switched(t0, t0, None);
+        assert!(stranded(&c, t0 + SWITCH_HOLD, None));
+        assert_eq!(c.passed_over(), Some(PHONE_A));
+        c.request_connect(Some(PHONE_A));
+        assert_eq!(c.passed_over(), None);
+    }
+
+    #[test]
+    fn the_identity_document_names_its_phone() {
+        let json = r#"{"name":"Owner\"s iPhone","deviceID":"68:A7:29:00:25:10","model":"iPhone17,1","osName":"iPhone OS","osVersion":"27.1"}"#;
+        assert_eq!(ident_device(json), Some(PHONE_A));
+        assert_eq!(ident_device(r#"{"name":"x","deviceID":"","model":""}"#), None);
+        assert_eq!(ident_device("{}"), None);
     }
 
     #[test]

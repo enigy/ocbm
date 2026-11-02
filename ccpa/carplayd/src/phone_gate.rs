@@ -15,6 +15,8 @@
 //! a new name forgets everything decided for the old one.
 //!
 //! With a phone named:
+//! - discovery dials only the phone whose `_carplay-ctrl` TXT `id` is that address ([`PhoneGate::wants`],
+//!   fix 1b); a TXT without an id is dialled as before;
 //! - a phase-1 SETUP whose `deviceID` is another phone is refused (HTTP 500, connection closed), before
 //!   the session publishes who the phone is, and that peer address is refused for the rest of this
 //!   name: its connections are dropped and discovery no longer dials it;
@@ -152,6 +154,18 @@ impl PhoneGate {
     pub fn is_refused(&self, ip: IpAddr) -> bool {
         let mut st = self.lock();
         self.expected_now(&mut st).is_some() && st.refused.contains(&ip)
+    }
+
+    /// Whether discovery should dial a phone whose `_carplay-ctrl` TXT `id` is `txt_id`. The phone puts
+    /// its BR/EDR address there (bench 2026-11-01: `id=68:a7:29:00:25:10`), the same address btd names,
+    /// so another phone is left alone before anything is dialled (fix 1b). No gate, or no readable id:
+    /// dial, and the SETUP check still applies.
+    pub fn wants(&self, txt_id: Option<&str>) -> bool {
+        let mut st = self.lock();
+        match (self.expected_now(&mut st), txt_id.and_then(normalize)) {
+            (Some(expected), Some(id)) => id == expected,
+            _ => true,
+        }
     }
 }
 
@@ -302,6 +316,20 @@ mod tests {
         assert!(!wired.armed());
         assert!(wired.on_setup(1, ip(100), Some(OTHER)));
         assert!(!wired.is_refused(ip(100)));
+    }
+
+    #[test]
+    fn discovery_dials_only_the_named_phone_by_its_txt_id() {
+        // 2026-11-01 bench: "_carplay-ctrl TXT: id=68:a7:29:00:25:10 srcvers=1005.13.1".
+        let (gate, path) = gate_naming(Some(OWNER));
+        assert!(gate.wants(Some("68:a7:29:00:25:10")), "the TXT spells it in lower case");
+        assert!(!gate.wants(Some(OTHER)), "another phone is never dialled");
+        assert!(gate.wants(None), "no id: dial, and the SETUP check decides");
+        assert!(gate.wants(Some("not a mac")));
+        std::fs::write(&path, OTHER).unwrap();
+        assert!(gate.wants(Some(OTHER)), "follows the phone btd serves now");
+        let _ = std::fs::remove_file(path);
+        assert!(gate.wants(Some(OWNER)), "no name, no gate");
     }
 
     #[test]

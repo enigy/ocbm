@@ -857,7 +857,8 @@ pub fn run(
 
         // A named request is tried alone and first. While a phone switch holds the box, only the
         // phone it holds for is paged, round after round, until it connects or the hold lapses
-        // (`Control::request_switch`). Anything else walks the policy order.
+        // (`Control::request_switch`). Anything else walks the policy order, with a switched-to phone
+        // that never reached CarPlay moved last for a while (`Control::switch_stranded`).
         let targets: Vec<[u8; 6]> = match request {
             Some(Some(addr)) => {
                 if bonds.contains(&addr) {
@@ -878,7 +879,7 @@ pub fn run(
                     log(&format!("switch hold -- paging only {}", control::fmt_addr(&held)));
                     vec![held]
                 }
-                _ => bonds.clone(),
+                _ => ctrl.call_order(bonds.clone()),
             },
         };
 

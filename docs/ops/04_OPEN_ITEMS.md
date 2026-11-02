@@ -125,6 +125,13 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
      B's Bluetooth session with no CarPlay for anyone until the app stopped, 3 min later. After the
      hold it should drop a session that never reached Wi-Fi (fix 6). `_carplay-ctrl`'s TXT `id`
      is the phone's BR/EDR address, so discovery can dial only `btd`'s phone (fix 1b).
+     **Fixes 6 and 1b landed 2026-11-02, NOT yet benched.** Fix 6 (`Control::switch_stranded`): a
+     switched-to phone's session still live when the hold ends (and at least 20 s after it started),
+     with no SETUP from it in `/tmp/phone_identity` and no wireless-AA session, is ended through the
+     go-quiet teardown; that phone is then last in the call order and refused on the accept path for
+     45 s, or until the app asks for it again. Fix 1b (`PhoneGate::wants`): discovery skips a
+     `_carplay-ctrl` whose TXT `id` is another phone than the one `btd` names; a TXT without an id
+     is dialled as before and the SETUP check still applies.
   3. **"Phone drop on host re-SUBSCRIBE" (`PROJ_MODE NONE` then `SESSION_EVENT PHONE_ABSENT` after
      an app relaunch) — NOT reproduced, 2026-09-25.** Three timelines, all wired, the phone never
      left the bus in any: (a) kill-without-STOP relaunch (`adb install -r`): SUBSCRIBE → stale
