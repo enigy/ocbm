@@ -55,8 +55,10 @@ echo 'PASSED in 3 s'"
 }
 # Carlinkit daemon names this host runs itself (macOS has its own usbmuxd): ocbm_finish.sh skips them.
 HOST_DAEMONS="$(for n in usbmuxd mdnsd boa; do pgrep -x "$n" >/dev/null 2>&1 && printf '%s ' "$n"; done)"
+# umount as the box has it, recording what it was asked to let go of (deliver() lets the stick go).
+printf '#!/bin/sh\necho "$*" >> "%s/umount.calls"\n' "$T" > "$T/umount"; chmod 755 "$T/umount"
 boot() {  # $1 shell, $2 dir: one start of the adapter
-  env ROOT="$2/root" RUN="$2/run" STICK="$2/stick" PROC="$2/proc" POLL=1 STICK_WAIT=2 ANSWER_SECS=3 FINISH_IGNORE="$HOST_DAEMONS" \
+  env UMOUNT="$T/umount" ROOT="$2/root" RUN="$2/run" STICK="$2/stick" PROC="$2/proc" POLL=1 STICK_WAIT=2 ANSWER_SECS=3 FINISH_IGNORE="$HOST_DAEMONS" \
       REBOOT="touch $2/rebooted" "$1" "$2/root/script/start_main_service.sh" > "$2/boot.out" 2>&1
 }
 restart() { reap; rm -rf "${1:?}/run"; mkdir -p "$1/run"; rm -f "$1"/m.* "$1/rebooted"; }  # power cycle: /tmp is gone
@@ -105,6 +107,7 @@ for sh in ${SHELLS:-sh dash}; do
     "the report goes to the stick, above the install's result"
   check 'waitfor "[ ! -e $d/run/not_change_mass_storage ]" 3 && [ -e "$d/root/etc/ocbm/delivered_result.txt" ] && [ ! -e "$d/root/etc/ocbm/pending_result.txt" ]' \
     "delivered once; later sticks are shared with the car again"
+  check 'grep -qxF "$d/stick" "$T/umount.calls"' "and the stick is unmounted once the report is synced (the truck's FAT, 3 Nov)"
   d="$T/$sh-late"; make_box "$d" ""; echo "OCBM install: BACK TO STOCK" > "$d/root/etc/ocbm/pending_result.txt"
   : > "$d/proc/mounts"; rm -f "$d/stick/OCBM_RESULT.txt"; boot "$sh" "$d"; sleep 2
   check '[ -e "$d/run/not_change_mass_storage" ] && [ ! -e "$d/stick/OCBM_RESULT.txt" ]' "with no stick in, the report waits"

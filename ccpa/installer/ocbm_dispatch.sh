@@ -37,7 +37,7 @@
 # ocbm_install.sh gets from ::respawn.
 #
 # Test hooks (tools/ocbm_stageb_test.sh, tools/ocbm_update_test.sh): ROOT RUN STICK PROC POLL
-# STICK_WAIT REBOOT ANSWER_SECS.
+# STICK_WAIT REBOOT ANSWER_SECS UMOUNT.
 ROOT="${ROOT:-}"
 RUN="${RUN:-/tmp}"
 STICK="${STICK:-/mnt/UPAN}"
@@ -50,6 +50,7 @@ EO="$ROOT/etc/ocbm"
 SMS_STOCK="$S/start_main_service.stock.sh"
 U="$EO/update_pending"
 REBOOT="${REBOOT:-/sbin/reboot}"
+UMOUNT="${UMOUNT:-umount}"
 update_trial=0
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin:/tmp/bin:$PATH
 
@@ -71,7 +72,7 @@ deliver() {  # the last revert's report, onto the next stick that is plugged in
   # synced, but the stick stayed mounted read-write under a stock that cycled for 40 s until the adapter
   # was unplugged, and its FAT came back inconsistent (OCBM_RESULT.txt starting on a free cluster).
   # Unmounted, or read-only if something holds it, nothing on the adapter can write to it again.
-  if umount "$STICK" 2>/dev/null || mount -o remount,ro "$STICK" 2>/dev/null; then
+  if $UMOUNT "$STICK" 2>/dev/null || mount -o remount,ro "$STICK" 2>/dev/null; then
     log "the report is on the stick; the stick is unmounted or read-only now"
   fi
   rm -f "$RUN/not_change_mass_storage"   # later sticks are shared with the car again, as stock does
