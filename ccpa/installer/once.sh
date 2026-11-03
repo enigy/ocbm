@@ -183,6 +183,15 @@ if [ "$dispatcher" = 1 ] && [ -e "$MODE" ]; then
       "When the adapter has restarted, unplug it and plug it back in with this stick in: the install runs then."
     exit 1
   fi
+  # An update package on the same stick: OCBM takes it itself at its start (ocbm_dispatch.sh, stick_update),
+  # with the update's own trial; this image would only refuse the installed OCBM. Stand aside, image left.
+  if [ "$ROUTE" = stick ] && ls "$STICK"/ocbm-update-*.tgz >/dev/null 2>&1; then
+    say "an OCBM update package is on the stick: OCBM updates itself from it when it starts; this image waits"
+    result "WAITING FOR THE UPDATE" \
+      "An OCBM update package is on this stick, and OCBM on this adapter updates itself from it when it starts." \
+      "This image was not used." "" "The update's own report goes above this one when it has finished."
+    exit 1
+  fi
   have=$(cat "$EO/installed_version" 2>/dev/null)
   if [ "$have" = "$VER" ]; then   # e.g. the stick went in again after power was lost before finish.sh
     say "already installed: $VER ($(cat "$MODE"))"

@@ -160,6 +160,10 @@ for sh in ${SHELLS:-sh dash}; do
   check '[ $rc = 1 ] && grep -q "^OCBM install: WAITING FOR THE RESTORE" "$d/stick/OCBM_RESULT.txt" && [ "$(snap "$d/root")" = "$(cat "$d/b4")" ] && [ -e "$d/stick/A15W_Update.img" ] && [ -e "$d/stick/OCBM_RESTORE" ]' \
     "OCBM_RESTORE on the stick goes first: nothing changed, the image stays for the install after it (the truck, 2 Nov)"
   rm -f "$d/stick/OCBM_RESTORE"
+  : > "$d/stick/ocbm-update-1.1.0.tgz"; refresh "$d"; snap "$d/root" > "$d/b5"; run_once "$sh" "$d"; rc=$?
+  check '[ $rc = 1 ] && grep -q "^OCBM install: WAITING FOR THE UPDATE" "$d/stick/OCBM_RESULT.txt" && [ "$(snap "$d/root")" = "$(cat "$d/b5")" ] && [ -e "$d/stick/A15W_Update.img" ]' \
+    "an update package on the stick: OCBM takes it at its start; nothing changed, the image stays (3 Nov)"
+  rm -f "$d/stick/ocbm-update-1.1.0.tgz"
   for c in product firmware chip factory handmade stray damaged flash stick backup; do
     r="$T/$sh-$c"; make_box "$r"; extra=""
     case $c in

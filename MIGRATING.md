@@ -144,6 +144,19 @@ as a trial that falls back to the version it replaced if the self-test fails
 (`ccpa/installer/ocbm_update.sh`). It needs flash for the changed files, at about 0.7 of their size,
 plus 384 KB spare. In trial, small updates fit; one that replaces `carplayd` (about 1.9 MB) needs final.
 
+**From a USB stick, with no internet and no computer.** Put the package and its checksum file
+(`ocbm-update-X.Y.Z.tgz` and `ocbm-update-X.Y.Z.tgz.sha256`, from the enigy/ocbm releases page) on any
+FAT stick, alone or next to the install image, plug it into the adapter and start the adapter (turn the
+car on, or unplug and replug it). In trial or final, OCBM looks for one package in the first 20 s after
+it starts. If the checksum matches, it installs the package the same way as an update from Carlink:
+same checks, then a trial that falls back to the version it replaced. The adapter restarts once to run
+it. A stick plugged in during a drive is used at the next start, never during the drive.
+`OCBM_RESULT.txt` on the stick then says UPDATED, ROLLED BACK (and why) or REFUSED (and why). The
+package is renamed `.used`, or `.refused`, so leaving the stick in doesn't run it again. In a trial
+without room for the update, the report says so: remove stock CarPlay in Carlink first, or go back to
+stock and install the full image. While the install waits for its finish (confirmed), the package is
+left untouched until a later start.
+
 Where it stands on 1 November 2026: Carlink's Play releases don't yet send the install confirm, its
 adapter-update screen isn't released, and no installer image is published with a release. A migrated
 adapter is ready for all three.

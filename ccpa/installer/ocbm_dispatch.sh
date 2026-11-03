@@ -37,7 +37,7 @@
 # ocbm_install.sh gets from ::respawn.
 #
 # Test hooks (tools/ocbm_stageb_test.sh, tools/ocbm_update_test.sh): ROOT RUN STICK PROC POLL
-# STICK_WAIT REBOOT ANSWER_SECS UMOUNT.
+# STICK_WAIT STICK_PKG_WAIT REBOOT ANSWER_SECS UMOUNT.
 ROOT="${ROOT:-}"
 RUN="${RUN:-/tmp}"
 STICK="${STICK:-/mnt/UPAN}"
@@ -45,6 +45,7 @@ PROC="${PROC:-/proc}"
 POLL="${POLL:-2}"
 STICK_WAIT="${STICK_WAIT:-60}"
 ANSWER_SECS="${ANSWER_SECS:-120}"
+STICK_PKG_WAIT="${STICK_PKG_WAIT:-20}"   # how long a start waits for a stick that may carry an update
 S="$ROOT/script"
 EO="$ROOT/etc/ocbm"
 SMS_STOCK="$S/start_main_service.stock.sh"
@@ -57,16 +58,16 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin:/tmp/bin:$PATH
 log() { echo "[dispatch] $*" >> "$RUN/ocbm_dispatch.log"; echo "[dispatch] $*" >> "$RUN/box.log"; }
 stick_in() { [ -d "$STICK" ] && grep -q " $STICK " "$PROC/mounts" 2>/dev/null; }
 
-deliver() {  # the last revert's report, onto the next stick that is plugged in
+deliver() {  # $1 a report in /etc/ocbm, onto the next stick plugged in; $2 share: then hand sticks back to stock
   while ! stick_in; do sleep "$POLL"; done
   sleep "$POLL"   # let update_box.sh look at the stick first
   r="$STICK/OCBM_RESULT.txt"
   if [ -f "$r" ]; then
-    { cat "$EO/pending_result.txt"; echo; echo "--- before that"; cat "$r"; } > "$r.new"
+    { cat "$1"; echo; echo "--- before that"; cat "$r"; } > "$r.new"
   else
-    cp "$EO/pending_result.txt" "$r.new"
+    cp "$1" "$r.new"
   fi
-  mv -f "$r.new" "$r" && sync && mv -f "$EO/pending_result.txt" "$EO/delivered_result.txt"
+  mv -f "$r.new" "$r" && sync && mv -f "$1" "$EO/delivered_result.txt"
   sync
   # Done with this stick: let it go before stock gets it. The truck, 3 Nov: the report was delivered and
   # synced, but the stick stayed mounted read-write under a stock that cycled for 40 s until the adapter
@@ -75,14 +76,14 @@ deliver() {  # the last revert's report, onto the next stick that is plugged in
   if $UMOUNT "$STICK" 2>/dev/null || mount -o remount,ro "$STICK" 2>/dev/null; then
     log "the report is on the stick; the stick is unmounted or read-only now"
   fi
-  rm -f "$RUN/not_change_mass_storage"   # later sticks are shared with the car again, as stock does
+  [ "${2:-}" = share ] && rm -f "$RUN/not_change_mass_storage"   # later sticks are shared with the car again, as stock does
 }
 
 stock() {
   if [ -s "$SMS_STOCK" ]; then
     if [ -f "$EO/pending_result.txt" ]; then
       touch "$RUN/not_change_mass_storage"   # keep the next stick mounted until the report is on it
-      deliver </dev/null >/dev/null 2>&1 &
+      deliver "$EO/pending_result.txt" share </dev/null >/dev/null 2>&1 &
     fi
     exec sh "$SMS_STOCK"
   fi
@@ -135,6 +136,7 @@ update_commit() {  # the update passed its self-test, or a power cut stopped its
   put "$EO/update_result" "committed $to (from $from)"
   rm -f "$EO/update_attempts" "$U"; sync
   log "update committed: $to (from $from)"
+  stick_outcome UPDATED
 }
 
 update_rollback() {  # $1 why: put back the version the update replaced
@@ -154,6 +156,7 @@ update_rollback() {  # $1 why: put back the version the update replaced
   # The failed starts were the update's, not the install's.
   rm -f "$EO/update_attempts" "$EO/boot_attempts" "$U"; sync
   log "update rolled back to $from: $why"
+  stick_outcome "ROLLED BACK"
 }
 
 update_boot() {  # before OCBM starts
@@ -251,6 +254,64 @@ restore_watch() {
   done
 }
 
+# ---- an update from a USB stick (offline: no internet on the head unit and no computer; Scott, 3 Nov) ----
+# At a trial or final start only, never mid-session, since an update restarts the adapter: a stick with
+# one ocbm-update-X.Y.Z.tgz and its .sha256 (tools/make_ocbm_update.sh) goes to ocbm_update.sh as ocbmd
+# hands it a package on MGMT_UPDATE, with the same checks and the same trial. The package is used once
+# (renamed .used, or .refused), and the outcome goes onto the stick as OCBM_RESULT.txt: at once for a
+# refusal, after the update's trial for a commit or a rollback. stick_result.txt holds the report until
+# a stick takes it, across the restart a rollback makes.
+stick_report() {  # $1 headline, $2 the line under it
+  { echo "OCBM update: $1"; echo "adapter: OCBM $(cat "$EO/installed_version" 2>/dev/null)"; echo; echo "$2"; } \
+    > "$EO/stick_result.txt.new" && mv -f "$EO/stick_result.txt.new" "$EO/stick_result.txt"
+  sync
+  delivering=1
+  deliver "$EO/stick_result.txt" </dev/null >/dev/null 2>&1 &
+}
+
+stick_outcome() {  # $1 headline: an update from the stick ended its trial
+  [ -f "$EO/stick_update" ] || return 0
+  rm -f "$EO/stick_update"; sync
+  stick_report "$1" "$(cat "$EO/update_result" 2>/dev/null)"
+}
+
+stick_update() {
+  i=0
+  while ! stick_in && [ "$i" -lt "$STICK_PKG_WAIT" ]; do sleep "$POLL"; i=$((i + POLL)); done
+  stick_in || return 0
+  [ -e "$STICK/OCBM_RESTORE" ] && return 0   # the way back goes first
+  set -- "$STICK"/ocbm-update-*.tgz
+  [ -f "$1" ] || return 0
+  if [ $# -gt 1 ]; then
+    stick_report REFUSED "There is more than one OCBM update package on the stick. Leave only the newest, with its .sha256, and restart the adapter."
+    return 0
+  fi
+  pkg=$1; n=${pkg##*/}
+  want=$(cut -c1-64 "$pkg.sha256" 2>/dev/null)
+  if [ -z "$want" ] || [ "$(sha256sum "$pkg" 2>/dev/null | cut -c1-64)" != "$want" ]; then
+    mv -f "$pkg" "$pkg.refused"; sync
+    stick_report REFUSED "$n does not match $n.sha256, or has none, so it was not used. Copy both files to the stick again."
+    return 0
+  fi
+  { cp "$pkg" "$RUN/ocbm-update.tgz" && mv -f "$pkg" "$pkg.used" && sync; } || { log "could not take $n off the stick"; return 0; }
+  log "update package on the stick: $n"
+  echo "$n" > "$EO/stick_update"; sync
+  "$S/ocbm_update.sh" "$RUN/ocbm-update.tgz" >> "$RUN/box.log" 2>&1
+  [ -f "$U" ] && return 0   # placed: the adapter restarts into the update's trial, and its outcome is reported then
+  rm -f "$EO/stick_update"
+  r=$(cat "$EO/update_result" 2>/dev/null)
+  case "$r" in
+    committed*) stick_report UPDATED "$r" ;;
+    *)
+      mv -f "$STICK/$n.used" "$STICK/$n.refused"; sync
+      case "$mode:$r" in
+        trial:*"Not enough flash"*)
+          r="$r In a trial the flash holds stock CarPlay too: remove stock CarPlay in Carlink first (Settings > Adapter), or go back to stock and install the full image." ;;
+      esac
+      stick_report REFUSED "$r" ;;
+  esac
+}
+
 respawn() { while :; do "$@"; sleep 1; done; }
 
 # ---------------------------------------------------------------------------------------------
@@ -288,6 +349,12 @@ fi
 [ -x "$S/init_gpio.sh" ] && "$S/init_gpio.sh" >/dev/null 2>&1 &   # stock: Bluetooth reset line, quick-charge pins
 respawn "$S/run_ocbmd.sh" </dev/null >/dev/null 2>&1 &
 respawn "$S/run_supervisor.sh" </dev/null >/dev/null 2>&1 &
+# A stick report a restart interrupted, then an update package on a stick in at this start.
+if [ -f "$EO/stick_result.txt" ]; then   # one report at a time: a new package waits for the next start
+  [ -n "${delivering:-}" ] || deliver "$EO/stick_result.txt" </dev/null >/dev/null 2>&1 &
+elif [ "$update_trial" = 0 ] && [ "$mode" != confirmed ] && [ ! -f "$U" ]; then
+  stick_update </dev/null >/dev/null 2>&1 &
+fi
 if [ "$mode" = final ]; then
   [ -e "$EO/finish_pending" ] && [ -x "$S/ocbm_finish.sh" ] && "$S/ocbm_finish.sh" </dev/null >> "$RUN/box.log" 2>&1 &
   if [ "$update_trial" = 1 ]; then
