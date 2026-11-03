@@ -32,7 +32,7 @@
 # EXIT   0 AP converged   1 failed to converge
 ########################
 set -u
-export PATH=/usr/sbin:/usr/bin:/sbin:/bin:/tmp/bin:$PATH
+export PATH=${OCBM_TEST_PATH:+$OCBM_TEST_PATH:}/usr/sbin:/usr/bin:/sbin:/bin:/tmp/bin:$PATH
 L="[radio_ap_up]"
 
 IF=${RADIO_WLAN_IF:-wlan0}

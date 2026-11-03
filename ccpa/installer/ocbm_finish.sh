@@ -36,7 +36,7 @@ EO="$ROOT/etc/ocbm"
 MODE="$S/ocbm_mode"
 PENDING="$EO/finish_pending"
 GONE="$EO/finished.txt"
-export PATH=/usr/sbin:/usr/bin:/sbin:/bin:$PATH
+export PATH=${OCBM_TEST_PATH:+$OCBM_TEST_PATH:}/usr/sbin:/usr/bin:/sbin:/bin:$PATH
 
 SBIN_A="AppleCarPlay ARMadb-driver ARMandroid_Mirror ARMAndroidAuto ARMHiCar ARMiPhoneIAP2 \
 AutomaticTest boa boa_old boxHUDServer boxImgTools boxImgTools.zip boxNetworkService \

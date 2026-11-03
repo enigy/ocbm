@@ -53,7 +53,7 @@ U="$EO/update_pending"
 REBOOT="${REBOOT:-/sbin/reboot}"
 UMOUNT="${UMOUNT:-umount}"
 update_trial=0
-export PATH=/usr/sbin:/usr/bin:/sbin:/bin:/tmp/bin:$PATH
+export PATH=${OCBM_TEST_PATH:+$OCBM_TEST_PATH:}/usr/sbin:/usr/bin:/sbin:/bin:/tmp/bin:$PATH
 
 log() { echo "[dispatch] $*" >> "$RUN/ocbm_dispatch.log"; echo "[dispatch] $*" >> "$RUN/box.log"; }
 stick_in() { [ -d "$STICK" ] && grep -q " $STICK " "$PROC/mounts" 2>/dev/null; }

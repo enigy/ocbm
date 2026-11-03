@@ -29,7 +29,7 @@
 # into /tmp/box.log, and wireless_down() kills it at teardown. Opt-in and harmless when btmon is
 # absent (unknown on the CCPA rootfs) -- see btmon_start()/the "[b]tmon" pkill lines.
 set -u
-export PATH=/usr/sbin:/usr/bin:/sbin:/bin:$PATH
+export PATH=${OCBM_TEST_PATH:+$OCBM_TEST_PATH:}/usr/sbin:/usr/bin:/sbin:/bin:$PATH
 
 # S2 singleton guard: mirrors the mkdir test-and-set + PID-liveness reclaim idiom in
 # ccpa/rootfs/script/radio_hal.sh:84-99 (lock_take), so a second supervisor invocation (e.g. a

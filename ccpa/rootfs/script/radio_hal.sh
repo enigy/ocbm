@@ -52,7 +52,7 @@
 # the control channel you are standing on.
 ########################
 set -u
-export PATH=/usr/sbin:/usr/bin:/sbin:/bin:/tmp/bin:$PATH
+export PATH=${OCBM_TEST_PATH:+$OCBM_TEST_PATH:}/usr/sbin:/usr/bin:/sbin:/bin:/tmp/bin:$PATH
 
 VERB="${1:-}"
 CAPS=/tmp/radio_caps

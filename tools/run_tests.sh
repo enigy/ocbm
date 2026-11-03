@@ -71,6 +71,8 @@ run "ocbm-stageb" bash tools/ocbm_stageb_test.sh
 run "ocbm-update" bash tools/ocbm_update_test.sh
 # The radio seam's detection against synthetic units (Carlinkit's and lvalen's dispatcher texts).
 run "radio-detect" bash tools/radio_detect_test.sh
+# The box scripts' suites again under BusyBox's sh and awk, the adapter's (v1.32.1); skipped without it.
+run "busybox (the adapter's sh and awk)" sh tools/busybox_suites.sh
 
 # host/MacHost's own hardware-free Swift harness (tests/run_tests.sh) — no Xcode project, no
 # dongle. Skipped (not a failure) when the Swift toolchain isn't on this machine, since the rest of
