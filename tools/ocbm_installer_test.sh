@@ -50,6 +50,12 @@ check '[ "$want" = "$have" ]' "the payload is ocbm_install.sh --full's file set"
 mkdir -p "$T/noinst"; cp "$REPO/ccpa/installer/"* "$T/noinst/"; rm -f "$T/noinst/ocbm_dispatch.sh"
 check '! BIN_DIR="$T/bin" IRS_BIN="$T/irs" INSTALLER_DIR="$T/noinst" bash "$HERE/make_ocbm_installer.sh" "$T/out2" >/dev/null 2>&1' \
   "the builder refuses without the Stage B scripts"
+# The adapter's BusyBox 1.32.1 awk reads `name (` as a call (ocbm_update.sh's newer(), 3 Nov): no box
+# script may use the form, and the lint must catch the line that broke every update.
+box_scripts="$REPO/ccpa/installer/once.sh $REPO/ccpa/installer/finish.sh $(bash "$HERE/make_ocbm_installer.sh" --sources | cut -d'|' -f1 | grep '\.sh$')"
+check 'python3 -I "$HERE/awk_lint.py" $box_scripts > "$T/awk_lint.out"' "the box scripts' awk programs read the same under BusyBox awk"
+printf "%s\n" "awk -v a=1 '" "  function key(v,  k, p) { return k (p == \"\" ? \"~\" : \"-\" p) }" "  BEGIN { print key(a) }'" > "$T/awk_bad.sh"
+check '! python3 -I "$HERE/awk_lint.py" "$T/awk_bad.sh" >/dev/null' "and the lint catches the line that broke every update on the adapter"
 VER="$(head -1 "$T/img/tmp/ocbm/VERSION")"
 STOCK_SMS='#!/bin/sh
 # stock start_main_service.sh (test stand-in)

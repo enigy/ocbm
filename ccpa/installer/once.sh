@@ -144,7 +144,9 @@ image_update() {
     "No update is guaranteed to succeed, least of all one the OCBM project did not build; what you put on" \
     "your adapter is your choice (MIGRATING.md)."
   park used   # one use: the update restarts the adapter, and a stick left in must not run it again
-  "$ROOT/script/ocbm_update.sh" "$pk.tgz" >> "$LOG" 2>&1   # placed: it restarts the adapter
+  # The image's own updater, not the installed one: a newer image can then update an adapter whose
+  # updater is broken, as 5287ffc's was under BusyBox awk (dev adapter, 3 Nov), with no re-install.
+  sh "$PAYLOAD/script/ocbm_update.sh" "$pk.tgz" >> "$LOG" 2>&1   # placed: it restarts the adapter
   [ -f "$EO/update_pending" ] && exit 1
   rm -f "$EO/stick_update" "$pk.tgz"
   r=$(cat "$EO/update_result" 2>/dev/null)
@@ -257,7 +259,7 @@ if [ "$dispatcher" = 1 ] && [ -e "$MODE" ]; then
     exit 1
   fi
   have=$(cat "$EO/installed_version" 2>/dev/null)
-  if [ "$have" != "$VER" ] && [ -x "$ROOT/script/ocbm_update.sh" ]; then image_update; fi
+  if [ "$have" != "$VER" ] && [ -s "$PAYLOAD/script/ocbm_update.sh" ]; then image_update; fi
   if [ "$have" = "$VER" ]; then   # e.g. the stick went in again after power was lost before finish.sh
     say "already installed: $VER ($(cat "$MODE"))"
     result "ALREADY INSTALLED" "OCBM $VER is already on this adapter (mode: $(cat "$MODE")). Nothing was changed." \

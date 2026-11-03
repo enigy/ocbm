@@ -296,7 +296,7 @@ stick_update() {
   while ! stick_in && [ "$i" -lt "$STICK_PKG_WAIT" ]; do sleep "$POLL"; i=$((i + POLL)); done
   stick_in || return 0
   if [ -e "$STICK/OCBM_RESTORE" ]; then   # the way back goes first: in final from the stick's own backup,
-    [ "$mode" = final ] && [ -x "$S/ocbm_restore.sh" ] && "$S/ocbm_restore.sh" </dev/null >> "$RUN/box.log" 2>&1
+    [ "$mode" = final ] && [ -x "$S/ocbm_restore.sh" ] && "$S/ocbm_restore.sh" </dev/null >/dev/null 2>&1   # it logs to box.log itself
     return 0                              # in a trial by restore_watch's revert
   fi
   set -- "$STICK"/ocbm-update-*.tgz
@@ -315,7 +315,7 @@ stick_update() {
   { cp "$pkg" "$RUN/ocbm-update.tgz" && mv -f "$pkg" "$pkg.used" && sync; } || { log "could not take $n off the stick"; return 0; }
   log "update package on the stick: $n"
   echo "$n" > "$EO/stick_update"; sync
-  "$S/ocbm_update.sh" "$RUN/ocbm-update.tgz" >> "$RUN/box.log" 2>&1
+  "$S/ocbm_update.sh" "$RUN/ocbm-update.tgz" >/dev/null 2>&1   # it logs to box.log itself (twice, before 3 Nov)
   [ -f "$U" ] && return 0   # placed: the adapter restarts into the update's trial, and its outcome is reported then
   rm -f "$EO/stick_update"
   r=$(cat "$EO/update_result" 2>/dev/null)

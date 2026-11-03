@@ -86,12 +86,15 @@ first() { set -- $1; echo "${1:-}"; }
 # Is version $1 newer than $2? X.Y.Z compared as numbers; a -suffix (1.1.0-beta.1) ranks below 1.1.0.
 newer() {
   awk -v a="$1" -v b="$2" '
-    function key(v,   i, p, n, x, k) {
+    function key(v,   i, p, n, x, k, s) {
       i = index(v, "-"); p = ""
       if (i) { p = substr(v, i + 1); v = substr(v, 1, i - 1) }
       n = split(v, x, "."); k = ""
       for (i = 1; i <= 3; i++) k = k sprintf("%06d", (i <= n ? x[i] : 0) + 0)
-      return k (p == "" ? "~" : "-" p)
+      # Not `return k (...)`: BusyBox 1.32.1 awk (on the adapter) reads `k (` as a call to a function k and
+      # fails, which made newer() false for every pair (dev adapter, 3 Nov; tools/awk_lint.py).
+      s = (p == "" ? "~" : "-" p)
+      return k s
     }
     BEGIN { exit !(key(a) > key(b)) }'
 }

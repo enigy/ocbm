@@ -317,6 +317,17 @@ for sh in ${SHELLS:-sh dash}; do
   check 'waitfor "stick_says \"$d\" REFUSED" 15 && grep -q "more than one" "$d/stick/OCBM_RESULT.txt" && is_old "$d"' "two packages: refused, neither used"
 done
 
+echo "== newer() under BusyBox awk, the adapter's"
+# 3 Nov: under BusyBox 1.32.1's awk newer() was false for every pair, and every update was refused.
+if command -v busybox >/dev/null 2>&1 && busybox awk 'BEGIN{}' 2>/dev/null; then
+  mkdir -p "$T/bb"; ln -sf "$(command -v busybox)" "$T/bb/awk"
+  sed -n '/^newer() {/,/^}/p' "$INST/ocbm_update.sh" > "$T/newer.sh"
+  got=$(PATH="$T/bb:$PATH" sh -c '. "$1"; for p in "1.0.1 1.0.0" "1.10.0 1.9.0" "1.0.0 1.0.0" "1.1.0-beta.1 1.1.0" "1.1.0 1.1.0-beta.1" "1.1.0-beta.2 1.1.0-beta.1" "1.0.0 1.0.1"; do set -- $p; newer $1 $2 && printf y || printf n; done' _ "$T/newer.sh")
+  check '[ "$got" = yynnyyn ]' "1.0.1>1.0.0, 1.10.0>1.9.0, not 1.0.0>1.0.0, betas below their release, and reverses ($got)"
+else
+  echo "  (skipped: no busybox on this host; tools/awk_lint.py in ocbm_installer_test.sh covers the form)"
+fi
+
 echo "== make_ocbm_update.sh"
 b="$T/build"; mkdir -p "$b/bin" "$b/inst" "$b/from" "$b/out"
 for f in ocbmd iap2d carplayd btd aa-bridge; do printf '%s v1\n' "$f" > "$b/bin/$f"; done
