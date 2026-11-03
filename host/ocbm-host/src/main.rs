@@ -22,7 +22,8 @@
 //!                                               local response, and send the host-authored bytes.
 //!                                               --mute-once: drop the FIRST RS_REQ (author/send nothing) to
 //!                                               exercise the box's timeout → sticky-local fallback.
-//! Every connection also auto-pushes the host clock right after HELLO.
+//! Every connection also auto-pushes the host clock right after the HELLO_ACK. Without one, nothing
+//! else is sent and ocbm-host exits 1.
 
 mod setup_driver;
 
@@ -157,7 +158,8 @@ fn host_instance_nonce() -> u32 {
     })
 }
 
-fn do_hello(link: &mut Link) {
+/// HELLO, and wait for the HELLO_ACK. True when it came.
+fn do_hello(link: &mut Link) -> bool {
     let mut hi = [0u8; 6];
     hi[0] = p::CT_HELLO;
     hi[1] = p::VERSION;
@@ -192,7 +194,7 @@ fn do_hello(link: &mut Link) {
                     caps,
                     if l >= 7 { out[6] } else { 0 }
                 );
-                return;
+                return true;
             }
             stale += 1; // leftover frame from a prior session — keep draining toward the ACK
         }
@@ -202,6 +204,7 @@ fn do_hello(link: &mut Link) {
         }
     }
     eprintln!("no HELLO_ACK");
+    false
 }
 
 /// Push the host wall clock to the box (CT_SETTIME) and consume the box's ack.
@@ -1624,7 +1627,12 @@ fn main() {
     let xfer: usize = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(16384);
 
     let mut link = open(vid, pid);
-    do_hello(&mut link);
+    // Nothing but HELLO goes out until the HELLO_ACK: a trial's ocbmd takes a host's first other frame
+    // as the proof it answered (the one-file install's answer_watch), so a clock push after "no
+    // HELLO_ACK" vouched for a box that never answered (truck bench, 2 Nov).
+    if !do_hello(&mut link) {
+        std::process::exit(1);
+    }
     // Auto-sync the box clock on every connect (the box has no RTC battery).
     push_time(&mut link);
     match mode {

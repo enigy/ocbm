@@ -132,6 +132,12 @@ box  → host: HELLO_ACK { ocbm_version, box_caps, active_mode }
 host → box:  MODE_SELECT { mode }        (only when the host wants a non-default mode)
 ```
 
+- **A host sends nothing but `HELLO` until it has a `HELLO_ACK`** (sending `HELLO` again is fine). A
+  one-file install's trial takes a host's first other frame as the proof that `ocbmd` answered it
+  (`/tmp/ocbmd_answered`, [../ops/01_RECOVERY.md](../ops/01_RECOVERY.md)), so a host that carried on
+  without the ACK would vouch for a box that never answered. Carlink, the macOS app and `ocbm-probe`
+  hold to this; `ocbm-host` pushed its clock and ran its verb after "no HELLO_ACK" until 3 Nov, and
+  now exits 1 instead.
 - `HELLO_ACK`'s `box_caps` mirrors CarPlay's own negotiation (see Extensibility) so the two ends
   evolve independently; unknown capabilities are ignored. There is **no host→box capability word** —
   that slot is the host instance nonce (see the note under the CTRL table). A host's capability is

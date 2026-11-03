@@ -153,7 +153,11 @@ way back, and six things call it:
 - `ocbmd` hearing a host for two minutes without answering it (the dispatcher's `answer_watch`: a
   host's first HELLO in `/tmp/ocbmd_heard` and no other frame from it in `/tmp/ocbmd_answered`). The
   self-test runs with no host, so it passed on the truck adapter on 2 Nov while its accessory driver
-  kept `9b2331d`'s `ocbmd` from ever writing, and the unit sat on a dead trial;
+  kept `9b2331d`'s `ocbmd` from ever writing, and the unit sat on a dead trial. The two files hold for
+  the boot, not for one `ocbmd`: a restarted one starts from them. Under `a81d3f5` they were per
+  process, and on the truck that evening the `ocbmd` that heard the HELLO restarted single-threaded,
+  the host's next frames went to the new one, which had seen no HELLO, and a working trial went back
+  to stock at 121 s;
 - a file named `OCBM_RESTORE` on a stick, at any time during the trial (renamed `.done` once used);
 - `MGMT_GO_STOCK` from the app, or `ocbm-host install stock` on the bench;
 - by hand over the OCBM console: `/script/ocbm_revert.sh "why"`.

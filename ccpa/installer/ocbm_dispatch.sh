@@ -184,8 +184,10 @@ selftest() {
 # A host that talks to ocbmd and never hears back. The truck adapter, 2 Nov: its accessory driver let
 # OCBM read and never write, the self-test passed with no host to ask, and the adapter sat on a dead
 # trial. ocbmd writes the uptime of a host's first HELLO to ocbmd_heard, and of its first other frame,
-# which a host sends only once it has our HELLO_ACK, to ocbmd_answered. Heard for ANSWER_SECS with no
-# answer goes back as a failed self-test does: to stock, or in an update's trial to the OCBM it replaced.
+# which a host sends only once it has our HELLO_ACK, to ocbmd_answered. Both hold for the boot: the
+# answer can reach an ocbmd restarted since the HELLO (the truck, 2 Nov 21:06). Heard for ANSWER_SECS
+# with no answer goes back as a failed self-test does: to stock, or in an update's trial to the OCBM it
+# replaced.
 answer_watch() {
   while :; do
     [ -e "$RUN/ocbmd_answered" ] && return

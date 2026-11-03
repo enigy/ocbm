@@ -429,7 +429,11 @@ interruptibly), and the host sent twice or more meanwhile. It then writes `/etc/
 and restarts, and from then on that unit's ocbmd reads and writes the device on its poll loop, one
 call at a time (`AccIo::Direct`). `wchan` cannot tell the two apart: the kernel skips the mutex
 functions there, so a writer waiting on the mutex reads `acc_write`, the same as one waiting for the
-host. `OCBMD_ACC_IO=direct|relay` overrides the choice on the bench.
+host. `OCBMD_ACC_IO=direct|relay` overrides the choice on the bench. The first ocbmd's HELLO_ACK goes
+out as it exits, so the host's next frame comes to the new one, which takes it as the answer to the
+HELLO in `/tmp/ocbmd_heard` (the truck, 2 Nov 21:06). A revert to stock keeps the flag, so the unit's
+next trial starts single-threaded (the truck's retry, 2 Nov 21:17: HELLO_ACK in 8 ms); a stock restore
+removes `/etc/ocbm` whole, the flag with it.
 
 ### The two physical ports
 

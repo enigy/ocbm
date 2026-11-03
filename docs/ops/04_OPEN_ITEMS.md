@@ -77,11 +77,21 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
   adapter `9b2331d` never answered a HELLO (2 Nov, 17:06):** its accessory driver serializes reads and
   writes ([../carplay/00_ARCHITECTURE.md](../carplay/00_ARCHITECTURE.md), "Not every unit's module
   allows that"), the self-test passed with no host to ask, and the unit sat on a dead trial until
-  `OCBM_RESTORE` took it back; the truck is on `052fd04` again. Fixed the same day, NOT benched:
+  `OCBM_RESTORE` took it back; the truck is on `052fd04` again. Fixed the same day (`a81d3f5`):
   ocbmd falls back to the single-threaded loop on such a driver and keeps that on flash
   (`AccIo::Direct`), and a trial whose `ocbmd` hears a host for two minutes without answering goes
-  back by itself (`answer_watch`, [01_RECOVERY.md](01_RECOVERY.md)). Only the truck has this driver,
-  so only the truck can bench it, and nothing new goes to the truck before that bench (Scott's OK).
+  back by itself (`answer_watch`, [01_RECOVERY.md](01_RECOVERY.md)). **Truck bench, 2 Nov 21:05:**
+  the fallback worked (the first `ocbmd` restarted single-threaded, `/etc/ocbm/acc_direct_io` was
+  saved, the session ran), but `answer_watch` sent the working trial back at 121 s: the host's answer
+  went to the restarted `ocbmd`, which had not seen the HELLO. **Retry, 21:17-21:36: PASS.** The revert
+  had kept the flag, so `ocbmd` was single-threaded from its first start: HELLO_ACK in 8 ms, heard and
+  answered both written, Scott's iPhone paired, HEVC 8 s after Bluetooth; after a power cycle, HELLO_ACK
+  in 4 ms and video 22 s after Carlink connected, `dropped=av:0`. The truck stays on that trial,
+  unconfirmed. The restart case is fixed 3 Nov, NOT benched: a restarted `ocbmd` starts from the
+  heard/answered files, and `ocbm-host` sends nothing without a HELLO_ACK. It matters on the first
+  contact after any fresh install on this driver, since `stock_restore.sh` removes `/etc/ocbm` whole;
+  benching it on the truck needs the flag removed first. The dev-adapter bench of `a81d3f5` waits for
+  that build.
   1. **`MGMT_DISCONNECT_PHONE`, transport-aware, plus a capability bit.** Problem: the app's
      Disconnect Phone has no honest verb to send — OCBM's six MGMT verbs are
      `crates/ocbm-proto/src/lib.rs:334-346`, dispatched at `ccpa/ocbmd/src/main.rs:3397-3446`; the

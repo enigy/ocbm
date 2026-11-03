@@ -621,7 +621,8 @@ struct Daemon {
     last_proj_mode_check: Option<std::time::Instant>,
     /// Throttle for the periodic health line. See [`Daemon::health_tick`].
     last_health_log: Option<std::time::Instant>,
-    /// A host's HELLO has arrived ([`HEARD_FILE`]), and a frame after it ([`ANSWERED_FILE`]).
+    /// A host's HELLO has arrived ([`HEARD_FILE`]), and a frame after it ([`ANSWERED_FILE`]). Read from
+    /// those files at start ([`host_frames_on_record`]), so a restarted ocbmd carries on from the last.
     heard: bool,
     answered: bool,
 }
@@ -1125,6 +1126,15 @@ fn write_uptime_file(path: &str) {
     if std::fs::write(&tmp, format!("{secs}\n")).and_then(|_| std::fs::rename(&tmp, path)).is_err() {
         eprintln!("[ocbmd] could not write {path}");
     }
+}
+
+/// Whether an ocbmd earlier this boot heard a host's HELLO ([`HEARD_FILE`]) and had the host's next
+/// frame ([`ANSWERED_FILE`]): a restart carries on from them. The truck adapter, 2 Nov 21:06: the ocbmd
+/// that heard the HELLO restarted for [`AccIo::Direct`], its queued HELLO_ACK went out as it exited, and
+/// the host's SUBSCRIBE came to the new ocbmd. That one had seen no HELLO, so it never counted the
+/// answer, and the dispatcher sent a working trial back to stock two minutes later.
+fn host_frames_on_record() -> (bool, bool) {
+    (std::path::Path::new(HEARD_FILE).exists(), std::path::Path::new(ANSWERED_FILE).exists())
 }
 
 /// Whether `/tmp/phone_identity` (text `now`, written at `written`) goes to the host, which was last sent
@@ -4028,7 +4038,9 @@ impl Daemon {
 
     /// Note a host's first HELLO ([`HEARD_FILE`]) and the first frame of any other kind after it
     /// ([`ANSWERED_FILE`]): a host sends nothing but HELLO until it has our HELLO_ACK, so that frame is
-    /// the proof this side was heard. Once each per process.
+    /// the proof this side was heard. Once each per boot: a restart starts from the files
+    /// ([`host_frames_on_record`]), so the answer may come to another ocbmd than the HELLO did, and the
+    /// first HELLO's time stands (the dispatcher's two minutes run from it).
     fn note_host_frame(&mut self, hello: bool) {
         if hello && !self.heard {
             self.heard = true;
@@ -4689,8 +4701,9 @@ impl AccIo {
 }
 
 /// Set, on flash, when this unit's driver serializes reads and writes ([`AccIo::Direct`]); later starts
-/// go straight to Direct. A stock restore takes /etc/ocbm away whole. If flash refuses it,
-/// [`ACC_DIRECT_TMP_FLAG`] holds it until the next power-off.
+/// go straight to Direct. A revert to stock keeps it; a stock restore takes /etc/ocbm away whole, and
+/// the first start after that goes through the restart again ([`host_frames_on_record`]). If flash
+/// refuses it, [`ACC_DIRECT_TMP_FLAG`] holds it until the next power-off.
 #[cfg(not(test))]
 const ACC_DIRECT_FLAG: &str = "/etc/ocbm/acc_direct_io";
 #[cfg(test)]
@@ -5020,6 +5033,7 @@ fn main() {
         eprintln!("[ocbmd] required A/V seam listener missing — exiting");
         std::process::exit(1);
     }
+    let (heard, answered) = host_frames_on_record();
     let mut d = Daemon {
         acc: to_host,
         seq: 0,
@@ -5079,8 +5093,8 @@ fn main() {
         proj_mode: None,
         last_proj_mode_check: None,
         last_health_log: None,
-        heard: false,
-        answered: false,
+        heard,
+        answered,
     };
     let mut reasm = p::Reassembler::new();
     let mut rbuf = vec![0u8; p::HDR_LEN + p::MAX_PAYLOAD];
@@ -5633,6 +5647,13 @@ mod tests {
         LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Serializes the tests that write `HEARD_FILE` and `ANSWERED_FILE`, one path each for the whole
+    /// process as with [`presence_flag_lock`].
+    fn host_frame_files_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// A Daemon with no MFi chip, no listeners and a /dev/null accessory fd.
     fn td() -> Daemon {
         Daemon {
@@ -5701,8 +5722,10 @@ mod tests {
             proj_mode: None,
             last_proj_mode_check: None,
             last_health_log: None,
-            heard: false,
-            answered: false,
+            // Already heard and answered, so the tests that send a HELLO leave HEARD_FILE and
+            // ANSWERED_FILE to the two tests about them (host_frame_files_lock).
+            heard: true,
+            answered: true,
         }
     }
 
@@ -7343,13 +7366,44 @@ mod tests {
 
     #[test]
     fn a_host_is_heard_at_its_hello_and_answered_at_its_next_frame() {
+        let _files = host_frame_files_lock();
+        let _ = std::fs::remove_file(HEARD_FILE);
+        let _ = std::fs::remove_file(ANSWERED_FILE);
         let mut d = td();
+        (d.heard, d.answered) = host_frames_on_record();
+        assert!(!d.heard && !d.answered, "a fresh boot has nothing on record");
         d.note_host_frame(false);
         assert!(!d.answered, "nothing before a HELLO counts");
         d.note_host_frame(true);
         d.note_host_frame(true);
         assert!(d.heard && !d.answered, "HELLOs alone: the host has not had our HELLO_ACK");
+        assert!(std::path::Path::new(HEARD_FILE).exists() && !std::path::Path::new(ANSWERED_FILE).exists());
         d.note_host_frame(false);
-        assert!(d.answered);
+        assert!(d.answered && std::path::Path::new(ANSWERED_FILE).exists());
+        let _ = std::fs::remove_file(HEARD_FILE);
+        let _ = std::fs::remove_file(ANSWERED_FILE);
+    }
+
+    #[test]
+    fn a_restarted_ocbmd_takes_the_hosts_next_frame_as_the_answer_to_the_hello_before_it() {
+        // The truck adapter, 2 Nov 21:06: the ocbmd that heard the HELLO restarted for single-threaded
+        // I/O, and the host's SUBSCRIBE came to the next one.
+        let _files = host_frame_files_lock();
+        std::fs::write(HEARD_FILE, "40\n").unwrap();
+        let _ = std::fs::remove_file(ANSWERED_FILE);
+        let mut d = td();
+        (d.heard, d.answered) = host_frames_on_record();
+        assert!(d.heard && !d.answered);
+        d.note_host_frame(true);
+        assert_eq!(
+            std::fs::read_to_string(HEARD_FILE).unwrap(),
+            "40\n",
+            "a HELLO to the restarted ocbmd keeps the first one's time"
+        );
+        assert!(!std::path::Path::new(ANSWERED_FILE).exists());
+        d.note_host_frame(false);
+        assert!(std::path::Path::new(ANSWERED_FILE).exists(), "the first non-HELLO frame is the answer");
+        let _ = std::fs::remove_file(HEARD_FILE);
+        let _ = std::fs::remove_file(ANSWERED_FILE);
     }
 }

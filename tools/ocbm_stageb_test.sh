@@ -132,6 +132,17 @@ for sh in ${SHELLS:-sh dash}; do
   d="$T/$sh-answered"; make_box "$d" trial; boot "$sh" "$d"
   echo 11 > "$d/run/ocbmd_answered"; echo 10 > "$d/run/ocbmd_heard"; echo "500.00 80.00" > "$d/proc/uptime"
   check '! waitfor "[ -e $d/rebooted ]" 3 && mode_is "$d" trial' "answered: the trial stays"
+  # The truck adapter, 2 Nov 21:06: the ocbmd that hears the HELLO restarts (single-threaded I/O), and
+  # the host's answer comes to the one run_ocbmd.sh starts next.
+  d="$T/$sh-restarted"; make_box "$d" trial
+  stand_in "$d/root/script/run_ocbmd.sh" "$d/m.run_ocbmd" \
+    "[ -e '$d/run/ocbmd_heard' ] && { echo 43 > '$d/run/ocbmd_answered'; exec sleep 30; }
+echo 40 > '$d/run/ocbmd_heard'; exit 1"
+  boot "$sh" "$d"
+  check 'waitfor "[ -e $d/run/ocbmd_answered ]" 5 && [ "$(grep -c ran "$d/m.run_ocbmd")" = 2 ]' \
+    "one ocbmd hears the host and the next one answers it"
+  echo "500.00 80.00" > "$d/proc/uptime"
+  check '! waitfor "[ -e $d/rebooted ]" 3 && mode_is "$d" trial' "an answer to another ocbmd's HELLO keeps the trial"
   d="$T/$sh-deaf-final"; make_box "$d" final; boot "$sh" "$d"
   echo 10 > "$d/run/ocbmd_heard"; echo "500.00 80.00" > "$d/proc/uptime"
   check '! waitfor "[ -e $d/rebooted ]" 3 && mode_is "$d" final' "final has nothing to go back to: left alone"
