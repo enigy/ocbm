@@ -102,7 +102,16 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
   power cycle clean. One finding there: after the power cycle the first-called iPhone answered the
   page and reset the link 4 s later, and `btd` went on to the second phone, which got CarPlay. Fixed:
   such a phone is paged once more before the next ([../wireless/01_BT_AND_RADIO.md](../wireless/01_BT_AND_RADIO.md),
-  "A phone that answers and resets"), NOT benched.
+  "A phone that answers and resets"), NOT benched: no phone reset the link on the 3 Nov bench.
+- **One-file install, dev adapter, 3 Nov (`cb97f01`): PASS.** A retry over a try a power cut stopped
+  mid-place removed its files ("2510 KB", then 3760 KB free) and installed; two starts that never
+  passed the self-test went back to stock at the third; a finish cut at 49 of 105 deletes resumed
+  and completed; in final, `OCBM_RESTORE` was left alone with `OCBM_RESTORE.txt` beside it (the
+  trial watcher outliving the finish is covered by Stage B only); two restores from final matched
+  the backup. **Still open: stock CarPlay after the prune is unverified in a live session** (Carlink
+  2.08 cannot run one on Carlinkit's firmware), while the revert report ("Stock CarPlay and Android
+  Auto work as before") and Carlink's Go back dialog both promise it. The wording stays until that
+  session is run or Scott rewords it.
   1. **`MGMT_DISCONNECT_PHONE`, transport-aware, plus a capability bit.** Problem: the app's
      Disconnect Phone has no honest verb to send — OCBM's six MGMT verbs are
      `crates/ocbm-proto/src/lib.rs:334-346`, dispatched at `ccpa/ocbmd/src/main.rs:3397-3446`; the
