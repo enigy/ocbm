@@ -56,6 +56,14 @@ const BACKOFF_MAX_SECS: u64 = 60;
 /// very next attempt succeeded - but only after the 10 s floor, so each cost ~15 s. Once per daemon
 /// start, so it cannot spin: every later round still gets the floor and the doubling.
 const FIRST_RETRY_SECS: u64 = 2;
+/// The pause before the one more try a phone gets when it answers the page and then resets the link
+/// ([`Attempt::Reset`]), before the next phone in the call order is paged. Dev bench, 2 Nov: 32 s after
+/// a power cut the first-called iPhone accepted the page and reset it 4 s later (`SDP query failed:
+/// Connection reset by peer`), and the walk went straight on to the second phone, which got CarPlay; in
+/// the truck that hands it to a passenger's phone after a short stop with the engine off. The reset
+/// cycle behind [`FIRST_RETRY_SECS`] found the very next attempt succeeds, but that retry only runs once
+/// no phone in the round connected.
+const RESET_RETRY_SECS: u64 = 2;
 /// Let bring-up/SSP/SDP settle and give the phone a moment to connect IN on its own before we start
 /// paging it ourselves.
 ///
@@ -162,10 +170,62 @@ enum Attempt {
     Ran,
     /// SDP/RFCOMM failed for an ordinary reason (absent phone, page timeout, lost claim).
     Failed,
+    /// The phone answered the page and then reset the link (`ConnectionReset` from SDP or RFCOMM): it is
+    /// there but not ready, as an iPhone still letting go of a session a power cut ended. Paged once more
+    /// before the next phone ([`walk`]).
+    Reset,
     /// The phone rejected the SSP re-pair (`rfcomm_uspace::connect_to` → `PermissionDenied`):
     /// paging it again just produces another prompt it cannot accept. Hold off for the maximum
     /// backoff and let the operator re-pair from the iPhone.
     PairRejected,
+}
+
+/// [`Attempt::Reset`] when the phone reset the link, else [`Attempt::Failed`].
+fn failure(e: &std::io::Error) -> Attempt {
+    if e.kind() == std::io::ErrorKind::ConnectionReset {
+        Attempt::Reset
+    } else {
+        Attempt::Failed
+    }
+}
+
+/// What one walk down the call order did.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Walk {
+    ran: bool,
+    rejected: bool,
+}
+
+/// Page `targets` in order until `stop` says not to go on. A phone that answers and resets the link
+/// ([`Attempt::Reset`]) is paged once more, after `pause` (false: go no further), before the next one.
+fn walk(
+    targets: &[[u8; 6]],
+    mut stop: impl FnMut() -> bool,
+    mut pause: impl FnMut([u8; 6]) -> bool,
+    mut page: impl FnMut([u8; 6]) -> Attempt,
+) -> Walk {
+    let mut out = Walk::default();
+    for &peer in targets {
+        if stop() {
+            break;
+        }
+        let mut result = page(peer);
+        if result == Attempt::Reset {
+            if !pause(peer) {
+                break;
+            }
+            result = page(peer);
+        }
+        match result {
+            Attempt::Ran => out.ran = true,
+            Attempt::Failed | Attempt::Reset => {}
+            Attempt::PairRejected => {
+                out.rejected = true;
+                break; // do not page the next phone into the same rejection storm
+            }
+        }
+    }
+    out
 }
 
 fn attempt(
@@ -196,7 +256,7 @@ fn attempt(
         Ok(s) => s,
         Err(e) => {
             log(&format!("SDP query failed: {e}"));
-            return Attempt::Failed;
+            return failure(&e);
         }
     };
     // WIRED Android Auto owns the box (2026-09-04): the phone on the cable still needs the car as
@@ -237,7 +297,7 @@ fn attempt(
         }
         Err(e) => {
             log(&format!("RFCOMM connect to channel {channel} failed: {e}"));
-            return Attempt::Failed;
+            return failure(&e);
         }
     };
     log(&format!("RFCOMM connected OUT to the phone (ch {channel}) — starting iAP2 handshake"));
@@ -883,21 +943,20 @@ pub fn run(
             },
         };
 
-        let mut ran = false;
-        let mut rejected = false;
-        for &peer in &targets {
-            if shutdown.load(Ordering::Relaxed) || session_active.load(Ordering::Relaxed) {
-                break;
-            }
-            match attempt(peer, name, shutdown, session_active, ctrl) {
-                Attempt::Ran => ran = true,
-                Attempt::Failed => {}
-                Attempt::PairRejected => {
-                    rejected = true;
-                    break; // do not page the next phone into the same rejection storm
-                }
-            }
-        }
+        let Walk { ran, rejected } = walk(
+            &targets,
+            || shutdown.load(Ordering::Relaxed) || session_active.load(Ordering::Relaxed),
+            |peer| {
+                log(&format!(
+                    "{} answered and reset the link -- paging it once more in {RESET_RETRY_SECS}s before the next phone",
+                    control::fmt_addr(&peer)
+                ));
+                sleep_or_request(RESET_RETRY_SECS, shutdown, ctrl)
+                    && !ctrl.has_request()
+                    && !session_active.load(Ordering::Relaxed)
+            },
+            |peer| attempt(peer, name, shutdown, session_active, ctrl),
+        );
         if rejected {
             backoff = BACKOFF_MAX_SECS; // the phone said no; more paging only rotates codes
         } else if ran {
@@ -930,9 +989,77 @@ pub fn run(
 
 #[cfg(test)]
 mod tests {
-    use super::{has_established_on_local_port, headset_candidates, split_at_lines};
+    use super::{failure, has_established_on_local_port, headset_candidates, split_at_lines, walk, Attempt, Walk};
     use crate::hfp_hf::Path;
     use crate::sdp_client::Services;
+
+    const SCOTT: [u8; 6] = [1, 0, 0, 0, 0, 0];
+    const YODA: [u8; 6] = [2, 0, 0, 0, 0, 0];
+
+    /// Walk `[SCOTT, YODA]` with each phone's answers in turn (Failed once they run out), never stopping and
+    /// always ready to retry: which phones were paged, in order, and what the walk did.
+    fn walk_with(answers: &[(&[u8; 6], Attempt)]) -> (Vec<[u8; 6]>, Walk) {
+        let mut queue: Vec<_> = answers.iter().map(|(p, a)| (**p, *a)).collect();
+        let mut paged = Vec::new();
+        let walked = walk(
+            &[SCOTT, YODA],
+            || false,
+            |_| true,
+            |peer| {
+                paged.push(peer);
+                match queue.iter().position(|(p, _)| *p == peer) {
+                    Some(i) => queue.remove(i).1,
+                    None => Attempt::Failed,
+                }
+            },
+        );
+        (paged, walked)
+    }
+
+    /// The dev bench, 2 Nov: after a power cut the first-called iPhone answered and reset the link, and the
+    /// walk handed CarPlay to the second phone. It is paged once more first.
+    #[test]
+    fn a_phone_that_answers_and_resets_is_paged_once_more_before_the_next() {
+        let (paged, walked) = walk_with(&[(&SCOTT, Attempt::Reset), (&SCOTT, Attempt::Ran)]);
+        assert_eq!(&paged[..2], &[SCOTT, SCOTT]);
+        assert!(walked.ran);
+        let (paged, walked) = walk_with(&[(&SCOTT, Attempt::Reset), (&SCOTT, Attempt::Reset), (&YODA, Attempt::Ran)]);
+        assert_eq!(paged, vec![SCOTT, SCOTT, YODA], "only once: then the next phone");
+        assert!(walked.ran);
+    }
+
+    #[test]
+    fn an_absent_phone_is_not_paged_twice() {
+        let (paged, _) = walk_with(&[(&SCOTT, Attempt::Failed), (&YODA, Attempt::Ran)]);
+        assert_eq!(paged, vec![SCOTT, YODA]);
+    }
+
+    #[test]
+    fn a_request_or_a_session_during_the_pause_ends_the_walk() {
+        let mut paged = Vec::new();
+        let walked = walk(&[SCOTT, YODA], || false, |_| false, |peer| {
+            paged.push(peer);
+            Attempt::Reset
+        });
+        assert_eq!(paged, vec![SCOTT]);
+        assert_eq!(walked, Walk::default());
+    }
+
+    #[test]
+    fn a_rejected_pairing_still_ends_the_walk() {
+        let (paged, walked) = walk_with(&[(&SCOTT, Attempt::PairRejected)]);
+        assert_eq!(paged, vec![SCOTT]);
+        assert!(walked.rejected && !walked.ran);
+    }
+
+    #[test]
+    fn only_a_reset_link_counts_as_a_reset() {
+        let reset = std::io::Error::from_raw_os_error(libc::ECONNRESET);
+        assert_eq!(failure(&reset), Attempt::Reset);
+        for errno in [libc::EHOSTDOWN, libc::ETIMEDOUT, libc::ECONNREFUSED] {
+            assert_eq!(failure(&std::io::Error::from_raw_os_error(errno)), Attempt::Failed, "errno {errno}");
+        }
+    }
 
     /// The bench Pixel's own numbers: HFP AG on RFCOMM 4, HSP AG on 3. AUTO must try HFP first —
     /// that is the route the stock firmware proved against this exact phone.

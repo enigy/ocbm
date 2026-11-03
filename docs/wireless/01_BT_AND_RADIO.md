@@ -796,6 +796,13 @@ every unrecognized event. Now:
   `reconnect.rs` maps that to `Attempt::PairRejected`: stop paging the remaining bonds, sleep
   `BACKOFF_MAX_SECS` (60 s), then clear the flag so the next attempt is judged on its own.
   `NEW_LINK_KEY` also clears the flag; `DEVICE_DISCONNECTED` clears the code.
+- **A phone that answers and resets.** `Connection reset by peer` from the SDP query or the RFCOMM
+  connect is `Attempt::Reset`: the phone took the page and then dropped the link, so it is there but
+  not ready. `reconnect::walk` pages it once more `RESET_RETRY_SECS` (2 s) later, before the next phone
+  in the call order (an app's Connect request or a session that comes up meanwhile ends the walk
+  instead). Dev bench, 2 Nov: 32 s after a power cut the first-called iPhone accepted the page and
+  reset it 4 s later, and the walk handed CarPlay to the second phone; `FIRST_RETRY_SECS` only helps
+  when no phone in the round connects.
 - **Bonding intent.** Both backends request `BT_SECURITY_MEDIUM` (general bonding) on the outgoing
   socket (`rfcomm_uspace::request_bonding`) so a box-initiated connect's own side asks for a
   persistent key (`store_hint=1`); without it the kernel reported `store_hint=0` and a freshly

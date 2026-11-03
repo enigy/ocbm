@@ -96,8 +96,13 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
   continuing anyway" on that first contact is expected: the SETTIME waits in the driver through the
   restart, and the new `ocbmd` applies it about 3 s late, past Carlink's 2 s wait. Cold restart and
   power cycle after it: single-threaded from the start, HELLO_ACK in 5 ms and 19 ms, no drops or
-  stalls. The truck is on the `924f497` trial, unconfirmed. Still owed: the dev-adapter bench of
-  `924f497` (relay threads, both iPhones, switches).
+  stalls. The truck is on the `924f497` trial, unconfirmed. **Dev-adapter bench, 2 Nov: PASS**
+  (CarLink-fd6c, two iPhones): a fresh install from stock, relay threads on every `ocbmd` start and no
+  flag, HELLO_ACK in 2 ms, heard and answered on record, switches 8 of 8 with video, cold restart and
+  power cycle clean. One finding there: after the power cycle the first-called iPhone answered the
+  page and reset the link 4 s later, and `btd` went on to the second phone, which got CarPlay. Fixed:
+  such a phone is paged once more before the next ([../wireless/01_BT_AND_RADIO.md](../wireless/01_BT_AND_RADIO.md),
+  "A phone that answers and resets"), NOT benched.
   1. **`MGMT_DISCONNECT_PHONE`, transport-aware, plus a capability bit.** Problem: the app's
      Disconnect Phone has no honest verb to send — OCBM's six MGMT verbs are
      `crates/ocbm-proto/src/lib.rs:334-346`, dispatched at `ccpa/ocbmd/src/main.rs:3397-3446`; the
