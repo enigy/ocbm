@@ -69,7 +69,7 @@ deliver() {  # $1 a report in /etc/ocbm, onto the next stick plugged in; $2 shar
     { cat "$1" && echo && echo "--- before that" && cat "$r"; } > "$r.new"
   else
     cp "$1" "$r.new"
-  fi && mv -f "$r.new" "$r" && sync && mv -f "$1" "$EO/delivered_result.txt" || {
+  fi && mv -f "$r.new" "$r" && sync && mv -f "$1" "$EO/delivered_result.txt" && log "the report is on the stick" || {
     rm -f "$r.new"
     log "could not write the report to the stick (full?): it is tried again at the next start"
   }
@@ -79,7 +79,7 @@ deliver() {  # $1 a report in /etc/ocbm, onto the next stick plugged in; $2 shar
   # was unplugged, and its FAT came back inconsistent (OCBM_RESULT.txt starting on a free cluster).
   # Unmounted, or read-only if something holds it, nothing on the adapter can write to it again.
   if $UMOUNT "$STICK" 2>/dev/null || mount -o remount,ro "$STICK" 2>/dev/null; then
-    log "the report is on the stick; the stick is unmounted or read-only now"
+    log "the stick is unmounted or read-only now"
   fi
   [ "${2:-}" = share ] && rm -f "$RUN/not_change_mass_storage"   # later sticks are shared with the car again, as stock does
 }
@@ -296,7 +296,7 @@ stick_update() {
   while ! stick_in && [ "$i" -lt "$STICK_PKG_WAIT" ]; do sleep "$POLL"; i=$((i + POLL)); done
   stick_in || return 0
   if [ -e "$STICK/OCBM_RESTORE" ]; then   # the way back goes first: in final from the stick's own backup,
-    [ "$mode" = final ] && [ -x "$S/ocbm_restore.sh" ] && "$S/ocbm_restore.sh" </dev/null >/dev/null 2>&1   # it logs to box.log itself
+    [ "$mode" = final ] && [ -x "$S/ocbm_restore.sh" ] && "$S/ocbm_restore.sh" </dev/null >/dev/null 2>>"$RUN/box.log"   # it logs there itself; errors still reach it
     return 0                              # in a trial by restore_watch's revert
   fi
   set -- "$STICK"/ocbm-update-*.tgz
@@ -315,7 +315,7 @@ stick_update() {
   { cp "$pkg" "$RUN/ocbm-update.tgz" && mv -f "$pkg" "$pkg.used" && sync; } || { log "could not take $n off the stick"; return 0; }
   log "update package on the stick: $n"
   echo "$n" > "$EO/stick_update"; sync
-  "$S/ocbm_update.sh" "$RUN/ocbm-update.tgz" >/dev/null 2>&1   # it logs to box.log itself (twice, before 3 Nov)
+  "$S/ocbm_update.sh" "$RUN/ocbm-update.tgz" >/dev/null 2>>"$RUN/box.log"   # it logs there itself; errors still reach it
   [ -f "$U" ] && return 0   # placed: the adapter restarts into the update's trial, and its outcome is reported then
   rm -f "$EO/stick_update"
   r=$(cat "$EO/update_result" 2>/dev/null)

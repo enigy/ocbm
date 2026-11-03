@@ -120,7 +120,8 @@ for sh in ${SHELLS:-sh dash}; do
   check '[ "$(cat "$d/stick/OCBM_RESULT.txt")" = "an older report" ] && [ -e "$d/root/etc/ocbm/pending_result.txt" ] && [ ! -e "$d/root/etc/ocbm/delivered_result.txt" ]' \
     "a stick it cannot write to: the older report stays whole, and the report stays pending"
   rmdir "$d/stick/OCBM_RESULT.txt.new"; restart "$d"; boot "$sh" "$d"
-  check 'waitfor "grep -q \"^OCBM install: BACK TO STOCK\" $d/stick/OCBM_RESULT.txt" 5 && grep -q "an older report" "$d/stick/OCBM_RESULT.txt" && [ -e "$d/root/etc/ocbm/delivered_result.txt" ]' \
+  # All inside waitfor: delivered_result.txt appears only after deliver()'s sync, slow on macOS (the Mac, 3 Nov).
+  check 'waitfor "grep -q \"^OCBM install: BACK TO STOCK\" $d/stick/OCBM_RESULT.txt && grep -q \"an older report\" $d/stick/OCBM_RESULT.txt && [ -e $d/root/etc/ocbm/delivered_result.txt ]" 15' \
     "and the next start delivers it, above the older one"
 
   echo "== $sh: the start counter catches a start that never finishes"
