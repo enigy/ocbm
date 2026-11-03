@@ -151,6 +151,12 @@ for s in $SCRIPT_A; do gone "/script/$s"; done
 for e in $ETC_A; do gone "/etc/$e"; done
 gone /etc/boa
 gone /script/start_main_service.stock.sh
+# Hand-install leftovers Carlinkit's image does not ship (the truck adapter, 3 Nov), as prune.list
+# takes them at the install; libz goes with the libraries below, when nothing that stays names it.
+for p in /usr/sbin/dropbear /usr/libexec/sftp-server /root/.ssh/authorized_keys /.ash_history \
+         /root/.ash_history /script/custom_init.sh; do
+  gone "$p"
+done
 for h in udisk_insert.sh udisk_hotplug.sh; do   # keep mounting sticks; the updater is gone
   f="$ROOT/etc/mdev/$h"
   grep -q '^[[:space:]]*/script/update_box\.sh' "$f" 2>/dev/null || continue
@@ -166,6 +172,7 @@ sync
 cand=""
 for l in $LIB_VENDOR; do [ -e "$ROOT/usr/lib/$l" ] && cand="$cand /usr/lib/$l"; done
 for l in $LIB_DEV; do [ -e "$ROOT/lib/$l" ] && cand="$cand /lib/$l"; done
+for l in libz.so libz.so.1 libz.so.1.2.11; do [ -e "$ROOT/lib/$l" ] && cand="$cand /lib/$l"; done   # a hand-install leftover
 K="$RUN/ocbm_finish.keep"; F="$RUN/ocbm_finish.refs"
 : > "$K"
 for d in /bin /sbin /usr/bin /usr/sbin /usr/lib /lib; do

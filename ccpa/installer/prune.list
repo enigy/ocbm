@@ -36,6 +36,21 @@ lib/libSegFault.so
 lib/libmemusage.so
 lib/libpcprofile.so
 
+# Hand-install leftovers (the truck adapter, 3 Nov): what tools/ncm_base_install.sh and an earlier
+# hand conversion put on a unit, none of which Carlinkit's 2025.10.15.1127 image ships. The truck's
+# factory dump held 302 KB of them that the dev adapter's has not; its trial kept ~900 KB free instead
+# of ~1220. rcS's bare "dropbear" line then finds nothing, harmlessly; ocbm_boot.sh already stops
+# dropbear in OCBM. A restore from the stick's backup puts them all back.
+usr/sbin/dropbear
+usr/libexec/sftp-server
+root/.ssh/authorized_keys
+.ash_history
+root/.ash_history
+# "?": only when no file that stays names it (a stock start script that calls custom_init.sh keeps it;
+# nothing on the truck links libz once dropbear and sftp-server are gone).
+?lib/libz.so*
+?script/custom_init.sh
+
 # Web UI pages. usr/sbin/boa, etc/boa/boa.conf and etc/mime.types stay: start_main_service.sh
 # brings the Wi-Fi AP up from inside its `test -e /usr/sbin/boa` block.
 etc/boa/www/*

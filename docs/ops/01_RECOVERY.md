@@ -227,6 +227,10 @@ start the dispatcher runs `ccpa/installer/ocbm_restore.sh`:
 4. **Report**: `OCBM_RESULT.txt` says BACK TO STOCK, `OCBM_RESTORE` becomes `OCBM_RESTORE.done`, the
    stick is unmounted, and the adapter restarts on stock.
 
+The checks catch a damaged backup or one that is plainly another unit's. They don't prove who made
+it: mtd0 and mtd1 are likely the same on every unit of this firmware. That is deliberate (Scott,
+3 Nov): what goes on the adapter from a stick is the owner's choice, as with an update package
+(MIGRATING.md, "Your hardware, your choice of software").
 A refusal or a stop renames the file `OCBM_RESTORE.refused` and says why, so a stick left in does not
 retry at every start; rename it back to try again. A power cut before apply's switch leaves
 `OCBM_RESTORE` in place, and the next start resumes (apply is idempotent). After the switch the

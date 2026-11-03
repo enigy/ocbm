@@ -225,8 +225,13 @@ echo 40 > '$d/run/ocbmd_heard'; exit 1"
   check 'mode_is "$d" trial && stock_left "$d"' "in the trial it does nothing"
   d="$T/$sh-fin-back"; fin_box "$d" confirmed; echo 1 > "$d/run/host_present"; run_finish "$d" --after-session
   check 'mode_is "$d" confirmed && stock_left "$d" && grep -q "an app is back" "$d/fin.out"' "an app back within the grace: not yet"
-  d="$T/$sh-fin"; fin_box "$d" confirmed; echo 0 > "$d/run/host_present"; run_finish "$d" --after-session; rc=$?
-  R="$d/root"
+  d="$T/$sh-fin"; fin_box "$d" confirmed; echo 0 > "$d/run/host_present"
+  # The truck's hand-install leftovers (3 Nov): dropbear links libz, and nothing else does.
+  R="$d/root"; mkdir -p "$R/usr/libexec" "$R/root/.ssh"
+  printf 'dropbear: libz.so.1 libc.so.6\n' > "$R/usr/sbin/dropbear"; printf 'sftp\n' > "$R/usr/libexec/sftp-server"
+  printf 'key\n' > "$R/root/.ssh/authorized_keys"; printf 'ls\n' > "$R/.ash_history"; printf '#!/bin/sh\n' > "$R/script/custom_init.sh"
+  printf 'z' > "$R/lib/libz.so.1.2.11"; ln -s libz.so.1.2.11 "$R/lib/libz.so.1"
+  run_finish "$d" --after-session; rc=$?
   check '[ $rc = 0 ] && mode_is "$d" final && [ ! -e "$R/etc/ocbm/finish_pending" ]' "after the grace: mode final"
   check '[ ! -e "$R/usr/sbin/AppleCarPlay" ] && [ ! -e "$R/usr/sbin/mdnsd" ] && [ ! -e "$R/usr/sbin/boa" ] && [ ! -e "$R/script/update_box.sh" ] && [ ! -e "$R/etc/boa" ] && [ ! -e "$R/etc/BoxHelper.apk" ] && [ ! -e "$R/script/start_main_service.stock.sh" ]' \
     "the Carlinkit programs, scripts, updater, web pages and the stock start script are gone"
@@ -234,6 +239,8 @@ echo 40 > '$d/run/ocbmd_heard'; exit 1"
     "the radio stack, i2c tools, riddle.conf, OCBM and the start script stay"
   check '[ -e "$R/usr/lib/libssl.so.1.1" ] && [ ! -e "$R/usr/lib/libdmsdp.so" ] && [ ! -e "$R/lib/crt1.o" ]' \
     "libraries: a still-named one stays (libssl for hostapd), unnamed ones go"
+  check 'n=0; for f in usr/sbin/dropbear usr/libexec/sftp-server root/.ssh/authorized_keys .ash_history script/custom_init.sh lib/libz.so.1.2.11 lib/libz.so.1; do { [ -e "$R/$f" ] || [ -L "$R/$f" ]; } && n=$((n+1)); done; [ $n = 0 ] && grep -qx /usr/sbin/dropbear "$R/etc/ocbm/finished.txt"' \
+    "a hand conversion's leftovers go too, libz once dropbear no longer names it (the truck, 3 Nov)"
   check 'grep -q "^# OTA-removed #" "$R/etc/mdev/udisk_insert.sh" && grep -q "mount /dev" "$R/etc/mdev/udisk_insert.sh"' \
     "the stick handler still mounts, without its call into the deleted updater"
   check 'grep -qx /usr/sbin/AppleCarPlay "$R/etc/ocbm/finished.txt" && grep -qx /usr/lib/libdmsdp.so "$R/etc/ocbm/finished.txt"' "finished.txt records what went"

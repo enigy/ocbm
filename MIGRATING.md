@@ -157,6 +157,14 @@ without room for the update, the report says so: remove stock CarPlay in Carlink
 stock and install the full image. While the install waits for its finish (confirmed), the package is
 left untouched until a later start.
 
+**Your hardware, your choice of software.** The stick routes take any package or backup that is well
+formed: the `.sha256` only catches a damaged copy, and nothing checks who built it. That is
+deliberate (Scott, 3 Nov). It is how a factory Carlinkit adapter treats a stick, and an owner keeps
+the right to put whatever they choose on their own adapter, OCBM's image updates included. **No
+update is guaranteed to succeed, least of all one the OCBM project did not build.** The update trial
+falls back to the version it replaced when the new one fails its self-test, but it cannot catch
+everything a package might do.
+
 Where it stands on 1 November 2026: Carlink's Play releases don't yet send the install confirm, its
 adapter-update screen isn't released, and no installer image is published with a release. A migrated
 adapter is ready for all three.

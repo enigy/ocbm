@@ -245,6 +245,26 @@ for sh in ${SHELLS:-sh dash}; do
   check '[ $rc = 0 ] && installed "$r"' "stock_restore.sh keeps radio_*.sh: the install goes ahead and replaces them"
   check 'grep -q "would overwrite" "$T/$sh-stray/once.out"' "any other OCBM file already there, with no /etc/ocbm, is still refused"
 
+  echo "== $sh: a unit converted by hand before: its leftovers go (the truck adapter, 3 Nov)"
+  leftovers() {  # $1 root: what the truck's factory dump holds and the dev adapter's has not
+    mkdir -p "$1/usr/libexec" "$1/root/.ssh" "$1/lib"
+    { head -c 2000 /dev/urandom; printf 'libz.so.1\n'; } > "$1/usr/sbin/dropbear"   # dropbear itself links libz
+    blob "$1/usr/libexec/sftp-server" 2000; echo "ssh-ed25519 AAAA key" > "$1/root/.ssh/authorized_keys"
+    echo ls > "$1/.ash_history"; echo ls > "$1/root/.ash_history"
+    blob "$1/lib/libz.so.1.2.11" 3000; ln -s libz.so.1.2.11 "$1/lib/libz.so.1"; ln -s libz.so.1 "$1/lib/libz.so"
+    printf '#!/bin/sh\necho ncm\n' > "$1/script/custom_init.sh"
+  }
+  r="$T/$sh-hand"; make_box "$r"; leftovers "$r/root"; run_once "$sh" "$r"; rc=$?
+  check '[ $rc = 0 ] && installed "$r" && n=0 && for f in usr/sbin/dropbear usr/libexec/sftp-server root/.ssh/authorized_keys .ash_history root/.ash_history lib/libz.so.1.2.11 lib/libz.so.1 lib/libz.so script/custom_init.sh; do [ -e "$r/root/$f" ] || [ -L "$r/root/$f" ] && n=$((n+1)); done; [ $n = 0 ]' \
+    "dropbear, sftp-server, authorized_keys, the shell histories, libz and custom_init.sh go"
+  check 'grep -qx /usr/sbin/dropbear "$r/root/etc/ocbm/pruned.txt" && grep -qx /lib/libz.so.1.2.11 "$r/root/etc/ocbm/pruned.txt"' "and pruned.txt records them, as the rest of the prune"
+  r="$T/$sh-hand2"; make_box "$r"; leftovers "$r/root"
+  printf 'libz.so.1\n' >> "$r/root/usr/sbin/i2cset"                                  # a kept program links libz
+  printf '#!/bin/sh\n[ -x /script/custom_init.sh ] && /script/custom_init.sh\necho stock\n' > "$r/root/script/start_main_service.sh"
+  run_once "$sh" "$r"; rc=$?
+  check '[ $rc = 0 ] && [ -e "$r/root/lib/libz.so.1.2.11" ] && [ -L "$r/root/lib/libz.so" ] && [ -e "$r/root/script/custom_init.sh" ] && [ ! -e "$r/root/usr/sbin/dropbear" ]' \
+    "but libz stays while a kept program names it, and custom_init.sh while the stock start script calls it"
+
   echo "== $sh: not enough room after the prune"
   r="$T/$sh-tight"; make_box "$r"; run_once "$sh" "$r" FAKE_FREE_AFTER_KB=10; rc=$?
   check '[ $rc = 1 ] && grep -q "^OCBM install: STOPPED" "$r/stick/OCBM_RESULT.txt" && stock_boot "$r" && [ ! -e "$r/root/script/ocbm_mode" ] && [ -e "$r/stick/A15W_Update.img.stopped" ]' \

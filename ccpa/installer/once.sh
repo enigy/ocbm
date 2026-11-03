@@ -129,15 +129,33 @@ is_radio() {
   return 1
 }
 
-prune_targets() {  # existing paths matched by prune.list, radio files excluded. stdout is the list:
+prune_matches() {  # $1 plain|guarded: existing paths matched by prune.list's lines of that kind, radio files excluded
   while read -r line; do   # notes go to the log only
-    case "$line" in ''|'#'*|/*|*..*) continue ;; esac
+    case "$line" in ''|'#'*) continue ;; '?'*) [ "$1" = guarded ] || continue; line=${line#?} ;; *) [ "$1" = plain ] || continue ;; esac
+    case "$line" in /*|*..*) continue ;; esac
     for p in $ROOT/$line; do
       [ -e "$p" ] || [ -L "$p" ] || continue
       if is_radio "/${p#$ROOT/}"; then echo "[ocbm] keep (radio guard) /${p#$ROOT/}" >> "$LOG"; continue; fi
       echo "$p"
     done
   done < "$PAYLOAD/prune.list"
+}
+
+prune_targets() {  # what the prune removes. stdout is the list: every plain match, then each guarded
+  # one ("?" in prune.list) that no file staying behind names. A library is named by its stem
+  # (libz.so for libz.so.1.2.11), anything else by its own name.
+  plain=$(prune_matches plain); guarded=$(prune_matches guarded)
+  [ -n "$plain" ] && echo "$plain"
+  [ -n "$guarded" ] || return 0
+  x="$STATE.prune_x"; printf '%s\n' $plain $guarded > "$x"
+  for p in $guarded; do
+    b=${p##*/}
+    case "$b" in lib*.so*) b="${b%%.so*}.so" ;; esac
+    by=$(grep -rlsF -- "$b" "$ROOT/bin" "$ROOT/sbin" "$ROOT/usr" "$ROOT/lib" "$ROOT/script" "$ROOT/etc" 2>/dev/null \
+      | grep -vxF -f "$x" | head -1)
+    if [ -n "$by" ]; then echo "[ocbm] keep /${p#$ROOT/}: /${by#$ROOT/} names it" >> "$LOG"; else echo "$p"; fi
+  done
+  rm -f "$x"
 }
 under_root() { case "$1" in "$ROOT"/?*) return 0 ;; esac; return 1; }
 payload_files() {  # what the place step writes: the manifest's usr/sbin, usr/bin and script files
