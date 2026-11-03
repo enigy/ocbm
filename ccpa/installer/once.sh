@@ -66,6 +66,11 @@ step() {
   [ "${STOP_AT:-}" = "$1" ] && { say "simulated power loss before $1"; exit 99; }
   say "== $1 (+$(( $(up) - T0 )) s)"
 }
+# A run that ends "not now" (exit 1: refused, stopped, waiting, already installed) leaves nothing for
+# update_box.sh to use, yet its error path kept the unpacked image in RAM: 4.3 MB of tmpfs for the
+# rest of the drive (dev adapter, 3 Nov). Success empties it itself (hand_off), and a power cut (99)
+# leaves it for a rerun.
+trap 'rc=$?; [ "$rc" = 1 ] && case "$UPDATE" in ""|/) ;; *) rm -rf "$UPDATE" ;; esac' EXIT
 
 product=$(cat "$ROOT/etc/box_product_type" 2>/dev/null)
 IMG="$STICK/${product:-$WANT_PRODUCT}_Update.img"
