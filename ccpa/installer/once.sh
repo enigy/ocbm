@@ -117,7 +117,7 @@ abort() {  # past the prune: stock still boots, the extras are gone
 # OCBM's image on an adapter that already runs OCBM, trial or final: an update, not a refusal (Scott,
 # 3 Nov: one image on a stick takes stock to OCBM and any OCBM to this one, with no way back to stock
 # first). The payload's programs and scripts, with their sums, become a package that updates from any
-# version (FROM_MIN 0.0.0), and the adapter's own ocbm_update.sh installs it: its checks (newer, room,
+# version (FROM_MIN 0.0.0), and the image's own ocbm_update.sh installs it: its checks (newer, room,
 # product, chip, factory mode, mode) and its trial, which keeps the new version once it passes its
 # self-test and puts the old one back otherwise. Only the files that differ are written. From a stick,
 # the dispatcher reports the trial's outcome above this run's report (stick_update in /etc/ocbm).
@@ -141,7 +141,7 @@ image_update() {
   echo "$VER" > "$pk/VERSION"; echo 0.0.0 > "$pk/FROM_MIN"
   (cd "$pk" && tar -cf - VERSION FROM_MIN SHA256SUMS files) | gzip -c > "$pk.tgz" && rm -rf "$pk" \
     || refuse "Could not make the update package in RAM."
-  say "OCBM ${have:-?} runs here: updating it to $VER with the adapter's ocbm_update.sh"
+  say "OCBM ${have:-?} runs here: updating it to $VER with this image's ocbm_update.sh"
   [ "$ROUTE" = stick ] && { echo "${IMG##*/}" > "$EO/stick_update"; sync; }
   result "UPDATING" "OCBM ${have:-?} runs on this adapter: this image updates it to $VER." "" \
     "The adapter restarts and tries the new version; the outcome is added above this when the trial ends." \
