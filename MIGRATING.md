@@ -163,7 +163,15 @@ adapter is ready for all three.
 
 ## Back to stock later
 
-Copy the stick's `OCBM_BACKUP/<id>` folder to the host, keep it private, and restore from it:
+**From the stick, with no computer.** On the stick the first install was made from (the one with
+`OCBM_BACKUP/<id>`), add an empty file named `OCBM_RESTORE`. Plug the stick into the adapter and start
+it (unplug and replug, or turn the car off and on). In trial, OCBM goes back to the stock firmware it
+kept. In final, it rebuilds stock from that backup on the adapter itself, checking first that the
+backup is this adapter's. It takes a few minutes, then restarts on stock, and `OCBM_RESULT.txt` on the
+stick says BACK TO STOCK or why not. The details are in `docs/ops/01_RECOVERY.md`.
+
+**From a computer.** Copy the stick's `OCBM_BACKUP/<id>` folder to the host, keep it private, and
+restore from it:
 
 ```
 /opt/homebrew/bin/bash tools/stock_restore.sh --profile onefile --backup /path/to/OCBM_BACKUP-id \

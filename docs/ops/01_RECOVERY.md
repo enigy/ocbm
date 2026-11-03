@@ -210,8 +210,33 @@ either: the finish deletes the stock updater that would run it (`update_box.sh` 
 (This read "its own decrypter `ARMimg_maker` among them" until 31 Oct: `ARMimg_maker` is in
 `ncm_base_install.sh`'s `SBIN_B`, which only the deep NCM strip removes, and the finish uses
 `SBIN_A`; a tester's `final` adapter still had it, and the stick updater worked after the restore.)
-The way back without an SPI programmer is `tools/stock_restore.sh --profile onefile`, over the OCBM
-console, from one of the unit's own backups:
+**From the stick alone (no computer, no internet; Scott, 3 Nov).** Put an empty file named
+`OCBM_RESTORE` on the stick the adapter's first install was made from, next to its `OCBM_BACKUP`
+folder, and start the adapter with it in (unplug and replug it, or turn the car off and on). At that
+start the dispatcher runs `ccpa/installer/ocbm_restore.sh`:
+
+1. **Checks**, changing nothing on a refusal: `OCBM_BACKUP/<id>` for this adapter (named as `once.sh`
+   names it), its `SHA256SUMS` verifying, mtd0 and mtd1 byte for byte the backup's (another adapter's
+   backup is never applied), the install final with no finish pending, 30 MB of RAM in `/tmp`.
+2. **Decode** `mtd2.bin` into `/tmp` with `ocbmd jffs2-extract`, the Rust port of
+   `tools/jffs2_extract.py` (type-22 swapped zlib, rtime, CRCs, versions), owners as on the flash.
+   It must be a factory rootfs: no OCBM, a stock start script, and this adapter's `software_version`.
+   A backup taken by a later install holds OCBM and is refused: use the computer route below.
+3. **Restore** with `stock_restore_box.sh` (shipped as `/script/stock_restore_box.sh`), `PROFILE=onefile`:
+   plan, apply, verify, as the computer route runs it. mtd0 and mtd1 are only read.
+4. **Report**: `OCBM_RESULT.txt` says BACK TO STOCK, `OCBM_RESTORE` becomes `OCBM_RESTORE.done`, the
+   stick is unmounted, and the adapter restarts on stock.
+
+A refusal or a stop renames the file `OCBM_RESTORE.refused` and says why, so a stick left in does not
+retry at every start; rename it back to try again. A power cut before apply's switch leaves
+`OCBM_RESTORE` in place, and the next start resumes (apply is idempotent). After the switch the
+adapter starts stock, and OCBM's own files may be left behind, unused. A stick plugged in during a
+drive gets `OCBM_RESTORE.txt`, saying the restore runs at the next start.
+`tools/stock_restore_test.sh` covers the route with the real `ocbmd` decoder when
+`tools/run_tests.sh` builds it, and with `jffs2_extract.py` otherwise.
+
+The way back without an SPI programmer, from a computer, is `tools/stock_restore.sh --profile onefile`,
+over the OCBM console, from one of the unit's own backups:
 
     tools/stock_restore.sh --profile onefile --backup OCBM_BACKUP/<serial> --dump dryrun   # flash untouched
     tools/stock_restore.sh --profile onefile --backup OCBM_BACKUP/<serial> --dump all

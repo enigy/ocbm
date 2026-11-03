@@ -223,14 +223,23 @@ answer_watch() {
   done
 }
 
-final_note() {  # OCBM_RESTORE.txt on the stick: why OCBM_RESTORE does nothing on a final adapter
-  { echo "OCBM_RESTORE was not used: OCBM on this adapter is final."
-    echo
-    echo "Stock CarPlay was removed, and the Carlinkit files with it, so there is no stock start to go"
-    echo "back to. The way back to stock is the flash backup the first install wrote to its stick"
-    echo "(OCBM_BACKUP/<adapter>), put back with tools/stock_restore.sh: see docs/ops/01_RECOVERY.md."
-  } > "$STICK/OCBM_RESTORE.txt" && sync
-  log "OCBM_RESTORE on the stick, but the mode is final: left OCBM_RESTORE.txt saying why"
+final_note() {  # OCBM_RESTORE.txt on the stick: what OCBM_RESTORE does on a final adapter, put in after its start
+  if [ -x "$S/ocbm_restore.sh" ]; then
+    { echo "OCBM_RESTORE was not used yet: on this adapter it is used when the adapter starts."
+      echo
+      echo "Stock CarPlay was removed, so the way back to stock is the flash backup the first install wrote"
+      echo "to its stick (OCBM_BACKUP/<adapter>). With that stick in, unplug the adapter and plug it back in"
+      echo "(or turn the car off and on): OCBM restores stock from the backup, then restarts on stock."
+    } > "$STICK/OCBM_RESTORE.txt" && sync
+  else
+    { echo "OCBM_RESTORE was not used: OCBM on this adapter is final."
+      echo
+      echo "Stock CarPlay was removed, and the Carlinkit files with it, so there is no stock start to go"
+      echo "back to. The way back to stock is the flash backup the first install wrote to its stick"
+      echo "(OCBM_BACKUP/<adapter>), put back with tools/stock_restore.sh: see docs/ops/01_RECOVERY.md."
+    } > "$STICK/OCBM_RESTORE.txt" && sync
+  fi
+  log "OCBM_RESTORE on the stick after the start, and the mode is final: left OCBM_RESTORE.txt saying what to do"
 }
 
 # OCBM_RESTORE on a stick: back to stock. The mode is read on every look, and once it is final the file
@@ -279,7 +288,10 @@ stick_update() {
   i=0
   while ! stick_in && [ "$i" -lt "$STICK_PKG_WAIT" ]; do sleep "$POLL"; i=$((i + POLL)); done
   stick_in || return 0
-  [ -e "$STICK/OCBM_RESTORE" ] && return 0   # the way back goes first
+  if [ -e "$STICK/OCBM_RESTORE" ]; then   # the way back goes first: in final from the stick's own backup,
+    [ "$mode" = final ] && [ -x "$S/ocbm_restore.sh" ] && "$S/ocbm_restore.sh" </dev/null >> "$RUN/box.log" 2>&1
+    return 0                              # in a trial by restore_watch's revert
+  fi
   set -- "$STICK"/ocbm-update-*.tgz
   [ -f "$1" ] || return 0
   if [ $# -gt 1 ]; then
@@ -349,11 +361,13 @@ fi
 [ -x "$S/init_gpio.sh" ] && "$S/init_gpio.sh" >/dev/null 2>&1 &   # stock: Bluetooth reset line, quick-charge pins
 respawn "$S/run_ocbmd.sh" </dev/null >/dev/null 2>&1 &
 respawn "$S/run_supervisor.sh" </dev/null >/dev/null 2>&1 &
-# A stick report a restart interrupted, then an update package on a stick in at this start.
+# A stick report a restart interrupted; then what a stick in at this start asks for (an update, or in
+# final the way back to stock); then, in final, a note on a stick that asks for stock later.
+stick_job=0
 if [ -f "$EO/stick_result.txt" ]; then   # one report at a time: a new package waits for the next start
   [ -n "${delivering:-}" ] || deliver "$EO/stick_result.txt" </dev/null >/dev/null 2>&1 &
 elif [ "$update_trial" = 0 ] && [ "$mode" != confirmed ] && [ ! -f "$U" ]; then
-  stick_update </dev/null >/dev/null 2>&1 &
+  stick_job=1
 fi
 if [ "$mode" = final ]; then
   [ -e "$EO/finish_pending" ] && [ -x "$S/ocbm_finish.sh" ] && "$S/ocbm_finish.sh" </dev/null >> "$RUN/box.log" 2>&1 &
@@ -361,10 +375,11 @@ if [ "$mode" = final ]; then
     selftest </dev/null >/dev/null 2>&1 &
     answer_watch </dev/null >/dev/null 2>&1 &
   else
-    restore_watch </dev/null >/dev/null 2>&1 &   # final: only the note on a stick that asks for stock
+    { [ "$stick_job" = 1 ] && stick_update; restore_watch; } </dev/null >/dev/null 2>&1 &
   fi
   exit 0
 fi
+[ "$stick_job" = 1 ] && { stick_update </dev/null >/dev/null 2>&1 & }
 selftest </dev/null >/dev/null 2>&1 &
 answer_watch </dev/null >/dev/null 2>&1 &
 restore_watch </dev/null >/dev/null 2>&1 &

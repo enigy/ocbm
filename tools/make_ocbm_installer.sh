@@ -29,7 +29,8 @@ payload() {  # SOURCE|PATH-ON-BOX: ocbm_install.sh manifest() --full, then Stage
   echo "$REPO/tools/run_ocbmd.sh|script/run_ocbmd.sh"
   for s in radio_detect radio_hal radio_ap_up; do echo "$REPO/ccpa/rootfs/script/$s.sh|script/$s.sh"; done
   for s in session_supervisor projection_up phone_reset run_supervisor; do echo "$REPO/tools/$s.sh|script/$s.sh"; done
-  for s in ocbm_dispatch ocbm_selftest ocbm_revert ocbm_finish ocbm_update; do echo "$INSTALLER_DIR/$s.sh|script/$s.sh"; done
+  for s in ocbm_dispatch ocbm_selftest ocbm_revert ocbm_finish ocbm_update ocbm_restore; do echo "$INSTALLER_DIR/$s.sh|script/$s.sh"; done
+  echo "$REPO/tools/stock_restore_box.sh|script/stock_restore_box.sh"   # ocbm_restore.sh's engine: back to stock from a stick
 }
 
 if [ "${1:-}" = --list ]; then payload | cut -d'|' -f2; exit 0; fi

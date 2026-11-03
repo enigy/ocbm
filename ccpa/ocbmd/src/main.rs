@@ -14,6 +14,8 @@ use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+mod jffs2;
+
 const ACC_DEV: &str = "/dev/usb_accessory";
 
 /// carplayd's local HID-input ingest (task #20). ocbmd relays each CH_INPUT sub-frame here, length-
@@ -4929,6 +4931,10 @@ fn set_nonblocking(f: &File) {
 }
 
 fn main() {
+    // `ocbmd jffs2-extract MTD2 OUT`: a tool run, not the daemon (ocbm_restore.sh's decoder; see jffs2.rs).
+    if let Some(code) = jffs2::cli(&std::env::args().collect::<Vec<_>>()) {
+        std::process::exit(code);
+    }
     // Singleton guard BEFORE anything with a side effect — see [`PID_LOCK_FILE`]. The fd is held
     // (never closed) for the process lifetime; the kernel releases the lock when we exit.
     let _pid_lock = match acquire_pid_lock(PID_LOCK_FILE) {

@@ -99,6 +99,40 @@ OCBM_PATHS="$(bash "$HERE/make_ocbm_installer.sh" --list)"
 # Carlinkit daemon names this host runs itself (macOS has its own usbmuxd): ocbm_finish.sh skips them.
 HOST_DAEMONS="$(for n in usbmuxd mdnsd boa; do pgrep -x "$n" >/dev/null 2>&1 && printf '%s ' "$n"; done)"
 
+# ---- back to stock from the stick on the adapter itself (ccpa/installer/ocbm_restore.sh; Scott, 3 Nov) --
+RESTORE="$REPO/ccpa/installer/ocbm_restore.sh"
+# `ocbmd jffs2-extract` as ocbm_restore.sh runs it: the real one when tools/run_tests.sh built it
+# (OCBMD_BIN), else tools/jffs2_extract.py with each link's owner taken from its report.
+if [ -n "${OCBMD_BIN:-}" ] && [ -x "$OCBMD_BIN" ]; then
+  DECODER="$OCBMD_BIN"
+else
+  DECODER="$T/ocbmd-standin"
+  cat > "$DECODER" <<EOF
+#!/bin/sh
+[ "\$1" = jffs2-extract ] || exit 2
+python3 -I "$HERE/jffs2_extract.py" "\$2" "\$3" || exit \$?
+awk -F '\t' '\$1 == "OK" && \$2 == "l" { split(\$8, a, " -> "); p = a[1]; sub(/^\//, "", p); print \$4 "\t" \$5 "\t" p }' \
+  "\$3/report.tsv" | sort > "\$3/links.tsv"
+EOF
+  chmod 755 "$DECODER"
+fi
+stick_box() {  # $1 dir, $2 mtd2 image: the final adapter $T/fin, its flash, and its first install's stick
+  rm -rf "$1"; mkdir -p "$1/dev" "$1/run" "$1/sys"
+  cp -pR "$T/fin" "$1/root"; printf 'ABCDEF0123456789' > "$1/root/etc/device_serial"
+  echo 2025.10.15.1127 > "$1/root/etc/software_version"
+  blob "$1/dev/mtd0" 4096; blob "$1/dev/mtd1" 8192
+  b="$1/stick/OCBM_BACKUP/ABCDEF0123456789"; mkdir -p "$b"
+  cp "$1/dev/mtd0" "$b/mtd0.bin"; cp "$1/dev/mtd1" "$b/mtd1.bin"; cp "$2" "$b/mtd2.bin"
+  ( cd "$b" && sha256sum mtd0.bin mtd1.bin mtd2.bin > SHA256SUMS )
+  touch "$1/stick/OCBM_RESTORE"
+}
+run_restore() {  # $1 dir, rest: env
+  d_="$1"; shift
+  env ROOT="$d_/root" RUN="$d_/run" STICK="$d_/stick" DEVDIR="$d_/dev" SYS="$d_/sys" REBOOT="touch $d_/rebooted" \
+    UMOUNT=true OCBMD="$DECODER" ENGINE="$PAYLOAD" TMP_MIN_KB=0 "$@" "$SH1" "$RESTORE" > "$d_/out" 2>&1
+}
+restore_says() { grep -q "^OCBM restore: $2" "$1/stick/OCBM_RESULT.txt" 2>/dev/null; }
+
 make_trial() {  # $1 dir: an adapter in its one-file trial — stock kept, OCBM placed, the dispatcher armed
   r="$1"
   mkdir -p "$r/bin" "$r/usr/sbin" "$r/usr/bin" "$r/usr/lib" "$r/lib/firmware/nxp" "$r/script" "$r/etc/mdev" \
@@ -286,6 +320,37 @@ onefile_tests() {  # $1 shell
   "$SH1" "$TREE" --dump "$T/bad.bin" "$T/badtree" > "$T/out" 2>&1; rc=$?
   check '[ $rc -ne 0 ] && grep -q "did not decode cleanly" "$T/out"' "dump: refuses one that does not decode"
   rm -rf "$T/bad" "$T/badtree" "$T/bad.bin"
+
+  echo "=== back to stock from the stick, on the adapter (ocbm_restore.sh) under $SH1"
+  # The stock tree as the factory image has it, firmware version included.
+  rm -rf "$T/rsstock"; cp -pR "$T/stock" "$T/rsstock"; echo 2025.10.15.1127 > "$T/rsstock/etc/software_version"
+  python3 -I "$HERE/jffs2_extract_test.py" --make-image "$T/rsstock" "$T/rsstock.bin"
+  r="$T/rs"; stick_box "$r" "$T/rsstock.bin"; m="$(cksum "$r/dev/mtd0" "$r/dev/mtd1")"
+  run_restore "$r"; rc=$?
+  check '[ $rc -eq 0 ] && restore_says "$r" "BACK TO STOCK" && [ -e "$r/rebooted" ] && [ -e "$r/stick/OCBM_RESTORE.done" ]' \
+    "a final adapter goes back to stock from its stick's backup, reports it and restarts"
+  check '! is_dispatcher "$r/root" && cmp -s "$r/root/usr/sbin/ARMHiCar" "$T/stock/usr/sbin/ARMHiCar" && [ ! -e "$r/root/usr/sbin/ocbmd" ] && [ ! -e "$r/root/etc/ocbm" ]' \
+    "the rootfs is the factory's, extras included, OCBM gone"
+  check '[ "$(cksum "$r/dev/mtd0" "$r/dev/mtd1")" = "$m" ] && [ ! -d "$r/run/ocbm-restore" ]' "mtd0 and mtd1 are only read; the decoded backup is gone from RAM"
+  for case_ in sums identity trial notfinal; do
+    r="$T/rs-$case_"; stick_box "$r" "$T/rsstock.bin"; b="$r/stick/OCBM_BACKUP/ABCDEF0123456789"
+    case "$case_" in
+      sums) echo x >> "$b/mtd2.bin"; want="does not match its SHA256SUMS" ;;
+      identity) blob "$b/mtd1.bin" 8192; ( cd "$b" && sha256sum mtd0.bin mtd1.bin mtd2.bin > SHA256SUMS ); want="mtd1 differs" ;;
+      trial) cp "$T/trial.bin" "$b/mtd2.bin"; ( cd "$b" && sha256sum mtd0.bin mtd1.bin mtd2.bin > SHA256SUMS ); want="holds OCBM" ;;
+      notfinal) echo trial > "$r/root/script/ocbm_mode"; want="not final" ;;
+    esac
+    before=$(tree_sum "$r/root")
+    run_restore "$r"; rc=$?
+    check '[ $rc -eq 1 ] && restore_says "$r" REFUSED && grep -q "$want" "$r/stick/OCBM_RESULT.txt" && [ "$(tree_sum "$r/root")" = "$before" ] && [ -e "$r/stick/OCBM_RESTORE.refused" ] && [ ! -e "$r/rebooted" ]' \
+      "refuses ($case_), changing nothing"
+  done
+  r="$T/rs-cut"; stick_box "$r" "$T/rsstock.bin"
+  run_restore "$r" STOP_AT=switch; rc=$?
+  check '[ $rc -eq 99 ] && is_dispatcher "$r/root" && [ -e "$r/stick/OCBM_RESTORE" ]' "a power cut before the switch: OCBM still starts, OCBM_RESTORE still on the stick"
+  run_restore "$r"; rc=$?
+  check '[ $rc -eq 0 ] && restore_says "$r" "BACK TO STOCK" && ! is_dispatcher "$r/root"' "and the next start finishes the restore"
+  rm -rf "$T"/rs "$T"/rs-* "$T/rsstock" "$T/rsstock.bin"
 
   rm -rf "$T/box"; cp -pR "$T/fin" "$T/box"
   blob "$T/box/lib/firmware/nxp/added_after.bin" 300    # a radio file of the unit's, added after the archive

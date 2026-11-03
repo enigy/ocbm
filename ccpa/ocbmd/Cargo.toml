@@ -12,3 +12,6 @@ path = "src/main.rs"
 ocbm-proto = { path = "../../crates/ocbm-proto" }
 box-common = { path = "../../crates/box-common" }
 libc = "0.2"
+# inflate for `ocbmd jffs2-extract` (src/jffs2.rs): the on-adapter restore decodes the stick's flash dump
+# with no computer (Scott, 3 Nov). Pure Rust, no unsafe, no C.
+miniz_oxide = "0.8"

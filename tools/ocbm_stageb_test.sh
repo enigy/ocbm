@@ -58,7 +58,7 @@ HOST_DAEMONS="$(for n in usbmuxd mdnsd boa; do pgrep -x "$n" >/dev/null 2>&1 && 
 # umount as the box has it, recording what it was asked to let go of (deliver() lets the stick go).
 printf '#!/bin/sh\necho "$*" >> "%s/umount.calls"\n' "$T" > "$T/umount"; chmod 755 "$T/umount"
 boot() {  # $1 shell, $2 dir: one start of the adapter
-  env UMOUNT="$T/umount" ROOT="$2/root" RUN="$2/run" STICK="$2/stick" PROC="$2/proc" POLL=1 STICK_WAIT=2 ANSWER_SECS=3 FINISH_IGNORE="$HOST_DAEMONS" \
+  env UMOUNT="$T/umount" ROOT="$2/root" RUN="$2/run" STICK="$2/stick" PROC="$2/proc" POLL=1 STICK_WAIT=2 STICK_PKG_WAIT=2 ANSWER_SECS=3 FINISH_IGNORE="$HOST_DAEMONS" \
       REBOOT="touch $2/rebooted" "$1" "$2/root/script/start_main_service.sh" > "$2/boot.out" 2>&1
 }
 restart() { reap; rm -rf "${1:?}/run"; mkdir -p "$1/run"; rm -f "$1"/m.* "$1/rebooted"; }  # power cycle: /tmp is gone
@@ -178,6 +178,11 @@ echo 40 > '$d/run/ocbmd_heard'; exit 1"
     "no counter, no self-test, OCBM_RESTORE left as it is"
   check 'grep -q "OCBM on this adapter is final" "$d/stick/OCBM_RESTORE.txt" && grep -q "tools/stock_restore.sh" "$d/stick/OCBM_RESTORE.txt"' \
     "and OCBM_RESTORE.txt beside it says why, and where the way back is now"
+  # Scott, 3 Nov: a final adapter goes back to stock from the stick itself (ocbm_restore.sh) at its start.
+  d="$T/$sh-final-rs"; make_box "$d" final
+  stand_in "$d/root/script/ocbm_restore.sh" "$d/m.restore" "mv -f '$d/stick/OCBM_RESTORE' '$d/stick/OCBM_RESTORE.done'"   # as the real one does
+  touch "$d/stick/OCBM_RESTORE"; boot "$sh" "$d"
+  check 'waitfor "[ -e $d/m.restore ]" 5 && [ ! -e "$d/stick/OCBM_RESTORE.txt" ]' "a final start with OCBM_RESTORE on the stick runs ocbm_restore.sh"
   # The dev adapter, 3 Nov: the watcher of the boot the finish ran in outlived the finish.
   d="$T/$sh-final-late"; make_box "$d" trial; boot "$sh" "$d"
   check 'waitfor "grep -q PASSED $d/root/etc/ocbm/first_start.txt 2>/dev/null" 5' "a trial boot, its restore watcher running"

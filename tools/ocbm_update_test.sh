@@ -319,7 +319,7 @@ echo "== make_ocbm_update.sh"
 b="$T/build"; mkdir -p "$b/bin" "$b/inst" "$b/from" "$b/out"
 for f in ocbmd iap2d carplayd btd aa-bridge; do printf '%s v1\n' "$f" > "$b/bin/$f"; done
 printf 'irs\n' > "$b/irs"
-for f in ocbm_dispatch ocbm_selftest ocbm_revert ocbm_finish ocbm_update; do cp "$INST/$f.sh" "$b/inst/$f.sh"; done
+for f in ocbm_dispatch ocbm_selftest ocbm_revert ocbm_finish ocbm_update ocbm_restore; do cp "$INST/$f.sh" "$b/inst/$f.sh"; done
 echo 1.0.0 > "$b/inst/VERSION"
 printf 'final_kb=3900\ntrial_kb=1252\n' > "$b/inst/update_budget"
 export BIN_DIR="$b/bin" IRS_BIN="$b/irs" INSTALLER_DIR="$b/inst"
