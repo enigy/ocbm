@@ -79,7 +79,9 @@ tree_sum() { ( cd "$1" && find . -print | sort | while IFS= read -r p; do
   if [ -L "$p" ]; then echo "L $p $(readlink "$p")"; elif [ -f "$p" ]; then echo "F $p $(md5sum < "$p" | cut -c1-32)"; else echo "D $p"; fi
 done ) | md5sum | cut -c1-32; }
 
-grp() { stat -f %g "$1" 2>/dev/null || stat -c %g "$1"; }   # the group of $1 itself, a link not followed
+# The group of $1 itself, a link not followed. BSD stat on the Mac; GNU stat's -f means the file system
+# and does not fail, so a Linux host asks stat -c (cross builder's run-tests, 3 Nov).
+grp() { case "$(uname)" in Darwin) stat -f %g "$1" ;; *) stat -c %g "$1" ;; esac; }
 
 run_payload() {  # $1 shell, $2 mode, $3 root, rest: env
   sh_="$1" mode_="$2" root_="$3"; shift 3
@@ -264,7 +266,8 @@ onefile_tests() {  # $1 shell
   check 'cmp -s "$T/dtree/usr/sbin/ARMadb-driver" "$T/tree/usr/sbin/ARMadb-driver" && grep -q "^1000	0	usr/sbin/ARMadb-driver$" "$T/dtree.owners"' \
     "dump of a trial: the same files as the archive gives, owned as in the image (1000)"
   links_from_pack "$T/dtree"
-  check 'grep -q "^1000	0	usr/lib/libssl.so$" "$T/dtree.links" && ! grep -q "^$me	" "$T/dtree.links"' \
+  # A user who is uid 1000 (the cross builder's) owns as the image does, so only another one can show up.
+  check 'grep -q "^1000	0	usr/lib/libssl.so$" "$T/dtree.links" && { [ "$me" = 1000 ] || ! grep -q "^$me	" "$T/dtree.links"; }' \
     "dump of a trial: links gives the image's owner for each link (1000:0, as the dev adapter's 20), not this Mac's user"
   # A dump from before any install: the factory rootfs, extras included, taken as it is.
   rm -rf "$T/stock"; cp -pR "$T/dtree" "$T/stock"; blob "$T/stock/usr/sbin/ARMHiCar" 30000; chmod 755 "$T/stock/usr/sbin/ARMHiCar"

@@ -13,13 +13,14 @@ use std::os::unix::io::RawFd;
 
 pub const APPLE_VID: u16 = 0x05ac;
 
-// usbdevfs ioctls (asm-generic encoding, matches 32-bit ARM). musl's ioctl() takes the request as
-// `int`, so these are c_int (the 0xC010_5500-class values are just bit patterns).
-const USBDEVFS_CONTROL: libc::c_int = 0xC010_5500u32 as libc::c_int; // _IOWR('U',0,16)
-const USBDEVFS_BULK: libc::c_int = 0xC010_5502u32 as libc::c_int; // _IOWR('U',2,16)
-const USBDEVFS_CLAIMINTERFACE: libc::c_int = 0x8004_550Fu32 as libc::c_int; // _IOR('U',15,4)
-const USBDEVFS_RELEASEINTERFACE: libc::c_int = 0x8004_5510u32 as libc::c_int; // _IOR('U',16,4)
-const USBDEVFS_RESET: libc::c_int = 0x0000_5514u32 as libc::c_int; // _IO('U',20)
+// usbdevfs ioctls (asm-generic encoding, matches 32-bit ARM), as their u32 bit patterns. The request
+// goes to ioctl() as `libc::Ioctl`: musl's `int` on the box, glibc's `unsigned long` on a Linux host,
+// where the old c_int constants did not compile (cross builder's run-tests, 3 Nov).
+const USBDEVFS_CONTROL: u32 = 0xC010_5500; // _IOWR('U',0,16)
+const USBDEVFS_BULK: u32 = 0xC010_5502; // _IOWR('U',2,16)
+const USBDEVFS_CLAIMINTERFACE: u32 = 0x8004_550F; // _IOR('U',15,4)
+const USBDEVFS_RELEASEINTERFACE: u32 = 0x8004_5510; // _IOR('U',16,4)
+const USBDEVFS_RESET: u32 = 0x0000_5514; // _IO('U',20)
 
 #[repr(C)]
 struct CtrlTransfer {
@@ -63,7 +64,7 @@ pub fn control(
             data.as_mut_ptr() as *mut c_void
         },
     };
-    let r = unsafe { libc::ioctl(fd, USBDEVFS_CONTROL, &mut ct as *mut CtrlTransfer) };
+    let r = unsafe { libc::ioctl(fd, USBDEVFS_CONTROL as libc::Ioctl, &mut ct as *mut CtrlTransfer) };
     if r < 0 {
         return Err(format!("control(req=0x{b_request:02x}) errno={}", errno()));
     }
@@ -79,7 +80,7 @@ pub fn bulk(fd: RawFd, ep: u32, data: &mut [u8], timeout: u32) -> Result<usize, 
         timeout,
         data: data.as_mut_ptr() as *mut c_void,
     };
-    let r = unsafe { libc::ioctl(fd, USBDEVFS_BULK, &mut bt as *mut BulkTransfer) };
+    let r = unsafe { libc::ioctl(fd, USBDEVFS_BULK as libc::Ioctl, &mut bt as *mut BulkTransfer) };
     if r < 0 {
         return Err(errno());
     }
@@ -100,7 +101,7 @@ pub fn bulk_write_all(fd: RawFd, ep: u32, mut data: &[u8]) -> Result<(), i32> {
 }
 
 pub fn claim_interface(fd: RawFd, iface: u32) -> Result<(), String> {
-    let r = unsafe { libc::ioctl(fd, USBDEVFS_CLAIMINTERFACE, &iface as *const u32) };
+    let r = unsafe { libc::ioctl(fd, USBDEVFS_CLAIMINTERFACE as libc::Ioctl, &iface as *const u32) };
     if r < 0 {
         return Err(format!("claim interface {iface}: errno={}", errno()));
     }
@@ -109,14 +110,14 @@ pub fn claim_interface(fd: RawFd, iface: u32) -> Result<(), String> {
 
 pub fn release_interface(fd: RawFd, iface: u32) {
     unsafe {
-        libc::ioctl(fd, USBDEVFS_RELEASEINTERFACE, &iface as *const u32);
+        libc::ioctl(fd, USBDEVFS_RELEASEINTERFACE as libc::Ioctl, &iface as *const u32);
     }
 }
 
 /// Reset the device — also unblocks a thread parked in a no-timeout bulk-IN.
 pub fn reset(fd: RawFd) {
     unsafe {
-        libc::ioctl(fd, USBDEVFS_RESET);
+        libc::ioctl(fd, USBDEVFS_RESET as libc::Ioctl);
     }
 }
 
