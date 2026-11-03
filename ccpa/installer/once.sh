@@ -6,13 +6,15 @@
 # non-zero exit stops the stock updater with nothing copied. The payload is tmp/ocbm/ next to this.
 #
 #   1 checks     refuse, changing nothing: product, firmware, chip, factory mode, OCBM state,
-#                payload checksums, flash room, stick room, same-version guard (stick only)
+#                payload checksums, stick room, same-version guard (stick only), then flash room.
+#                For that last one an earlier try's OCBM files (after a revert, or a try stopped
+#                part way) are removed first, so the room is measured: nothing uses them while no
+#                mode is set, and a refusal then says so.
 #   2 backup     stick: mtd0-2 to OCBM_BACKUP/<id>/, each read back against its SHA-256 (a complete one
 #                from an earlier try is kept: it predates every change); both
 #                routes: /etc/ocbm/identity.tgz. A failed backup is a refusal.
 #   3 make room  delete prune.list (HiCar, Android Mirror, test leftovers, web UI pages); stock
 #                CarPlay and Android Auto keep working. Removed paths go to /etc/ocbm/pruned.txt.
-#                On a re-install after a revert or a stopped try, the earlier OCBM files go too.
 #   4 place      each payload file as .new, checked against SHA256SUMS, then renamed
 #   5 arm        keep start_main_service.stock.sh, write /script/ocbm_mode=trial, then the one
 #                boot-critical write: rename the dispatcher over start_main_service.sh. Power lost
@@ -32,7 +34,8 @@
 #
 # Test hooks (tools/ocbm_installer_test.sh): ROOT SYS PROC DEVDIR STICK UPDATE ROUTE PAYLOAD LOG
 # STATE RESULT FAKE_FREE_KB FAKE_FREE_AFTER_KB FAKE_STICK_FREE_KB, and STOP_AT=<step> to simulate
-# power loss (exit 99) right before that step.
+# power loss (exit 99) right before that step. FAKE_FREE_KB rises by what the checks remove of an
+# earlier try, as df does.
 ROOT="${ROOT:-}"
 SYS="${SYS:-/sys}"
 PROC="${PROC:-/proc}"
@@ -90,7 +93,7 @@ park() {  # $1 suffix
 }
 refuse() {
   say "REFUSED: $1"
-  result "REFUSED" "$1" "" "Nothing on the adapter was changed." \
+  result "REFUSED" "$1" "" "${refused_note:-Nothing on the adapter was changed.}" \
     "Remove the stick, then unplug the adapter and plug it back in: it starts stock CarPlay as before."
   park refused
   exit 1
@@ -212,23 +215,6 @@ done < "$PAYLOAD/SHA256SUMS"
 
 need_kb=$(sed -n 's/^need_kb=//p' "$PAYLOAD/BUDGET" 2>/dev/null)
 [ -n "$need_kb" ] || refuse "The installer's BUDGET file is missing: the image is damaged."
-prune_kb=0
-for p in $(prune_targets); do
-  under_root "$p" && prune_kb=$((prune_kb + $(du -sk "$p" | cut -f1)))
-done
-# An earlier try's OCBM files (reverted, or stopped part way) are replaced, so they count as room too:
-# make_room deletes them. Stock boots without them, since nothing names them while no mode is set.
-old_kb=0
-if [ -d "$EO" ]; then
-  for rel in $(payload_files); do
-    [ -f "$ROOT/$rel" ] && old_kb=$((old_kb + $(du -sk "$ROOT/$rel" | cut -f1)))
-  done
-fi
-free=${FAKE_FREE_KB:-$(free_kb "$ROOT/")}
-gain=$((prune_kb * 7 / 10 + old_kb * 6 / 10))   # JFFS2 holds these at ~0.8 and OCBM's binaries at ~0.62 of their size
-say "flash: $free KB free, ~$gain KB more after making room, OCBM needs $need_kb KB + $RESERVE_KB KB spare"
-[ $((free + gain)) -ge $((need_kb + RESERVE_KB)) ] \
-  || refuse "Not enough flash: $free KB free and about $gain KB more after making room, but OCBM needs $need_kb KB plus $RESERVE_KB KB spare."
 
 if [ "$ROUTE" = stick ]; then
   [ -d "$STICK" ] || refuse "No USB stick is mounted."
@@ -242,6 +228,39 @@ fi
 if [ "$ROUTE" = stick ] && grep -qxF "reverted version=$VER" "$EO/last_result.txt" 2>/dev/null && [ ! -e "$STICK/OCBM_RETRY" ]; then
   refuse "This installer ($VER) was installed and undone on this adapter before. To try it again anyway, put an empty file named OCBM_RETRY on the stick next to the image."
 fi
+
+# The flash room, last: it is the one check that may change something. An earlier try's OCBM files
+# (reverted, or stopped part way) are replaced anyway and nothing names them while no mode is set, so
+# they go now and the room is measured. Dev adapter, 3 Nov: power cut mid-place, and the retry counted
+# only the finished files, at 0.6 of their size, and the half-written .new not at all ("2188 KB free and
+# about 732 KB more"), so it refused a flash with ~1620 KB in those files; a cut during the first file
+# would have kept its .new for good. The radio seam stays (is_radio): place replaces it like the rest.
+freed_kb=0
+if [ -d "$EO" ]; then
+  for rel in $(payload_files); do
+    for f in "$ROOT/$rel.new" "$ROOT/$rel"; do
+      [ -f "$f" ] || continue
+      case "$f" in "$ROOT"/script/radio_*.sh) continue ;; esac
+      freed_kb=$((freed_kb + $(du -sk "$f" | cut -f1)))
+      rm -f "$f"
+    done
+  done
+  if [ "$freed_kb" -gt 0 ]; then
+    sync
+    say "removed the earlier try's OCBM files ($freed_kb KB), which nothing uses while no mode is set"
+    refused_note="Only the earlier try's unused OCBM files were removed; nothing else on the adapter was changed."
+    [ -n "${FAKE_FREE_KB:-}" ] && FAKE_FREE_KB=$((FAKE_FREE_KB + freed_kb))
+  fi
+fi
+prune_kb=0
+for p in $(prune_targets); do
+  under_root "$p" && prune_kb=$((prune_kb + $(du -sk "$p" | cut -f1)))
+done
+free=${FAKE_FREE_KB:-$(free_kb "$ROOT/")}
+gain=$((prune_kb * 7 / 10))   # JFFS2 holds these at ~0.8 of their size
+say "flash: $free KB free, ~$gain KB more after making room, OCBM needs $need_kb KB + $RESERVE_KB KB spare"
+[ $((free + gain)) -ge $((need_kb + RESERVE_KB)) ] \
+  || refuse "Not enough flash: $free KB free and about $gain KB more after making room, but OCBM needs $need_kb KB plus $RESERVE_KB KB spare."
 
 # ---------------------------------------------------------------------------------------------
 step backup
@@ -303,10 +322,6 @@ for p in $(prune_targets); do
   under_root "$p" || continue
   rm -rf "$p" && echo "/${p#$ROOT/}" >> "$EO/pruned.txt"
 done
-if [ "$old_kb" -gt 0 ]; then
-  for rel in $(payload_files); do rm -f "$ROOT/$rel" "$ROOT/$rel.new"; done
-  say "removed the earlier try's OCBM files ($old_kb KB)"
-fi
 sync
 free2=${FAKE_FREE_AFTER_KB:-${FAKE_FREE_KB:-$(free_kb "$ROOT/")}}
 say "flash after making room: $free2 KB free"

@@ -72,7 +72,11 @@ The size cost of those five lands almost entirely in `carplayd` — the only bin
   jffs2 (whole-file gzip says 2,119 KB, but jffs2 compresses 4 KiB pages); **1,256 KB free** during
   the trial, with stock kept. `tools/make_ocbm_installer.sh` writes the payload's jffs2 estimate into
   the image (`BUDGET`: the model plus 5%, 2,644 KB against the 2,568 measured), and once.sh refuses
-  a unit without that room plus 384 KB.
+  a unit without that room plus 384 KB. On a unit an earlier try left OCBM files on (a revert, or a
+  try a power cut stopped part way), once.sh removes them, half-written `.new` files included, before
+  it measures: counting them at 0.6 of their size, and the `.new` not at all, refused the dev adapter's
+  retry after a cut mid-place (3 Nov: 2,188 KB free and "about 732 KB more", while the cut try's
+  files held ~1,620 KB).
 
 ### Component footprint
 

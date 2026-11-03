@@ -16,7 +16,8 @@
 #                     `confirmed` a passing self-test runs ocbm_finish.sh: the confirming session was
 #                     ended by the power going off.
 #   final             OCBM only: ocbm_finish.sh removed the Carlinkit stack, so there is nothing to
-#                     go back to. A finish a power cut interrupted (finish_pending) is resumed.
+#                     go back to. A finish a power cut interrupted (finish_pending) is resumed, and a
+#                     stick with OCBM_RESTORE gets OCBM_RESTORE.txt saying where the way back is now.
 #
 # An update (ocbm_update.sh, in trial or final) leaves /etc/ocbm/update_pending, its journal, and
 # restarts. Before OCBM starts, the dispatcher settles it: a commit a power cut interrupted is
@@ -211,14 +212,32 @@ answer_watch() {
   done
 }
 
-restore_watch() {  # OCBM_RESTORE on a stick: back to stock
+final_note() {  # OCBM_RESTORE.txt on the stick: why OCBM_RESTORE does nothing on a final adapter
+  { echo "OCBM_RESTORE was not used: OCBM on this adapter is final."
+    echo
+    echo "Stock CarPlay was removed, and the Carlinkit files with it, so there is no stock start to go"
+    echo "back to. The way back to stock is the flash backup the first install wrote to its stick"
+    echo "(OCBM_BACKUP/<adapter>), put back with tools/stock_restore.sh: see docs/ops/01_RECOVERY.md."
+  } > "$STICK/OCBM_RESTORE.txt" && sync
+  log "OCBM_RESTORE on the stick, but the mode is final: left OCBM_RESTORE.txt saying why"
+}
+
+# OCBM_RESTORE on a stick: back to stock. The mode is read on every look, and once it is final the file
+# is left as it is, with a note beside it: dev adapter, 3 Nov, the watcher of the boot the finish ran in
+# outlived the finish, used the driver's OCBM_RESTORE up, and the revert refused ("OCBM is final") with
+# nothing on the stick to say why. A final boot runs it for the note alone.
+restore_watch() {
   while :; do
     if stick_in && [ -e "$STICK/OCBM_RESTORE" ]; then
-      mv -f "$STICK/OCBM_RESTORE" "$STICK/OCBM_RESTORE.done"; sync   # one use: a later install is not undone
-      log "OCBM_RESTORE found on the stick"
-      [ -f "$U" ] && update_rollback "a file named OCBM_RESTORE was found on a USB stick"   # stock gets the OCBM it had
-      "$S/ocbm_revert.sh" "a file named OCBM_RESTORE was found on a USB stick"
-      return
+      if [ "$(cat "$S/ocbm_mode" 2>/dev/null)" = final ]; then
+        [ -e "$STICK/OCBM_RESTORE.txt" ] || final_note
+      else
+        mv -f "$STICK/OCBM_RESTORE" "$STICK/OCBM_RESTORE.done"; sync   # one use: a later install is not undone
+        log "OCBM_RESTORE found on the stick"
+        [ -f "$U" ] && update_rollback "a file named OCBM_RESTORE was found on a USB stick"   # stock gets the OCBM it had
+        "$S/ocbm_revert.sh" "a file named OCBM_RESTORE was found on a USB stick"
+        return
+      fi
     fi
     sleep "$POLL"
   done
@@ -266,6 +285,8 @@ if [ "$mode" = final ]; then
   if [ "$update_trial" = 1 ]; then
     selftest </dev/null >/dev/null 2>&1 &
     answer_watch </dev/null >/dev/null 2>&1 &
+  else
+    restore_watch </dev/null >/dev/null 2>&1 &   # final: only the note on a stick that asks for stock
   fi
   exit 0
 fi

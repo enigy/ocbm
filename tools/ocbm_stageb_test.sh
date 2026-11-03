@@ -172,7 +172,15 @@ echo 40 > '$d/run/ocbmd_heard'; exit 1"
   check 'waitfor "[ -e $d/m.run_ocbmd ]" 5 && [ -e "$d/m.boot" ]' "OCBM starts and is respawned"
   sleep 3
   check '[ ! -e "$d/root/etc/ocbm/boot_attempts" ] && [ ! -e "$d/m.selftest" ] && mode_is "$d" final && [ ! -e "$d/rebooted" ] && [ -e "$d/stick/OCBM_RESTORE" ]' \
-    "no counter, no self-test, OCBM_RESTORE ignored"
+    "no counter, no self-test, OCBM_RESTORE left as it is"
+  check 'grep -q "OCBM on this adapter is final" "$d/stick/OCBM_RESTORE.txt" && grep -q "tools/stock_restore.sh" "$d/stick/OCBM_RESTORE.txt"' \
+    "and OCBM_RESTORE.txt beside it says why, and where the way back is now"
+  # The dev adapter, 3 Nov: the watcher of the boot the finish ran in outlived the finish.
+  d="$T/$sh-final-late"; make_box "$d" trial; boot "$sh" "$d"
+  check 'waitfor "grep -q PASSED $d/root/etc/ocbm/first_start.txt 2>/dev/null" 5' "a trial boot, its restore watcher running"
+  echo final > "$d/root/script/ocbm_mode"; touch "$d/stick/OCBM_RESTORE"   # the finish ran; then the stick
+  check 'waitfor "[ -e $d/stick/OCBM_RESTORE.txt ]" 5 && [ -e "$d/stick/OCBM_RESTORE" ] && [ ! -e "$d/stick/OCBM_RESTORE.done" ] && mode_is "$d" final && [ ! -e "$d/rebooted" ]' \
+    "once the mode is final it leaves OCBM_RESTORE alone and writes the note, with no revert"
 
   echo "== $sh: ocbm_revert.sh"
   d="$T/$sh-rv"; make_box "$d" final

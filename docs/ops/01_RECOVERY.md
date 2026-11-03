@@ -158,7 +158,11 @@ way back, and six things call it:
   process, and on the truck that evening the `ocbmd` that heard the HELLO restarted single-threaded,
   the host's next frames went to the new one, which had seen no HELLO, and a working trial went back
   to stock at 121 s;
-- a file named `OCBM_RESTORE` on a stick, at any time during the trial (renamed `.done` once used);
+- a file named `OCBM_RESTORE` on a stick, at any time during the trial (renamed `.done` once used).
+  The watcher reads the mode each time it looks: once a finish has made it `final`, in that boot or a
+  later one, it leaves the file alone and writes `OCBM_RESTORE.txt` beside it saying that the way back
+  is now the flash backup and `tools/stock_restore.sh` (dev adapter, 3 Nov: the watcher of the boot
+  the finish ran in used the file up, and the revert refused with nothing on the stick to say why);
 - `MGMT_GO_STOCK` from the app, or `ocbm-host install stock` on the bench;
 - by hand over the OCBM console: `/script/ocbm_revert.sh "why"`.
 

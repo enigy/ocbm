@@ -217,13 +217,14 @@ for sh in ${SHELLS:-sh dash}; do
   r="$T/$sh-reinst"; make_box "$r"; run_once "$sh" "$r" >/dev/null; mkdir -p "$r/run"
   env ROOT="$r/root" RUN="$r/run" "$sh" "$r/root/script/ocbm_revert.sh" --no-reboot "test" > "$r/revert.out" 2>&1
   old_kb=0; for rel in $(bash "$HERE/make_ocbm_installer.sh" --list); do
-    [ "$rel" = script/ocbm_dispatch.sh ] || old_kb=$((old_kb + $(du -sk "$r/root/$rel" | cut -f1))); done
+    case "$rel" in script/ocbm_dispatch.sh|script/radio_*) continue ;; esac   # the radio seam is kept
+    old_kb=$((old_kb + $(du -sk "$r/root/$rel" | cut -f1))); done
   need=$(( $(sed -n 's/^need_kb=//p' "$T/img/tmp/ocbm/BUDGET") + 384 ))
   touch "$r/stick/OCBM_RETRY"; refresh "$r"
   B="$r/stick/OCBM_BACKUP/ABCDEF0123456789"; bk="$(cksum "$B"/*)"; echo changed >> "$r/dev/mtd2"
-  run_once "$sh" "$r" FAKE_FREE_KB=$((need - old_kb * 6 / 10 + 8)) FAKE_FREE_AFTER_KB=$((need + 8)); rc=$?
-  check '[ $rc = 0 ] && installed "$r" && grep -q "removed the earlier try" "$r/install.log"' \
-    "the earlier try's OCBM files count as room, are removed and placed again"
+  run_once "$sh" "$r" FAKE_FREE_KB=$((need - old_kb + 8)); rc=$?
+  check '[ $rc = 0 ] && installed "$r" && grep -q "removed the earlier try.s OCBM files ($old_kb KB)" "$r/install.log"' \
+    "the earlier try's OCBM files are removed before the room is measured, then placed again"
   check '[ "$(cksum "$B"/*)" = "$bk" ] && grep -q "kept the earlier one" "$r/install.log"' \
     "the earlier try's flash backup is kept, not dumped over with the changed flash"
   head -c 100 "$B/mtd2.bin" > "$B/x"; mv "$B/x" "$B/mtd2.bin"
@@ -244,6 +245,30 @@ for sh in ${SHELLS:-sh dash}; do
   r="$T/$sh-tight"; make_box "$r"; run_once "$sh" "$r" FAKE_FREE_AFTER_KB=10; rc=$?
   check '[ $rc = 1 ] && grep -q "^OCBM install: STOPPED" "$r/stick/OCBM_RESULT.txt" && stock_boot "$r" && [ ! -e "$r/root/script/ocbm_mode" ] && [ -e "$r/stick/A15W_Update.img.stopped" ]' \
     "stops before placing anything; the adapter still boots stock"
+
+  echo "== $sh: power lost while a file was being placed, then a retry on a tight flash (dev adapter, 3 Nov)"
+  bins="$(bash "$HERE/make_ocbm_installer.sh" --list | grep '^usr/sbin/')"
+  b1=$(echo "$bins" | sed -n 1p); b2=$(echo "$bins" | sed -n 2p); b3=$(echo "$bins" | sed -n 3p)
+  need=$(( $(sed -n 's/^need_kb=//p' "$T/img/tmp/ocbm/BUDGET") + 384 ))
+  r="$T/$sh-midplace"; make_box "$r"; run_once "$sh" "$r" STOP_AT=place >/dev/null
+  cp "$T/img/tmp/ocbm/$b1" "$r/root/$b1"; cp "$T/img/tmp/ocbm/$b2" "$r/root/$b2"   # two files placed,
+  head -c 50000 "$T/img/tmp/ocbm/$b3" > "$r/root/$b3.new"                        # the third cut short
+  left=0; for f in "$r/root/$b1" "$r/root/$b2" "$r/root/$b3.new"; do left=$((left + $(du -sk "$f" | cut -f1))); done
+  refresh "$r"; run_once "$sh" "$r" FAKE_FREE_KB=$((need - left + 8)); rc=$?
+  check '[ $rc = 0 ] && installed "$r" && grep -q "removed the earlier try.s OCBM files ($left KB)" "$r/install.log"' \
+    "the cut try's files, the half-written one too, are removed and the room measured: it installs"
+  check '[ -z "$(find "$r/root" -name "*.new")" ]' "no .new is left on the flash"
+  r="$T/$sh-midfirst"; make_box "$r"; run_once "$sh" "$r" STOP_AT=place >/dev/null
+  head -c 50000 "$T/img/tmp/ocbm/$b1" > "$r/root/$b1.new"   # cut while writing the first file
+  left=$(du -sk "$r/root/$b1.new" | cut -f1)
+  refresh "$r"; run_once "$sh" "$r" FAKE_FREE_KB=$((need - left + 8)); rc=$?
+  check '[ $rc = 0 ] && installed "$r" && [ -z "$(find "$r/root" -name "*.new")" ]' \
+    "a cut during the first file: its .new is removed and counted as well"
+  r="$T/$sh-midtight"; make_box "$r"; run_once "$sh" "$r" STOP_AT=place >/dev/null
+  head -c 50000 "$T/img/tmp/ocbm/$b1" > "$r/root/$b1.new"
+  refresh "$r"; run_once "$sh" "$r" FAKE_FREE_KB=10; rc=$?
+  check '[ $rc = 1 ] && grep -q "^OCBM install: REFUSED" "$r/stick/OCBM_RESULT.txt" && grep -q "Only the earlier try.s unused OCBM files were removed" "$r/stick/OCBM_RESULT.txt" && stock_boot "$r"' \
+    "too little room even so: refused, and the report says what was removed"
 
   echo "== $sh: power lost at each step, then the stick goes in again"
   for s in backup make_room place arm rename hand_off; do
