@@ -109,6 +109,50 @@ abort() {  # past the prune: stock still boots, the extras are gone
   exit 1
 }
 
+# OCBM's image on an adapter that already runs OCBM, trial or final: an update, not a refusal (Scott,
+# 3 Nov: one image on a stick takes stock to OCBM and any OCBM to this one, with no way back to stock
+# first). The payload's programs and scripts, with their sums, become a package that updates from any
+# version (FROM_MIN 0.0.0), and the adapter's own ocbm_update.sh installs it: its checks (newer, room,
+# product, chip, factory mode, mode) and its trial, which keeps the new version once it passes its
+# self-test and puts the old one back otherwise. Only the files that differ are written. From a stick,
+# the dispatcher reports the trial's outcome above this run's report (stick_update in /etc/ocbm).
+image_update() {
+  # Never mid-drive: the stick handler runs this the moment a stick goes in, and the update restarts
+  # the adapter. At a start the stick is read before an app connects (mdev at boot), so it runs then.
+  if [ "$(cat "${RUN:-/tmp}/host_present" 2>/dev/null)" = 1 ]; then
+    say "an app is connected: this image updates OCBM at the next start, not during the drive"
+    result "WAITING FOR THE NEXT START" \
+      "OCBM ${have:-?} runs on this adapter, and this image updates it to $VER, but not during a drive:" \
+      "the update restarts the adapter." "" \
+      "Leave the stick in: the update runs the next time the adapter starts (the car is turned on, or it is unplugged and plugged back in)."
+    exit 1
+  fi
+  pk="$UPDATE/ocbm-image-update"
+  rm -rf "$pk" "$pk.tgz"; mkdir -p "$pk/files" || refuse "Could not make the update package in RAM."
+  grep -E '  (usr/sbin|usr/bin|script)/' "$PAYLOAD/SHA256SUMS" > "$pk/SHA256SUMS"
+  while read -r sum rel; do
+    mkdir -p "$pk/files/${rel%/*}" && cp "$PAYLOAD/$rel" "$pk/files/$rel" || refuse "Could not make the update package in RAM."
+  done < "$pk/SHA256SUMS"
+  echo "$VER" > "$pk/VERSION"; echo 0.0.0 > "$pk/FROM_MIN"
+  (cd "$pk" && tar -cf - VERSION FROM_MIN SHA256SUMS files) | gzip -c > "$pk.tgz" && rm -rf "$pk" \
+    || refuse "Could not make the update package in RAM."
+  say "OCBM ${have:-?} runs here: updating it to $VER with the adapter's ocbm_update.sh"
+  [ "$ROUTE" = stick ] && { echo "${IMG##*/}" > "$EO/stick_update"; sync; }
+  result "UPDATING" "OCBM ${have:-?} runs on this adapter: this image updates it to $VER." "" \
+    "The adapter restarts and tries the new version; the outcome is added above this when the trial ends." \
+    "If the new version fails its start-up self-test, the adapter goes back to OCBM ${have:-?} by itself."
+  park used   # one use: the update restarts the adapter, and a stick left in must not run it again
+  "$ROOT/script/ocbm_update.sh" "$pk.tgz" >> "$LOG" 2>&1   # placed: it restarts the adapter
+  [ -f "$EO/update_pending" ] && exit 1
+  rm -f "$EO/stick_update" "$pk.tgz"
+  r=$(cat "$EO/update_result" 2>/dev/null)
+  case "$r" in
+    committed*) result "UPDATED" "$r"; exit 1 ;;
+  esac
+  [ "$ROUTE" = stick ] && [ -f "$IMG.used" ] && mv -f "$IMG.used" "$IMG.refused" && sync
+  refuse "${r:-The update did not run.}"
+}
+
 # THE WLAN/BT GUARD, as in tools/ncm_base_install.sh: no deletion may take a unit's radio files.
 is_radio() {
   case "$1" in
@@ -211,6 +255,7 @@ if [ "$dispatcher" = 1 ] && [ -e "$MODE" ]; then
     exit 1
   fi
   have=$(cat "$EO/installed_version" 2>/dev/null)
+  if [ "$have" != "$VER" ] && [ -x "$ROOT/script/ocbm_update.sh" ]; then image_update; fi
   if [ "$have" = "$VER" ]; then   # e.g. the stick went in again after power was lost before finish.sh
     say "already installed: $VER ($(cat "$MODE"))"
     result "ALREADY INSTALLED" "OCBM $VER is already on this adapter (mode: $(cat "$MODE")). Nothing was changed." \
@@ -218,7 +263,7 @@ if [ "$dispatcher" = 1 ] && [ -e "$MODE" ]; then
     park installed
     exit 1
   fi
-  refuse "OCBM ${have:-(another version)} is already installed on this adapter (mode: $(cat "$MODE")). Updating it this way is not supported yet."
+  refuse "OCBM ${have:-(another version)} is already installed on this adapter (mode: $(cat "$MODE")). This OCBM is too old to update itself from an image: go back to stock first, then install this image."
 fi
 [ -e "$ROOT/usr/sbin/ocbmd" ] && [ ! -d "$EO" ] \
   && refuse "This adapter was converted to OCBM by hand (tools/ocbm_install.sh); manage it with that tool."

@@ -212,7 +212,7 @@ echo 40 > '$d/run/ocbmd_heard'; exit 1"
     printf 'busybox: libc.so.6 libm.so.6 libcrypt.so.1 libgcc_s.so.1 libpthread.so.0 libdl.so.2 librt.so.1 libresolv.so.2 libutil.so.1 libnsl.so.1\n' > "$R/bin/busybox"
     for f in usr/lib/libssl.so.1.1 usr/lib/libdmsdp.so lib/crt1.o etc/BoxHelper.apk etc/rgbLight.conf \
              etc/dbus-1/system.d/riddle.conf etc/boa/www/index.html etc/riddle.conf; do printf 'x' > "$R/$f"; done
-    for f in update_box.sh phone_link_deamon.sh init_audio_codec.sh init_bluetooth_wifi.sh; do printf '#!/bin/sh\n' > "$R/script/$f"; done
+    for f in update_box.sh update_box_ota.sh quickly_update.sh check_update.sh smart_copy.sh phone_link_deamon.sh init_audio_codec.sh init_bluetooth_wifi.sh; do printf '#!/bin/sh\n' > "$R/script/$f"; done
     printf '#!/bin/sh\nif [ -d /sys/block/*/$MDEV ] ; then\n\tmount /dev/$MDEV /mnt/UPAN -t vfat -o utf8=1\n\t/script/update_box.sh /dev/$MDEV >> /dev/console &\nfi\n' \
       > "$R/etc/mdev/udisk_insert.sh"
   }
@@ -233,16 +233,16 @@ echo 40 > '$d/run/ocbmd_heard'; exit 1"
   printf 'z' > "$R/lib/libz.so.1.2.11"; ln -s libz.so.1.2.11 "$R/lib/libz.so.1"
   run_finish "$d" --after-session; rc=$?
   check '[ $rc = 0 ] && mode_is "$d" final && [ ! -e "$R/etc/ocbm/finish_pending" ]' "after the grace: mode final"
-  check '[ ! -e "$R/usr/sbin/AppleCarPlay" ] && [ ! -e "$R/usr/sbin/mdnsd" ] && [ ! -e "$R/usr/sbin/boa" ] && [ ! -e "$R/script/update_box.sh" ] && [ ! -e "$R/etc/boa" ] && [ ! -e "$R/etc/BoxHelper.apk" ] && [ ! -e "$R/script/start_main_service.stock.sh" ]' \
-    "the Carlinkit programs, scripts, updater, web pages and the stock start script are gone"
+  check '[ ! -e "$R/usr/sbin/AppleCarPlay" ] && [ ! -e "$R/usr/sbin/mdnsd" ] && [ ! -e "$R/usr/sbin/boa" ] && [ ! -e "$R/script/phone_link_deamon.sh" ] && [ ! -e "$R/script/update_box_ota.sh" ] && [ ! -e "$R/etc/boa" ] && [ ! -e "$R/etc/BoxHelper.apk" ] && [ ! -e "$R/script/start_main_service.stock.sh" ]' \
+    "the Carlinkit programs, scripts, web pages and the stock start script are gone"
+  check '[ -e "$R/script/update_box.sh" ] && [ -e "$R/script/quickly_update.sh" ] && [ -e "$R/script/check_update.sh" ] && [ -e "$R/script/smart_copy.sh" ] && grep -q "^[[:space:]]*/script/update_box.sh" "$R/etc/mdev/udisk_insert.sh"' \
+    "the stock stick updater stays, called by the stick handler: a final adapter runs an image as stock does (Scott, 3 Nov)"
   check '[ -e "$R/usr/sbin/hostapd" ] && [ -e "$R/usr/sbin/i2cset" ] && [ -e "$R/etc/riddle.conf" ] && [ -e "$R/script/init_bluetooth_wifi.sh" ] && [ -x "$R/usr/sbin/ocbmd" ] && [ -e "$R/script/start_main_service.sh" ]' \
     "the radio stack, i2c tools, riddle.conf, OCBM and the start script stay"
   check '[ -e "$R/usr/lib/libssl.so.1.1" ] && [ ! -e "$R/usr/lib/libdmsdp.so" ] && [ ! -e "$R/lib/crt1.o" ]' \
     "libraries: a still-named one stays (libssl for hostapd), unnamed ones go"
   check 'n=0; for f in usr/sbin/dropbear usr/libexec/sftp-server root/.ssh/authorized_keys .ash_history script/custom_init.sh lib/libz.so.1.2.11 lib/libz.so.1; do { [ -e "$R/$f" ] || [ -L "$R/$f" ]; } && n=$((n+1)); done; [ $n = 0 ] && grep -qx /usr/sbin/dropbear "$R/etc/ocbm/finished.txt"' \
     "a hand conversion's leftovers go too, libz once dropbear no longer names it (the truck, 3 Nov)"
-  check 'grep -q "^# OTA-removed #" "$R/etc/mdev/udisk_insert.sh" && grep -q "mount /dev" "$R/etc/mdev/udisk_insert.sh"' \
-    "the stick handler still mounts, without its call into the deleted updater"
   check 'grep -qx /usr/sbin/AppleCarPlay "$R/etc/ocbm/finished.txt" && grep -qx /usr/lib/libdmsdp.so "$R/etc/ocbm/finished.txt"' "finished.txt records what went"
   env ROOT="$R" RUN="$d/run" REBOOT="touch $d/rebooted" "$sh" "$R/script/ocbm_revert.sh" "test" > "$d/rv.out" 2>&1; rc=$?
   check '[ $rc = 1 ] && mode_is "$d" final && [ ! -e "$d/rebooted" ]' "afterwards there is no going back"

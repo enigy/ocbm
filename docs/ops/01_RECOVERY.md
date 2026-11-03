@@ -204,12 +204,26 @@ toolchain leftovers and `test_mic.sh` the prune also deletes are not in Carlinki
 they are harmless. Everything the prune took is in the first install's flash dump, which the restore
 below can write back.
 
-In `final` there is no stock left and `ocbm_revert.sh` refuses. Carlinkit's image cannot rebuild it
-either: the finish deletes the stock updater that would run it (`update_box.sh` and
-`update_box_ota.sh` in `ocbm_finish.sh`'s `SCRIPT_A`, and the updater call in the stick handlers).
-(This read "its own decrypter `ARMimg_maker` among them" until 31 Oct: `ARMimg_maker` is in
-`ncm_base_install.sh`'s `SBIN_B`, which only the deep NCM strip removes, and the finish uses
-`SBIN_A`; a tester's `final` adapter still had it, and the stick updater worked after the restore.)
+In `final` there is no stock left and `ocbm_revert.sh` refuses. **The stock stick updater stays,
+though** (Scott, 3 Nov): a final adapter runs an `A15W_Update.img` from a stick as stock does. Finishes
+before 3 Nov deleted it and commented out its call. The chain, traced from both factory dumps: the stick
+handlers (`/etc/mdev/udisk_insert.sh`, `udisk_hotplug.sh`) call `update_box.sh` the moment a stick goes
+in. It decrypts the image with `ARMimg_maker` (static, kept), runs the image's `tmp/once.sh`, then
+`quickly_update.sh` (`check_update.sh`, `smart_copy.sh`) to copy the image's files over the rootfs, and
+for a `.hwfs` `module_upgrade.sh` (`getFuncModule.sh`). The finish keeps those six and the handlers'
+call (`UPDATER` in `ocbm_finish.sh`); `update_box_ota.sh` still goes (only `ARMadb-driver` called it),
+and so does `start_mass_storage.sh` (OCBM sets `/tmp/not_change_mass_storage` at every start).
+
+- **OCBM's own image** on an OCBM adapter, trial or final, is an update: `once.sh` makes a package of
+  its payload and hands it to `ocbm_update.sh` (newer only, room, the update trial that falls back to
+  the version it replaced). It waits while an app is connected (`/tmp/host_present`), so it never
+  restarts the adapter mid-drive; it runs at the next start, when the stick is read at boot.
+- **Carlinkit's own image** on a final adapter runs as it would on stock. Its `once.sh` may rewrite
+  U-Boot and the kernel from its own `upg`, then `quickly_update.sh` copies Carlinkit's rootfs over
+  OCBM's. The adapter ends up as stock Carlinkit, with OCBM's own files (`/usr/sbin/ocbmd` and the
+  rest, `/etc/ocbm`) left behind, unused, until a stock restore or an OCBM install replaces them. That
+  is the owner's choice; nothing guarantees how a vendor image goes (MIGRATING.md, "Your hardware,
+  your choice of software").
 **From the stick alone (no computer, no internet; Scott, 3 Nov).** Put an empty file named
 `OCBM_RESTORE` on the stick the adapter's first install was made from, next to its `OCBM_BACKUP`
 folder, and start the adapter with it in (unplug and replug it, or turn the car off and on). At that

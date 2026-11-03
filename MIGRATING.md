@@ -157,6 +157,13 @@ without room for the update, the report says so: remove stock CarPlay in Carlink
 stock and install the full image. While the install waits for its finish (confirmed), the package is
 left untouched until a later start.
 
+**With the image instead.** The same `A15W_Update.img` that converts a stock adapter also updates one
+already on OCBM, in trial or final: put it on a stick and start the adapter with it in. It installs
+as an update (newer versions only, same trial and fallback), and `OCBM_RESULT.txt` says UPDATING, then
+UPDATED or ROLLED BACK. A stick put in during a drive waits for the next start. A final adapter also
+runs Carlinkit's own images from a stick, as stock does; see `docs/ops/01_RECOVERY.md` for what that
+leaves.
+
 **Your hardware, your choice of software.** The stick routes take any package or backup that is well
 formed: the `.sha256` only catches a damaged copy, and nothing checks who built it. That is
 deliberate (Scott, 3 Nov). It is how a factory Carlinkit adapter treats a stick, and an owner keeps

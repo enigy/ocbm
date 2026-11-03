@@ -17,12 +17,12 @@
 # finish never interleave.
 #
 # What goes is tools/ncm_base_install.sh's strip set (a test keeps the lists equal): the vendor
-# programs (SBIN_A), scripts (SCRIPT_A, the stock updater among them), config and logos (ETC_A,
-# /etc/boa), and the vendor and toolchain libraries (LIB_VENDOR, LIB_DEV) that no surviving file
+# programs (SBIN_A), scripts (SCRIPT_A, but not the stock stick updater, UPDATER), config and logos
+# (ETC_A, /etc/boa), and the vendor and toolchain libraries (LIB_VENDOR, LIB_DEV) that no surviving file
 # names, plus start_main_service.stock.sh. Every candidate passes is_radio() first, and no Carlinkit
-# daemon may be running. Kept: the radio stack, the i2c tools, riddle.conf, and what the OCBM start
-# still uses (rcS, init_gpio.sh, ko.tar.gz). The stick handlers keep mounting sticks, with their call
-# into the deleted updater commented out, as in ccpa/rootfs/etc/mdev/udisk_insert.sh.
+# daemon may be running. Kept: the radio stack, the i2c tools, riddle.conf, what the OCBM start still
+# uses (rcS, init_gpio.sh, ko.tar.gz), and the stick handlers with their call into the updater, so a
+# final adapter runs an A15W_Update.img as stock does (Scott, 3 Nov).
 #
 # Test hooks (tools/ocbm_stageb_test.sh): ROOT RUN GRACE POLL, FINISH_IGNORE for daemon names the test
 # host itself runs (macOS has its own usbmuxd), and STOP_AT=deletes to simulate power loss (exit 99)
@@ -75,6 +75,13 @@ libthread_db.so libthread_db.so.1 libubsan.so libubsan.so.0"
 KILL_PROCS="ARMadb-driver ARMiPhoneIAP2 ARMAndroidAuto ARMHiCar ARMandroid_Mirror AppleCarPlay \
 AutomaticTest boa boxNetworkService boxHUDServer colorLightDaemon mdnsd riddle_top usbmuxd \
 fakeiOSDevice fakeCarLife fakeAADevice"
+# The stock stick updater stays (Scott, 3 Nov: a final adapter runs an A15W_Update.img from a stick as
+# stock does, Carlinkit's own included). SCRIPT_A, which must equal ncm_base_install.sh's, names these;
+# the loop below skips them. The chain, traced on the Mac from both factory dumps: udisk_insert.sh and
+# udisk_hotplug.sh call update_box.sh, which decrypts with ARMimg_maker (static; SBIN_A spares it),
+# runs the image's tmp/once.sh, then quickly_update.sh (check_update.sh, smart_copy.sh), and for .hwfs
+# module_upgrade.sh (getFuncModule.sh). update_box_ota.sh still goes: only ARMadb-driver called it.
+UPDATER="update_box.sh quickly_update.sh check_update.sh smart_copy.sh module_upgrade.sh getFuncModule.sh"
 
 say() { echo "[finish] $*"; }
 free_kb() { df -k "$ROOT/" 2>/dev/null | awk 'NR>1 {f=$4} END {print f+0}'; }
@@ -147,7 +154,10 @@ fi
 
 [ "${STOP_AT:-}" = deletes ] && { say "simulated power loss before the deletes"; exit 99; }
 for b in $SBIN_A; do gone "/usr/sbin/$b"; done
-for s in $SCRIPT_A; do gone "/script/$s"; done
+for s in $SCRIPT_A; do
+  case " $UPDATER " in *" $s "*) continue ;; esac
+  gone "/script/$s"
+done
 for e in $ETC_A; do gone "/etc/$e"; done
 gone /etc/boa
 gone /script/start_main_service.stock.sh
@@ -156,13 +166,6 @@ gone /script/start_main_service.stock.sh
 for p in /usr/sbin/dropbear /usr/libexec/sftp-server /root/.ssh/authorized_keys /.ash_history \
          /root/.ash_history /script/custom_init.sh; do
   gone "$p"
-done
-for h in udisk_insert.sh udisk_hotplug.sh; do   # keep mounting sticks; the updater is gone
-  f="$ROOT/etc/mdev/$h"
-  grep -q '^[[:space:]]*/script/update_box\.sh' "$f" 2>/dev/null || continue
-  sed 's|^\([[:space:]]*\)\(/script/update_box\.sh\)|# OTA-removed #\1\2|' "$f" > "$f.new" \
-    && grep -q 'mount' "$f.new" && chmod 755 "$f.new" && mv -f "$f.new" "$f" \
-    && echo "/etc/mdev/$h: the updater call" >> "$GONE"
 done
 sync
 

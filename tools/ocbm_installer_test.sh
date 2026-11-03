@@ -90,7 +90,7 @@ run_once() {  # $1 shell, $2 dir, then VAR=value overrides; returns once.sh's st
   local sh="$1" d="$2"; shift 2
   env ROOT="$d/root" SYS="$d/sys" PROC="$d/proc" DEVDIR="$d/dev" STICK="$d/stick" UPDATE="$d/update" \
       ROUTE=stick LOG="$d/install.log" STATE="$d/state" RESULT="$d/result.txt" \
-      FAKE_FREE_KB=6000 FAKE_STICK_FREE_KB=100000 "$@" "$sh" "$d/update/tmp/once.sh" > "$d/once.out" 2>&1
+      RUN="$d/run" REBOOT="touch $d/rebooted" FAKE_FREE_KB=6000 FAKE_STICK_FREE_KB=100000 "$@" "$sh" "$d/update/tmp/once.sh" > "$d/once.out" 2>&1
 }
 run_finish() {  # $1 shell, $2 dir
   env STATE="$2/state" REBOOT="touch $2/rebooted" REBOOT_DELAY=0 "$1" "$2/update/tmp/finish.sh" 0 > "$2/finish.out" 2>&1
@@ -153,9 +153,21 @@ for sh in ${SHELLS:-sh dash}; do
   refresh "$d"; snap "$d/root" > "$d/b2"; run_once "$sh" "$d"; rc=$?
   check '[ $rc = 1 ] && grep -q "^OCBM install: ALREADY INSTALLED" "$d/stick/OCBM_RESULT.txt" && [ "$(snap "$d/root")" = "$(cat "$d/b2")" ] && [ ! -e "$d/stick/A15W_Update.img" ]' \
     "the same version again: ALREADY INSTALLED, nothing changed, image parked"
-  echo "0.9.0 ocbm older" > "$d/root/etc/ocbm/installed_version"; refresh "$d"; snap "$d/root" > "$d/b3"; run_once "$sh" "$d"; rc=$?
-  check '[ $rc = 1 ] && grep -q "^OCBM install: REFUSED" "$d/stick/OCBM_RESULT.txt" && [ "$(snap "$d/root")" = "$(cat "$d/b3")" ] && [ -e "$d/stick/A15W_Update.img.refused" ]' \
-    "another version installed: REFUSED, nothing changed, image parked as .refused"
+  # An OCBM image on an adapter running another OCBM updates it (Scott, 3 Nov): ocbm_update.sh's own
+  # checks and trial, from a package once.sh makes of the image's payload.
+  e="$T/$sh-imgup"; cp -pR "$d" "$e"; rm -f "$e/rebooted"
+  echo "9.9.9 ocbm newer" > "$e/root/etc/ocbm/installed_version"; refresh "$e"; snap "$e/root" > "$e/b4"; run_once "$sh" "$e"; rc=$?
+  check '[ $rc = 1 ] && grep -q "^OCBM install: REFUSED" "$e/stick/OCBM_RESULT.txt" && grep -q "already runs OCBM 9.9.9" "$e/stick/OCBM_RESULT.txt" && [ -e "$e/stick/A15W_Update.img.refused" ] && [ ! -e "$e/rebooted" ] && [ ! -e "$e/root/etc/ocbm/update_pending" ] && [ "$(cat "$e/root/etc/ocbm/installed_version")" = "9.9.9 ocbm newer" ]' \
+    "a newer OCBM installed: ocbm_update.sh refuses the image, nothing changed, image parked as .refused"
+  echo "0.9.0 ocbm older" > "$d/root/etc/ocbm/installed_version"; echo "old-ocbmd" > "$d/root/usr/sbin/ocbmd"
+  rm -f "$d/rebooted"; mkdir -p "$d/run"; echo 1 > "$d/run/host_present"; refresh "$d"; snap "$d/root" > "$d/b6"; run_once "$sh" "$d"; rc=$?
+  check '[ $rc = 1 ] && grep -q "^OCBM install: WAITING FOR THE NEXT START" "$d/stick/OCBM_RESULT.txt" && [ "$(snap "$d/root")" = "$(cat "$d/b6")" ] && [ -e "$d/stick/A15W_Update.img" ] && [ ! -e "$d/rebooted" ]' \
+    "an app connected (a stick put in mid-drive): the image waits for the next start, nothing changed"
+  rm -f "$d/run/host_present" "$d/rebooted"; refresh "$d"; run_once "$sh" "$d"; rc=$?
+  check '[ $rc = 1 ] && grep -q "^OCBM install: UPDATING" "$d/stick/OCBM_RESULT.txt" && [ -e "$d/rebooted" ] && grep -qx placed "$d/root/etc/ocbm/update_pending" && [ -e "$d/stick/A15W_Update.img.used" ] && [ -e "$d/root/etc/ocbm/stick_update" ]' \
+    "an older OCBM installed: the image updates it through ocbm_update.sh, used once, and restarts into the trial"
+  check 'cmp -s "$d/root/usr/sbin/ocbmd" "$T/img/tmp/ocbm/usr/sbin/ocbmd" && [ "$(cat "$d/root/usr/sbin/ocbmd.prev")" = old-ocbmd ] && [ ! -e "$d/root/usr/sbin/btd.prev" ]' \
+    "only the files that differ are swapped, the old ones kept for a rollback"
   touch "$d/stick/OCBM_RESTORE"; refresh "$d"; snap "$d/root" > "$d/b4"; run_once "$sh" "$d"; rc=$?
   check '[ $rc = 1 ] && grep -q "^OCBM install: WAITING FOR THE RESTORE" "$d/stick/OCBM_RESULT.txt" && [ "$(snap "$d/root")" = "$(cat "$d/b4")" ] && [ -e "$d/stick/A15W_Update.img" ] && [ -e "$d/stick/OCBM_RESTORE" ]' \
     "OCBM_RESTORE on the stick goes first: nothing changed, the image stays for the install after it (the truck, 2 Nov)"
