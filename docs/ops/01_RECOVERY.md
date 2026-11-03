@@ -190,7 +190,10 @@ in `/etc/ocbm/last_result.txt` (a stick install then refuses that version unless
 app is not checked, since each one is a press of Convert),
 removes `/script/ocbm_mode` and restarts. The start script then hands every boot to the
 kept `start_main_service.stock.sh`, and the report lands on the next stick plugged in as
-`OCBM_RESULT.txt`. HiCar, the Android Mirror helper and the web pages stay deleted. Carlinkit's own
+`OCBM_RESULT.txt` (a copy stays in `/etc/ocbm/delivered_result.txt`); once it is synced the stick is
+unmounted, or remounted read-only, so stock writes nothing more to it (the truck, 3 Nov: the stick
+stayed mounted under a stock that cycled until the adapter was unplugged, and its FAT came back
+inconsistent). HiCar, the Android Mirror helper and the web pages stay deleted. Carlinkit's own
 2025.10.15.1127 image puts back what it ships, but not all of it lands: it unpacks its web pages INTO
 `/etc/boa/www` (`rm -rf /etc/boa/www/*; tar -xvf www.tar.gz -C /etc/boa/www/`), which an install
 before 31 Oct deleted, so the tar failed silently and the web UI stayed blank; and it ships only an

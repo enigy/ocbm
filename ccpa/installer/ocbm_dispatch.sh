@@ -67,6 +67,13 @@ deliver() {  # the last revert's report, onto the next stick that is plugged in
   fi
   mv -f "$r.new" "$r" && sync && mv -f "$EO/pending_result.txt" "$EO/delivered_result.txt"
   sync
+  # Done with this stick: let it go before stock gets it. The truck, 3 Nov: the report was delivered and
+  # synced, but the stick stayed mounted read-write under a stock that cycled for 40 s until the adapter
+  # was unplugged, and its FAT came back inconsistent (OCBM_RESULT.txt starting on a free cluster).
+  # Unmounted, or read-only if something holds it, nothing on the adapter can write to it again.
+  if umount "$STICK" 2>/dev/null || mount -o remount,ro "$STICK" 2>/dev/null; then
+    log "the report is on the stick; the stick is unmounted or read-only now"
+  fi
   rm -f "$RUN/not_change_mass_storage"   # later sticks are shared with the car again, as stock does
 }
 
