@@ -271,7 +271,9 @@ restore_watch() {
 # refusal, after the update's trial for a commit or a rollback. stick_result.txt holds the report until
 # a stick takes it, across the restart a rollback makes.
 stick_report() {  # $1 headline, $2 the line under it
-  { echo "OCBM update: $1"; echo "adapter: OCBM $(cat "$EO/installed_version" 2>/dev/null)"; echo; echo "$2"; } \
+  { echo "OCBM update: $1"; echo "adapter: OCBM $(cat "$EO/installed_version" 2>/dev/null)"; echo; echo "$2"; echo
+    echo "No update is guaranteed to succeed, least of all one the OCBM project did not build. Its .sha256"
+    echo "only catches a damaged copy; what you put on your adapter is your choice (MIGRATING.md)."; } \
     > "$EO/stick_result.txt.new" && mv -f "$EO/stick_result.txt.new" "$EO/stick_result.txt"
   sync
   delivering=1

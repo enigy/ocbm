@@ -278,33 +278,35 @@ for sh in ${SHELLS:-sh dash}; do
   # Offline, from a USB stick (Scott, 3 Nov): no internet on the head unit and no computer.
   echo "== $sh: an update from a USB stick"
   d="$T/$sh-stick"; make_box "$d" final; stick_pkg "$d" dispatch; boot "$sh" "$d"
-  check 'waitfor "[ -e $d/rebooted ]" 6 && grep -qx placed "$d/root/etc/ocbm/update_pending"' "a final start takes the package and restarts into its trial"
+  check 'waitfor "[ -e $d/rebooted ]" 15 && grep -qx placed "$d/root/etc/ocbm/update_pending"' "a final start takes the package and restarts into its trial"
   check '[ -e "$d/stick/ocbm-update-1.1.0.tgz.used" ] && [ ! -e "$d/stick/ocbm-update-1.1.0.tgz" ]' "used once: renamed .used"
   restart "$d"; boot "$sh" "$d"
-  check 'waitfor "is_new \"$d\" && stick_says \"$d\" UPDATED" 8 && grep -q "committed $NEW (from $OLD)" "$d/stick/OCBM_RESULT.txt"' \
-    "the trial passes, and OCBM_RESULT.txt on the stick says UPDATED"
+  check 'waitfor "is_new \"$d\" && stick_says \"$d\" UPDATED" 15 && grep -q "committed $NEW (from $OLD)" "$d/stick/OCBM_RESULT.txt" && grep -q "No update is guaranteed" "$d/stick/OCBM_RESULT.txt"' \
+    "the trial passes, and OCBM_RESULT.txt on the stick says UPDATED, with the disclaimer"
   restart "$d"; boot "$sh" "$d"; sleep 3
   check '[ ! -e "$d/rebooted" ] && is_new "$d"' "the stick left in does nothing more"
 
   d="$T/$sh-stickfail"; make_box "$d" trial; stick_pkg "$d" ""; boot "$sh" "$d"
-  check 'waitfor "[ -e $d/rebooted ]" 6' "a trial start takes the package too"
+  check 'waitfor "[ -e $d/rebooted ]" 15' "a trial start takes the package too"
   touch "$d/st.fail"; restart "$d"; boot "$sh" "$d"
-  check 'waitfor "[ -e $d/rebooted ]" 6 && is_old "$d"' "its self-test fails: the old version back, and a restart"
+  check 'waitfor "[ -e $d/rebooted ]" 15 && is_old "$d"' "its self-test fails: the old version back, and a restart"
   restart "$d"; boot "$sh" "$d"
-  check 'waitfor "stick_says \"$d\" \"ROLLED BACK\"" 6 && grep -q "rolled_back $NEW" "$d/stick/OCBM_RESULT.txt" && [ ! -e "$d/root/etc/ocbm/stick_result.txt" ]' \
+  # All of it inside waitfor: deliver() moves stick_result.txt aside only after the report's mv and sync
+  # (a race on the Mac, 3 Nov), and a busy host needs the time.
+  check 'waitfor "stick_says \"$d\" \"ROLLED BACK\" && grep -q \"rolled_back $NEW\" \"$d/stick/OCBM_RESULT.txt\" && [ ! -e \"$d/root/etc/ocbm/stick_result.txt\" ]" 15' \
     "the report waits through that restart, then says ROLLED BACK"
 
   d="$T/$sh-sticksum"; make_box "$d" final; stick_pkg "$d" ""; echo "0000  ocbm-update-1.1.0.tgz" > "$d/stick/ocbm-update-1.1.0.tgz.sha256"
   boot "$sh" "$d"
-  check 'waitfor "stick_says \"$d\" REFUSED" 6 && grep -q "does not match" "$d/stick/OCBM_RESULT.txt" && [ -e "$d/stick/ocbm-update-1.1.0.tgz.refused" ] && [ ! -e "$d/rebooted" ] && is_old "$d"' \
+  check 'waitfor "stick_says \"$d\" REFUSED" 15 && grep -q "does not match" "$d/stick/OCBM_RESULT.txt" && [ -e "$d/stick/ocbm-update-1.1.0.tgz.refused" ] && [ ! -e "$d/rebooted" ] && is_old "$d"' \
     "a package that does not match its .sha256: refused, renamed .refused, nothing changed"
   d="$T/$sh-stickold"; make_box "$d" final; echo "$NEW" > "$d/root/etc/ocbm/installed_version"; stick_pkg "$d" ""; boot "$sh" "$d"
-  check 'waitfor "stick_says \"$d\" REFUSED" 6 && grep -q "already runs OCBM" "$d/stick/OCBM_RESULT.txt" && [ -e "$d/stick/ocbm-update-1.1.0.tgz.refused" ] && [ ! -e "$d/rebooted" ]' \
+  check 'waitfor "stick_says \"$d\" REFUSED" 15 && grep -q "already runs OCBM" "$d/stick/OCBM_RESULT.txt" && [ -e "$d/stick/ocbm-update-1.1.0.tgz.refused" ] && [ ! -e "$d/rebooted" ]' \
     "not newer: refused with ocbm_update.sh's reason"
   d="$T/$sh-stickmin"; make_box "$d" final; stick_pkg "$d" "" 1.0.5; boot "$sh" "$d"
-  check 'waitfor "stick_says \"$d\" REFUSED" 6 && grep -q "updates OCBM 1.0.5 or newer" "$d/stick/OCBM_RESULT.txt" && is_old "$d"' "FROM_MIN too new: refused"
+  check 'waitfor "stick_says \"$d\" REFUSED" 15 && grep -q "updates OCBM 1.0.5 or newer" "$d/stick/OCBM_RESULT.txt" && is_old "$d"' "FROM_MIN too new: refused"
   d="$T/$sh-stickroom"; make_box "$d" trial; stick_pkg "$d" ""; boot "$sh" "$d" FAKE_FREE_KB=1
-  check 'waitfor "stick_says \"$d\" REFUSED" 6 && grep -q "Not enough flash" "$d/stick/OCBM_RESULT.txt" && grep -q "remove stock CarPlay" "$d/stick/OCBM_RESULT.txt" && is_old "$d"' \
+  check 'waitfor "stick_says \"$d\" REFUSED" 15 && grep -q "Not enough flash" "$d/stick/OCBM_RESULT.txt" && grep -q "remove stock CarPlay" "$d/stick/OCBM_RESULT.txt" && is_old "$d"' \
     "a trial without room: refused, saying how to make it"
   d="$T/$sh-stickconf"; make_box "$d" confirmed; stick_pkg "$d" ""; boot "$sh" "$d"; sleep 4
   check '[ -e "$d/stick/ocbm-update-1.1.0.tgz" ] && [ ! -e "$d/stick/OCBM_RESULT.txt" ]' "confirmed: the package waits for the finish, untouched"
@@ -312,7 +314,7 @@ for sh in ${SHELLS:-sh dash}; do
   echo "/dev/sda1 $d/stick vfat rw 0 0" > "$d/proc/mounts"; sleep 3
   check '[ -e "$d/stick/ocbm-update-1.1.0.tgz" ] && [ ! -e "$d/rebooted" ]' "a stick put in after the start waits for the next start"
   d="$T/$sh-sticktwo"; make_box "$d" final; stick_pkg "$d" ""; cp "$d/stick/ocbm-update-1.1.0.tgz" "$d/stick/ocbm-update-1.0.9.tgz"; boot "$sh" "$d"
-  check 'waitfor "stick_says \"$d\" REFUSED" 6 && grep -q "more than one" "$d/stick/OCBM_RESULT.txt" && is_old "$d"' "two packages: refused, neither used"
+  check 'waitfor "stick_says \"$d\" REFUSED" 15 && grep -q "more than one" "$d/stick/OCBM_RESULT.txt" && is_old "$d"' "two packages: refused, neither used"
 done
 
 echo "== make_ocbm_update.sh"

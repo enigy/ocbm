@@ -140,7 +140,9 @@ image_update() {
   [ "$ROUTE" = stick ] && { echo "${IMG##*/}" > "$EO/stick_update"; sync; }
   result "UPDATING" "OCBM ${have:-?} runs on this adapter: this image updates it to $VER." "" \
     "The adapter restarts and tries the new version; the outcome is added above this when the trial ends." \
-    "If the new version fails its start-up self-test, the adapter goes back to OCBM ${have:-?} by itself."
+    "If the new version fails its start-up self-test, the adapter goes back to OCBM ${have:-?} by itself." "" \
+    "No update is guaranteed to succeed, least of all one the OCBM project did not build; what you put on" \
+    "your adapter is your choice (MIGRATING.md)."
   park used   # one use: the update restarts the adapter, and a stick left in must not run it again
   "$ROOT/script/ocbm_update.sh" "$pk.tgz" >> "$LOG" 2>&1   # placed: it restarts the adapter
   [ -f "$EO/update_pending" ] && exit 1

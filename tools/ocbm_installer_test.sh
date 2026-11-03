@@ -164,7 +164,7 @@ for sh in ${SHELLS:-sh dash}; do
   check '[ $rc = 1 ] && grep -q "^OCBM install: WAITING FOR THE NEXT START" "$d/stick/OCBM_RESULT.txt" && [ "$(snap "$d/root")" = "$(cat "$d/b6")" ] && [ -e "$d/stick/A15W_Update.img" ] && [ ! -e "$d/rebooted" ]' \
     "an app connected (a stick put in mid-drive): the image waits for the next start, nothing changed"
   rm -f "$d/run/host_present" "$d/rebooted"; refresh "$d"; run_once "$sh" "$d"; rc=$?
-  check '[ $rc = 1 ] && grep -q "^OCBM install: UPDATING" "$d/stick/OCBM_RESULT.txt" && [ -e "$d/rebooted" ] && grep -qx placed "$d/root/etc/ocbm/update_pending" && [ -e "$d/stick/A15W_Update.img.used" ] && [ -e "$d/root/etc/ocbm/stick_update" ]' \
+  check '[ $rc = 1 ] && grep -q "^OCBM install: UPDATING" "$d/stick/OCBM_RESULT.txt" && grep -q "No update is guaranteed" "$d/stick/OCBM_RESULT.txt" && [ -e "$d/rebooted" ] && grep -qx placed "$d/root/etc/ocbm/update_pending" && [ -e "$d/stick/A15W_Update.img.used" ] && [ -e "$d/root/etc/ocbm/stick_update" ]' \
     "an older OCBM installed: the image updates it through ocbm_update.sh, used once, and restarts into the trial"
   check 'cmp -s "$d/root/usr/sbin/ocbmd" "$T/img/tmp/ocbm/usr/sbin/ocbmd" && [ "$(cat "$d/root/usr/sbin/ocbmd.prev")" = old-ocbmd ] && [ ! -e "$d/root/usr/sbin/btd.prev" ]' \
     "only the files that differ are swapped, the old ones kept for a rollback"
