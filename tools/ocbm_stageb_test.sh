@@ -113,6 +113,15 @@ for sh in ${SHELLS:-sh dash}; do
   check '[ -e "$d/run/not_change_mass_storage" ] && [ ! -e "$d/stick/OCBM_RESULT.txt" ]' "with no stick in, the report waits"
   echo "/dev/sda1 $d/stick vfat rw 0 0" > "$d/proc/mounts"
   check 'waitfor "[ -e $d/stick/OCBM_RESULT.txt ]" 5 && grep -q "BACK TO STOCK" "$d/stick/OCBM_RESULT.txt"' "and goes to the stick when one is plugged in"
+  # A stick the report cannot be written to (full, on the Mac, 3 Nov): here OCBM_RESULT.txt.new is a
+  # directory, so the write fails inside deliver(). Nothing may be lost or counted delivered.
+  d="$T/$sh-full"; make_box "$d" ""; echo "OCBM install: BACK TO STOCK" > "$d/root/etc/ocbm/pending_result.txt"
+  echo "an older report" > "$d/stick/OCBM_RESULT.txt"; mkdir "$d/stick/OCBM_RESULT.txt.new"; boot "$sh" "$d"; sleep 3
+  check '[ "$(cat "$d/stick/OCBM_RESULT.txt")" = "an older report" ] && [ -e "$d/root/etc/ocbm/pending_result.txt" ] && [ ! -e "$d/root/etc/ocbm/delivered_result.txt" ]' \
+    "a stick it cannot write to: the older report stays whole, and the report stays pending"
+  rmdir "$d/stick/OCBM_RESULT.txt.new"; restart "$d"; boot "$sh" "$d"
+  check 'waitfor "grep -q \"^OCBM install: BACK TO STOCK\" $d/stick/OCBM_RESULT.txt" 5 && grep -q "an older report" "$d/stick/OCBM_RESULT.txt" && [ -e "$d/root/etc/ocbm/delivered_result.txt" ]' \
+    "and the next start delivers it, above the older one"
 
   echo "== $sh: the start counter catches a start that never finishes"
   d="$T/$sh-hang"; make_box "$d" trial; touch "$d/st.hang"

@@ -43,7 +43,9 @@ log() { echo "[restore] $*"; echo "[restore] $*" >> "$RUN/box.log"; }
 report() {  # $1 headline, then lines: OCBM_RESULT.txt on the stick, the one before kept below it
   r="$STICK/OCBM_RESULT.txt"
   { echo "OCBM restore: $1"; shift; echo; for l in "$@"; do echo "$l"; done
-    if [ -f "$r" ]; then echo; echo "--- before that"; cat "$r"; fi; } > "$r.new" && mv -f "$r.new" "$r"
+    if [ -f "$r" ]; then echo; echo "--- before that"; cat "$r"; fi; } > "$RUN/ocbm_restore_report.txt"
+  # Written in RAM first, then copied: on a full stick the cp fails and the older report stays whole.
+  cp "$RUN/ocbm_restore_report.txt" "$r.new" && mv -f "$r.new" "$r" || rm -f "$r.new"
   sync
 }
 let_go() { sync; $UMOUNT "$STICK" 2>/dev/null || mount -o remount,ro "$STICK" 2>/dev/null; }

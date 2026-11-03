@@ -62,12 +62,17 @@ deliver() {  # $1 a report in /etc/ocbm, onto the next stick plugged in; $2 shar
   while ! stick_in; do sleep "$POLL"; done
   sleep "$POLL"   # let update_box.sh look at the stick first
   r="$STICK/OCBM_RESULT.txt"
+  # Every step chained: on a full stick the write fails, and moving on regardless left an empty
+  # OCBM_RESULT.txt (an older report on it lost too) and the report counted delivered (the Mac, 3 Nov).
+  # A failed write keeps the report pending for the next start.
   if [ -f "$r" ]; then
-    { cat "$1"; echo; echo "--- before that"; cat "$r"; } > "$r.new"
+    { cat "$1" && echo && echo "--- before that" && cat "$r"; } > "$r.new"
   else
     cp "$1" "$r.new"
-  fi
-  mv -f "$r.new" "$r" && sync && mv -f "$1" "$EO/delivered_result.txt"
+  fi && mv -f "$r.new" "$r" && sync && mv -f "$1" "$EO/delivered_result.txt" || {
+    rm -f "$r.new"
+    log "could not write the report to the stick (full?): it is tried again at the next start"
+  }
   sync
   # Done with this stick: let it go before stock gets it. The truck, 3 Nov: the report was delivered and
   # synced, but the stick stayed mounted read-write under a stock that cycled for 40 s until the adapter
