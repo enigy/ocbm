@@ -86,7 +86,7 @@ Until an image is published with a release, build it:
 bash tools/make_ocbm_installer.sh ~/ocbm-image
 ```
 
-This writes `A15W_Update.img`, labelled `1.0.0 ocbm <commit>`, and its `SHA256SUMS`. Copy it to the
+This writes `A15W_Update.img`, labelled `1.0.1 ocbm <commit>` (the version in ccpa/installer/VERSION), and its `SHA256SUMS`. Copy it to the
 root of the stick and check the copy (macOS shown):
 
 ```
