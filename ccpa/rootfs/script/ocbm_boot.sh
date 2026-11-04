@@ -30,11 +30,21 @@ touch /tmp/UDiskPassThroughMode
   # stage + load the gadget modules (copy_to_tmp may not have run yet)
   [ -e /tmp/g_android_accessory.ko ] || { [ -e /script/ko.tar.gz ] && tar -xzf /script/ko.tar.gz -C /tmp 2>/dev/null; }
   grep -q storage_common /proc/modules || insmod /tmp/storage_common.ko 2>/dev/null
-  grep -q g_android_accessory /proc/modules || insmod /tmp/g_android_accessory.ko 2>/dev/null
+  # The Auto Box gadget where the unit has one. On 2025.10.15 firmware (the one-file installer's target)
+  # ko.tar.gz's g_android_accessory.ko is a generic Android/HiCar gadget: its interface, compiled in,
+  # reads "Android Accessory Interface" FF/FF as an Android phone in accessory mode does, and GM's head
+  # unit offered Android Auto on every start (dev adapter in the truck, 4 Nov). The interface stock
+  # CarPlay presents ("Auto Box Interface" FF/F0) is g_android_autobox.ko there. On 2025.02.25 firmware
+  # (the truck) g_android_accessory.ko is the Auto Box gadget itself, and there is no autobox file.
+  GADGET_KO=/tmp/g_android_accessory.ko
+  [ -e /tmp/g_android_autobox.ko ] && GADGET_KO=/tmp/g_android_autobox.ko
+  grep -qE '^g_android_(accessory|autobox) ' /proc/modules || insmod "$GADGET_KO" 2>/dev/null
+  GADGET_MOD=$(awk '$1 == "g_android_accessory" || $1 == "g_android_autobox" { print $1; exit }' /proc/modules)
+  echo "[ocbm-boot] gadget module: ${GADGET_MOD:-none} ($GADGET_KO)" >> /tmp/box.log
   # ZLP after a wMaxPacketSize-multiple accessory write. Off by default (accZLP=N, measured
   # 2026-09-02); without it a 512-multiple frame followed by idle never completes the host's
   # bulk read and is discarded on its timeout (macOS app and ocbm-host alike).
-  echo Y > /sys/module/g_android_accessory/parameters/accZLP 2>/dev/null
+  echo Y > "/sys/module/${GADGET_MOD:-g_android_accessory}/parameters/accZLP" 2>/dev/null
   A=/sys/class/android_usb_accessory/android0
   i=0; while [ ! -e "$A/enable" ] && [ "$i" -lt 50 ]; do i=$((i+1)); sleep 0.1; done
   [ -e "$A/enable" ] || { echo "[ocbm-boot] gadget sysfs never appeared" >> "$L"; echo "[ocbm-boot] gadget sysfs never appeared" >> /tmp/box.log; exit 0; }
@@ -53,6 +63,10 @@ touch /tmp/UDiskPassThroughMode
   # OCBM host app matches.
   echo 1314 > "$A/idVendor"
   echo 2d00 > "$A/idProduct"                # stable OCBM accessory PID (see comment above)
+  # The strings too, for the same reason: no unit depends on its module's defaults ("Android"/"Android" on
+  # 2025.10.15's generic gadget). These are the Auto Box gadget's own, as stock CarPlay presents them.
+  echo "Magic Communication Tec." > "$A/iManufacturer" 2>/dev/null
+  echo "Auto Box" > "$A/iProduct" 2>/dev/null
   echo accessory > "$A/functions"; echo 1 > "$A/enable"
   i=0; while [ ! -e /dev/usb_accessory ] && [ "$i" -lt 50 ]; do i=$((i+1)); sleep 0.1; done
   /usr/sbin/ocbmd >> /tmp/box.log 2>&1 &
