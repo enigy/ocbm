@@ -75,6 +75,9 @@ stopped() {  # apply ran part way: OCBM still starts, apply can run again
 
 # ---- 1 checks -----------------------------------------------------------------------------------
 log "OCBM_RESTORE on the stick: back to stock from its flash backup"
+# restore_watch's note from a stick put in while OCBM ran ("used when the adapter starts"): this is that start,
+# and OCBM_RESULT.txt says what came of it (dev adapter, 4 Nov: the note was left behind, out of date).
+rm -f "$STICK/OCBM_RESTORE.txt"
 id=$(tr -cd 'A-Za-z0-9' < "$ROOT/etc/device_serial" 2>/dev/null | cut -c1-32)
 [ -n "$id" ] || id=$(tr -cd '0-9A-Fa-f' < "$SYS/class/net/wlan0/address" 2>/dev/null)
 [ -n "$id" ] || id=adapter

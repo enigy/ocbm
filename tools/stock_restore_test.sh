@@ -128,6 +128,7 @@ stick_box() {  # $1 dir, $2 mtd2 image: the final adapter $T/fin, its flash, and
   cp "$1/dev/mtd0" "$b/mtd0.bin"; cp "$1/dev/mtd1" "$b/mtd1.bin"; cp "$2" "$b/mtd2.bin"
   ( cd "$b" && sha256sum mtd0.bin mtd1.bin mtd2.bin > SHA256SUMS )
   touch "$1/stick/OCBM_RESTORE"
+  echo "not used yet" > "$1/stick/OCBM_RESTORE.txt"   # restore_watch's note, from a stick put in while OCBM ran
 }
 run_restore() {  # $1 dir, rest: env
   d_="$1"; shift
@@ -330,8 +331,8 @@ onefile_tests() {  # $1 shell
   python3 -I "$HERE/jffs2_extract_test.py" --make-image "$T/rsstock" "$T/rsstock.bin"
   r="$T/rs"; stick_box "$r" "$T/rsstock.bin"; m="$(cksum "$r/dev/mtd0" "$r/dev/mtd1")"
   run_restore "$r"; rc=$?
-  check '[ $rc -eq 0 ] && restore_says "$r" "BACK TO STOCK" && [ -e "$r/rebooted" ] && [ -e "$r/stick/OCBM_RESTORE.done" ]' \
-    "a final adapter goes back to stock from its stick's backup, reports it and restarts"
+  check '[ $rc -eq 0 ] && restore_says "$r" "BACK TO STOCK" && [ -e "$r/rebooted" ] && [ -e "$r/stick/OCBM_RESTORE.done" ] && [ ! -e "$r/stick/OCBM_RESTORE.txt" ]' \
+    "a final adapter goes back to stock from its stick's backup, reports it and restarts; restore_watch's note goes"
   check '! is_dispatcher "$r/root" && cmp -s "$r/root/usr/sbin/ARMHiCar" "$T/stock/usr/sbin/ARMHiCar" && [ ! -e "$r/root/usr/sbin/ocbmd" ] && [ ! -e "$r/root/etc/ocbm" ]' \
     "the rootfs is the factory's, extras included, OCBM gone"
   check '[ ! -e "$r/root/script/stock_restore_box.sh" ] && grep -q RESTORE_VERIFIED "$r/run/ocbm_restore_verify.txt"' \
