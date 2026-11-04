@@ -129,13 +129,14 @@ for sh in ${SHELLS:-sh dash}; do
   comm -13 <(sed 's/ .*//' "$d/before") <(sed 's/ .*//' "$d/after") > "$d/added"
   comm -23 <(sed 's/ .*//' "$d/before") <(sed 's/ .*//' "$d/after") > "$d/removed"
   exp_add="$( { for rel in $(bash "$HERE/make_ocbm_installer.sh" --list); do [ "$rel" = script/ocbm_dispatch.sh ] || echo "./$rel"; done
-               printf '%s\n' ./etc/ocbm ./etc/ocbm/addresses.txt ./etc/ocbm/identity.tgz ./etc/ocbm/installed_version ./etc/ocbm/pruned.txt \
+               printf '%s\n' ./etc/ocbm ./etc/ocbm/addresses.txt ./etc/ocbm/identity.tgz ./etc/ocbm/install_id ./etc/ocbm/installed_version ./etc/ocbm/pruned.txt \
                  ./script/ocbm_mode ./script/start_main_service.stock.sh; } | LC_ALL=C sort)"
   check '[ "$(cat "$d/added")" = "$exp_add" ]' "nothing is added beyond the payload, /etc/ocbm and the arm files"
   check '! grep -vE "^\./(usr/sbin/ARMHiCar|usr/lib/lib(dmsdp|Hisight|HwKeystore|securec|nearby)|etc/(udhcpd_hicar_ap.conf|hichain|BoxHelper.apk|boa/(www|cgi-bin|images))|usr/sbin/AutomaticTest|script/test_mic.sh|lib/(crt1.o|libgomp.spec|libasan.la|libstdc\+\+.so.6.0.20-gdb.py|libSegFault.so))" "$d/removed"' \
     "nothing is removed beyond prune.list"
   changed="$(comm -23 <(sort "$d/before") <(sort "$d/after") | sed 's/ .*//' | grep -vxF -f "$d/removed")"
   check '[ "$changed" = "./script/start_main_service.sh" ]' "the only rewritten stock file is start_main_service.sh"
+  check 'grep -qxE "[0-9a-f]{16}" "$d/root/etc/ocbm/install_id"' "the install writes its own id (install_id), for Carlink's once-per-install records"
   check '[ "$(wc -l < "$d/root/etc/ocbm/pruned.txt" | tr -d " ")" = 21 ] && grep -qx /etc/boa/www/index.html "$d/root/etc/ocbm/pruned.txt"' "pruned.txt records the deletions"
   check '( for x in etc/boa/www etc/boa/cgi-bin etc/boa/images etc/hichain; do [ -d "$d/root/$x" ] && [ -z "$(ls -A "$d/root/$x")" ] || exit 1; done )' \
     "the prune empties etc/boa/www, cgi-bin, images and etc/hichain but keeps them: Carlinkit's own image unpacks into etc/boa/www"
@@ -219,12 +220,15 @@ for sh in ${SHELLS:-sh dash}; do
   touch -t 202101010000 "$T/ref2021"
   check '[ -z "$(find "$r/root/etc/hostapd.conf" -newer "$T/ref2021")" ]' \
     "it copies hostapd.conf back with cp -p (a plain cp left the dev adapter's 0777 file 0755, 31 Oct)"
+  id1=$(cat "$r/root/etc/ocbm/install_id" 2>/dev/null)
   echo 2 > "$r/root/etc/ocbm/boot_attempts"
   refresh "$r"; run_once "$sh" "$r"; rc=$?
   check '[ $rc = 1 ] && grep -q "OCBM_RETRY" "$r/stick/OCBM_RESULT.txt"' "an undone version is refused without OCBM_RETRY"
   touch "$r/stick/OCBM_RETRY"; refresh "$r"; run_once "$sh" "$r"; rc=$?
   check '[ $rc = 0 ] && installed "$r"' "with OCBM_RETRY it installs again, and start_main_service.stock.sh is still stock"
   check '[ ! -e "$r/stick/OCBM_RETRY" ] && [ -e "$r/stick/OCBM_RETRY.used" ]' "the install uses OCBM_RETRY up: it is renamed OCBM_RETRY.used"
+  check '[ -n "$id1" ] && grep -qxE "[0-9a-f]{16}" "$r/root/etc/ocbm/install_id" && [ "$(cat "$r/root/etc/ocbm/install_id")" != "$id1" ]' \
+    "the new install has a new install_id"
   check 'grep -q "^OCBM install: REFUSED" "$r/stick/OCBM_RESULT.prev.txt" && [ ! -e "$r/stick/OCBM_RESULT.txt" ]' \
     "the refusal's report is kept as OCBM_RESULT.prev.txt until finish.sh writes the new one"
   check '[ ! -e "$r/root/etc/ocbm/boot_attempts" ] && [ ! -e "$r/root/etc/ocbm/pending_result.txt" ]' "arming clears the earlier try's start counter and report"

@@ -435,6 +435,9 @@ fi
 rm -f "$EO/boot_attempts" "$EO/first_start.txt" "$EO/pending_result.txt"   # Stage B state of an earlier try
 { echo trial > "$MODE.new" && mv -f "$MODE.new" "$MODE"; } || abort "Could not write /script/ocbm_mode."
 echo "$VER" > "$EO/installed_version" || abort "Could not write /etc/ocbm/installed_version."
+# A new id for each install, which updates keep: Carlink's once-per-install records (a trial proven by
+# CarPlay, its welcome) start over with it (dev adapter, 4 Nov: one trial's CarPlay proved every later one).
+{ date; cat "$PROC/uptime" 2>/dev/null; dd if=/dev/urandom bs=16 count=1 2>/dev/null; } | sha256sum | cut -c1-16 > "$EO/install_id"
 want=$(awk '$2 == "script/ocbm_dispatch.sh" {print $1}' "$PAYLOAD/SHA256SUMS")
 if ! { cp "$PAYLOAD/script/ocbm_dispatch.sh" "$SMS.new" && chmod 755 "$SMS.new" && [ "$(sum_of "$SMS.new")" = "$want" ]; }; then
   rm -f "$SMS.new" "$MODE"
