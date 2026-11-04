@@ -174,8 +174,11 @@ update_rollback() {  # $1 why: put back the version the update replaced
   done
   to=$(journal to); from=$(journal from)
   put "$EO/update_result" "rolled_back $to: $why (kept $from)"
-  # The failed starts were the update's, not the install's.
-  rm -f "$EO/update_attempts" "$EO/boot_attempts" "$U"; sync
+  # The failed starts were the update's, not the install's. acc_direct_io too may be the update's: ocbmd
+  # sets it for the gadget the boot script loads, and 1.0.3 changed which (the Auto Box one serializes,
+  # the generic one does not, and single-threaded on it brings back the 2 Nov stalls). Cleared, the next
+  # start finds a serializing driver again with one ~8 s restart (the Mac, 4 Nov).
+  rm -f "$EO/update_attempts" "$EO/boot_attempts" "$EO/acc_direct_io" "$U"; sync
   log "update rolled back to $from: $why"
   stick_outcome "ROLLED BACK"
 }

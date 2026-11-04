@@ -38,9 +38,19 @@ touch /tmp/UDiskPassThroughMode
   # (the truck) g_android_accessory.ko is the Auto Box gadget itself, and there is no autobox file.
   GADGET_KO=/tmp/g_android_accessory.ko
   [ -e /tmp/g_android_autobox.ko ] && GADGET_KO=/tmp/g_android_autobox.ko
-  grep -qE '^g_android_(accessory|autobox) ' /proc/modules || insmod "$GADGET_KO" 2>/dev/null
+  # Both files name their module g_android_accessory (/proc/modules tells them apart by size only), so
+  # the log says which file this start loaded, or that a gadget was already loaded.
+  if grep -qE '^g_android_(accessory|autobox) ' /proc/modules; then
+    GADGET_HOW="already loaded"
+  elif insmod "$GADGET_KO" 2>/dev/null; then
+    GADGET_HOW="loaded $GADGET_KO"
+  elif [ "$GADGET_KO" != /tmp/g_android_accessory.ko ] && insmod /tmp/g_android_accessory.ko 2>/dev/null; then
+    GADGET_HOW="loaded /tmp/g_android_accessory.ko ($GADGET_KO did not load)"   # a gadget at all keeps the unit reachable
+  else
+    GADGET_HOW="no module loaded ($GADGET_KO)"
+  fi
   GADGET_MOD=$(awk '$1 == "g_android_accessory" || $1 == "g_android_autobox" { print $1; exit }' /proc/modules)
-  echo "[ocbm-boot] gadget module: ${GADGET_MOD:-none} ($GADGET_KO)" >> /tmp/box.log
+  echo "[ocbm-boot] gadget module: $GADGET_HOW: ${GADGET_MOD:-none} $(awk -v m="$GADGET_MOD" '$1 == m { print "size " $2 }' /proc/modules)" >> /tmp/box.log
   # ZLP after a wMaxPacketSize-multiple accessory write. Off by default (accZLP=N, measured
   # 2026-09-02); without it a 512-multiple frame followed by idle never completes the host's
   # bulk read and is discarded on its timeout (macOS app and ocbm-host alike).

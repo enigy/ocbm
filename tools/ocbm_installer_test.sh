@@ -221,6 +221,7 @@ for sh in ${SHELLS:-sh dash}; do
   check '[ -z "$(find "$r/root/etc/hostapd.conf" -newer "$T/ref2021")" ]' \
     "it copies hostapd.conf back with cp -p (a plain cp left the dev adapter's 0777 file 0755, 31 Oct)"
   id1=$(cat "$r/root/etc/ocbm/install_id" 2>/dev/null)
+  echo flagged > "$r/root/etc/ocbm/acc_direct_io"   # the earlier install's driver finding
   echo 2 > "$r/root/etc/ocbm/boot_attempts"
   refresh "$r"; run_once "$sh" "$r"; rc=$?
   check '[ $rc = 1 ] && grep -q "OCBM_RETRY" "$r/stick/OCBM_RESULT.txt"' "an undone version is refused without OCBM_RETRY"
@@ -229,6 +230,7 @@ for sh in ${SHELLS:-sh dash}; do
   check '[ ! -e "$r/stick/OCBM_RETRY" ] && [ -e "$r/stick/OCBM_RETRY.used" ]' "the install uses OCBM_RETRY up: it is renamed OCBM_RETRY.used"
   check '[ -n "$id1" ] && grep -qxE "[0-9a-f]{16}" "$r/root/etc/ocbm/install_id" && [ "$(cat "$r/root/etc/ocbm/install_id")" != "$id1" ]' \
     "the new install has a new install_id"
+  check '[ ! -e "$r/root/etc/ocbm/acc_direct_io" ]' "and starts without the earlier install's acc_direct_io"
   check 'grep -q "^OCBM install: REFUSED" "$r/stick/OCBM_RESULT.prev.txt" && [ ! -e "$r/stick/OCBM_RESULT.txt" ]' \
     "the refusal's report is kept as OCBM_RESULT.prev.txt until finish.sh writes the new one"
   check '[ ! -e "$r/root/etc/ocbm/boot_attempts" ] && [ ! -e "$r/root/etc/ocbm/pending_result.txt" ]' "arming clears the earlier try's start counter and report"

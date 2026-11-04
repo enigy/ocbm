@@ -170,8 +170,9 @@ for sh in ${SHELLS:-sh dash}; do
 
   echo "== $sh: two starts that never pass put the old version back before OCBM starts"
   d="$T/$sh-hang"; make_box "$d" final; make_pkg "$d/run/ocbm-update.tgz" ""
-  update "$sh" "$d"; restart "$d"; echo 2 > "$d/root/etc/ocbm/update_attempts"; boot "$sh" "$d"
+  update "$sh" "$d"; restart "$d"; echo 2 > "$d/root/etc/ocbm/update_attempts"; echo flagged > "$d/root/etc/ocbm/acc_direct_io"; boot "$sh" "$d"
   check 'is_old "$d" && result_is "$d" "rolled_back $NEW: OCBM 1.1.0 started 2 times in a row"' "rolled back at boot"
+  check '[ ! -e "$d/root/etc/ocbm/acc_direct_io" ]' "the rollback clears acc_direct_io: it may be the update gadget's, not the old one's (the Mac, 4 Nov)"
   check '[ -e "$d/m.boot" ] && [ ! -e "$d/rebooted" ]' "and the old OCBM starts, with no restart"
 
   echo "== $sh: a power cut at every step ends on a working version"
