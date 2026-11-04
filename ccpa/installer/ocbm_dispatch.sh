@@ -37,7 +37,7 @@
 # ocbm_install.sh gets from ::respawn.
 #
 # Test hooks (tools/ocbm_stageb_test.sh, tools/ocbm_update_test.sh): ROOT RUN STICK PROC POLL
-# STICK_WAIT STICK_PKG_WAIT REBOOT ANSWER_SECS UMOUNT.
+# STICK_WAIT STICK_PKG_WAIT REBOOT ANSWER_SECS UMOUNT INSTALL_START INSTALL_WAIT.
 ROOT="${ROOT:-}"
 RUN="${RUN:-/tmp}"
 STICK="${STICK:-/mnt/UPAN}"
@@ -52,6 +52,8 @@ SMS_STOCK="$S/start_main_service.stock.sh"
 U="$EO/update_pending"
 REBOOT="${REBOOT:-/sbin/reboot}"
 UMOUNT="${UMOUNT:-umount}"
+INSTALL_START="${INSTALL_START:-60}"   # deliver(): how long an install image may take to start its once.sh
+INSTALL_WAIT="${INSTALL_WAIT:-900}"    # ...and to finish
 update_trial=0
 export PATH=${OCBM_TEST_PATH:+$OCBM_TEST_PATH:}/usr/sbin:/usr/bin:/sbin:/bin:/tmp/bin:$PATH
 
@@ -61,6 +63,20 @@ stick_in() { [ -d "$STICK" ] && grep -q " $STICK " "$PROC/mounts" 2>/dev/null; }
 deliver() {  # $1 a report in /etc/ocbm, onto the next stick plugged in; $2 share: then hand sticks back to stock
   while ! stick_in; do sleep "$POLL"; done
   sleep "$POLL"   # let update_box.sh look at the stick first
+  # An install image on the stick: stock's update_box.sh runs its once.sh at this start, and once.sh takes this
+  # report and puts it under its own (the truck, 4 Nov: written and unmounted beside a running install, which
+  # never finished). Leave the stick to it: wait for the install to start, then to end, and write only a report
+  # it did not take.
+  i=0
+  while [ -f "$1" ] && [ ! -e "$RUN/ocbm_install.running" ] && [ "$i" -lt "$INSTALL_START" ] \
+    && ls "$STICK"/*_Update.img >/dev/null 2>&1; do sleep "$POLL"; i=$((i + POLL)); done
+  i=0
+  while [ -f "$1" ] && [ -e "$RUN/ocbm_install.running" ] && [ "$i" -lt "$INSTALL_WAIT" ]; do sleep "$POLL"; i=$((i + POLL)); done
+  if [ ! -f "$1" ]; then
+    log "the install on this stick took the report"
+    [ "${2:-}" = share ] && rm -f "$RUN/not_change_mass_storage"
+    return 0
+  fi
   r="$STICK/OCBM_RESULT.txt"
   # Every step chained: on a full stick the write fails, and moving on regardless left an empty
   # OCBM_RESULT.txt (an older report on it lost too) and the report counted delivered (the Mac, 3 Nov).

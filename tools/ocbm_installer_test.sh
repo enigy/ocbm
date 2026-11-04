@@ -276,7 +276,11 @@ for sh in ${SHELLS:-sh dash}; do
     blob "$1/lib/libz.so.1.2.11" 3000; ln -s libz.so.1.2.11 "$1/lib/libz.so.1"; ln -s libz.so.1 "$1/lib/libz.so"
     printf '#!/bin/sh\necho ncm\n' > "$1/script/custom_init.sh"
   }
-  r="$T/$sh-hand"; make_box "$r"; leftovers "$r/root"; run_once "$sh" "$r"; rc=$?
+  r="$T/$sh-hand"; make_box "$r"; leftovers "$r/root"
+  # A link to a file that names libz is not followed: the scan reads regular files only (the truck, 4 Nov: grep -r
+  # read through 421 links, 358 of them to busybox, for every guarded entry).
+  mkdir -p "$r/root/opt" "$r/root/usr/bin"; printf 'libz.so\n' > "$r/root/opt/zdoc"; ln -s ../../opt/zdoc "$r/root/usr/bin/zlink"
+  run_once "$sh" "$r"; rc=$?
   check '[ $rc = 0 ] && installed "$r" && n=0 && for f in usr/sbin/dropbear usr/libexec/sftp-server root/.ssh/authorized_keys .ash_history root/.ash_history lib/libz.so.1.2.11 lib/libz.so.1 lib/libz.so script/custom_init.sh; do [ -e "$r/root/$f" ] || [ -L "$r/root/$f" ] && n=$((n+1)); done; [ $n = 0 ]' \
     "dropbear, sftp-server, authorized_keys, the shell histories, libz and custom_init.sh go"
   check 'grep -qx /usr/sbin/dropbear "$r/root/etc/ocbm/pruned.txt" && grep -qx /lib/libz.so.1.2.11 "$r/root/etc/ocbm/pruned.txt"' "and pruned.txt records them, as the rest of the prune"
@@ -286,6 +290,19 @@ for sh in ${SHELLS:-sh dash}; do
   run_once "$sh" "$r"; rc=$?
   check '[ $rc = 0 ] && [ -e "$r/root/lib/libz.so.1.2.11" ] && [ -L "$r/root/lib/libz.so" ] && [ -e "$r/root/script/custom_init.sh" ] && [ ! -e "$r/root/usr/sbin/dropbear" ]' \
     "but libz stays while a kept program names it, and custom_init.sh while the stock start script calls it"
+  check '[ "$(grep -c "keep /lib/libz.so.1.2.11" "$r/install.log")" = 1 ]' "the guard's scan runs once an install, not again at make_room"
+
+  echo "== $sh: a report Stage B still owes the stick, at the start the image installs at (the truck, 4 Nov)"
+  # The revert ran with no stick in; at the next stock start the dispatcher's deliver() and this install meet.
+  r="$T/$sh-owed"; make_box "$r"; mkdir -p "$r/root/etc/ocbm" "$r/run"
+  printf 'OCBM install: BACK TO STOCK\nthe revert report\n' > "$r/root/etc/ocbm/pending_result.txt"
+  echo "an older report" > "$r/stick/OCBM_RESULT.txt"
+  run_once "$sh" "$r"; rc=$?
+  run_finish "$sh" "$r"
+  check '[ $rc = 0 ] && installed "$r" && awk "/^--- before that/{b=NR} /the revert report/{v=NR} END{exit !(b && v > b)}" "$r/stick/OCBM_RESULT.txt"' \
+    "the install takes the owed report and puts it under its own"
+  check '[ ! -e "$r/root/etc/ocbm/pending_result.txt" ] && grep -q "the revert" "$r/root/etc/ocbm/delivered_result.txt" && [ ! -e "$r/run/ocbm_install.running" ] && grep -q "an older report" "$r/stick/OCBM_RESULT.prev.txt"' \
+    "counted delivered, so the dispatcher writes nothing beside it; the marker deliver() waits on is gone"
 
   echo "== $sh: not enough room after the prune"
   r="$T/$sh-tight"; make_box "$r"; run_once "$sh" "$r" FAKE_FREE_AFTER_KB=10; rc=$?

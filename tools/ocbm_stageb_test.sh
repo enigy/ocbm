@@ -58,7 +58,7 @@ HOST_DAEMONS="$(for n in usbmuxd mdnsd boa; do pgrep -x "$n" >/dev/null 2>&1 && 
 # umount as the box has it, recording what it was asked to let go of (deliver() lets the stick go).
 printf '#!/bin/sh\necho "$*" >> "%s/umount.calls"\n' "$T" > "$T/umount"; chmod 755 "$T/umount"
 boot() {  # $1 shell, $2 dir: one start of the adapter
-  env UMOUNT="$T/umount" ROOT="$2/root" RUN="$2/run" STICK="$2/stick" PROC="$2/proc" POLL=1 STICK_WAIT=2 STICK_PKG_WAIT=2 ANSWER_SECS=3 FINISH_IGNORE="$HOST_DAEMONS" \
+  env UMOUNT="$T/umount" ROOT="$2/root" RUN="$2/run" STICK="$2/stick" PROC="$2/proc" POLL=1 STICK_WAIT=2 STICK_PKG_WAIT=2 ANSWER_SECS=3 INSTALL_START=3 INSTALL_WAIT=12 FINISH_IGNORE="$HOST_DAEMONS" \
       REBOOT="touch $2/rebooted" "$1" "$2/root/script/start_main_service.sh" > "$2/boot.out" 2>&1
 }
 restart() { reap; rm -rf "${1:?}/run"; mkdir -p "$1/run"; rm -f "$1"/m.* "$1/rebooted"; }  # power cycle: /tmp is gone
@@ -123,6 +123,20 @@ for sh in ${SHELLS:-sh dash}; do
   # All inside waitfor: delivered_result.txt appears only after deliver()'s sync, slow on macOS (the Mac, 3 Nov).
   check 'waitfor "grep -q \"^OCBM install: BACK TO STOCK\" $d/stick/OCBM_RESULT.txt && grep -q \"an older report\" $d/stick/OCBM_RESULT.txt && [ -e $d/root/etc/ocbm/delivered_result.txt ]" 15' \
     "and the next start delivers it, above the older one"
+  # An install image on the stick at that start: once.sh takes the report, and deliver() must neither write nor
+  # unmount the stick while it runs (the truck, 4 Nov: an install that never finished beside the delivery).
+  d="$T/$sh-owed"; make_box "$d" ""; echo "OCBM install: BACK TO STOCK" > "$d/root/etc/ocbm/pending_result.txt"
+  rm -f "$d/stick/OCBM_RESULT.txt"; echo img > "$d/stick/A15W_Update.img"; mkdir -p "$d/run"; : > "$d/run/ocbm_install.running"
+  boot "$sh" "$d"; sleep 4
+  check '[ ! -e "$d/stick/OCBM_RESULT.txt" ] && ! grep -qxF "$d/stick" "$T/umount.calls" && [ -e "$d/root/etc/ocbm/pending_result.txt" ]' \
+    "with an install running from the stick, deliver() leaves the stick alone"
+  mv -f "$d/root/etc/ocbm/pending_result.txt" "$d/root/etc/ocbm/delivered_result.txt"; mv "$d/stick/A15W_Update.img" "$d/stick/A15W_Update.img.used"; rm -f "$d/run/ocbm_install.running"
+  check 'waitfor "grep -q \"took the report\" $d/run/ocbm_dispatch.log" 5 && [ ! -e "$d/stick/OCBM_RESULT.txt" ] && waitfor "[ ! -e $d/run/not_change_mass_storage ]" 3' \
+    "and once the install took the report, writes nothing and hands sticks back to stock"
+  d="$T/$sh-owed2"; make_box "$d" ""; echo "OCBM install: BACK TO STOCK" > "$d/root/etc/ocbm/pending_result.txt"
+  rm -f "$d/stick/OCBM_RESULT.txt"; echo img > "$d/stick/A15W_Update.img"; boot "$sh" "$d"
+  check 'waitfor "grep -q \"^OCBM install: BACK TO STOCK\" $d/stick/OCBM_RESULT.txt" 10' \
+    "an image whose install never starts (not OCBM's): the report goes once the wait for it is over"
 
   echo "== $sh: the start counter catches a start that never finishes"
   d="$T/$sh-hang"; make_box "$d" trial; touch "$d/st.hang"

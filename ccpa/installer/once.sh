@@ -70,7 +70,7 @@ step() {
 # update_box.sh to use, yet its error path kept the unpacked image in RAM: 4.3 MB of tmpfs for the
 # rest of the drive (dev adapter, 3 Nov). Success empties it itself (hand_off), and a power cut (99)
 # leaves it for a rerun.
-trap 'rc=$?; [ "$rc" = 1 ] && case "$UPDATE" in ""|/) ;; *) rm -rf "$UPDATE" ;; esac' EXIT
+trap 'rc=$?; rm -f "${RUN:-/tmp}/ocbm_install.running"; [ "$rc" = 1 ] && case "$UPDATE" in ""|/) ;; *) rm -rf "$UPDATE" ;; esac' EXIT
 
 product=$(cat "$ROOT/etc/box_product_type" 2>/dev/null)
 IMG="$STICK/${product:-$WANT_PRODUCT}_Update.img"
@@ -81,6 +81,14 @@ if [ -z "${ROUTE:-}" ]; then
     *) ROUTE=stick ;;
   esac
 fi
+# A report Stage B still owes this stick (a revert with no stick in: the dispatcher's stock() delivers it at
+# the next start, the one this runs at). This run takes it and puts it under its own, so the two never write
+# the stick at once: the truck, 4 Nov, an install that never finished while that delivery ran beside it.
+BEFORE="${RESULT}.before"
+rm -f "$BEFORE"
+[ "$ROUTE" = stick ] && [ -f "$EO/pending_result.txt" ] && cp "$EO/pending_result.txt" "$BEFORE"
+# deliver() in the dispatcher waits while this is here. touch, not ": >": a failed redirect on ":" ends the script.
+touch "${RUN:-/tmp}/ocbm_install.running" 2>/dev/null
 if [ "$ROUTE" = stick ] && [ -f "$STICK/OCBM_RESULT.txt" ]; then   # this run's report replaces it
   mv -f "$STICK/OCBM_RESULT.txt" "$STICK/OCBM_RESULT.prev.txt"; sync
 fi
@@ -88,8 +96,11 @@ fi
 result() {  # $1 headline, then lines of text for the user
   { echo "OCBM install: $1"; echo "installer: ${VER:-unknown}"; echo; shift
     for l in "$@"; do echo "$l"; done
-    echo; echo "--- log"; cat "$LOG"; } > "$RESULT"
-  if [ "$ROUTE" = stick ] && [ -d "$STICK" ]; then cp "$RESULT" "$STICK/OCBM_RESULT.txt"; fi
+    echo; echo "--- log"; cat "$LOG"
+    if [ -s "$BEFORE" ]; then echo; echo "--- before that"; cat "$BEFORE"; fi; } > "$RESULT"
+  if [ "$ROUTE" = stick ] && [ -d "$STICK" ] && cp "$RESULT" "$STICK/OCBM_RESULT.txt" && [ -s "$BEFORE" ]; then
+    cp "$BEFORE" "$EO/delivered_result.txt" 2>/dev/null; rm -f "$EO/pending_result.txt"   # on the stick now, under this one
+  fi
   sync
 }
 park() {  # $1 suffix
@@ -200,15 +211,43 @@ prune_targets() {  # what the prune removes. stdout is the list: every plain mat
   plain=$(prune_matches plain); guarded=$(prune_matches guarded)
   [ -n "$plain" ] && echo "$plain"
   [ -n "$guarded" ] || return 0
-  x="$STATE.prune_x"; printf '%s\n' $plain $guarded > "$x"
+  x="$STATE.prune_x"; n="$STATE.prune_n"; h="$STATE.prune_h"
+  printf '%s\n' $plain $guarded > "$x"
+  for p in $guarded; do b=${p##*/}; case "$b" in lib*.so*) b="${b%%.so*}.so" ;; esac; echo "$b"; done | sort -u > "$n"
+  # One pass over the regular files, symlinks not followed, for all the names at once. grep -r read
+  # through every link to a file: on the truck, 421 of them (358 to the 0.6 MB busybox), ~242 MB a
+  # scan, once per guarded entry and twice per install, 2 GB in all (4 Nov: checks +75 s, make_room +62 s).
+  named_files "$n" "$ROOT/bin" "$ROOT/sbin" "$ROOT/usr" "$ROOT/lib" "$ROOT/script" "$ROOT/etc" | grep -vxF -f "$x" > "$h"
   for p in $guarded; do
     b=${p##*/}
     case "$b" in lib*.so*) b="${b%%.so*}.so" ;; esac
-    by=$(grep -rlsF -- "$b" "$ROOT/bin" "$ROOT/sbin" "$ROOT/usr" "$ROOT/lib" "$ROOT/script" "$ROOT/etc" 2>/dev/null \
-      | grep -vxF -f "$x" | head -1)
+    by=""
+    while IFS= read -r f; do grep -qsF -- "$b" "$f" && { by=$f; break; }; done < "$h"
     if [ -n "$by" ]; then echo "[ocbm] keep /${p#$ROOT/}: /${by#$ROOT/} names it" >> "$LOG"; else echo "$p"; fi
   done
-  rm -f "$x"
+  rm -f "$x" "$n" "$h"
+}
+named_files() {  # $1 a file of names, then directories: the regular files under them holding any of the names
+  nf=$1; shift
+  dirs=$(printf '%s\n' "$@")
+  while [ -n "$dirs" ]; do
+    next=""
+    while IFS= read -r d; do
+      [ -d "$d" ] && [ ! -L "$d" ] || continue
+      set --
+      for f in "$d"/* "$d"/.[!.]*; do
+        if [ -L "$f" ]; then continue
+        elif [ -d "$f" ]; then next="$next$f
+"
+        elif [ -f "$f" ]; then set -- "$@" "$f"
+        fi
+      done
+      [ $# -gt 0 ] && grep -lsF -f "$nf" "$@"
+    done <<DIRS
+$dirs
+DIRS
+    dirs=$next   # one path a line; the blank last one is skipped above
+  done
 }
 under_root() { case "$1" in "$ROOT"/?*) return 0 ;; esac; return 1; }
 payload_files() {  # what the place step writes: the manifest's usr/sbin, usr/bin and script files
@@ -333,8 +372,10 @@ if [ -d "$EO" ]; then
     [ -n "${FAKE_FREE_KB:-}" ] && FAKE_FREE_KB=$((FAKE_FREE_KB + freed_kb))
   fi
 fi
+# The prune's targets, worked out once: make_room removes this list, not a second scan's.
+targets=$(prune_targets)
 prune_kb=0
-for p in $(prune_targets); do
+for p in $targets; do
   under_root "$p" && prune_kb=$((prune_kb + $(du -sk "$p" | cut -f1)))
 done
 free=${FAKE_FREE_KB:-$(free_kb "$ROOT/")}
@@ -399,7 +440,7 @@ say "identity: /etc/ocbm/identity.tgz ($(echo $files | wc -w | tr -d ' ') entrie
 # ---------------------------------------------------------------------------------------------
 step make_room
 [ -z "$ROOT" ] && killall ARMHiCar >/dev/null 2>&1
-for p in $(prune_targets); do
+for p in $targets; do
   under_root "$p" || continue
   rm -rf "$p" && echo "/${p#$ROOT/}" >> "$EO/pruned.txt"
 done
@@ -458,7 +499,7 @@ fi
 # ---------------------------------------------------------------------------------------------
 step hand_off
 { echo "VER='$VER'"; echo "ROUTE='$ROUTE'"; echo "STICK='$STICK'"; echo "IMG='$IMG'"
-  echo "BACKUP='$B'"; echo "LOG='$LOG'"; echo "RESULT='$RESULT'"; } > "$STATE"
+  echo "BACKUP='$B'"; echo "LOG='$LOG'"; echo "RESULT='$RESULT'"; echo "BEFORE='$BEFORE'"; echo "EO='$EO'"; } > "$STATE"
 for e in "$UPDATE"/* "$UPDATE"/.[!.]*; do
   [ -e "$e" ] || continue
   [ "$e" = "$UPDATE/tmp" ] || rm -rf "$e"

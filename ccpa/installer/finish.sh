@@ -30,10 +30,13 @@ REBOOT_DELAY="${REBOOT_DELAY:-3}"
   echo
   echo "--- log"
   cat "$LOG"
+  # A report Stage B still owed this stick, which once.sh took (the truck, 4 Nov): under this one.
+  if [ -s "${BEFORE:-}" ]; then echo; echo "--- before that"; cat "$BEFORE"; fi
 } > "$RESULT"
 
 if [ "$ROUTE" = stick ] && [ -d "$STICK" ]; then
   cp "$RESULT" "$STICK/OCBM_RESULT.txt"
+  [ -s "${BEFORE:-}" ] && [ -n "${EO:-}" ] && cp "$BEFORE" "$EO/delivered_result.txt"
   [ -f "$IMG" ] && mv -f "$IMG" "$IMG.installed"
   sync
   ( sleep "$REBOOT_DELAY"; $REBOOT ) >/dev/null 2>&1 &
