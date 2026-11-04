@@ -394,7 +394,9 @@ fn mode_mfi(link: &mut Link) {
 /// The one-file install's management verbs, for the bench: `info` prints MGMT_INFO (its `install`
 /// key is the mode), `confirm` sends MGMT_INSTALL_CONFIRM as the Carlink3 build with the way back
 /// would, and `stock` sends MGMT_GO_STOCK. `confirm` is what lets the box remove the Carlinkit stack
-/// after the session ends, so only send it when that is meant.
+/// after the session ends, so only send it when that is meant. From this tool the box never sees
+/// that session end (ocbm-host never subscribes, so no heartbeat lapses, and the transport stays
+/// up): replug the adapter, and the finish runs at its next start (dev adapter, 4 Nov).
 fn mode_install(link: &mut Link, what: &str) {
     let verb = match what {
         "info" => p::MGMT_GET_INFO,
@@ -420,6 +422,9 @@ fn mode_install(link: &mut Link, what: &str) {
         if l >= 3 && out[0] == p::MGMT_ACK && out[1] == verb {
             if out[2] == 0 {
                 println!("install {what}: accepted");
+                if verb == p::MGMT_INSTALL_CONFIRM {
+                    println!("install confirm: unplug the adapter and plug it back in; the finish runs at its next start");
+                }
                 return;
             }
             eprintln!("install {what}: refused by the box (status {})", out[2]);
