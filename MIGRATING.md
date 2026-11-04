@@ -160,9 +160,14 @@ left untouched until a later start.
 **With the image instead.** The same `A15W_Update.img` that converts a stock adapter also updates one
 already on OCBM, in trial or final: put it on a stick and start the adapter with it in. It installs
 as an update (newer versions only, same trial and fallback), and `OCBM_RESULT.txt` says UPDATING, then
-UPDATED or ROLLED BACK. A stick put in during a drive waits for the next start. A final adapter also
-runs Carlinkit's own images from a stick, as stock does; see `docs/ops/01_RECOVERY.md` for what that
-leaves.
+UPDATED or ROLLED BACK. A stick put in during a drive waits for the next start. It needs the same room
+as a package: the files that changed since the installed version, at about 0.7 of their size, plus
+384 KB spare. A trial is often short of that: 1.0.0 (ocbm cb97f01) to 1.0.1 changes 11 files, about
+1.2 MB on flash, and a trial installed over leftovers of a hand install has about 900 KB, so there it is
+REFUSED with "Not enough flash". In a trial, go back to stock in Carlink and install the new image fresh
+(the Bluetooth name, identity and phone pairing are kept), or remove stock CarPlay first.
+A final adapter also runs Carlinkit's own images from a stick, as stock does; see
+`docs/ops/01_RECOVERY.md` for what that leaves.
 
 **Your hardware, your choice of software.** The stick routes take any package or backup that is well
 formed: the `.sha256` only catches a damaged copy, and nothing checks who built it. That is
