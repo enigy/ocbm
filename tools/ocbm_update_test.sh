@@ -319,8 +319,11 @@ done
 
 echo "== newer() under BusyBox awk, the adapter's"
 # 3 Nov: under BusyBox 1.32.1's awk newer() was false for every pair, and every update was refused.
-if command -v busybox >/dev/null 2>&1 && busybox awk 'BEGIN{}' 2>/dev/null; then
-  mkdir -p "$T/bb"; ln -sf "$(command -v busybox)" "$T/bb/awk"
+# The same BusyBox tools/busybox_suites.sh finds: $BUSYBOX, then PATH, then /opt/busybox-1.32.1.
+BB="${BUSYBOX:-$(command -v busybox 2>/dev/null || true)}"
+[ -n "$BB" ] || { [ -x /opt/busybox-1.32.1/busybox ] && BB=/opt/busybox-1.32.1/busybox; }
+if [ -n "$BB" ] && "$BB" awk 'BEGIN{}' 2>/dev/null; then
+  mkdir -p "$T/bb"; ln -sf "$BB" "$T/bb/awk"
   sed -n '/^newer() {/,/^}/p' "$INST/ocbm_update.sh" > "$T/newer.sh"
   got=$(PATH="$T/bb:$PATH" sh -c '. "$1"; for p in "1.0.1 1.0.0" "1.10.0 1.9.0" "1.0.0 1.0.0" "1.1.0-beta.1 1.1.0" "1.1.0 1.1.0-beta.1" "1.1.0-beta.2 1.1.0-beta.1" "1.0.0 1.0.1"; do set -- $p; newer $1 $2 && printf y || printf n; done' _ "$T/newer.sh")
   check '[ "$got" = yynnyyn ]' "1.0.1>1.0.0, 1.10.0>1.9.0, not 1.0.0>1.0.0, betas below their release, and reverses ($got)"

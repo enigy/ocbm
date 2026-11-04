@@ -119,6 +119,9 @@ fi
 stick_box() {  # $1 dir, $2 mtd2 image: the final adapter $T/fin, its flash, and its first install's stick
   rm -rf "$1"; mkdir -p "$1/dev" "$1/run" "$1/sys"
   cp -pR "$T/fin" "$1/root"; printf 'ABCDEF0123456789' > "$1/root/etc/device_serial"
+  # The engine where the installer puts it, which apply removes with OCBM's other scripts: run with ENGINE
+  # unset, as on the adapter (3 Nov: it ran from there, and verify found nothing to run).
+  cp "$PAYLOAD" "$1/root/script/stock_restore_box.sh"
   echo 2025.10.15.1127 > "$1/root/etc/software_version"
   blob "$1/dev/mtd0" 4096; blob "$1/dev/mtd1" 8192
   b="$1/stick/OCBM_BACKUP/ABCDEF0123456789"; mkdir -p "$b"
@@ -129,7 +132,7 @@ stick_box() {  # $1 dir, $2 mtd2 image: the final adapter $T/fin, its flash, and
 run_restore() {  # $1 dir, rest: env
   d_="$1"; shift
   env ROOT="$d_/root" RUN="$d_/run" STICK="$d_/stick" DEVDIR="$d_/dev" SYS="$d_/sys" REBOOT="touch $d_/rebooted" \
-    UMOUNT=true OCBMD="$DECODER" ENGINE="$PAYLOAD" TMP_MIN_KB=0 "$@" "$SH1" "$RESTORE" > "$d_/out" 2>&1
+    UMOUNT=true OCBMD="$DECODER" TMP_MIN_KB=0 "$@" "$SH1" "$RESTORE" > "$d_/out" 2>&1
 }
 restore_says() { grep -q "^OCBM restore: $2" "$1/stick/OCBM_RESULT.txt" 2>/dev/null; }
 
@@ -331,6 +334,8 @@ onefile_tests() {  # $1 shell
     "a final adapter goes back to stock from its stick's backup, reports it and restarts"
   check '! is_dispatcher "$r/root" && cmp -s "$r/root/usr/sbin/ARMHiCar" "$T/stock/usr/sbin/ARMHiCar" && [ ! -e "$r/root/usr/sbin/ocbmd" ] && [ ! -e "$r/root/etc/ocbm" ]' \
     "the rootfs is the factory's, extras included, OCBM gone"
+  check '[ ! -e "$r/root/script/stock_restore_box.sh" ] && grep -q RESTORE_VERIFIED "$r/run/ocbm_restore_verify.txt"' \
+    "apply removes the engine from the rootfs, and verify still runs, from its copy in RAM"
   check '[ "$(cksum "$r/dev/mtd0" "$r/dev/mtd1")" = "$m" ] && [ ! -d "$r/run/ocbm-restore" ]' "mtd0 and mtd1 are only read; the decoded backup is gone from RAM"
   for case_ in sums identity trial notfinal; do
     r="$T/rs-$case_"; stick_box "$r" "$T/rsstock.bin"; b="$r/stick/OCBM_BACKUP/ABCDEF0123456789"
@@ -350,6 +355,10 @@ onefile_tests() {  # $1 shell
   check '[ $rc -eq 99 ] && is_dispatcher "$r/root" && [ -e "$r/stick/OCBM_RESTORE" ]' "a power cut before the switch: OCBM still starts, OCBM_RESTORE still on the stick"
   run_restore "$r"; rc=$?
   check '[ $rc -eq 0 ] && restore_says "$r" "BACK TO STOCK" && ! is_dispatcher "$r/root"' "and the next start finishes the restore"
+  r="$T/rs-late"; stick_box "$r" "$T/rsstock.bin"
+  run_restore "$r" RECREATE=usr/sbin/written_late; rc=$?
+  check '[ $rc -eq 0 ] && ! is_dispatcher "$r/root" && restore_says "$r" "BACK TO STOCK" && grep -q "did not all finish" "$r/stick/OCBM_RESULT.txt" && ! grep -q "still starts OCBM" "$r/stick/OCBM_RESULT.txt" && [ -e "$r/rebooted" ] && [ -e "$r/stick/OCBM_RESTORE.done" ]' \
+    "a failure after the switch: reported back to stock with what did not finish, and it restarts"
   rm -rf "$T"/rs "$T"/rs-* "$T/rsstock" "$T/rsstock.bin"
 
   rm -rf "$T/box"; cp -pR "$T/fin" "$T/box"

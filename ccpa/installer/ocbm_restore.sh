@@ -11,19 +11,23 @@
 #              adapter is never applied); the install final with no finish pending; 30 MB free in /tmp
 #   2 decode   mtd2.bin into /tmp (RAM) with `ocbmd jffs2-extract`, owners as on the flash: it must be
 #              a factory rootfs (stock start script, no OCBM) whose software_version is this adapter's
-#   3 restore  tools/stock_restore_box.sh (installed as /script/stock_restore_box.sh), PROFILE=onefile:
-#              plan, apply, verify. Bootable at every step; until its one rename the adapter starts OCBM
+#   3 restore  tools/stock_restore_box.sh (installed as /script/stock_restore_box.sh, run from a copy in
+#              RAM: apply removes it), PROFILE=onefile: plan, apply, verify. Bootable at every step; until
+#              its one rename (the switch) the adapter starts OCBM, and from then on stock
 #   4 report   OCBM_RESULT.txt on the stick, OCBM_RESTORE renamed .done, the stick let go, restart
 #
 # mtd0 (U-Boot) and mtd1 (the kernel) are read, never written: the boot stack is fixed platform firmware.
 # Power lost before apply's switch: OCBM_RESTORE is still on the stick and the next start runs this again
 # (apply is idempotent). Lost after it: the adapter starts stock, and OCBM's files may be left, unused.
-# Any other failure renames OCBM_RESTORE to OCBM_RESTORE.refused, with the reason on the stick: rename
-# it back to try again.
+# Past the switch nothing is reported as stopped: a failure after it still reports BACK TO STOCK, with
+# what did not finish, and restarts. Any failure before it renames OCBM_RESTORE to
+# OCBM_RESTORE.refused, with the reason on the stick: rename it back to try again.
 #
-# Exit 0: back to stock, restarting. Exit 1: refused or stopped (OCBM still runs).
+# Exit 0: back to stock (past the switch), restarting. Exit 1: refused or stopped before the switch (OCBM
+# still runs).
 # Test hooks (tools/stock_restore_test.sh): ROOT SYS DEVDIR RUN STICK REBOOT UMOUNT OCBMD ENGINE
-# TMP_MIN_KB, and the engine's STOP_AT=switch, a power cut right before its switch (exit 99).
+# TMP_MIN_KB (the suite leaves ENGINE unset: the engine sits in ROOT, where apply removes it), and the
+# engine's STOP_AT=switch (exit 99, a power cut right before its switch) and RECREATE.
 ROOT="${ROOT:-}"
 SYS="${SYS:-/sys}"
 PROC="${PROC:-/proc}"
@@ -109,29 +113,51 @@ done
 log "decoded: the factory rootfs, $want"
 
 # ---- 3 restore ----------------------------------------------------------------------------------
+# The engine runs from a copy in RAM: apply's step 5 removes /script/stock_restore_box.sh with the rest
+# of OCBM's scripts, and verify then had nothing to run (dev adapter, 3 Nov: restored, reported STOPPED).
+E="$RUN/ocbm_restore_engine.sh"
+cp "$ENGINE" "$E" || refuse "Could not copy the restore's engine into RAM ($RUN)."
 export PROFILE=onefile SRC="$T" LINKS="$X/links.tsv" ROOT="${ROOT:-/}" RUN WORK="$RUN/ocbm-restore-work"
-sh "$ENGINE" plan > "$RUN/ocbm_restore_plan.txt" 2>&1
+sh "$E" plan > "$RUN/ocbm_restore_plan.txt" 2>&1
 grep -q RESTORE_PLAN_OK "$RUN/ocbm_restore_plan.txt" \
   || refuse "The restore's plan refused ($(grep -m1 'ABORT' "$RUN/ocbm_restore_plan.txt" | sed 's/^\[restore\] //'))."
 log "plan: $(grep -c . "$RUN/ocbm_restore_plan.txt") lines; applying"
-sh "$ENGINE" apply > "$RUN/ocbm_restore_apply.txt" 2>&1; rc=$?
+sh "$E" apply > "$RUN/ocbm_restore_apply.txt" 2>&1; rc=$?
 cat "$RUN/ocbm_restore_apply.txt" >> "$RUN/box.log"
 [ "$rc" = 99 ] && exit 99   # the engine's STOP_AT test hook: a power cut, OCBM_RESTORE left for the next start
-grep -q RESTORE_DONE "$RUN/ocbm_restore_apply.txt" \
-  || stopped "The restore did not finish: $(grep -m1 'ABORT' "$RUN/ocbm_restore_apply.txt" | sed 's/^\[restore\] //')"
-sh "$ENGINE" verify > "$RUN/ocbm_restore_verify.txt" 2>&1
-grep -q RESTORE_VERIFIED "$RUN/ocbm_restore_verify.txt" \
-  || stopped "The rootfs does not match the backup yet ($(grep -c . "$RUN/ocbm_restore_verify.txt") lines in the check)."
+# The switch is the start script: until it is stock's the adapter starts OCBM, and from then on stock.
+if grep -q '^# OCBM_DISPATCH' "${ROOT%/}/script/start_main_service.sh" 2>/dev/null \
+  || [ ! -s "${ROOT%/}/script/start_main_service.sh" ]; then
+  stopped "The restore did not finish: $(grep -m1 'ABORT' "$RUN/ocbm_restore_apply.txt" | sed 's/^\[restore\] //')"
+fi
+# Past the switch nothing is reported as stopped: the next start is stock's whatever follows.
+checked=""
+if ! grep -q RESTORE_DONE "$RUN/ocbm_restore_apply.txt"; then
+  checked="The restore's last steps did not all finish ($(grep -m1 'ABORT' "$RUN/ocbm_restore_apply.txt" | sed 's/^\[restore\] //')): some of OCBM's files may be left, unused."
+else
+  sh "$E" verify > "$RUN/ocbm_restore_verify.txt" 2>&1
+  grep -q RESTORE_VERIFIED "$RUN/ocbm_restore_verify.txt" \
+    || checked="The check after the restore found $(grep -c '^    ' "$RUN/ocbm_restore_verify.txt") differences from the backup (listed below)."
+fi
 # OCBM's bond store: the OCBM still running may have written it again since apply removed it.
 [ -e "$T/etc/carplay" ] || rm -rf "${ROOT%/}/etc/carplay"
 rm -rf "$X"
 
 # ---- 4 report -----------------------------------------------------------------------------------
 mv -f "$STICK/OCBM_RESTORE" "$STICK/OCBM_RESTORE.done" 2>/dev/null
-report "BACK TO STOCK" "The adapter is back to the stock Carlinkit firmware ($want) from its own flash backup," \
-  "and the rootfs matches the backup. It restarts on stock CarPlay now." "" \
-  "To use OCBM again, install it from a stick with the OCBM installer image (A15W_Update.img)."
-log "back to stock: the rootfs matches the backup; restarting"
+if [ -z "$checked" ]; then
+  report "BACK TO STOCK" "The adapter is back to the stock Carlinkit firmware ($want) from its own flash backup," \
+    "and the rootfs matches the backup. It restarts on stock CarPlay now." "" \
+    "To use OCBM again, install it from a stick with the OCBM installer image (A15W_Update.img)."
+  log "back to stock: the rootfs matches the backup; restarting"
+else
+  report "BACK TO STOCK" "The adapter starts the stock Carlinkit firmware ($want) from now on: the stock start script is in place." \
+    "It restarts on stock CarPlay now." "" "$checked" \
+    "If stock misbehaves, restore from a computer with tools/stock_restore.sh --profile onefile." "" \
+    "To use OCBM again, install it from a stick with the OCBM installer image (A15W_Update.img)." \
+    "" "--- the restore's log" "$(cat "$RUN/ocbm_restore_apply.txt" "$RUN/ocbm_restore_verify.txt" 2>/dev/null | tail -40)"
+  log "back to stock, unconfirmed: $checked; restarting"
+fi
 let_go
 sync; $REBOOT
 exit 0
