@@ -194,8 +194,34 @@ fn failure(e: &std::io::Error) -> Attempt {
 struct Walk {
     ran: bool,
     rejected: bool,
-    /// A phone answered and reset the link on both pages: it most likely forgot the pairing.
-    bond_lost: bool,
+}
+
+/// Answered-and-reset pages in a row, across reconnect rounds, for [`ocbm_proto::BTP_BOND_LOST`]. A still-paired
+/// iPhone also answers and hangs up once after a power cut (dev adapter, 3 Nov), so one or two say little; every
+/// page answered and reset, [`Self::TELL_AT`] or more with nothing else between, means it most likely forgot the
+/// pairing (5 Nov bench: six, and Carlink offered pairing only a minute later). Told once per streak.
+#[derive(Debug, Default)]
+struct ResetStreak {
+    count: u32,
+    told: bool,
+}
+
+impl ResetStreak {
+    const TELL_AT: u32 = 3;
+
+    /// One page's outcome: true exactly when the streak reaches [`Self::TELL_AT`].
+    fn note(&mut self, result: Attempt) -> bool {
+        if result != Attempt::Reset {
+            *self = Self::default();
+            return false;
+        }
+        self.count += 1;
+        if self.count >= Self::TELL_AT && !self.told {
+            self.told = true;
+            return true;
+        }
+        false
+    }
 }
 
 /// Page `targets` in order until `stop` says not to go on. A phone that answers and resets the link
@@ -217,9 +243,6 @@ fn walk(
                 break;
             }
             result = page(peer);
-            if result == Attempt::Reset {
-                out.bond_lost = true;
-            }
         }
         match result {
             Attempt::Ran => out.ran = true,
@@ -865,6 +888,7 @@ pub fn run(
     }
 
     let mut backoff = BACKOFF_START_SECS;
+    let mut streak = ResetStreak::default();
     let mut first_round = true;
     // Log only on a change in the bonded/idle state, so the per-round re-read below doesn't spam the log.
     // `None` = nothing logged yet; `Some(true)` = had bonds; `Some(false)` = idle.
@@ -948,7 +972,7 @@ pub fn run(
             },
         };
 
-        let Walk { ran, rejected, bond_lost } = walk(
+        let Walk { ran, rejected } = walk(
             &targets,
             || shutdown.load(Ordering::Relaxed) || session_active.load(Ordering::Relaxed),
             |peer| {
@@ -960,14 +984,19 @@ pub fn run(
                     && !ctrl.has_request()
                     && !session_active.load(Ordering::Relaxed)
             },
-            |peer| attempt(peer, name, shutdown, session_active, ctrl),
+            |peer| {
+                let result = attempt(peer, name, shutdown, session_active, ctrl);
+                if streak.note(result) && !session_active.load(Ordering::Relaxed) {
+                    log(&format!(
+                        "{} answered and reset the link on {} pages in a row: it has most likely forgotten the pairing",
+                        control::fmt_addr(&peer),
+                        ResetStreak::TELL_AT
+                    ));
+                    bt_driver::publish_bt_phase(ocbm_proto::BTP_BOND_LOST);
+                }
+                result
+            },
         );
-        if bond_lost && !ran && !session_active.load(Ordering::Relaxed) {
-            // The 5 Nov bench: an iPhone that had forgotten the adapter answered six pages and reset each, and
-            // Carlink offered pairing only after a minute of waiting. Say what it is, so the app can ask for a re-pair.
-            log("a bonded phone answered and reset the link twice: it has most likely forgotten the pairing");
-            bt_driver::publish_bt_phase(ocbm_proto::BTP_BOND_LOST);
-        }
         if rejected {
             backoff = BACKOFF_MAX_SECS; // the phone said no; more paging only rotates codes
         } else if ran {
@@ -1000,7 +1029,7 @@ pub fn run(
 
 #[cfg(test)]
 mod tests {
-    use super::{failure, has_established_on_local_port, headset_candidates, split_at_lines, walk, Attempt, Walk};
+    use super::{failure, has_established_on_local_port, headset_candidates, split_at_lines, walk, Attempt, ResetStreak, Walk};
     use crate::hfp_hf::Path;
     use crate::sdp_client::Services;
 
@@ -1039,14 +1068,21 @@ mod tests {
         assert!(walked.ran);
     }
 
-    /// The 5 Nov bench: an iPhone that had forgotten the adapter answered every page and reset the link.
+    /// The 5 Nov bench: an iPhone that had forgotten the adapter answered six pages and reset each. A still-paired
+    /// one also answered and hung up once after a power cut (3 Nov), so only a streak of three says so, once.
     #[test]
-    fn a_phone_that_resets_on_both_pages_has_most_likely_lost_the_bond() {
-        let (_, walked) = walk_with(&[(&SCOTT, Attempt::Reset), (&SCOTT, Attempt::Reset)]);
-        assert!(walked.bond_lost);
-        assert!(!walked.ran);
-        let (_, walked) = walk_with(&[(&SCOTT, Attempt::Reset), (&SCOTT, Attempt::Ran)]);
-        assert!(!walked.bond_lost, "a reset once, then a session: a power cut, not a lost bond");
+    fn three_answered_and_reset_pages_in_a_row_say_the_bond_is_lost_once() {
+        let mut s = ResetStreak::default();
+        assert!(!s.note(Attempt::Reset));
+        assert!(!s.note(Attempt::Reset));
+        assert!(s.note(Attempt::Reset), "the third in a row tells");
+        assert!(!s.note(Attempt::Reset), "once per streak");
+        assert!(!s.note(Attempt::Failed), "anything else ends the streak");
+        assert!(!s.note(Attempt::Reset));
+        assert!(!s.note(Attempt::Ran));
+        assert!(!s.note(Attempt::Reset));
+        assert!(!s.note(Attempt::Reset), "a session between: the count starts again");
+        assert!(s.note(Attempt::Reset));
     }
 
     #[test]

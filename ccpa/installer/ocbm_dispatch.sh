@@ -37,7 +37,7 @@
 # ocbm_install.sh gets from ::respawn.
 #
 # Test hooks (tools/ocbm_stageb_test.sh, tools/ocbm_update_test.sh): ROOT RUN STICK PROC POLL
-# STICK_WAIT STICK_PKG_WAIT REBOOT ANSWER_SECS UMOUNT INSTALL_START INSTALL_WAIT.
+# STICK_WAIT STICK_PKG_WAIT REBOOT ANSWER_SECS UMOUNT INSTALL_START INSTALL_WAIT BTD_SECS BTD_UP.
 ROOT="${ROOT:-}"
 RUN="${RUN:-/tmp}"
 STICK="${STICK:-/mnt/UPAN}"
@@ -54,6 +54,8 @@ REBOOT="${REBOOT:-/sbin/reboot}"
 UMOUNT="${UMOUNT:-umount}"
 INSTALL_START="${INSTALL_START:-60}"   # deliver(): how long an install image may take to start its once.sh
 INSTALL_WAIT="${INSTALL_WAIT:-900}"    # ...and to finish
+BTD_SECS="${BTD_SECS:-90}"             # an update's trial: how long the commit waits for btd (btd_settles)
+BTD_UP="${BTD_UP:-pgrep -f /usr/sbin/btd}"   # ...and how it asks whether btd runs
 update_trial=0
 export PATH=${OCBM_TEST_PATH:+$OCBM_TEST_PATH:}/usr/sbin:/usr/bin:/sbin:/bin:/tmp/bin:$PATH
 
@@ -232,6 +234,34 @@ selftest() {
 # answer can reach an ocbmd restarted since the HELLO (the truck, 2 Nov 21:06). Heard for ANSWER_SECS
 # with no answer goes back as a failed self-test does: to stock, or in an update's trial to the OCBM it
 # replaced.
+# btd, before an update's trial is kept. ocbm_selftest.sh checks the gadget, the node, ocbmd and the radio
+# descriptor, not btd, and btd only starts once a host subscribes (the supervisor's wireless_up). An update
+# whose btd never comes up would pass, be kept once Carlink is answered, and leave the adapter with no
+# Bluetooth: no pairing, no wireless CarPlay, and no way back but another update (the Mac, 5 Nov). So the
+# commit waits for btd running at two looks in a row, BTD_SECS at most, unless the radios are meant to be
+# off: the app's CT_RADIO off, wireless: false in its config, or a wired session owning the box.
+btd_expected() {
+  [ ! -f "$RUN/radio_off" ] || return 1
+  grep -qiE '^[[:space:]]*wireless:[[:space:]]*false' "$RUN/carplay_cfg.yaml" 2>/dev/null && return 1
+  case "$(cat "$RUN/projection_owner" 2>/dev/null)" in wired-*) return 1 ;; esac
+  return 0
+}
+btd_settles() {
+  waited=0; seen=0
+  while [ "$waited" -lt "$BTD_SECS" ]; do
+    btd_expected || { log "update trial: btd not expected (radios off or wired); not waited for"; return 0; }
+    if $BTD_UP >/dev/null 2>&1; then
+      seen=$((seen + 1))
+      [ "$seen" -ge 2 ] && { log "update trial: btd is up"; return 0; }
+    else
+      seen=0
+    fi
+    sleep "$POLL"; waited=$((waited + POLL))
+  done
+  log "update trial: btd never came up in $BTD_SECS s"
+  return 1
+}
+
 answer_watch() {
   while :; do
     if [ -e "$RUN/ocbmd_answered" ]; then
@@ -239,6 +269,10 @@ answer_watch() {
       # An update's trial: answered, so kept once its self-test has passed too. A failed self-test puts
       # the old version back itself, and the journal goes with it.
       while [ ! -e "$RUN/ocbm_update_selftest_passed" ]; do [ -f "$U" ] || return; sleep "$POLL"; done
+      if ! btd_settles; then
+        [ -f "$U" ] && { update_rollback "btd never came up (${BTD_SECS} s after the host was answered)"; sync; $REBOOT; }
+        return
+      fi
       [ -f "$U" ] && update_commit
       return
     fi

@@ -333,7 +333,8 @@ fn run_active_session(
         // that exits leaves the box discoverable but unable to pair for the rest of the session.
         while !t.load(Ordering::Relaxed) {
             let on_pair_rejected = || bt_driver::publish_bt_phase(ocbm_proto::BTP_PAIR_REJECTED);
-            match ssp_agent::run(CONTROLLER_INDEX, &t, Some(&on_pair_rejected), Some(&pair_answer), Some(&pair_window)) {
+            let on_bond_lost = || bt_driver::publish_bt_phase(ocbm_proto::BTP_BOND_LOST);
+            match ssp_agent::run(CONTROLLER_INDEX, &t, Some(&on_pair_rejected), Some(&on_bond_lost), Some(&pair_answer), Some(&pair_window)) {
                 Ok(()) => break,
                 Err(e) => {
                     log(&format!("SSP agent exited: {e} -- restarting"));

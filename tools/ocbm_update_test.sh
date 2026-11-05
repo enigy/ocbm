@@ -103,7 +103,7 @@ update() {  # $1 shell, $2 dir, then KEY=VALUE overrides: run ocbm_update.sh as 
 boot() {  # $1 shell, $2 dir, then KEY=VALUE overrides: one start of the adapter
   local sh="$1" d="$2"; shift 2
   env ROOT="$d/root" RUN="$d/run" STICK="$d/stick" PROC="$d/proc" SYS="$d/sys" POLL=1 STICK_WAIT=1 STICK_PKG_WAIT=2 \
-      UMOUNT=true REBOOT="touch $d/rebooted" "$@" "$sh" "$d/root/script/start_main_service.sh" > "$d/boot.out" 2>&1
+      UMOUNT=true REBOOT="touch $d/rebooted" BTD_UP=true BTD_SECS=4 "$@" "$sh" "$d/root/script/start_main_service.sh" > "$d/boot.out" 2>&1
 }
 # An update package and its .sha256 on the adapter's stick, mounted ($2 $3 as make_pkg's).
 stick_pkg() {  # $1 dir, $2 extra, $3 from_min
@@ -178,6 +178,16 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
     "and so do more of them: a start that passes its self-test is not counted against the update"
   touch "$d/run/ocbmd_answered"
   check 'waitfor "is_new \"$d\"" 8' "until a host is answered: committed then"
+
+  # btd starts only once a host subscribes, and the self-test does not check it: the commit waits for it
+  # (the Mac, 5 Nov: an update whose btd never came up would be kept, with no Bluetooth and no way back).
+  d="$T/$sh-nobtd"; make_box "$d" final; make_pkg "$d/run/ocbm-update.tgz" dispatch
+  update "$sh" "$d"; restart "$d"; touch "$d/run/ocbmd_answered"; boot "$sh" "$d" BTD_UP=false
+  check 'waitfor "is_old \"$d\" && [ -e \"$d/rebooted\" ]" 12 && result_is "$d" "rolled_back $NEW: btd never came up"' \
+    "answered, but btd never came up: the old version back, and a restart"
+  d="$T/$sh-radiooff"; make_box "$d" final; make_pkg "$d/run/ocbm-update.tgz" dispatch
+  update "$sh" "$d"; restart "$d"; touch "$d/run/ocbmd_answered" "$d/run/radio_off"; boot "$sh" "$d" BTD_UP=false
+  check 'waitfor "is_new \"$d\"" 8' "with the radios off on purpose, btd is not waited for: committed"
 
   echo "== $sh: an update whose self-test fails goes back to the version it replaced"
   d="$T/$sh-fail"; make_box "$d" final; make_pkg "$d/run/ocbm-update.tgz" dispatch
