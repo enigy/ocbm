@@ -141,10 +141,42 @@ for sh in ${SHELLS:-sh dash}; do
   check 'grep -qx "replace script/start_main_service.sh" "$d/root/etc/ocbm/update_pending" && [ "$(grep -E "^(replace|add) " "$d/root/etc/ocbm/update_pending" | tail -1)" = "replace script/start_main_service.sh" ]' \
     "the start script is swapped last"
   check '[ ! -e "$d/run/ocbm-update.tgz" ] && [ ! -d "$d/run/ocbm-update" ]' "the package and its unpacked copy go"
-  restart "$d"; boot "$sh" "$d"
-  check 'waitfor "is_new \"$d\"" 5' "the trial passes: the update is kept, installed_version moves on"
+  restart "$d"; touch "$d/run/ocbmd_answered"; boot "$sh" "$d"   # a host answered: Carlink connected
+  check 'waitfor "is_new \"$d\"" 5' "the trial passes and a host is answered: the update is kept, installed_version moves on"
   check 'result_is "$d" "committed $NEW (from $OLD)"' "update_result: committed"
   check '[ ! -e "$d/rebooted" ] && [ -e "$d/m.boot" ] && [ "$(cat "$d/root/script/ocbm_mode")" = final ]' "no restart; still final"
+
+  # Kept only once ocbmd has answered a host: the self-test needs none, and an update that breaks the
+  # accessory link passes it (the Mac, 4 Nov: 1.0.2's dispatcher committed before the first HELLO, and an
+  # answer_watch timeout after that "rolled back" nothing, with blank versions, and restarted).
+  echo "== $sh: an update's trial is kept once a host is answered, and only then"
+  d="$T/$sh-deaf"; make_box "$d" final; make_pkg "$d/run/ocbm-update.tgz" dispatch
+  update "$sh" "$d"; restart "$d"; boot "$sh" "$d" ANSWER_SECS=3
+  check 'waitfor "grep -q \"self-test passed; the update is kept once\" $d/run/box.log" 5 && [ -e "$d/root/usr/sbin/ocbmd.prev" ] && grep -qx placed "$d/root/etc/ocbm/update_pending"' \
+    "the self-test passes with no host: not committed, the .prev copies kept"
+  echo 40 > "$d/run/ocbmd_heard"; echo "500.00 80.00" > "$d/proc/uptime"
+  check 'waitfor "is_old \"$d\" && [ -e \"$d/rebooted\" ]" 8' "heard and never answered: the old version back, and a restart"
+  check 'result_is "$d" "rolled_back $NEW: ocbmd heard the host for 460 s and never answered it (kept $OLD)"' \
+    "update_result names both versions and why"
+  d="$T/$sh-heard"; make_box "$d" final; make_pkg "$d/run/ocbm-update.tgz" dispatch
+  update "$sh" "$d"; restart "$d"; boot "$sh" "$d" ANSWER_SECS=3
+  sleep 2; touch "$d/run/ocbmd_answered"
+  check 'waitfor "is_new \"$d\"" 8 && result_is "$d" "committed $NEW (from $OLD)" && [ ! -e "$d/rebooted" ]' "answered: committed, the .prev copies gone"
+  echo 40 > "$d/run/ocbmd_heard"; echo "500.00 80.00" > "$d/proc/uptime"; rm -f "$d/run/ocbmd_answered"; sleep 4
+  check 'is_new "$d" && result_is "$d" "committed $NEW (from $OLD)" && [ ! -e "$d/rebooted" ]' \
+    "after the commit, a host heard and not answered rolls nothing back and restarts nothing"
+  d="$T/$sh-respawn"; make_box "$d" final; make_pkg "$d/run/ocbm-update.tgz" dispatch
+  update "$sh" "$d"; restart "$d"; echo "41.00 80.00" > "$d/proc/uptime"; echo 40 > "$d/run/ocbmd_heard"; boot "$sh" "$d" ANSWER_SECS=30
+  sleep 2; touch "$d/run/ocbmd_answered"   # ocbmd restarted single-threaded, and the answer came from the new one
+  check 'waitfor "is_new \"$d\"" 8 && result_is "$d" "committed $NEW"' "answered across an ocbmd restart: committed"
+  d="$T/$sh-nohost"; make_box "$d" final; make_pkg "$d/run/ocbm-update.tgz" dispatch
+  update "$sh" "$d"; restart "$d"; boot "$sh" "$d"
+  check 'waitfor "grep -q \"self-test passed; the update is kept once\" $d/run/box.log" 5' "a start with no host leaves the trial open"
+  restart "$d"; boot "$sh" "$d"; restart "$d"; boot "$sh" "$d"
+  check 'waitfor "grep -q \"self-test passed; the update is kept once\" $d/run/box.log" 5 && grep -qx placed "$d/root/etc/ocbm/update_pending" && [ ! -e "$d/root/etc/ocbm/update_attempts" ]' \
+    "and so do more of them: a start that passes its self-test is not counted against the update"
+  touch "$d/run/ocbmd_answered"
+  check 'waitfor "is_new \"$d\"" 8' "until a host is answered: committed then"
 
   echo "== $sh: an update whose self-test fails goes back to the version it replaced"
   d="$T/$sh-fail"; make_box "$d" final; make_pkg "$d/run/ocbm-update.tgz" dispatch
@@ -179,7 +211,7 @@ for sh in ${SHELLS:-sh dash}; do
   for at in unpack checks place journal swap swap-mid restart; do
     d="$T/$sh-cut-$at"; make_box "$d" final; make_pkg "$d/run/ocbm-update.tgz" dispatch
     update "$sh" "$d" STOP_AT="$at"; rc=$?
-    restart "$d"; boot "$sh" "$d"
+    restart "$d"; touch "$d/run/ocbmd_answered"; boot "$sh" "$d"
     case "$at" in
       restart) check 'waitfor "is_new \"$d\"" 5' "cut before $at: the trial runs and keeps the update" ;;
       journal)   # .new files written, no journal: the old version runs; the next update run removes them
@@ -281,7 +313,7 @@ for sh in ${SHELLS:-sh dash}; do
   d="$T/$sh-stick"; make_box "$d" final; stick_pkg "$d" dispatch; boot "$sh" "$d"
   check 'waitfor "[ -e $d/rebooted ]" 15 && grep -qx placed "$d/root/etc/ocbm/update_pending"' "a final start takes the package and restarts into its trial"
   check '[ -e "$d/stick/ocbm-update-1.1.0.tgz.used" ] && [ ! -e "$d/stick/ocbm-update-1.1.0.tgz" ]' "used once: renamed .used"
-  restart "$d"; boot "$sh" "$d"
+  restart "$d"; touch "$d/run/ocbmd_answered"; boot "$sh" "$d"
   check 'waitfor "is_new \"$d\" && stick_says \"$d\" UPDATED" 15 && grep -q "committed $NEW (from $OLD)" "$d/stick/OCBM_RESULT.txt" && grep -q "No update is guaranteed" "$d/stick/OCBM_RESULT.txt"' \
     "the trial passes, and OCBM_RESULT.txt on the stick says UPDATED, with the disclaimer"
   restart "$d"; boot "$sh" "$d"; sleep 3

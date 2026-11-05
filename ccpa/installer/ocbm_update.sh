@@ -3,7 +3,7 @@
 # final) to a newer OCBM, from a package the app pushed over CH_FILE (ocbm-update-X.Y.Z.tgz, built by
 # tools/make_ocbm_update.sh). ocbmd runs it on MGMT_UPDATE once the package's SHA-256 matches the one
 # the app sent. The next start is the update's trial (ocbm_dispatch.sh): the new version is kept once
-# it passes its start-up self-test, and the version it replaced is put back otherwise.
+# it passes its start-up self-test and ocbmd has answered a host, and the version it replaced is put back otherwise.
 #
 #   ocbm_update.sh PACKAGE
 #

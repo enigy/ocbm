@@ -149,7 +149,7 @@ put() {  # $1 file, $2 its one line: written .new + rename, so a power cut leave
   { echo "$2" > "$1.new" && mv -f "$1.new" "$1"; } 2>/dev/null
 }
 
-update_commit() {  # the update passed its self-test, or a power cut stopped its commit: keep it
+update_commit() {  # the update passed its self-test and ocbmd answered a host (or a power cut stopped its commit): keep it
   grep -qx committing "$U" || { echo committing >> "$U"; sync; }
   awk '$1 == "replace" { print $2 }' "$U" | while read -r t; do rm -f "$ROOT/$t.prev"; done
   to=$(journal to); from=$(journal from)
@@ -161,6 +161,7 @@ update_commit() {  # the update passed its self-test, or a power cut stopped its
 }
 
 update_rollback() {  # $1 why: put back the version the update replaced
+  [ -f "$U" ] || return 0   # no journal: committed, or settled already; nothing to put back
   grep -q '^rolling_back=' "$U" || { echo "rolling_back=$1" >> "$U"; sync; }
   why=$(journal rolling_back)
   awk '$1 == "replace" || $1 == "add" { print $1, $2 }' "$U" | while read -r kind t; do
@@ -203,7 +204,14 @@ selftest() {
   if "$S/ocbm_selftest.sh" > "$RUN/ocbm_selftest.txt" 2>&1; then
     rm -f "$EO/boot_attempts"; sync
     log "self-test: $(tail -1 "$RUN/ocbm_selftest.txt")"
-    [ "$update_trial" = 1 ] && update_commit
+    if [ "$update_trial" = 1 ]; then
+      # Not committed yet: the self-test needs no host, and an update that breaks the accessory link
+      # passes it (the Mac, 4 Nov: committed before the first HELLO, so answer_watch had nothing left to
+      # put back). answer_watch commits once ocbmd has answered a host. This start counts as a good
+      # one: starts with no host at all keep the trial open, and its .prev copies, until one comes.
+      rm -f "$EO/update_attempts"; touch "$RUN/ocbm_update_selftest_passed"; sync
+      log "update trial: self-test passed; the update is kept once ocbmd answers a host"
+    fi
     first_start PASSED
     [ "$mode" = confirmed ] && [ -x "$S/ocbm_finish.sh" ] && "$S/ocbm_finish.sh" >> "$RUN/box.log" 2>&1
   else
@@ -226,7 +234,14 @@ selftest() {
 # replaced.
 answer_watch() {
   while :; do
-    [ -e "$RUN/ocbmd_answered" ] && return
+    if [ -e "$RUN/ocbmd_answered" ]; then
+      [ "$update_trial" = 1 ] || return
+      # An update's trial: answered, so kept once its self-test has passed too. A failed self-test puts
+      # the old version back itself, and the journal goes with it.
+      while [ ! -e "$RUN/ocbm_update_selftest_passed" ]; do [ -f "$U" ] || return; sleep "$POLL"; done
+      [ -f "$U" ] && update_commit
+      return
+    fi
     heard=$(cat "$RUN/ocbmd_heard" 2>/dev/null)
     up=$(cut -d. -f1 "$PROC/uptime" 2>/dev/null)
     case "$heard" in ''|*[!0-9]*) heard="" ;; esac
@@ -236,8 +251,7 @@ answer_watch() {
       why="ocbmd heard the host for $((up - heard)) s and never answered it"
       log "$why"
       if [ "$update_trial" = 1 ]; then
-        update_rollback "$why"
-        sync; $REBOOT
+        [ -f "$U" ] && { update_rollback "$why"; sync; $REBOOT; }   # never after a commit: nothing is left to put back
         return
       fi
       "$S/ocbm_revert.sh" "$why"
