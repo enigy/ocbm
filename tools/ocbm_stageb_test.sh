@@ -69,7 +69,8 @@ reverted() {  # $1 dir: on stock, recorded for once.sh's same-version guard, rep
     && grep -qx 'wpa_passphrase=stock-pass' "$1/root/etc/hostapd.conf" && [ ! -e "$1/root/etc/ocbm/boot_attempts" ]
 }
 
-for sh in ${SHELLS:-sh dash}; do
+. "$HERE/test_shells.sh"
+for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   command -v "$sh" >/dev/null 2>&1 || { echo "== $sh: not installed, skipped"; continue; }
 
   echo "== $sh: stock mode hands the boot to Carlinkit's script"

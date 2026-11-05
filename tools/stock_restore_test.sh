@@ -518,10 +518,13 @@ onefile_tests() {  # $1 shell
     "a trial restores the same way (the rehearsal)"
 }
 
-SHELLS="sh"
-command -v dash >/dev/null 2>&1 && SHELLS="$SHELLS dash"
+. "$HERE/test_shells.sh"
+SHELLS=$(distinct_shells sh dash)
 
 for SH in $SHELLS; do
+  # tools/run_tests.sh runs this suite a second time only to put ocbmd's decoder under the on-adapter
+  # restore (OCBMD_BIN): that run needs the onefile cases alone, which build the adapter it restores.
+  if [ "${STOCK_RESTORE_DECODER_ONLY:-}" = 1 ]; then onefile_tests "$SH"; continue; fi
   echo "=== payload under $SH"
   "$SH" -n "$PAYLOAD" && ok "parses" || bad "parses"
   rm -rf "$T/src" "$T/box"
@@ -601,6 +604,7 @@ for B in /bin/bash "$(command -v bash)"; do
   [ -x "$B" ] || continue
   case " $BASHES " in *" $B "*) ;; *) BASHES="$BASHES $B" ;; esac
 done
+[ "${STOCK_RESTORE_DECODER_ONLY:-}" = 1 ] && BASHES=""   # the decoder's run: tested by the first
 for B in $BASHES; do
   echo "=== the driver's apply monitor (tools/stock_restore.sh) under $B, set -euo pipefail"
   out_=$("$B" -c 'set -euo pipefail; eval "$1"; new_steps "staging, no step yet" "^\[restore\] [0-9]/5|^RESTORE_" 0 | wc -l | tr -d " "; echo survived' _ "$NEW_STEPS" 2>&1)

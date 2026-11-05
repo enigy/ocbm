@@ -114,7 +114,8 @@ installed() {  # $1 dir: the armed state, complete
 }
 stock_boot() { [ "$(cat "$1/root/script/start_main_service.sh")" = "$STOCK_SMS" ]; }
 
-for sh in ${SHELLS:-sh dash}; do
+. "$HERE/test_shells.sh"
+for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   command -v "$sh" >/dev/null 2>&1 || { echo "== $sh: not installed, skipped"; continue; }
   echo "== $sh: install from a stick"
   d="$T/$sh-ok"; make_box "$d"; snap "$d/root" > "$d/before"

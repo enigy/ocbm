@@ -128,7 +128,8 @@ is_new() {  # $1 dir: the update kept, its .prev copies gone
 }
 result_is() { grep -q "^$2" "$1/root/etc/ocbm/update_result" 2>/dev/null; }
 
-for sh in ${SHELLS:-sh dash}; do
+. "$HERE/test_shells.sh"
+for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   command -v "$sh" >/dev/null 2>&1 || { echo "== $sh: not installed, skipped"; continue; }
 
   echo "== $sh: an update on a final adapter that passes its self-test"

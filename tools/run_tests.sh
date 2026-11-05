@@ -57,7 +57,7 @@ run "stock-restore" sh tools/stock_restore_test.sh
 # ...and its on-adapter route again with the real decoder, `ocbmd jffs2-extract`, in place of
 # tools/jffs2_extract.py (ccpa/installer/ocbm_restore.sh; Scott, 3 Nov).
 run "ocbmd (host build)" cargo build -p ocbmd --quiet
-run "stock-restore (ocbmd's decoder)" env OCBMD_BIN="${CARGO_TARGET_DIR:-$PWD/target}/debug/ocbmd" sh tools/stock_restore_test.sh
+run "stock-restore (ocbmd's decoder)" env OCBMD_BIN="${CARGO_TARGET_DIR:-$PWD/target}/debug/ocbmd" STOCK_RESTORE_DECODER_ONLY=1 sh tools/stock_restore_test.sh
 # The flash-dump decoder the restore's --dump uses, against JFFS2 images built node by node.
 run "jffs2-extract" python3 -I tools/jffs2_extract_test.py
 # The stick/OTA update-image packer and the stock survey image built with it.
