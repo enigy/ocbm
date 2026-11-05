@@ -164,7 +164,9 @@ pub fn state_dir() -> &'static str {
     })
 }
 
-fn link_key_store() -> &'static str {
+/// The link-key store (`bt_link_keys`): rewritten on every new bond. `pub` for btd's reconnect walk, which holds
+/// back BTP_BOND_LOST while a bond is new.
+pub fn link_key_store() -> &'static str {
     static P: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     P.get_or_init(|| format!("{}/bt_link_keys", state_dir()))
 }

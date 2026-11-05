@@ -200,28 +200,59 @@ struct Walk {
 /// iPhone also answers and hangs up once after a power cut (dev adapter, 3 Nov), so one or two say little; every
 /// page answered and reset, [`Self::TELL_AT`] or more with nothing else between, means it most likely forgot the
 /// pairing (5 Nov bench: six, and Carlink offered pairing only a minute later). Told once per streak.
+///
+/// A new bond starts the count over, and holds the news back for [`Self::NEW_BOND_HOLD`]: right after a pairing,
+/// until the driver accepts CarPlay on the iPhone, it refuses iAP2 and answers-and-resets too (the 1.0.4 bench,
+/// 5 Nov: two in a row within a minute of a successful re-pair, after a mis-tapped CarPlay prompt).
 #[derive(Debug, Default)]
 struct ResetStreak {
     count: u32,
     told: bool,
+    /// When the link-key store was last written, as of the last page.
+    bonds: Option<std::time::SystemTime>,
+    /// When btd first saw that write, on the monotonic clock: the hold's start when the write's age is unknown.
+    seen: Option<Instant>,
 }
 
 impl ResetStreak {
     const TELL_AT: u32 = 3;
+    const NEW_BOND_HOLD: Duration = Duration::from_secs(10 * 60);
 
-    /// One page's outcome: true exactly when the streak reaches [`Self::TELL_AT`].
-    fn note(&mut self, result: Attempt) -> bool {
+    /// One page's outcome, with the link-key store's last write ([`bonds_written`]), the wall clock and the monotonic
+    /// one: true exactly when the streak is at [`Self::TELL_AT`] or more and no bond is newer than
+    /// [`Self::NEW_BOND_HOLD`]. A write stamped later than the wall clock (it reads 2020 after a restart until Carlink's
+    /// SETTIME lands, the Mac, 6 Nov) has no age: its hold then runs from when btd first saw it, so it can't last.
+    fn note(
+        &mut self,
+        result: Attempt,
+        bonds: Option<std::time::SystemTime>,
+        now: std::time::SystemTime,
+        mono: Instant,
+    ) -> bool {
+        if bonds != self.bonds {
+            *self = Self { bonds, seen: Some(mono), ..Self::default() };
+        }
         if result != Attempt::Reset {
-            *self = Self::default();
+            *self = Self { bonds, seen: self.seen, ..Self::default() };
             return false;
         }
         self.count += 1;
-        if self.count >= Self::TELL_AT && !self.told {
+        let new_bond = match bonds.map(|t| now.duration_since(t)) {
+            None => false,
+            Some(Ok(age)) => age < Self::NEW_BOND_HOLD,
+            Some(Err(_)) => self.seen.is_some_and(|s| mono.duration_since(s) < Self::NEW_BOND_HOLD),
+        };
+        if self.count >= Self::TELL_AT && !self.told && !new_bond {
             self.told = true;
             return true;
         }
         false
     }
+}
+
+/// When the link-key store was last written: a new bond rewrites it.
+fn bonds_written() -> Option<std::time::SystemTime> {
+    std::fs::metadata(bt_common::ssp_agent::link_key_store()).and_then(|m| m.modified()).ok()
 }
 
 /// Page `targets` in order until `stop` says not to go on. A phone that answers and resets the link
@@ -986,7 +1017,9 @@ pub fn run(
             },
             |peer| {
                 let result = attempt(peer, name, shutdown, session_active, ctrl);
-                if streak.note(result) && !session_active.load(Ordering::Relaxed) {
+                if streak.note(result, bonds_written(), std::time::SystemTime::now(), Instant::now())
+                    && !session_active.load(Ordering::Relaxed)
+                {
                     log(&format!(
                         "{} answered and reset the link on {} pages in a row: it has most likely forgotten the pairing",
                         control::fmt_addr(&peer),
@@ -1030,6 +1063,7 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::{failure, has_established_on_local_port, headset_candidates, split_at_lines, walk, Attempt, ResetStreak, Walk};
+    use std::time::{Duration, Instant};
     use crate::hfp_hf::Path;
     use crate::sdp_client::Services;
 
@@ -1073,16 +1107,52 @@ mod tests {
     #[test]
     fn three_answered_and_reset_pages_in_a_row_say_the_bond_is_lost_once() {
         let mut s = ResetStreak::default();
-        assert!(!s.note(Attempt::Reset));
-        assert!(!s.note(Attempt::Reset));
-        assert!(s.note(Attempt::Reset), "the third in a row tells");
-        assert!(!s.note(Attempt::Reset), "once per streak");
-        assert!(!s.note(Attempt::Failed), "anything else ends the streak");
-        assert!(!s.note(Attempt::Reset));
-        assert!(!s.note(Attempt::Ran));
-        assert!(!s.note(Attempt::Reset));
-        assert!(!s.note(Attempt::Reset), "a session between: the count starts again");
-        assert!(s.note(Attempt::Reset));
+        let m = Instant::now();
+        let t = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let old = Some(t - Duration::from_secs(3600)); // bonded an hour ago
+        assert!(!s.note(Attempt::Reset, old, t, m));
+        assert!(!s.note(Attempt::Reset, old, t, m));
+        assert!(s.note(Attempt::Reset, old, t, m), "the third in a row tells");
+        assert!(!s.note(Attempt::Reset, old, t, m), "once per streak");
+        assert!(!s.note(Attempt::Failed, old, t, m), "anything else ends the streak");
+        assert!(!s.note(Attempt::Reset, old, t, m));
+        assert!(!s.note(Attempt::Ran, old, t, m));
+        assert!(!s.note(Attempt::Reset, old, t, m));
+        assert!(!s.note(Attempt::Reset, old, t, m), "a session between: the count starts again");
+        assert!(s.note(Attempt::Reset, old, t, m));
+    }
+
+    /// The 1.0.4 bench, 5 Nov: re-paired, CarPlay mis-tapped on the iPhone, which then answered-and-reset two pages
+    /// within a minute. A new bond starts the count over and holds the news back while it is new.
+    #[test]
+    fn a_new_bond_starts_the_count_over_and_holds_it_back() {
+        let mut s = ResetStreak::default();
+        let m = Instant::now();
+        let t = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let old = Some(t - Duration::from_secs(3600));
+        assert!(!s.note(Attempt::Reset, old, t, m));
+        assert!(!s.note(Attempt::Reset, old, t, m));
+        let new = Some(t); // NEW_LINK_KEY: the store is rewritten
+        assert!(!s.note(Attempt::Reset, new, t, m), "the count starts over");
+        assert!(!s.note(Attempt::Reset, new, t, m));
+        assert!(!s.note(Attempt::Reset, new, t + Duration::from_secs(60), m), "three, but the bond is a minute old");
+        let later = t + ResetStreak::NEW_BOND_HOLD + Duration::from_secs(1);
+        assert!(s.note(Attempt::Reset, new, later, m), "still resetting once the bond is no longer new: tell");
+    }
+
+    /// The Mac, 6 Nov: after a restart the box clock reads 2020 until Carlink's SETTIME lands, so a bond can be
+    /// stamped later than "now". Its age is unknown: the hold runs from when btd first saw it, and ends.
+    #[test]
+    fn a_bond_stamped_ahead_of_the_clock_is_held_from_when_it_was_seen_not_forever() {
+        let mut s = ResetStreak::default();
+        let m = Instant::now();
+        let t = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let ahead = Some(t + Duration::from_secs(365 * 24 * 3600)); // written before the restart, by the right clock
+        assert!(!s.note(Attempt::Reset, ahead, t, m));
+        assert!(!s.note(Attempt::Reset, ahead, t, m));
+        assert!(!s.note(Attempt::Reset, ahead, t, m + Duration::from_secs(60)), "held while it is new to btd");
+        let after = m + ResetStreak::NEW_BOND_HOLD + Duration::from_secs(1);
+        assert!(s.note(Attempt::Reset, ahead, t, after), "the hold ends on the monotonic clock");
     }
 
     #[test]
