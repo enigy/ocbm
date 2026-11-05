@@ -194,6 +194,8 @@ fn failure(e: &std::io::Error) -> Attempt {
 struct Walk {
     ran: bool,
     rejected: bool,
+    /// A phone answered and reset the link on both pages: it most likely forgot the pairing.
+    bond_lost: bool,
 }
 
 /// Page `targets` in order until `stop` says not to go on. A phone that answers and resets the link
@@ -215,6 +217,9 @@ fn walk(
                 break;
             }
             result = page(peer);
+            if result == Attempt::Reset {
+                out.bond_lost = true;
+            }
         }
         match result {
             Attempt::Ran => out.ran = true,
@@ -943,7 +948,7 @@ pub fn run(
             },
         };
 
-        let Walk { ran, rejected } = walk(
+        let Walk { ran, rejected, bond_lost } = walk(
             &targets,
             || shutdown.load(Ordering::Relaxed) || session_active.load(Ordering::Relaxed),
             |peer| {
@@ -957,6 +962,12 @@ pub fn run(
             },
             |peer| attempt(peer, name, shutdown, session_active, ctrl),
         );
+        if bond_lost && !ran && !session_active.load(Ordering::Relaxed) {
+            // The 5 Nov bench: an iPhone that had forgotten the adapter answered six pages and reset each, and
+            // Carlink offered pairing only after a minute of waiting. Say what it is, so the app can ask for a re-pair.
+            log("a bonded phone answered and reset the link twice: it has most likely forgotten the pairing");
+            bt_driver::publish_bt_phase(ocbm_proto::BTP_BOND_LOST);
+        }
         if rejected {
             backoff = BACKOFF_MAX_SECS; // the phone said no; more paging only rotates codes
         } else if ran {
@@ -1026,6 +1037,16 @@ mod tests {
         let (paged, walked) = walk_with(&[(&SCOTT, Attempt::Reset), (&SCOTT, Attempt::Reset), (&YODA, Attempt::Ran)]);
         assert_eq!(paged, vec![SCOTT, SCOTT, YODA], "only once: then the next phone");
         assert!(walked.ran);
+    }
+
+    /// The 5 Nov bench: an iPhone that had forgotten the adapter answered every page and reset the link.
+    #[test]
+    fn a_phone_that_resets_on_both_pages_has_most_likely_lost_the_bond() {
+        let (_, walked) = walk_with(&[(&SCOTT, Attempt::Reset), (&SCOTT, Attempt::Reset)]);
+        assert!(walked.bond_lost);
+        assert!(!walked.ran);
+        let (_, walked) = walk_with(&[(&SCOTT, Attempt::Reset), (&SCOTT, Attempt::Ran)]);
+        assert!(!walked.bond_lost, "a reset once, then a session: a power cut, not a lost bond");
     }
 
     #[test]

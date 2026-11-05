@@ -179,6 +179,9 @@ pub const BTP_WIFI_HANDOFF: u8 = 0x06; // 0x5703 sent: the phone now has the hot
 pub const BTP_PAIR_REJECTED: u8 = 0x07; // phone rejected N re-pair confirmations without a NEW_LINK_KEY —
                                          // stored key no longer matches; app should tell the user to
                                          // re-pair on the iPhone or forget the box (ssp_agent.rs)
+pub const BTP_BOND_LOST: u8 = 0x08; // a bonded phone answered the page and reset the link, twice in a row: it
+                                    // most likely forgot the pairing. The app should tell the driver to forget
+                                    // the adapter on the iPhone and pair again (btd reconnect walk; 5 Nov bench)
 pub const CT_RADIO: u8 = 0x16; // host->box [CT_RADIO][0=radios off now | 1=radios on if cfg allows]
                                // (docs/carplay/04_CAPABILITIES_AND_CONFIG.md radio gating: mid-session kill switch; radios-on is otherwise
                                // implied by SUBSCRIBE + config push, and app loss powers radios off)
