@@ -206,47 +206,71 @@ struct Walk {
 /// 5 Nov: two in a row within a minute of a successful re-pair, after a mis-tapped CarPlay prompt).
 #[derive(Debug, Default)]
 struct ResetStreak {
-    count: u32,
-    told: bool,
+    /// Each phone's own run: another phone's page doesn't end it. With two bonded iPhones and one away, every
+    /// round paged both, the absent one's failure ended the count, and BOND_LOST never came (the Mac, 6 Nov).
+    runs: std::collections::HashMap<[u8; 6], Run>,
     /// When the link-key store was last written, as of the last page.
     bonds: Option<std::time::SystemTime>,
     /// When btd first saw that write, on the monotonic clock: the hold's start when the write's age is unknown.
     seen: Option<Instant>,
 }
 
+#[derive(Debug, Default)]
+struct Run {
+    count: u32,
+    told: bool,
+}
+
 impl ResetStreak {
     const TELL_AT: u32 = 3;
     const NEW_BOND_HOLD: Duration = Duration::from_secs(10 * 60);
 
-    /// One page's outcome, with the link-key store's last write ([`bonds_written`]), the wall clock and the monotonic
-    /// one: true exactly when the streak is at [`Self::TELL_AT`] or more and no bond is newer than
-    /// [`Self::NEW_BOND_HOLD`]. A write stamped later than the wall clock (it reads 2020 after a restart until Carlink's
-    /// SETTIME lands, the Mac, 6 Nov) has no age: its hold then runs from when btd first saw it, so it can't last.
+    /// One page of `peer`, with the link-key store's last write ([`bonds_written`]), the wall clock and the
+    /// monotonic one: true exactly when that phone's run is at [`Self::TELL_AT`] or more and no bond is newer than
+    /// [`Self::NEW_BOND_HOLD`]. A session (Ran) or a new bond ends every run; the phone's own failure ends its own.
+    /// A write stamped later than the wall clock (it reads 2020 after a restart until Carlink's SETTIME lands, the
+    /// Mac, 6 Nov) has no age: its hold then runs from when btd first saw it, so it can't last.
     fn note(
         &mut self,
+        peer: [u8; 6],
         result: Attempt,
         bonds: Option<std::time::SystemTime>,
         now: std::time::SystemTime,
         mono: Instant,
     ) -> bool {
         if bonds != self.bonds {
-            *self = Self { bonds, seen: Some(mono), ..Self::default() };
+            self.runs.clear();
+            self.bonds = bonds;
+            self.seen = Some(mono);
         }
-        if result != Attempt::Reset {
-            *self = Self { bonds, seen: self.seen, ..Self::default() };
-            return false;
+        match result {
+            Attempt::Reset => {}
+            Attempt::Ran => {
+                self.runs.clear();
+                return false;
+            }
+            Attempt::Failed | Attempt::PairRejected => {
+                self.runs.remove(&peer);
+                return false;
+            }
         }
-        self.count += 1;
         let new_bond = match bonds.map(|t| now.duration_since(t)) {
             None => false,
             Some(Ok(age)) => age < Self::NEW_BOND_HOLD,
             Some(Err(_)) => self.seen.is_some_and(|s| mono.duration_since(s) < Self::NEW_BOND_HOLD),
         };
-        if self.count >= Self::TELL_AT && !self.told && !new_bond {
-            self.told = true;
+        let run = self.runs.entry(peer).or_default();
+        run.count += 1;
+        if run.count >= Self::TELL_AT && !run.told && !new_bond {
+            run.told = true;
             return true;
         }
         false
+    }
+
+    /// A session the phone started itself: it knows the adapter, and every run ends.
+    fn session(&mut self) {
+        self.runs.clear();
     }
 }
 
@@ -929,6 +953,7 @@ pub fn run(
         // Never fight an in-progress session (accept path or a prior reconnect). Advisory fast-path
         // only — the authoritative claim is the compare_exchange in attempt().
         if session_active.load(Ordering::Relaxed) {
+            streak.session();
             if !interruptible_sleep(BACKOFF_START_SECS, shutdown) {
                 break;
             }
@@ -1017,7 +1042,7 @@ pub fn run(
             },
             |peer| {
                 let result = attempt(peer, name, shutdown, session_active, ctrl);
-                if streak.note(result, bonds_written(), std::time::SystemTime::now(), Instant::now())
+                if streak.note(peer, result, bonds_written(), std::time::SystemTime::now(), Instant::now())
                     && !session_active.load(Ordering::Relaxed)
                 {
                     log(&format!(
@@ -1110,16 +1135,16 @@ mod tests {
         let m = Instant::now();
         let t = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         let old = Some(t - Duration::from_secs(3600)); // bonded an hour ago
-        assert!(!s.note(Attempt::Reset, old, t, m));
-        assert!(!s.note(Attempt::Reset, old, t, m));
-        assert!(s.note(Attempt::Reset, old, t, m), "the third in a row tells");
-        assert!(!s.note(Attempt::Reset, old, t, m), "once per streak");
-        assert!(!s.note(Attempt::Failed, old, t, m), "anything else ends the streak");
-        assert!(!s.note(Attempt::Reset, old, t, m));
-        assert!(!s.note(Attempt::Ran, old, t, m));
-        assert!(!s.note(Attempt::Reset, old, t, m));
-        assert!(!s.note(Attempt::Reset, old, t, m), "a session between: the count starts again");
-        assert!(s.note(Attempt::Reset, old, t, m));
+        assert!(!s.note(SCOTT, Attempt::Reset, old, t, m));
+        assert!(!s.note(SCOTT, Attempt::Reset, old, t, m));
+        assert!(s.note(SCOTT, Attempt::Reset, old, t, m), "the third in a row tells");
+        assert!(!s.note(SCOTT, Attempt::Reset, old, t, m), "once per streak");
+        assert!(!s.note(SCOTT, Attempt::Failed, old, t, m), "its own failure ends its run");
+        assert!(!s.note(SCOTT, Attempt::Reset, old, t, m));
+        assert!(!s.note(SCOTT, Attempt::Ran, old, t, m));
+        assert!(!s.note(SCOTT, Attempt::Reset, old, t, m));
+        assert!(!s.note(SCOTT, Attempt::Reset, old, t, m), "a session between: the count starts again");
+        assert!(s.note(SCOTT, Attempt::Reset, old, t, m));
     }
 
     /// The 1.0.4 bench, 5 Nov: re-paired, CarPlay mis-tapped on the iPhone, which then answered-and-reset two pages
@@ -1130,14 +1155,14 @@ mod tests {
         let m = Instant::now();
         let t = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         let old = Some(t - Duration::from_secs(3600));
-        assert!(!s.note(Attempt::Reset, old, t, m));
-        assert!(!s.note(Attempt::Reset, old, t, m));
+        assert!(!s.note(SCOTT, Attempt::Reset, old, t, m));
+        assert!(!s.note(SCOTT, Attempt::Reset, old, t, m));
         let new = Some(t); // NEW_LINK_KEY: the store is rewritten
-        assert!(!s.note(Attempt::Reset, new, t, m), "the count starts over");
-        assert!(!s.note(Attempt::Reset, new, t, m));
-        assert!(!s.note(Attempt::Reset, new, t + Duration::from_secs(60), m), "three, but the bond is a minute old");
+        assert!(!s.note(SCOTT, Attempt::Reset, new, t, m), "the count starts over");
+        assert!(!s.note(SCOTT, Attempt::Reset, new, t, m));
+        assert!(!s.note(SCOTT, Attempt::Reset, new, t + Duration::from_secs(60), m), "three, but the bond is a minute old");
         let later = t + ResetStreak::NEW_BOND_HOLD + Duration::from_secs(1);
-        assert!(s.note(Attempt::Reset, new, later, m), "still resetting once the bond is no longer new: tell");
+        assert!(s.note(SCOTT, Attempt::Reset, new, later, m), "still resetting once the bond is no longer new: tell");
     }
 
     /// The Mac, 6 Nov: after a restart the box clock reads 2020 until Carlink's SETTIME lands, so a bond can be
@@ -1148,11 +1173,43 @@ mod tests {
         let m = Instant::now();
         let t = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         let ahead = Some(t + Duration::from_secs(365 * 24 * 3600)); // written before the restart, by the right clock
-        assert!(!s.note(Attempt::Reset, ahead, t, m));
-        assert!(!s.note(Attempt::Reset, ahead, t, m));
-        assert!(!s.note(Attempt::Reset, ahead, t, m + Duration::from_secs(60)), "held while it is new to btd");
+        assert!(!s.note(SCOTT, Attempt::Reset, ahead, t, m));
+        assert!(!s.note(SCOTT, Attempt::Reset, ahead, t, m));
+        assert!(!s.note(SCOTT, Attempt::Reset, ahead, t, m + Duration::from_secs(60)), "held while it is new to btd");
         let after = m + ResetStreak::NEW_BOND_HOLD + Duration::from_secs(1);
-        assert!(s.note(Attempt::Reset, ahead, t, after), "the hold ends on the monotonic clock");
+        assert!(s.note(SCOTT, Attempt::Reset, ahead, t, after), "the hold ends on the monotonic clock");
+    }
+
+    /// The Mac, 6 Nov: two bonded iPhones, the one that forgot the adapter here and the other away. Every round pages
+    /// both, and the absent one's failure used to end the count, so it never told. Each phone keeps its own run.
+    #[test]
+    fn another_phone_away_does_not_hide_the_one_that_forgot() {
+        let t = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let old = Some(t - Duration::from_secs(3600));
+        let m = Instant::now();
+        for order in [[SCOTT, YODA], [YODA, SCOTT]] {
+            let mut s = ResetStreak::default();
+            let mut told = Vec::new();
+            for round in 1..=3 {
+                walk(&order, || false, |_| true, |peer| {
+                    let result = if peer == SCOTT { Attempt::Reset } else { Attempt::Failed };
+                    if s.note(peer, result, old, t, m) {
+                        told.push((round, peer));
+                    }
+                    result
+                });
+            }
+            assert_eq!(told, vec![(2, SCOTT)], "{order:?}: told once, in the second round (pages 3 and 4 are its)");
+        }
+        let mut s = ResetStreak::default();
+        assert!(!s.note(SCOTT, Attempt::Reset, old, t, m));
+        assert!(!s.note(SCOTT, Attempt::Reset, old, t, m));
+        s.session(); // it started a session itself: it knows the adapter
+        assert!(!s.note(SCOTT, Attempt::Reset, old, t, m), "the run starts over after a session");
+        assert!(!s.note(YODA, Attempt::Ran, old, t, m));
+        assert!(!s.note(SCOTT, Attempt::Reset, old, t, m));
+        assert!(!s.note(SCOTT, Attempt::Reset, old, t, m), "any phone's session ends every run");
+        assert!(s.note(SCOTT, Attempt::Reset, old, t, m));
     }
 
     #[test]
