@@ -1520,7 +1520,10 @@ fn run_pairing_server() -> io::Result<()> {
     if gate.armed() {
         println!("[carplayd] phone gate armed: serving only the phone btd names");
     }
-    discovery::start(device_id().to_string(), pairing_identity().to_string(), gate.clone());
+    // The advertised receiver version comes from the pushed config (`source_version`, a bench lever) like
+    // the `/info` it must match; read once here, as discovery advertises once per carplayd.
+    let source_version = load_device_config().source_version;
+    discovery::start(device_id().to_string(), pairing_identity().to_string(), source_version, gate.clone());
 
     // SESSION HIJACK (critical QC finding). The old loop served ONE control connection at a time,
     // blocking in serve_connection, so a second (preempting) phone starved in the TCP backlog until the

@@ -40,7 +40,15 @@ fn mac_to_dec(mac: &str) -> u64 {
 /// Dial the iPhone's CarPlay-control port: `GET /ctrl-int/1/connect` → the iPhone turns around and
 /// opens RTSP to our advertised `:5000`. Returns whether the dial was accepted, so a transient
 /// failure is retried rather than deduping the peer forever.
-fn connect_out(addr: SocketAddr, dev_dec: u64) -> bool {
+/// The connect-out request: the iPhone dials RTSP back once it has it. `User-Agent` carries the advertised
+/// receiver version (`DeviceConfig::source_version`).
+fn connect_request(addr: SocketAddr, dev_dec: u64, source_version: &str) -> String {
+    format!(
+        "GET /ctrl-int/1/connect HTTP/1.1\r\nHost: {addr}\r\nUser-Agent: AirPlay/{source_version}\r\nAirPlay-Receiver-Device-ID: {dev_dec}\r\nConnection: keep-alive\r\n\r\n"
+    )
+}
+
+fn connect_out(addr: SocketAddr, dev_dec: u64, source_version: &str) -> bool {
     // Bound the connect: a stale/unroutable address — a phone addr that lagged the mDNS resolve, or
     // an IPv6 link-local whose scope has since changed — must not block this single browse thread
     // for the OS default connect timeout (minutes), which would stall ALL discovery. 3s is generous
@@ -55,9 +63,7 @@ fn connect_out(addr: SocketAddr, dev_dec: u64) -> bool {
     };
     let _ = s.set_write_timeout(Some(Duration::from_secs(3)));
     let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
-    let req = format!(
-        "GET /ctrl-int/1/connect HTTP/1.1\r\nHost: {addr}\r\nUser-Agent: AirPlay/320.17\r\nAirPlay-Receiver-Device-ID: {dev_dec}\r\nConnection: keep-alive\r\n\r\n"
-    );
+    let req = connect_request(addr, dev_dec, source_version);
     // Check the write: a silently-dropped request is not a successful dial — returning true here
     // would mark the peer dialed forever without the iPhone ever being asked to open RTSP.
     if let Err(e) = s.write_all(req.as_bytes()) {
@@ -172,9 +178,16 @@ fn dialable(ip: IpAddr, port: u16, scope: u32) -> SocketAddr {
 /// failure in main.rs ("exiting IS the repair, not a crash loop" — both spawners back off).
 ///
 /// The thread (rather than inline) is for the blocking browse/dial loop, not for isolation.
-pub fn start(device_id: String, pairing_identity: String, gate: std::sync::Arc<crate::phone_gate::PhoneGate>) {
+/// `source_version` is the advertised receiver version (TXT `srcvers`, connect-out `User-Agent`), the same
+/// as the `/info` `sourceVersion` this carplayd serves.
+pub fn start(
+    device_id: String,
+    pairing_identity: String,
+    source_version: String,
+    gate: std::sync::Arc<crate::phone_gate::PhoneGate>,
+) {
     std::thread::spawn(move || {
-        if let Err(e) = run(&device_id, &pairing_identity, &gate) {
+        if let Err(e) = run(&device_id, &pairing_identity, &source_version, &gate) {
             eprintln!("[rx] discovery failed: {e}");
             eprintln!(
                 "[carplayd] FATAL: mDNS discovery is down — a receiver no phone can find is not a \
@@ -188,13 +201,14 @@ pub fn start(device_id: String, pairing_identity: String, gate: std::sync::Arc<c
 fn run(
     dev_id: &str,
     pi: &str,
+    source_version: &str,
     gate: &crate::phone_gate::PhoneGate,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let dev_dec = mac_to_dec(dev_id);
     let iface = std::env::var("RX_IFACE").unwrap_or_else(|_| "ncm0".to_string());
     let adv_addr = std::env::var("RX_ADDR").unwrap_or_default(); // "" => addr-auto
     println!(
-        "[rx] device id {dev_id} = {dev_dec} (dec); pi {pi}; iface={iface} adv_addr={}",
+        "[rx] device id {dev_id} = {dev_dec} (dec); pi {pi}; srcvers {source_version}; iface={iface} adv_addr={}",
         if adv_addr.is_empty() {
             "addr-auto"
         } else {
@@ -217,7 +231,7 @@ fn run(
         ("model", "CarLink-mac-1.0"),
         ("protovers", "1.0"),
         ("pi", pi),
-        ("srcvers", "320.17"),
+        ("srcvers", source_version),
     ] {
         props.insert(k.to_string(), v.to_string());
     }
@@ -312,7 +326,7 @@ fn run(
                             continue;
                         }
                         tried = true;
-                        if connect_out(sa, dev_dec) {
+                        if connect_out(sa, dev_dec, source_version) {
                             dialed.insert(sa.to_string());
                             dialed_by.entry(info.get_fullname().to_string()).or_default().push(sa.to_string());
                             break 'rounds;
@@ -356,6 +370,16 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_connect_out_carries_the_advertised_version() {
+        let addr: SocketAddr = "192.168.5.2:7000".parse().unwrap();
+        let req = connect_request(addr, 42, "950.7.1");
+        assert!(req.starts_with("GET /ctrl-int/1/connect HTTP/1.1\r\n"));
+        assert!(req.contains("\r\nUser-Agent: AirPlay/950.7.1\r\n"), "{req}");
+        assert!(req.contains("\r\nAirPlay-Receiver-Device-ID: 42\r\n"));
+        assert!(req.ends_with("\r\n\r\n"));
+    }
 
     #[test]
     fn mac_to_dec_matches_the_advertised_device_id() {

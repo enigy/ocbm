@@ -227,6 +227,16 @@ construction.
   validated by `ViewArea2Rule` in severity order (containment → all four values even → positive dims → the
   product floor 800x480 landscape / 480x800 portrait); the entry is emitted only when enabled AND legal, so
   the OFF document is byte-identical (docs/carplay/06_AV_PIPELINE.md §3).
+- **Applied, BENCH levers (2026-11-08, truck research after LIVI):** our top-level snake_case extensions
+  `source_version` and `display_panels`. `source_version` → `DeviceConfig.source_version` → `/info`
+  `sourceVersion`, the Bonjour TXT `srcvers` and the connect-out `User-Agent: AirPlay/<v>` alike (carplayd
+  reads it once at start for discovery, per connection for `/info`); refused unless 1-4 dot-separated numbers
+  of ≤ 5 digits (`valid_source_version`), so absent or refused keeps `320.17`. `display_panels: true` →
+  `DeviceConfig.display_panels` → `displayPanels` beside `displays`, one panel per display (`<uuid>-panel`,
+  its size, its stream as `initialVideoStreams`, `showsInstruments` on the type-111 cluster's), no
+  `displayPlugins` (car maker themes). Both default off, so the OFF `/info` is byte-identical. Neither is
+  proven on a device here; the comparison points are `CarPlaySDK` 509.11 (§03) and LIVI (f-io/LIVI, an
+  independent receiver advertising 950.7.1 with this panel shape). Bench them on the dev adapter only.
 - **Guard:** dimensions are applied only when both are > 0; a partial/garbled config falls through to the
   box default (never zeros the resolution out from under a session). The guard stays; the box default
   it falls to is an interim safety floor — target state per docs/carplay/04_CAPABILITIES_AND_CONFIG.md is hold-IDLE-until-config, with

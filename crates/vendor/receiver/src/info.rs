@@ -110,6 +110,13 @@ pub struct DeviceConfig {
     /// `OSInfo`. Default `false` (left-hand drive), and emitted UNCONDITIONALLY like Apple's own
     /// stack — it is a plain boolean, so there is no absent-means-default subtlety to preserve.
     pub right_hand_drive: bool,
+    /// `displayPanels` — the modern display description `CarPlaySDK` 509.11 sends beside `displays`
+    /// (docs/carplay/03_SDK_GROUND_TRUTH.md §5): one panel per `displays[]` entry, sized from it, listing that
+    /// display's stream as its initial video stream, and `showsInstruments` on the cluster's. Default
+    /// `false`, and then nothing is emitted and `/info` is byte-identical. A BENCH lever (truck research
+    /// after LIVI, 8 Nov): the pushed YAML's `display_panels: true` sets it. Unproven on a device here; LIVI
+    /// (f-io/LIVI, an independent receiver) sends this shape to shipping iPhones.
+    pub display_panels: bool,
 }
 
 impl Default for DeviceConfig {
@@ -153,6 +160,7 @@ impl Default for DeviceConfig {
             oem_icon_label: String::new(),
             oem_icon_visible: false,
             right_hand_drive: false,
+            display_panels: false,
         }
     }
 }
@@ -800,6 +808,36 @@ fn add_appearance_keys(d: &mut Dictionary) {
     }
 }
 
+/// `displayPanels` for [`DeviceConfig::display_panels`]: per `displays[]` entry, a panel `<uuid>-panel` of the
+/// entry's pixel and physical size whose one initial video stream is that entry, at the origin; the
+/// cluster's (type 111) panel carries `showsInstruments` in `properties`. No `displayPlugins`: those name a
+/// car maker's theme (CarPlay Ultra), which this box has none of.
+fn display_panels(displays: &[Value]) -> Vec<Value> {
+    displays
+        .iter()
+        .filter_map(Value::as_dictionary)
+        .filter_map(|disp| {
+            let uuid = disp.get("uuid")?.as_string()?.to_string();
+            let int = |k: &str| disp.get(k).and_then(Value::as_signed_integer).unwrap_or(0);
+            let cluster = int("type") == 111;
+            let mut stream = Dictionary::new();
+            stream.insert("uuid".into(), Value::String(uuid.clone()));
+            stream.insert("originXPixels".into(), Value::Integer(0.into()));
+            stream.insert("originYPixels".into(), Value::Integer(0.into()));
+            stream.insert("zIndex".into(), Value::Integer(0.into()));
+            let mut panel = Dictionary::new();
+            panel.insert("uid".into(), Value::String(format!("{uuid}-panel")));
+            for k in ["widthPixels", "heightPixels", "widthPhysical", "heightPhysical"] {
+                panel.insert(k.into(), Value::Integer(int(k).into()));
+            }
+            let properties = if cluster { vec![Value::String("showsInstruments".into())] } else { Vec::new() };
+            panel.insert("properties".into(), Value::Array(properties));
+            panel.insert("initialVideoStreams".into(), Value::Array(vec![Value::Dictionary(stream)]));
+            Some(Value::Dictionary(panel))
+        })
+        .collect()
+}
+
 /// Build the `/info` binary plist bytes from `cfg`.
 ///
 /// Resolves the second main view area (pushed config first, then the `CARPLAY_VIEWAREA2` bench
@@ -1025,6 +1063,9 @@ fn build_info_with_view_area_2(cfg: &DeviceConfig, second: Option<ViewArea2>) ->
             "altScreenSuggestUIURLs".into(),
             Value::Array(cluster_urls()),
         );
+    }
+    if cfg.display_panels {
+        d.insert("displayPanels".into(), Value::Array(display_panels(&displays)));
     }
     d.insert("displays".into(), Value::Array(displays));
 
@@ -1479,6 +1520,39 @@ fn audio_formats(cfg: &DeviceConfig) -> Vec<Value> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn display_panels_are_absent_by_default_and_mirror_displays_when_asked() {
+        let off = Value::from_reader(Cursor::new(build_info(&DeviceConfig::default()))).unwrap();
+        assert!(off.as_dictionary().unwrap().get("displayPanels").is_none(), "byte-identical /info by default");
+
+        let cfg = DeviceConfig { display_panels: true, ..DeviceConfig::default() };
+        let v = Value::from_reader(Cursor::new(build_info(&cfg))).unwrap();
+        let d = v.as_dictionary().unwrap();
+        let panels = d["displayPanels"].as_array().unwrap();
+        assert_eq!(panels.len(), d["displays"].as_array().unwrap().len(), "one panel per display");
+        let p = panels[0].as_dictionary().unwrap();
+        assert_eq!(p["uid"].as_string(), Some(format!("{DISPLAY_UUID}-panel").as_str()));
+        assert_eq!(p["widthPixels"].as_signed_integer(), Some(cfg.display_width));
+        assert_eq!(p["heightPixels"].as_signed_integer(), Some(cfg.display_height));
+        assert!(p["properties"].as_array().unwrap().is_empty(), "the main panel shows no instruments");
+        let s = p["initialVideoStreams"].as_array().unwrap()[0].as_dictionary().unwrap();
+        assert_eq!(s["uuid"].as_string(), Some(DISPLAY_UUID));
+        assert_eq!(s["zIndex"].as_signed_integer(), Some(0));
+    }
+
+    #[test]
+    fn the_cluster_panel_shows_instruments() {
+        let mut alt = Dictionary::new();
+        alt.insert("uuid".into(), Value::String("ALT".into()));
+        alt.insert("type".into(), Value::Integer(111.into()));
+        alt.insert("widthPixels".into(), Value::Integer(800.into()));
+        let panels = display_panels(&[Value::Dictionary(alt)]);
+        let p = panels[0].as_dictionary().unwrap();
+        assert_eq!(p["uid"].as_string(), Some("ALT-panel"));
+        assert_eq!(p["properties"].as_array().unwrap()[0].as_string(), Some("showsInstruments"));
+        assert_eq!(p["heightPixels"].as_signed_integer(), Some(0), "a missing size reads as 0, as the display's own");
+    }
 
     #[test]
     fn info_plist_has_full_capability_set() {

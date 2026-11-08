@@ -106,6 +106,25 @@ pub struct VehicleConfig {
     /// is a serde type error and rejects the whole document, exactly as a mistyped Apple key does.
     #[serde(default)]
     pub view_area_anim_ms: Option<i64>,
+    /// `source_version` — OUR extension, a BENCH lever (truck research after LIVI, 8 Nov): the receiver
+    /// version the box advertises in `/info` `sourceVersion`, the Bonjour TXT `srcvers` and the connect-out
+    /// `User-Agent: AirPlay/<v>`, all three alike. Absent, or not 1-4 dot-separated numbers of at most five
+    /// digits ([`valid_source_version`]), keeps `320.17`, the genuine CCPA family. To compare against
+    /// `CarPlaySDK` 509.11 and LIVI's 950.7.1 (docs tab "CarPlay receiver version, lookups").
+    #[serde(default)]
+    pub source_version: Option<String>,
+    /// `display_panels` — OUR extension, a BENCH lever: also emit `displayPanels`
+    /// ([`DeviceConfig::display_panels`]). Absent/false keeps `/info` byte-identical.
+    #[serde(default)]
+    pub display_panels: bool,
+}
+
+/// A receiver version the box will advertise: 1 to 4 dot-separated parts, each 1 to 5 ASCII digits
+/// ("320.17", "509.11", "950.7.1"). Anything else is refused, so a typo can't put a free string in the
+/// TXT record, `/info` and an HTTP header at once.
+pub fn valid_source_version(v: &str) -> bool {
+    let parts: Vec<&str> = v.split('.').collect();
+    (1..=4).contains(&parts.len()) && parts.iter().all(|p| (1..=5).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// One resolution of the OEM icon — a base64 PNG plus its pixel size.
@@ -809,6 +828,14 @@ impl VehicleConfig {
     /// a partial/garbled config must never zero the resolution out from under a working session; it
     /// falls through to `base` (the caller's interim default) instead.
     pub fn apply(&self, mut base: DeviceConfig) -> DeviceConfig {
+        if let Some(v) = self.source_version.as_deref().map(str::trim) {
+            if valid_source_version(v) {
+                base.source_version = v.to_string();
+            } else {
+                eprintln!("[cfg] source_version {v:?} refused (1-4 dot-separated numbers); keeping {}", base.source_version);
+            }
+        }
+        base.display_panels = self.display_panels;
         let d = &self
             .display_panels_config
             .main_display_panel
@@ -1123,6 +1150,27 @@ impl VehicleConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_version_is_a_bench_lever_and_refuses_free_strings() {
+        assert!(valid_source_version("320.17"));
+        assert!(valid_source_version("509.11"));
+        assert!(valid_source_version("950.7.1"));
+        assert!(!valid_source_version(""));
+        assert!(!valid_source_version("950.7.1 beta"));
+        assert!(!valid_source_version("1.2.3.4.5"));
+        assert!(!valid_source_version("123456.1"));
+        assert!(!valid_source_version("9..1"));
+
+        let none = VehicleConfig::from_yaml(b"name: x\n").unwrap().apply(DeviceConfig::default());
+        assert_eq!(none.source_version, "320.17", "absent keeps the genuine CCPA family");
+        assert!(!none.display_panels);
+        let set = VehicleConfig::from_yaml(b"name: x\nsource_version: \"950.7.1\"\ndisplay_panels: true\n").unwrap().apply(DeviceConfig::default());
+        assert_eq!(set.source_version, "950.7.1");
+        assert!(set.display_panels);
+        let bad = VehicleConfig::from_yaml(b"name: x\nsource_version: \"9.x\"\n").unwrap().apply(DeviceConfig::default());
+        assert_eq!(bad.source_version, "320.17", "a refused value keeps the default");
+    }
 
     /// The Apple `Widescreen.yaml` shape (trimmed): the box must read the MAIN panel's 1920×720 and
     /// NOT be confused by the identically-named `width`/`height` inside videoStreamsConfig.viewAreas.
