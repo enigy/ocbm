@@ -3,81 +3,38 @@
 > **STATUS:** CURRENT · the OCBM wire specification, kept in step with `crates/ocbm-proto` and
 > `ccpa/ocbmd`
 
-**OCBM is projection-agnostic.** It carries CarPlay and Android Auto over the same envelope — CarPlay
-A/V on its own channels, Android Auto as the phone's own byte stream over `CH_IP` — and the channel
-map below is the whole of what either protocol needs from the transport. It lives under `carplay/`
-only because that is where most of its channels are used; nothing in the envelope is CarPlay-specific.
-
 OCBM is the open replacement for riddleBox's `0x55AA55AA` protocol. Like it, OCBM is a **framed
 multiplexer** over the single `/dev/usb_accessory` bulk pipe (one IN stream + one OUT stream): a
 stable envelope carries many logical channels, discriminated by a channel id.
 
 The design contract: **the envelope never learns about features.** New codecs, audio formats,
 screens, and future phone-OS features are carried as *self-describing data inside channels*, never as
-new envelope fields or a new wire version. Android Auto arrived after the envelope was frozen and
-needed no change to it.
+new envelope fields or a new wire version.
+
+**Retired numbers.** OCBM 1.0.5 (8 Nov 2026) made the adapter CarPlay-only, and the channels,
+control messages, capability bits and markers that served Android Auto, the host MFi relay, the IP
+and Ethernet bridges, the throughput benches, the app-driven SETUP relay and Bluetooth call audio
+left the protocol. Their numbers are **reserved, never reused**: an older Carlink or box build would
+read them the old way. `crates/ocbm-proto/src/lib.rs` lists them in a comment table, not as
+constants, and §"Retired numbers" below repeats it. Their specification is at tag
+[`v1.0.4`](https://github.com/enigy/ocbm/blob/v1.0.4/docs/carplay/01_OCBM_PROTOCOL.md).
 
 
 ## The protocol has one definition, and it is checked
 
-`crates/ocbm-proto/src/lib.rs` is the protocol. Every other implementation restates its constants by
-hand in another language:
+`crates/ocbm-proto/src/lib.rs` is the protocol. The host app restates its constants by hand:
 
 | Implementation | File |
 |---|---|
 | box daemons (Rust) | `crates/ocbm-proto/src/lib.rs` — **canonical** |
-| macOS host app (Swift) | `host/MacHost/carlink_macOS/OCBM/OCBMFraming.swift` |
-| CarlinkAndroid host app (Kotlin, active since 2026-09-18 — see below) | `host/CarlinkAndroid/app/src/main/kotlin/com/carlink/ocbm/OcbmProto.kt` |
-| gm_ccpa client (Kotlin) | `host/gm_ccpa/netprobe_app/app/src/main/java/zeno/gmccpa/ocbm/OcbmProto.kt` — app-owned fork (see below) |
+| Carlink (Kotlin) | `app/src/main/kotlin/com/carlink/ocbm/OcbmProto.kt` in [enigy/carlink](https://github.com/enigy/carlink) |
 
-`tools/proto_check.py` verifies all three against the canonical table. Run it before committing a
-protocol change; it takes no arguments, every client is in-tree:
-
-    tools/proto_check.py
-
-A value that disagrees is an error: two ends of one link mean different things by the same byte. A
-constant a client has not defined yet is reported as a gap, and is an error only for the core set —
-channel ids, `CT_*` opcodes, frame flags — which every client must be able to name even where it does
-not act on the opcode. `--strict` promotes every gap to an error.
-
-**gm_ccpa's Kotlin file is an app-owned fork, not a symlink (since 2026-09-11).** From 2026-08-31 to
-2026-09-11 `host/gm_ccpa/.../ocbm/OcbmProto.kt` was a relative symlink into CarlinkAndroid's copy, from
-the days when gm_ccpa was a separate checkout and the protocol was "edited once, in the main project".
-That inverted the actual ownership at the time: CarlinkAndroid was dormant and behind the current
-protocol, while gm_ccpa and the macOS host were the implementations that shipped. The link was
-replaced with a real file
-(byte-identical to the CarlinkAndroid original except `package zeno.gmccpa.ocbm`), so the Kotlin clients
-are per-app exactly as the Swift client already was. The wire contract does not move: `crates/ocbm-proto`
-stays canonical and `tools/proto_check.py` is the seam — it now checks gm_ccpa's file by default, where
-before it did so only when handed a root path, and then only by reading the same file twice.
-
-**Correction, 2026-09-18: CarlinkAndroid is no longer dormant, and "behind" no longer holds
-uniformly.** Three work packages landed in `:app` this session (a third-party AAOS integration shell,
-phone-call audio over the voice seam, and a resolution/orientation-agnostic UI), its build+test gate
-is green, and client currency is genuinely **not uniform** across the fleet: `tools/proto_check.py`
-now shows the CarlinkAndroid Kotlin client ahead of gm_ccpa and the Swift client on the whole `LOG_*`
-table and the inbound `CMD_*` command surface (`CMD_REQUEST_UI`/`REQUEST_SIRI`/`LIMITED_UI_*`/
-`UI_APPEARANCE`, `MODE_*`, `NAV_APPEARANCE_*` — the Swift client still lacks all of these), and it
-closed its own `CMD_VIEW_AREA` gap on 2026-09-18 (gm_ccpa still lacks it) — while still carrying a
-local `F_BOTH` constant not in `ocbm-proto`, a gap gm_ccpa also carries. See
-`host/CarlinkAndroid/OCBMANDROID.md` for what shipped; the box side of all of this predates today —
-none of it is a protocol change, only client capability catching up.
-
-**Only what a byte means is shared.** The two Android apps serve different roles — gm_ccpa is the GM
-head-unit bridge, CarlinkAndroid targets a GM gminfo3.7 AAOS unit (corrected 2026-09-18 — this line
-previously said "Pi AAOS"; see `host/CarlinkAndroid/OCBMANDROID.md`) — so `OcbmClient`, `VoiceRouter`, `AacPlayer`,
-`MicUplink` and the transports are separate implementations and are allowed to differ, and now so are
-the protocol files, within what the checker enforces. Deployment policy stays in the app: gm_ccpa's
-`BH_REQUIRED_BRIDGE` lives in its `SessionSupervisor`, not in the protocol file, because it deliberately
-does not require `BH_WLAN_AP` in a role where the head unit owns Wi-Fi.
-
-**Why this exists.** `CT_PROJ_MODE`, `CT_BOX_HEALTH`, the `BH_*` health bits, `F_REPLAY` and the whole
-`CH_FILE` opcode set were added to the box and picked up by the gm_ccpa client, while this repo's own
-Swift and Kotlin clients never learned them — as was the MFi correlation tag, which `ocbmd` echoes and
-gm_ccpa's client sends, but which existed nowhere in `ocbm-proto` or in either client here — the macOS app could not name `CT_BT_PHASE` or
-`CT_BOX_HEALTH` at all, so box health telemetry arrived and was ignored. That gap was closed on
-2026-08-31 and this checker is what keeps it closed. Adding a constant to `ocbm-proto` without adding
-it to the clients now fails the check.
+Carlink keeps a copy of `lib.rs` (`proto/ocbm-proto.lib.rs`) and its `tools/proto_check.py` checks
+`OcbmProto.kt` against it. Refresh that copy whenever this file changes. A value that disagrees is an
+error: two ends of one link mean different things by the same byte. A constant the client has not
+defined yet is reported as a gap, and is an error only for the core set — channel ids, `CT_*`
+opcodes, frame flags — which every client must be able to name even where it does not act on the
+opcode.
 
 ## Envelope (v1)
 
@@ -135,7 +92,7 @@ host → box:  MODE_SELECT { mode }        (only when the host wants a non-defau
 - **A host sends nothing but `HELLO` until it has a `HELLO_ACK`** (sending `HELLO` again is fine). A
   one-file install's trial takes a host's first other frame as the proof that `ocbmd` answered it
   (`/tmp/ocbmd_answered`, [../ops/01_RECOVERY.md](../ops/01_RECOVERY.md)), so a host that carried on
-  without the ACK would vouch for a box that never answered. Carlink, the macOS app and `ocbm-probe`
+  without the ACK would vouch for a box that never answered. Carlink and `ocbm-probe`
   hold to this; `ocbm-host` pushed its clock and ran its verb after "no HELLO_ACK" until 2 Nov, and
   now exits 1 instead.
 - `HELLO_ACK`'s `box_caps` mirrors CarPlay's own negotiation (see Extensibility) so the two ends
@@ -143,9 +100,8 @@ host → box:  MODE_SELECT { mode }        (only when the host wants a non-defau
   that slot is the host instance nonce (see the note under the CTRL table). A host's capability is
   expressed by which channels and opcodes it actually uses.
 - **Optional host label** (added 2026-08-27). Anything after the nonce in `CT_HELLO` is an optional
-  UTF-8 label naming *what kind* of host this is — the box serves several (a GM head-unit app using it
-  as a BT+MFi bridge, an Android Auto host driving `aa-bridge` over `CH_IP`, bench tooling) and its
-  behaviour and logs differ between them, yet "what is talking to me" was previously unanswerable. The
+  UTF-8 label naming *what kind* of host this is (Carlink, bench tooling), which was previously
+  unanswerable. The
   box filters control characters, caps it at 64 chars, logs it, and reports it in `MGMT_INFO` as
   `host_name`. Purely diagnostic — nothing gates on it, and an absent label reads exactly as before.
   Additive in both directions: the box already ignored bytes past the nonce, and an older box still
@@ -170,17 +126,14 @@ host → box:  MODE_SELECT { mode }        (only when the host wants a non-defau
 | `0x01` | `HELLO` | host→box | `[ver u8][instance u32 LE]` — the trailing u32 is the host **instance nonce**, not caps. See the note below the table |
 | `0x02` | `HELLO_ACK` | box→host | `[ver u8][caps u32 LE][active_mode u8]` |
 | `0x03` | `MODE_SELECT` | host→box | `[mode u8]` |
-| `0x04` | `SRC` | host→box | `[ms u32 LE]` — box floods CH_ECHO for a downlink benchmark. The flood blocks ocbmd's single-threaded poll, so the box **clamps `ms` to `HEARTBEAT_GRACE/2` (5 s)** and refreshes `last_hb` when it ends (`Daemon::handle`, the `CT_SRC` arm). An unclamped bench past the grace used to make `presence_tick` see a stale `last_hb`, declare the host GONE and destroy the live session — a host asking for 30 s gets 5 s, not an error |
 | `0x05` | `SETTIME` | host→box | `[unix_seconds u64 LE]`; box `settimeofday()`s, then acks `[0x05][unix_seconds u64 LE][status u8]` (`0`=applied, `1`=failed) | (2026-09-03: the macOS client now sends it right after every SUBSCRIBE — until then only the Android client did, and a box that booted unsynced logged every line, read-time and write-time stamped alike, as 2020-01-02)
-| `0x06` | `CT_ETH_START` | host→box | `[iface bytes?]` — box bridges that netdev (default `ncm0`) onto CH_ETH |
-| `0x07` | `CT_ETH_STOP` | host→box | *(empty)* — box tears the raw-frame bridge down |
-| `0x14` | `CT_UPLINK` | box→host | `[state u8][rate u32 LE][ch u8][codec u8]` — mic-uplink gate: `1`=on (iPhone opened a type-100 `input=true` SETUP, or an HFP call opened SCO; app starts capturing at rate/ch), `0`=off (TEARDOWN; app stops). `codec` added 2026-09-04: `0` PCM S16LE (every CarPlay uplink and HFP/CVSD), `4` mSBC — the app returns whole 60 B eSCO packets, not PCM. ON is 8 bytes; **OFF stays the 7-byte all-zero form**, so read `codec` only when `len ≥ 8` and default it to 0 |
+| `0x14` | `CT_UPLINK` | box→host | `[state u8][rate u32 LE][ch u8][codec u8]` — mic-uplink gate: `1`=on (iPhone opened a type-100 `input=true` SETUP; app starts capturing at rate/ch), `0`=off (TEARDOWN; app stops). `codec` is always `0` PCM S16LE (`4`, mSBC for Bluetooth call audio, is retired). ON is 8 bytes; **OFF stays the 7-byte all-zero form**, so read `codec` only when `len ≥ 8` and default it to 0 |
 | `0x15` | `CT_PAIRING_CODE` | box→host | `[6 ascii digits \| empty]` — the wireless SSP Numeric-Comparison code to display for the user to match against the iPhone; empty payload = clear/hide | (macOS app, 2026-09-03: rendered one digit per shaded cell in the main-window overlay, grouped n/2 + n/2 with a dash for even lengths ≥ 4, semantic system colours, VoiceOver label; hidden when the payload is empty. The one-line status only carries the instruction.)
 | `0x1C` | `CT_PAIR_CONFIRM` | host→box | `[accept u8]` — the USER'S answer to the `CT_PAIRING_CODE` prompt: `1` = the codes match, pair; `0` = cancel. Any non-zero byte is a yes; a truncated frame reads as **cancel** (an unparseable request must never complete a bond nobody confirmed). SSP Numeric Comparison requires a real yes/no on BOTH devices, so the box no longer auto-accepts: it publishes the code, waits up to **55 s** (inside `pairing_aware_connect`'s 60 s hold), then replies `USER_CONFIRM_REPLY` or `USER_CONFIRM_NEG_REPLY`. ocbmd relays this to btd's control port as `{"cmd":"pair_answer","accept":…}` (127.0.0.1:9115). An answer with no prompt outstanding is ignored. (macOS app, 2026-09-03: **Pair** default/Return and **Cancel**/Escape under the code panel, disabled after one answer until the box clears the code.) See docs/wireless/01_BT_AND_RADIO.md |
 | `0x16` | `CT_RADIO` | host→box | `[0 \| 1]` — `0` = radios off now, `1` = clear the inhibit (the pushed cfg still governs). Any other value is logged and ignored; a fresh `CT_SUBSCRIBE` clears the inhibit **unconditionally**, so a config push always overrides a prior `off`. See the note below before trying to change that |
 | `0x17` | `CT_BT_PHASE` | box→host | `[BTP_* u8]` — Bluetooth/iAP2 handshake progress. See below |
 | `0x18` | `CT_PHONE_IDENT` | box→host | `[utf8 JSON \| empty]` — who the connected phone is: `{"name","deviceID","model","osName","osVersion"}`, lifted from the phone's own AirPlay phase-1 SETUP plist. `deviceID` is the BR/EDR MAC, so it joins `MGMT_INFO`'s bonded list. Sent only while subscribed, on **change** only, re-emitted after each `CT_SUBSCRIBE`; empty payload = no phone's session is live (since 2026-11-02 `carplayd` clears the file when the session ends, so a host connecting between sessions is told no phone, not the last one) |
-| `0x19` | `CT_PROJ_MODE` | box→host | `[PM_* u8]` — WHICH projection transport owns the box right now: `0x00` `PM_NONE` (idle), `0x01` `PM_WIRED_CP`, `0x02` `PM_WIRELESS_CP`, `0x03` `PM_WIRED_AA`, `0x04` `PM_WIRELESS_AA` (reserved, unbuilt). Mirrors the box's single-owner arbitration flag `/tmp/projection_owner` (docs/androidauto/02_ARBITRATION.md). Sent only while subscribed, on **change** only, re-emitted after each `CT_SUBSCRIBE`. Advisory: an unknown value means "some transport owns the box" — never gate on ordering |
+| `0x19` | `CT_PROJ_MODE` | box→host | `[PM_* u8]` — WHICH projection transport owns the box right now: `0x00` `PM_NONE` (idle), `0x01` `PM_WIRED_CP`, `0x02` `PM_WIRELESS_CP` (`0x03` and `0x04`, the Android Auto owners, are retired). Mirrors the box's single-owner arbitration flag `/tmp/projection_owner`. Sent only while subscribed, on **change** only, re-emitted after each `CT_SUBSCRIBE`. Advisory: an unknown value means "some transport owns the box" — never gate on ordering |
 | `0x1A` | `CT_BOX_HEALTH` | box→host | `[BH_* bitmask u8]` — the box's own readiness. Sent only while subscribed, on **change** only, re-emitted after each `CT_SUBSCRIBE`. See below |
 | `0x1B` | `CT_LOG_CTL` | host→box | `[enabled u8][cap_kb u16 LE]` — arm/disarm the box→host `CH_LOG` stream. `cap_kb` 0 = the built-in default (256). **Default is OFF**, and it resets to off on `CT_STOP` / host-gone like every other per-session state. Enabling streams from **offset 0** of every source — that IS the backfill, there is no separate dump opcode — then follows EOF. Every line that existed on disk at the moment a source is (re)opened for that offset-0 pass carries `LOG_F_BACKFILL` (see §CH_LOG), so a host can tell "already happened" replay from what happens next. A payload shorter than 2 bytes reads as *disable*: an unparseable request must never leave a stream running the host does not know about. See §CH_LOG |
 
@@ -280,9 +233,6 @@ lifecycle section below.
 > tool exercises replacement detection instead of defeating it. Until 2026-09-01 it sent the
 > caps-era constant `0x13`, which was worse than 0 — two successive runs looked like one host to the
 > box, so the re-arm never fired.
-> `OCBMClient.swift:197` still sends zeros — legal, but it forfeits replacement detection on macOS,
-> and its comment calling the field "caps" is stale. That remains a client bug against this spec,
-> not an alternative reading of it.
 
 
 ### `CT_BT_PHASE` (`0x17`) — Bluetooth/iAP2 handshake progress
@@ -332,8 +282,8 @@ therefore treat "no `CT_BT_PHASE` ever arrives" as normal and keep whatever fall
 
 ### The `:9003` voice seam tag (legacy / on-box-decrypt mode)
 
-Specified here because it is the mode `gm_ccpa` actually runs (`OCBM_FWD_ENC=0`), and it was
-previously described only in a source comment. **This is not the seam-v2 framing** — that is the
+Specified here because the on-box-decrypt mode (`OCBM_FWD_ENC=0`, a dev fallback) still emits it, and
+it was previously described only in a source comment. **This is not the seam-v2 framing** — that is the
 `[u32 BE len][SEAM_MAGIC][marker]` envelope with `SEAM_KEY`/`SEAM_FORMAT`/`SEAM_PKT` documented **below**
 (§"Media transport — committed model"), used when
 forward-encrypt is on. The two are wire-incompatible and there is **no discriminator on the wire**:
@@ -419,11 +369,8 @@ explicitly requests `CONSOLE`. New modes are pure additions — no rewrite.
 | Id | Channel | Payload | Model |
 |---|---|---|---|
 | `0x0000` | CTRL | handshake / caps / session lifecycle / box→host status (the `CT_*` table above; **no stream open** — see §Self-describing streams) | all |
-| `0x0001` | MFI | `[op u8][plen u16 BE][payload]` (verbatim bridge frame) | all |
 | `0x0002` | CONSOLE | raw PTY byte stream (root shell) | rescue |
-| `0x0010` | IP | `[type u8][conn_id u16 LE][data]` stream-mux (userspace L3/L4 relay) — **diagnostic/utility** | — |
 | `0x0011` | FILE | `[type u8][…]` — verified host↔box file push / pull (binary deploy) | all |
-| `0x0012` | ETH | one raw L2 ethernet frame bridged from a box netdev — **diagnostic** | — |
 | `0x0020` | VIDEO | box→host: main-screen video stream (key handoff + forward-encrypted frames; box seam `:9001`) | projection |
 | `0x0021` | MEDIA_AUDIO | box→host: media-audio streams (box seam `:9002`) | projection |
 | `0x0022` | ALT_AUDIO | box→host: voice-sink streams — telephony / speechRecognition / alert / default (box seam `:9003`, same seam framing as media) | projection |
@@ -431,11 +378,8 @@ explicitly requests `CONSOLE`. New modes are pure additions — no rewrite.
 | `0x0024` | ALT_VIDEO | box→host: the ALT / navigation (instrument-cluster) screen stream, decoded host-side on a **dedicated** decoder (box seam `:9005`) | projection |
 | `0x0030` | INPUT | host→box: **binary `INPUT_*` sub-frames** — `INPUT_TOUCH 0x01` (normalized u16 coords) / `INPUT_KEYFRAME 0x02` / `INPUT_MEDIA_BTN 0x03` (Consumer-Control HID uid 2) / `INPUT_COMMAND 0x04` / `INPUT_NAV 0x05` (D-Pad HID uid 3, `NAV_*`) / `INPUT_KEYFRAME_ALT 0x06` (re-IDRs the ALT/cluster stream **specifically**; a bare `INPUT_KEYFRAME` only re-IDRs main) / `INPUT_KNOB 0x07` (Knob HID uid 4) / `INPUT_TELEPHONY 0x08` (Telephony HID). `INPUT_COMMAND`'s payload is the `CMD_*` set — `CMD_REQUEST_UI 0x01`, `CMD_REQUEST_SIRI 0x02` *(deprecated, iOS ignores it)*, `CMD_SIRI_DOWN 0x03` / `CMD_SIRI_UP 0x04`, `CMD_NAV_START 0x05` / `CMD_NAV_STOP 0x06` / `CMD_NAV_CARD 0x07` / `CMD_NAV_APP 0x0A`, `CMD_LIMITED_UI_ON 0x08` / `CMD_LIMITED_UI_OFF 0x09`, `CMD_NAV_APPEARANCE 0x0B`, `CMD_NAV_ZOOM_IN 0x0C` / `CMD_NAV_ZOOM_OUT 0x0D`, `CMD_UI_APPEARANCE 0x0E` / `CMD_MAP_APPEARANCE 0x0F` / `CMD_NIGHT_MODE 0x10`, `CMD_VIEW_AREA 0x11` (`[cmd][index]` → `updateViewArea` for the MAIN display, refused if `/info` never declared the index; 2026-09-07), `CMD_REQUEST_UI_URL 0x12` (`[cmd][url…]`, UTF-8, no terminator, 1..=255 bytes → `requestUI{url}` on the MAIN screen, e.g. `maps:` / `nowplaying:`; empty, over-long or non-UTF-8 is refused with a log line; 2026-10-25, for the Carlink3 split-screen pane). ocbmd relays every sub-frame opaquely to carplayd; carplayd taps the iPhone HID devices for touch/media/nav/knob/telephony, dispatches `INPUT_COMMAND` as an AirPlay `/command`, and turns `INPUT_KEYFRAME` / `INPUT_KEYFRAME_ALT` into a `forceKeyFrame` on the event channel (main / `VideoStream.Alt1`). Constants are authoritative in `crates/ocbm-proto/src/lib.rs` | all |
 | `0x0031` | MIC | host→box: mic-uplink PCM (S16LE at the CT_UPLINK-negotiated rate/ch); ocbmd relays to carplayd's mic-ingest seam → RTP uplink to the iPhone | projection |
-| `0x0040` | MGMT | box management, request/response (the app's "CCPA" tab): host→box `MGMT_GET_INFO 0x01` / `MGMT_REBOOT 0x02` / `MGMT_FORGET_ALL 0x03` / `MGMT_FORGET_DEVICE 0x04` / `MGMT_RESTART_WIRELESS 0x05` / `MGMT_ENTER_NCM 0x06` (added 2026-09-03: box arms the persistent `/script/ncm_only` flag, drops any `/script/ocbm_trial` dead-man, ACKs, reboots into NCM maintenance mode; sticky — return over ssh with `rm /script/ncm_only; reboot`. Reachable from the app's CCPA tab (confirmed) and from `open -a <carlink_macOS.app> carlink://box/enter-ncm` while the app holds the USB interface (the `-a` form is required for a bundle in a build directory: LaunchServices does not bind the `carlink` scheme for it, so a bare `open carlink://…` fails with kLSApplicationNotFoundErr)); `MGMT_INSTALL_CONFIRM 0x0A` / `MGMT_GO_STOCK 0x0B` (added 2026-10-28 for the one-file install, advertised as `CAP_INSTALL 0x100`; `MGMT_INFO` carries `"install":"trial"\|"confirmed"\|"final"\|"none"`. CONFIRM moves `/script/ocbm_mode` from `trial` to `confirmed`, and when that session ends, or at the next start if the power was cut first, the box removes the Carlinkit stack for good (`ccpa/installer/ocbm_finish.sh`), so only an app that shows the user "Go back to stock" for the rest of the session may send it. GO_STOCK, while stock is still kept, ACKs and runs `ocbm_revert.sh`, which restarts the box on stock firmware; status 1 in `final` or on a box without the one-file install. Bench: `ocbm-host install [vid pid] info\|confirm\|stock`); `MGMT_SET_POLICY 0x07` / `MGMT_CONNECT_DEVICE 0x08` (`CAP_PHONE_POLICY 0x40`); `MGMT_SWITCH_DEVICE 0x0D` `[ascii MAC]` (added 2026-11-01, `CAP_PHONE_SWITCH 0x400`: the device screen's Connect while another phone projects. With another phone's WIRELESS session live, btd ends it through the arbiter-preempt go-quiet teardown, pages the named phone, and for 45 s refuses every other phone so the dropped one cannot re-dial in first; idle or already that phone, it is a connect. Never ends a wired session. `MGMT_ACK` 1 = not a MAC, not bonded, or btd unreachable); box→host `MGMT_INFO 0x81` / `MGMT_ACK 0x82` | all |
-| `0x0041` | RTSP | box↔host: the **app-driven SETUP relay** (box seam `:9106`, `receiver::relay`). ocbmd is a dumb byte pipe; the endpoint framing is `[u32 BE "RTSP"][u32 BE len][msg]` (len ≤ 512 KiB, magic-resync) carrying the `RS_*` messages below. Rides **out_hi** with the control plane (timing-critical pair/SETUP/RECORD phase) | projection |
+| `0x0040` | MGMT | box management, request/response (the app's "CCPA" tab): host→box `MGMT_GET_INFO 0x01` / `MGMT_REBOOT 0x02` / `MGMT_FORGET_ALL 0x03` / `MGMT_FORGET_DEVICE 0x04` / `MGMT_RESTART_WIRELESS 0x05` / `MGMT_ENTER_NCM 0x06` (added 2026-09-03: box arms the persistent `/script/ncm_only` flag, drops any `/script/ocbm_trial` dead-man, ACKs, reboots into NCM maintenance mode; sticky — return over ssh with `rm /script/ncm_only; reboot`. Bench: `ocbm-host ncm`); `MGMT_INSTALL_CONFIRM 0x0A` / `MGMT_GO_STOCK 0x0B` (added 2026-10-28 for the one-file install, advertised as `CAP_INSTALL 0x100`; `MGMT_INFO` carries `"install":"trial"\|"confirmed"\|"final"\|"none"`. CONFIRM moves `/script/ocbm_mode` from `trial` to `confirmed`, and when that session ends, or at the next start if the power was cut first, the box removes the Carlinkit stack for good (`ccpa/installer/ocbm_finish.sh`), so only an app that shows the user "Go back to stock" for the rest of the session may send it. GO_STOCK, while stock is still kept, ACKs and runs `ocbm_revert.sh`, which restarts the box on stock firmware; status 1 in `final` or on a box without the one-file install. Bench: `ocbm-host install [vid pid] info\|confirm\|stock`); `MGMT_SET_POLICY 0x07` / `MGMT_CONNECT_DEVICE 0x08` (`CAP_PHONE_POLICY 0x40`); `MGMT_SWITCH_DEVICE 0x0D` `[ascii MAC]` (added 2026-11-01, `CAP_PHONE_SWITCH 0x400`: the device screen's Connect while another phone projects. With another phone's WIRELESS session live, btd ends it through the arbiter-preempt go-quiet teardown, pages the named phone, and for 45 s refuses every other phone so the dropped one cannot re-dial in first; idle or already that phone, it is a connect. Never ends a wired session. `MGMT_ACK` 1 = not a MAC, not bonded, or btd unreachable); box→host `MGMT_INFO 0x81` / `MGMT_ACK 0x82` | all |
 | `0x0042` | LOG | **box→host only:** the box's own logs, streamed live. Payload = one or more back-to-back entries, `[source u8][flags u8][seq u16 LE][unix_ms u64 LE][len u16 LE][text]`, packed up to a 4096 B payload per frame. Off until the host sends `CT_LOG_CTL`. See below | all |
-| `0x00FF` | ECHO | benchmark echo / CT_SRC flood target | all |
-| `0x0FFF` | DISCARD | box parses + drops silently (uplink benchmark sink) | all |
 | `0xF000–0xFFFF` | reserved: **experimental / vendor** | — | — |
 
 ### Proposed MGMT verbs — NOT assigned (2026-09-25)
@@ -491,48 +435,12 @@ concurrent streams sharing the voice sink (telephony + alert) cannot clobber eac
 - `SEAM_KEY    0x00` — `[len=45]["SEAV"][0x00][key.output 32B][scid u64 LE]`  *(scid TRAILS the key here)*
 - `SEAM_PKT    0x01` — `[len=13+pkt]["SEAV"][0x01][scid u64 LE][raw encrypted RTP datagram]`
 - `SEAM_FORMAT 0x02` — `[len=21]["SEAV"][0x02][scid u64 LE][codec u8][rate u32 LE][ch u8][bits u8][audio_type u8]`
-  (codec 0 PCM · 1 AAC-LC · 2 AAC-ELD · 3 OPUS · 4 mSBC; `bits` 16 for PCM else 0; audio_type 0 media ·
+  (codec 0 PCM · 1 AAC-LC · 2 AAC-ELD · 3 OPUS — 4, mSBC, is retired; `bits` 16 for PCM else 0; audio_type 0 media ·
   1 telephony · 2 speechRecognition · 3 alert · 4 default · 5 compatibility — the PCM media
   fallback, split out of 4 so a consumer cannot misroute it by format alone; same values as the
   `:9003` `atype` table above)
-- `SEAM_PKT_PLAIN 0x03` — `[len=13+pcm]["SEAV"][0x03][scid u64 LE][payload]` — an **UNENCRYPTED**
-  access unit: no RTP header, no tag, no nonce, and **no `SEAM_KEY` is ever sent for that scid**.
-  Added 2026-09-03 for the Android Auto **telephony** lane: the call's audio reaches the box over
-  Bluetooth HFP/SCO (CVSD, 8 kHz mono S16LE), where there is no AirPlay stream to encrypt it with, so
-  the box forwards 320 B (= 160 samples = 20 ms) per frame verbatim on `CH_ALT_AUDIO` after a
-  `SEAM_FORMAT` of `codec 0 PCM, rate 8000, ch 1, bits 16, audio_type 1`. The payload is
-  **little-endian** (Android-native), unlike the big-endian PCM inside the CarPlay RTP — a host that
-  byte-swaps it plays full-scale white noise. A `SEAM_PKT_PLAIN` arriving before its `SEAM_FORMAT` is
-  dropped (the rate is unknowable) and counted; the host must not run the RFC 2198 demux over it.
-  Uplink for the same call is the existing mic path: the box's `CT_UPLINK` gate asks for
-  `uplink on 8000 1` and the host answers with S16LE 8 kHz mono on `CH_MIC` in 20 ms (320 B) frames.
-  **Wideband (codec 4 mSBC), added 2026-09-04 behind the box lever `BT_HFP_WBS` / `/tmp/hfp_wbs`:**
-  when the AG negotiates mSBC the controller stops decoding, and the box forwards each transparent
-  eSCO read VERBATIM as one `SEAM_PKT_PLAIN` — no 320 B aggregation, H2 headers untouched — under a
-  `SEAM_FORMAT` of `codec 4, rate 16000, ch 1, bits 16, audio_type 1`, where `rate`/`bits` describe
-  the DECODED audio and the payload is a bitstream. The host resynchronises on the H2 header
-  (`0x01` then `0x08`/`0x38`/`0xC8`/`0xF8`), never on message length, and must drop the stream rather
-  than play it if it cannot decode mSBC. The gate then reads `uplink on 16000 1 msbc` → `CT_UPLINK`
-  codec 4, and the host returns whole 60 B packets (H2 + 57 B frame + 1 pad) on `CH_MIC`; the box
-  writes them to the SCO socket unmodified and SKIPS a write it has no whole packet for.
-  **Box producer:** `crates/vendor/wireless/src/sco_audio.rs` — it connects to ocbmd's voice seam
-  `:9003` when the phone opens SCO and uses a FIXED scid `0x4846_5053_434F_0001` (ASCII `HFPSCO` +
-  an ordinal), because there is exactly one SCO channel at a time; a scid in a host log therefore
-  names its own origin. The uplink half has no ocbmd change at all: ocbmd's `CH_MIC` relay already
-  connects to `127.0.0.1:9112`, and during an Android Auto session — when carplayd is not running —
-  `btd` listens there itself and speaks carplayd's protocol verbatim. This lane is owner-gated
-  box-side to a wired- or wireless-AA projection owner (`sco_audio.rs`'s `:9112` serve check) —
-  it never carries CarPlay call audio, which stays inside the AirPlay session end to end.
-
-  **Client status, 2026-09-18 — CarlinkAndroid `:app` (the box side above is unchanged):** the
-  Android client's `AudioSeam.kt` now handles `SEAM_PKT_PLAIN` for this Android Auto telephony lane —
-  narrowband passthrough plus a ported mSBC decoder/encoder (`telephony/Msbc.kt`,
-  `telephony/MsbcFramer.kt`, resynchronising on the H2 header, never on message length, and dropping
-  rather than rendering an undecodable stream) — and the voice router now carries the codec through
-  instead of assuming AAC-ELD for every voice stream. This is client capability catching up to a
-  wire shape the box already produced; nothing box-side changed. **Test-green only** (JVM unit tests,
-  `AudioSeamPlainTest.kt`), **not yet hardware-verified** — no phone call has exercised it. See
-  `host/CarlinkAndroid/OCBMANDROID.md` "Phone-call audio (WP2)".
+- Marker `0x03` (`SEAM_PKT_PLAIN`, btd's unencrypted Bluetooth call audio) is retired. A host that meets
+  an unknown marker skips the message by its length, as it always has.
 
 The datagram is the iPhone's packet verbatim: `[12B RTP hdr][ciphertext][16B tag][8B nonce]`. Nonce =
 `[0,0,0,0]‖pkt[len-8..]`, AAD = `pkt[4..12]` (ts‖ssrc), ciphertext‖tag = `pkt[12..len-8]`. **This lane
@@ -566,39 +474,7 @@ host only.
 on-box and none of it applies: the video seam carries `[u32 BE len][Annex-B]` with no magic, marker, key
 or seq, and the audio seams carry the legacy `:9002` bare-ADTS / `:9003` 11-byte-tag framing described
 above. The two are wire-incompatible with no discriminator on the wire.
-The relayed-RTSP channel now exists — **`0x0041` CH_RTSP**, below; media-port coordination stays an
-open design item (see `../ops/04_OPEN_ITEMS.md` §Open design items).
-
-### RTSP channel (`0x0041`) — app-driven SETUP relay (plan P1)
-
-The box runs its unmodified `AvSession` first (**pre-bind + oracle**: every side effect happens
-box-side and the local response doubles as the report), then relays the decrypted request *plus that
-local response* to the host, which authors the response the phone actually sees. Any relay failure
-(timeout 3 s / `RS_ERR` / non-200 / seam death) falls back to the in-hand local response — sticky for
-the rest of that phone connection. Wireless was flipped 2026-08-10 — the relay now runs on both
-transports; the host preserves the box-only `iAPChannel`/`sessionManagement` tokens that only the
-wireless arm emits.
-
-ocbmd chunks the `:9106` seam bytes into ≤64 KiB OCBM frames both ways; **all message framing is
-endpoint-to-endpoint** (carplayd ↔ host app): `[u32 BE 0x52545350 "RTSP"][u32 BE len][msg]`, receiver
-resyncs by magic scan. Messages share the header `[op u8][conn u32 LE][cseq u32 LE]`; `conn` is
-monotonic per carplayd process (hijack ⇒ new conn, and the serve FIFO guarantees `RS_CLOSE(old)`
-precedes `RS_OPEN(new)`), the host drops messages for a non-current conn. Constants are authoritative
-in `receiver::relay` and mirrored in `ocbm-proto`/Swift (the META_* pattern).
-
-| Op | Message | Direction | Payload after the common header |
-|---|---|---|---|
-| `0x01` | RS_OPEN | box→host | `[ver=1][flags b0=wireless][cfg_crc u32 LE][ctx_len u32 LE][ctx bplist {peer, displayWidth, displayHeight}]` — `cfg_crc` = crc32 of the YAML this connection's `/info` was built from (0 = built-in default); host compares vs what it pushed at SUBSCRIBE |
-| `0x02` | RS_REQ | box→host | `[route u8][flags b0=NOTIFY][local_len u32 LE][local-resp bplist][req bplist]` — routes: 1 = SETUP, 2 = RECORD, 3 = TEARDOWN (always NOTIFY); 4–7 reserved. Phase 1 vs 2 SETUP is distinguished by the `streams` key, same as the box |
-| `0x03` | RS_RESP | host→box | `[status u16 LE][response body]` — non-200 = host-reject → local fallback (v1) |
-| `0x04` | RS_CLOSE | box→host | `[reason u8]` — 0 eof · 1 hijack · 2 error · 3 reset |
-| `0x05` | RS_ERR | host→box | `[code u8]` — box falls back to its local response |
-
-Harness: `ocbm-host setup-relay [vid pid] [secs] <cfg.yaml> [--author] [--mute-once]`. Default is
-Stage-0 transparency — echoes every local response verbatim. `--author` is Stage 1 (plan P2): author
-each response host-side and diff it against the box's local one. `--mute-once` deliberately DROPS the
-first `RS_REQ` (authors and sends nothing) to exercise the box's 3 s timeout → sticky-local fallback.
-The YAML must set `accessoryConfig.appDrivenSetup: true`, see `tools/setup_relay_cfg.yaml`.
+Media-port coordination is an open design item (see `../ops/04_OPEN_ITEMS.md` §Open design items).
 
 Because the A/V channels are the **live-UI** path, ocbmd carries them on dedicated **per-stream**
 queues (video / alt-video / audio) with **backpressure, not drop**: the poll loop only pulls a
@@ -641,7 +517,7 @@ and never writes to them; only source 0 is rotated. Sources:
 | `1` | `carplayd` | `/tmp/carplayd.log` | tail-only |
 | `2` | `carplayd_wl` | `/tmp/carplayd_wl.log` | tail-only |
 | `3` | `iap2d` | `/tmp/iap2d.log` | tail-only |
-| `4` | `aa-bridge` | `/tmp/aa-bridge.log` | tail-only |
+| `4` | — | — | retired (`aa-bridge`); a client renders it as unknown |
 | `5` | `rx-connect` | `/tmp/rx-connect.log` | tail-only |
 | `6` | `bt` | `/tmp/bt.log` | tail-only |
 | `7` | `radio_ap_dhcp` | `/tmp/radio_ap_dhcp.log` | tail-only |
@@ -691,7 +567,7 @@ helpers that funnel a daemon's own log lines (`iap2d`, `bt-common`'s `sdp_server
 `btd`'s `main`/`bt_driver`/`control`/`sdp_client`/`reconnect`/`arbiter_client`,
 `receiver`'s `iap_tunnel`) emit this prefix on every line; ocbmd's own `eprintln!`s into `box.log`
 and the shell-script writers (`session_supervisor.sh`, `ocbm_boot.sh`, `radio_hal.sh` et al.,
-`aa-bridge`/`rx-connect`'s ad hoc `eprintln!`s) do not, and stay read-time-stamped — deliberately:
+and the retired `rx-connect`) do not, and stay read-time-stamped — deliberately:
 this is a cheap `SystemTime::now()` in a handful of central Rust helpers, not a per-line shell pipe
 in the supervisor, which is CPU-bound.
 
@@ -765,7 +641,7 @@ parameters travel as data - is met today by four real mechanisms:
 
 2. **Audio: `SEAM_FORMAT` is the per-stream descriptor** - `[0x02][scid u64 LE][codec u8]
    [rate u32 LE][ch u8][bits u8][audio_type u8]`, on the media lane itself (see §Media transport for
-   the byte-exact framing). Codec `0 PCM / 1 AAC-LC / 2 AAC-ELD / 3 OPUS / 4 mSBC`; `audio_type`
+   the byte-exact framing). Codec `0 PCM / 1 AAC-LC / 2 AAC-ELD / 3 OPUS` (4 retired); `audio_type`
    `0 media / 1 telephony / 2 speechRecognition / 3 alert / 4 default / 5 compatibility`. Every
    `SEAM_KEY`/`SEAM_PKT` is scid-tagged too, so **N concurrent audio streams share one channel** and
    a host keeps per-scid key/format/decoder tables. New codecs are new enum values; an unknown value
@@ -779,11 +655,10 @@ parameters travel as data - is met today by four real mechanisms:
    mid-session therefore needs no protocol change - but equally, nothing on the wire ever *names*
    the codec.
 
-4. **`CH_RTSP 0x0041` is the real dynamic stream-open channel.** With `appDrivenSetup`, the phone's
-   own decrypted SETUP request - its `streams[]` array of `{type, streamConnectionID, audioFormat,
-   input, dataPort}` - is relayed box->host as `RS_REQ`, and the host authors the per-stream response
-   the phone sees (`RS_RESP`). That is a self-describing, dynamic, per-stream open/close negotiated
-   in Apple's own vocabulary, which is strictly better than re-encoding it as our own TLV.
+4. **Per-stream negotiation is the phone's own SETUP**, answered box-side from the pushed config.
+   Its `streams[]` array of `{type, streamConnectionID, audioFormat, input, dataPort}` is already a
+   self-describing, per-stream open/close in Apple's own vocabulary; OCBM does not re-encode it.
+   (OCBM 1.0.4 and earlier could relay it to the host on `CH_RTSP`, now retired.)
 
 **What is genuinely not supported (open item).** Video lanes are **fixed and capped at two** - one
 main, one alt/cluster. The box dispatches only AirPlay stream types 110 and 111, each to its own
@@ -825,16 +700,39 @@ Consequently:
 4. **Self-describing streams — as data on the stream's own lane, not as a CTRL stream-open.** Audio
    carries a per-stream `SEAM_FORMAT` descriptor inline on the media channel, and every audio message
    is scid-tagged so one channel carries N concurrent streams. Video carries its codec in-band as the
-   plaintext opcode-1 avcC/hvcC config the host sniffs. Per-stream *negotiation* is relayed verbatim
-   on `CH_RTSP` (`RS_REQ`/`RS_RESP`) in Apple's own SETUP vocabulary. A stream's *role* is its channel
+   plaintext opcode-1 avcC/hvcC config the host sniffs. Per-stream *negotiation* is the phone's own
+   SETUP, answered on the box. A stream's *role* is its channel
    id, fixed at design time — which is why video is capped at `CH_VIDEO`/`CH_ALT_VIDEO` and a third
    video stream would need a new channel id, not a new message. **There is no `STREAM_OPEN`.**
 5. **TLV / keyed metadata + control**; hard rule: **skip unknown TLVs/keys/streamTypes/codecs**,
    never fatal.
 6. **Reserved + experimental ranges** — add channels/enums without collision or a version bump.
-7. **`IP` tunnel as the universal escape hatch** — any un-modeled CarPlay feature works day one as
-   opaque bytes; later *promote* it to a typed channel by emitting a decoded stream instead of
-   tunneling, **with no protocol change** (progressive enhancement).
+7. **Retired numbers stay retired.** A channel, opcode, capability bit or marker that leaves the
+   protocol is listed in `ocbm-proto`'s retired table and never assigned again (§"Retired numbers").
 
 The only thing that could force a real rewrite is changing the envelope itself — which
 capability-versioning lets you avoid even then.
+
+## Retired numbers (OCBM 1.0.5, 8 Nov 2026)
+
+A box on 1.0.5 or later advertises `caps = 0x000007d1` in `HELLO_ACK`: `CAP_CONSOLE 0x01`,
+`CAP_FILE 0x10`, `CAP_PHONE_POLICY 0x40`, `CAP_PAIR_WINDOW 0x80`, `CAP_INSTALL 0x100`, `CAP_UPDATE 0x200`
+and `CAP_PHONE_SWITCH 0x400`. Earlier boxes advertised `0x000007ff`. Every number below left the
+protocol in 1.0.5 and is **reserved: never reuse one**. A host that still meets one (an older box) may
+handle it as before or ignore it; a box on 1.0.5 never sends one and ignores one it receives.
+
+| Kind | Number | What it was |
+|---|---|---|
+| channel | `CH_MFI 0x0001` | the host MFi relay (the chip's only users are now the box's own daemons) |
+| channel | `CH_IP 0x0010`, ops `IP_OPEN 0x01` / `IP_DATA 0x02` / `IP_CLOSE 0x03` / `IP_OPEN_UDP 0x04` | the userspace TCP/UDP relay (Android Auto's transport) |
+| channel | `CH_ETH 0x0012` | the raw `ncm0` Ethernet bridge |
+| channel | `CH_RTSP 0x0041`, ops `RS_OPEN 0x01` … `RS_ERR 0x05` | the app-driven SETUP relay (seam `:9106`) |
+| channel | `CH_ECHO 0x00FF`, `CH_DISCARD 0x0FFF` | the throughput benches |
+| control | `CT_SRC 0x04`, `CT_ETH_START 0x06`, `CT_ETH_STOP 0x07` | the downlink flood and the Ethernet bridge |
+| capability | `CAP_ECHO 0x02`, `CAP_MFI 0x04`, `CAP_IP 0x08`, `CAP_ETH 0x20` | the four above |
+| projection mode | `PM_WIRED_AA 0x03`, `PM_WIRELESS_AA 0x04` | the Android Auto owners |
+| log source | `4` (`aa-bridge`) | the Android Auto bridge's log |
+| audio seam | marker `0x03` (`SEAM_PKT_PLAIN`), `SEAM_FORMAT` codec `4` (mSBC), `CT_UPLINK` codec `4` | btd's Bluetooth call audio |
+
+The specification of each is at tag
+[`v1.0.4`](https://github.com/enigy/ocbm/blob/v1.0.4/docs/carplay/01_OCBM_PROTOCOL.md).

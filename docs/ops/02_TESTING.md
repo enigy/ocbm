@@ -197,42 +197,13 @@ arrived. Cross-check the summary: `AirPlay iPod SYN-ACK` must be **1**, not 31.
 
 Note `/usr/bin/log` explicitly — a shell function shadows `log` in this environment and swallows args.
 
-### Wired view-area resize matrix — Mac-side verdicts only (2026-09-07)
+### Wired view-area resize matrix (2026-09-07) — retired with the macOS host app
 
-`tools/va_wired_sweep.sh` is the wired counterpart of `tools/va_limit_sweep.sh`. Because the phone's
-port is on the box (above), it judges each case from the control socket (`get session`,
-`get viewarea`, `viewarea arm|off|request`, `shot` — verbs and reply shapes owned by
-docs/host/00_MACOS_HOST_APP.md "Bench control surface"), the app log (`view areas: 2 declared`,
-`full TEARDOWN`, `REFUSED`) and the PIXELS of the armed rect — a LOCKOUT is a black rect with the
-session alive, scored by mean luminance, not OCR. Run it from a plain Terminal:
-
-```sh
-TAP="<x> <y>" tools/va_wired_sweep.sh              # whole matrix; --only L-1280x720 ; --case PW PH AW AH
-tools/winshot.sh shot <pid> out.png                  # app window by CGWindowID — occlusion-proof
-```
-
-Two bench facts the scripts encode, so they are not rediscovered:
-
-- **The app dies seconds after a launch from a sandboxed shell** (`sandbox_extension_issue_file_to_process
-  failed ... Operation not permitted`). The launch line is unchanged — the caller's sandbox is the
-  difference. Launch from a plain Terminal; the sweep aborts if the app is gone 8 s after launch.
-- **Never score a screen REGION.** `screencapture -R` returns whatever window is on top; a Terminal
-  over the CarPlay picture poisons every verdict silently. `screencapture -o -l<CGWindowID>` (what
-  `winshot.sh` does) renders the window's own content — verified on macOS 27.0 with a partly covered
-  window. It fails for a window that is not on screen (hidden, minimised, other Space).
-
-**The Dock `TAP` is pinned but should not be needed.** The button is the pill at the TOP of the Dock
-rail (two arrows pointing inward, above the clock); from area 0 it is `tap 133 179` in the app's
-0..10000 space. It **moves with the area**, so the return press is elsewhere and no single constant
-works — which is why `viewarea request <index>` is the trigger and `TRIGGER_MODE=tap` is only for a
-box whose carplayd predates `CMD_VIEW_AREA 0x11`.
-
-**The LOCKOUT thresholds (`BLACK_MEAN=12`, `BLACK_DARK=0.85`) are KNOWN WRONG — do not trust an
-ACCEPTED verdict near a floor without looking at the PNG.** A real lockout frame (2026-09-07,
-`480x800` in 2160x3840) scored ACCEPTED: the lockout card is sized to FILL the view area, so the
-armed rect reads mean luma 40.0 / darkFrac 0.01 — content, not black — while the panel around it is
-95% dark. No luminance threshold separates that from a real render; the discriminator is chroma
-(coloured app icons vs a flat grey card). Tracked as Known-open 7 in ../ops/04_OPEN_ITEMS.md.
+The wired view-area matrix was judged Mac-side, by `tools/va_wired_sweep.sh` and `tools/winshot.sh`
+against the macOS host app's control socket. All three left the tree in OCBM 1.0.5; the procedure and
+its bench facts are at tag [`v1.0.4`](https://github.com/enigy/ocbm/blob/v1.0.4/docs/ops/02_TESTING.md).
+The results stand in `04_OPEN_ITEMS.md` §HANDOFF 2026-09-05 → 09-07. Known-open 7 there (the lockout
+thresholds) applies to any re-run with Carlink.
 
 ### Negative checks — all must be zero
 
@@ -329,6 +300,24 @@ Near the end, trigger `modesChanged` (change audio app / start-stop navigation) 
 re-DETECT routes for free. Expect `link already up (SYN-ACK received) — not re-DETECTing` or
 `resent SYN only`. There is no `resent DETECT+SYN` string in the code — the re-DETECT routes were closed, so the
 observable is the ABSENCE of a second `TX detect+SYN` line, not a dedicated warning.
+
+### Release gate — OCBM 1.0.5, the CarPlay-only cleanup (8 Nov 2026)
+
+One build, one bench, on the same branches; a failure is fixed there and the whole list runs again.
+
+- **Wired and wireless CarPlay** on Carlink 2.22: video, media audio, Siri, touch, metadata, the
+  cluster stream, and a **phone call in both directions on each transport** (CarPlay's calls ride the
+  AirPlay session; btd no longer has HFP/SCO, so a call that falls back to the phone's own Bluetooth
+  audio is a fail).
+- **Update from 1.0.4** over USB: the adapter reports `caps=0x000007d1`, `/usr/sbin/aa-bridge` is gone
+  after the commit and the box log says `retired /usr/sbin/aa-bridge`; a rollback keeps it. Report the
+  package size and the free flash after the commit.
+- **Trial adapter** (over the 1,252 KB trial limit): Carlink offers "Remove stock firmware" first,
+  then updates.
+- **Fresh install** from a stick that already holds an `OCBM_BACKUP`: a backup that checks out is kept;
+  one that does not is refused, never written over.
+- **Compatibility:** Carlink 2.22 against adapters on 1.0.1 to 1.0.4 and on stock; Carlink 2.21
+  against 1.0.5.
 
 ### Regression gate result — 2026-09-04 (after the AA telephony / metadata / tiers / margins / audio-engine changes)
 

@@ -149,14 +149,14 @@ forwards everything.)
 | BT/iAP2 link + Wi-Fi SoftAP + handover | ✔ radios + link mechanics | pushes wireless credentials/config (docs/carplay/04_CAPABILITIES_AND_CONFIG.md) |
 | AirPlay pair-setup/verify + ChaCha20 key derivation (`receiver_core` pairing path, on `ncm0`) | ✔ | — |
 | Encrypted A/V forward + session-key handoff | ✔ | receives |
-| SETUP negotiation (RTSP/codecs/resolution/features) | plumbing/relay only | ✔ drives (target) |
+| SETUP negotiation (RTSP/codecs/resolution/features) | ✔ answers, rendering the pushed config | ✔ authors the config it is answered from |
 | Decrypt + decode (HEVC) + render + UI + input | — | ✔ |
 | YAML config (source of truth) | receives subset | ✔ owns |
 
 The radio-bound + MFi + pairing *mechanics* always stay on the adapter (hardware-bound). Their
 configurable content — wireless credentials, identification/declaration content, every multi-valued
-parameter — is app-authored and pushed at init (docs/carplay/04_CAPABILITIES_AND_CONFIG.md). The evolving SETUP + decode + UI live in
-the app.
+parameter — is app-authored and pushed at init (docs/carplay/04_CAPABILITIES_AND_CONFIG.md). The box answers SETUP by rendering
+that config; decode and UI live in the app.
 
 > **Status (2026-07-10):** the adapter half is built and hardware-validated end-to-end — iAP2/MFi →
 > pairing/key-derivation → **encrypted A/V forward + session-key handoff** (0-failure host-side decrypt),

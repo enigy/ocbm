@@ -316,7 +316,7 @@ if [ "$dispatcher" = 1 ] && [ -e "$MODE" ]; then
   refuse "OCBM ${have:-(another version)} is already installed on this adapter (mode: $(cat "$MODE")). This OCBM is too old to update itself from an image: go back to stock first, then install this image."
 fi
 [ -e "$ROOT/usr/sbin/ocbmd" ] && [ ! -d "$EO" ] \
-  && refuse "This adapter was converted to OCBM by hand (tools/ocbm_install.sh); manage it with that tool."
+  && refuse "This adapter was converted to OCBM by hand (tools/ocbm_install.sh); MIGRATING.md moves it to this install."
 [ "$dispatcher" = 1 ] && [ ! -s "$SMS_STOCK" ] \
   && refuse "The OCBM start script is in place but the stock one it should keep is missing."
 [ -s "$SMS" ] || refuse "This adapter has no /script/start_main_service.sh."

@@ -2,7 +2,7 @@
 
 > **STATUS:** CURRENT · single owner for this topic. Consolidated 2026-08-31 from pre-consolidation docs 58, 08, 11, 44, 31, 54, 55, 09, 10; the originals are in git history and in the 2026-08-31 backup. Correct this file in place — do not add a sibling.
 
-**Contents:** the lifecycle model → hardening → real-world comparison → start ordering → the app-driven SETUP relay → session management as it stands. Historical captures and the peer-wipe postmortem are kept at the end as evidence.
+**Contents:** the lifecycle model → hardening → real-world comparison → start ordering → session management as it stands. Historical captures and the peer-wipe postmortem are kept at the end as evidence.
 
 ## Session management — current model
 
@@ -741,7 +741,7 @@ correctness failure — it means a stale frame or a stale map position is waitin
   `CT_HELLO` only; `go_idle()` does not.
 - **Scope: this is the BOX's egress policy.** Control traffic (pairing, the session-key handoff, the YAML
   config push) MUST be reliable — you cannot drop a byte of a key — and rides `out_hi`
-  (`CH_CTRL`/`CH_MFI`/`CH_RTSP`); `CH_CONSOLE` has its own `out_console` drained *below* A/V so a console
+  (`CH_CTRL`); `CH_CONSOLE` has its own `out_console` drained *below* A/V so a console
   flood cannot freeze video; reliable bulk is `out_lo`, whose cap-clear resyncs to the next `F_SOM` so the
   peer never sees a truncated message (#567). The live-UI principle above is unchanged and still governs
   the **host** renderer, where a stalled consumer still DROPS rather than buffers
@@ -1717,78 +1717,14 @@ None of these are implemented. Ordered box-side first.
    ephemeral-config split. Both match what Apple and GM do independently. Nuance: GM's pause-in-place
    is object/identity-scoped, not a guarantee that every subsystem underneath survives untouched.
 
-## App-driven SETUP
+## App-driven SETUP — retired in OCBM 1.0.5
 
-The host app authors the post-pairing AirPlay/RTSP SETUP + RECORD responses. The box terminates and
-decrypts the `:5000` control connection, runs its own `AvSession` first (bind + side effects, giving a
-local oracle response), then relays the decrypted request **plus that local response** to the app over
-OCBM `CH_RTSP` (`0x0041`). The app authors what the phone sees; any relay failure — timeout, host
-gone, non-200 — falls back to the in-hand local response, so the phone never sees a relay-caused
-error.
-
-**Status: default ON, both transports.** Wired flipped 2026-08-09 (`ba1df2a`), wireless 2026-08-10.
-Selection gate: `levers::appsetup() && relay::seam_up()` (`ccpa/carplayd/src/main.rs`,
-`SessionDelegate`). Box-driven `AvSession` remains the selectable sticky fallback. `wireless` survives
-only as an argument to `RemoteSession::new` and as RS_OPEN flags bit 0.
-
-**Latency, measured 2026-08-08** (wired, Mac ↔ CPC200-CCPA, release build). Idle `ocbm-host rtt`:
-p99 0.21 ms at 64 B, 0.49 ms at 4 KiB, 1.68 ms at 16 KiB, 4.85 ms at 64 KiB (MAX_PAYLOAD), zero
-timeouts. In-session under real A/V load (nav + media, ~32 fps video, 16.7 MB + 15 611 audio packets,
-0 decrypt failures): p50 0.49 ms, p99 **2.36 ms**, max 4.86 ms, zero lost pings, zero box-side
-cap-clears. The gate was p99 ≤ 50 ms; the measurement is ~21× inside it on the upper-bound path. A
-full relayed SETUP bring-up (5–8 exchanges) adds ~10–20 ms, against a phone-tolerated seconds-scale
-envelope.
-
-**Validation P0–P3** (hardware): P1 relay with verbatim echo — session behaviourally identical to
-box-driven, 0.85–1.90 ms per exchange, host-kill mid-SETUP survived on local fallback (`84d2b80`).
-P2 Rust harness authoring every response — live-oracle diff matched on all exchanges, 150–469 µs
-(`692cc80`). P3 real Swift app authoring — 5 exchanges (145/0/85/85/119 B) at 1.3–4.8 ms, **0 oracle
-divergences, 0 fallbacks, 8 A/V seams streaming** (`89c457b`). Divergence handling is warn-only by
-default; `CARPLAY_RELAY_STRICT=1` rejects a divergent response and falls back locally.
-
-**Bench levers.** `CARPLAY_PAIRSETUP_DUMP=<path>` (resolved once per process, `server.rs`'s
-`pairsetup_dump_path`, mirroring `CARPLAY_CMD_DUMP`'s length-prefixed `[u32 LE len][body]` append
-format) captures every raw `/pair-setup` request body to `path` before the exchange runs. M1 is the
-first ~6-byte body; decode it as TLV8 `[type][len][value]`: type `0x00` = Method (`00 01 00` plain,
-`00 01 01` MFi), type `0x06` = State.
-
-`CARPLAY_FEATURES_REVERSE=1` (resolved once, `relay.rs`'s `features_reverse`) reverses the
-`enabledFeatures` array the phone actually receives — the list `session.rs` authors in its SETUP
-response. In relay mode the SETUP exchange falls back to the local body while the lever is armed
-(logged as `[relay] CARPLAY_FEATURES_REVERSE=1 armed — LOCAL body for SETUP`), because otherwise the
-host's unreversed answer would reach the phone. Test: baseline session (lever off, note hevc/altScreen
-negotiation), a second session with `CARPLAY_FEATURES_REVERSE=1`, then compare; identical negotiation on
-both means feature order is not significant and `relay.rs`'s ordered oracle comparison could safely
-sort, a difference means order is significant and the ordered comparison must stay.
-
-**`tools/session_supervisor.sh` btmon bench lever (2026-09-03).** If `/tmp/carplay_btmon` exists
-(or `CARPLAY_BTMON=1` is exported into the supervisor's environment) AND `btmon` is on `PATH`,
-`wireless_up()` starts `btmon` for the wireless session, with its output appended to `/tmp/box.log`
-prefixed `[btmon] `; `wireless_down()` kills it (bracketed `pkill -f "[b]tmon"`, matching the
-existing carplayd/btd teardown style) in both its COMPLETE-teardown and
-advertiser-only branches. If `btmon` is absent — unknown whether the CCPA rootfs ships it — the
-lever logs one line and is otherwise a no-op; it never blocks bring-up.
-
-**Engaging a config change on wired requires a fresh carplayd connection — and a Mac-app restart is
-one (CORRECTED 2026-09-07, device-proven).** carplayd reads config per-connection at accept, while
-the phone's `:5000` connection is long-lived, so a toggle inside a running app does not apply. The
-claim that carplayd *survives* a Mac-app restart, and that `killall carplayd` or a replug is
-therefore required, is REFUTED: the app going away is a host-GONE edge, the supervisor's
-`kill_session` reaps carplayd, and the next SUBSCRIBE brings up a fresh one that reads the new
-config. Measured over six consecutive app restarts on 2026-09-07 (wired, 4K panel), each arming a
-different second view area: every restart produced a new `view areas: 2 declared — [1] <new rect>`
-line carrying that run's rect, with no `killall` and no replug. `killall carplayd` and a replug
-still work; they are not the only paths.
-
-**Failure modes, none of which wedge the phone.** Host absent → plain `AvSession` at selection. Host
-crash mid-SETUP → heartbeat loss → socket drop → HostGone → sticky `local_only`. Cap-clear or garbage
-→ magic resync, then timeout fallback. Hijack → `recv_timeout` completes ≤3 s; `impl Drop for
-RemoteSession` always sends `CLOSE_EOF` (it cannot distinguish eof from hijack or reset inside Drop —
-`CLOSE_HIJACK` exists only in a unit test).
-
-**Measurement caveats for a re-run.** A >64 KiB relay message spans OCBM frames and was not exercised
-end-to-end. Cap-clears are only visible box-side in `/tmp/box.log` (ocbmd's `[ocbmd]`-prefixed lines); the host sees them as a timeout
-or lost count. `avdec --rtt` cadence stretches toward ~300 ms on a silent link, which is why n varies.
+From 2026-08-08 to OCBM 1.0.5 the box could relay each decrypted SETUP/RECORD, with its own local
+response as the oracle and fallback, to the host over `CH_RTSP` and let the host author the answer
+(measured p99 2.36 ms under A/V load). Carlink never authored one, and 1.0.5 removed the relay: the box
+answers SETUP itself from the pushed config, which is what the relay's fallback always did. The
+design, the latency gate and the `CARPLAY_FEATURES_REVERSE` bench lever are at tag
+[`v1.0.4`](https://github.com/enigy/ocbm/blob/v1.0.4/docs/carplay/02_SESSION_LIFECYCLE.md).
 
 ## Reference measurements from the first full session
 

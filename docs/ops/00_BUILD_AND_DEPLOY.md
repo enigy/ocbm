@@ -14,20 +14,10 @@ How the box binaries are built, what they cost in flash/RAM, and how they are pu
   cross-build with `cargo zigbuild --release --target armv7-unknown-linux-musleabihf` (zig serves as
   the C cross-linker); `carplayd` additionally needs `FDK_AAC_PREFIX=$PWD/scratchpad/fdk/install` for
   its eld-codec. C probes use `zig cc -target arm-linux-musleabihf -static -Os -s`. Size profile below.
-- **Host** — macOS/Linux native, or Android. The two host *apps* are
-  `host/MacHost/carlink_macOS` (Swift/Xcode, shipping) and `host/CarlinkAndroid` (Kotlin/Gradle,
-  AAOS 12L / API 32 min — **no NDK and no Rust inside the app**; on `main`. (**Corrected 2026-09-18**
-  — this line previously said "in-tree on a feature branch, not yet merged to `main`", which
-  `docs/ops/04_OPEN_ITEMS.md` had already flagged stale (`git ls-tree -d --name-only main host/` lists
-  `host/CarlinkAndroid`), but this file itself was never fixed until now.) `host/ocbm-host` is native
-  **Rust** (`rusb`), and "`ocbm-rescue`" is a *role* of that same binary (`ocbm-host console`), not a
-  separate build. The only `clang` + `libusb` artifact in the tree is `host/accbench.c` (hand-built,
-  see `host/README.md`). The `aarch64-linux-android` NDK target IS used — but for the AAOS/Pi port of
-  the **box** daemons (`pi/`), not for any host client.
-  - **Gate:** `~/.claude/bin/bt ./gradlew :app:assembleDebug :app:testDebugUnitTest :app:detekt
-    :app:ktlintCheck` from `host/CarlinkAndroid`; run `python3 tools/proto_check.py` from the repo
-    root whenever `OcbmProto.kt` changes. The box binaries above are unaffected by this gate — it
-    is client-only and does not rebuild or redeploy any box daemon.
+- **Host** — the host app is Carlink (enigy/carlink, Kotlin/Gradle, built and gated in its own
+  repository). `host/ocbm-host` is native **Rust** (`rusb`) for the bench, and "`ocbm-rescue`" is a
+  *role* of that same binary (`ocbm-host console`), not a separate build. When `crates/ocbm-proto`
+  changes, refresh Carlink's copy (`proto/ocbm-proto.lib.rs`) and run its `tools/proto_check.py`.
   - **Emulator constraint:** exactly ONE AVD instance may run at a time. It holds the USB
     passthrough claim on the adapter (vendor id `0x1314`), and a second instance fights it for the
     claim. Reshape the running device with `wm size` / `wm density` instead of booting a second AVD.
@@ -88,10 +78,8 @@ were never written — every box daemon is Rust — and MEASURED figures follow 
 1. **Rust size profile** (above) — often 2–4× smaller than default release.
 2. **UPX** — an *optional manual* shrink, NOT applied by the installer (**3.96**, run in the Lima `ccpa-build` VM; host
    UPX 5.x segfaults the box's 3.14 kernel, so `upx -t`-verify the packed output); ~50% further shrink.
-   **`tools/upx_pack.sh <binary>...` is that procedure as one command** (starts the VM if needed, packs
-   with 3.96, `upx -t`-verifies, prints the packed path under `/tmp/upxout/` for `ocbm_push.sh`) — added
-   2026-08-25 because the "correct" path existed only as prose and sessions kept shipping unpacked
-   binaries. Measured on the current pair: ocbmd 454,864 → 230,316 B, aa-bridge 399,568 → 201,952 B.
+   Measured: ocbmd 454,864 → 230,316 B. (`tools/upx_pack.sh`, the one-command form, left main with the
+   hand-install tools in 1.0.5; it is at tag `v1.0.4`.)
 3. **jffs2 auto-compression** — free on-media reduction.
 4. **Run from `/tmp` (RAM)** — persist a small `.tar.xz` of binaries in rootfs, unpack to the 107 MB
    tmpfs at boot via a tiny loader; running binaries never touch flash.

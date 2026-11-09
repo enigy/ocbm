@@ -19,22 +19,13 @@ Rules that keep it that way:
 | File | Owns |
 |---|---|
 | [00_ARCHITECTURE.md](carplay/00_ARCHITECTURE.md) | vision, the box/host split, USB/NCM transport |
-| [01_OCBM_PROTOCOL.md](carplay/01_OCBM_PROTOCOL.md) | the OCBM envelope, channel ids, seam framing, backpressure — **projection-agnostic**: it carries Android Auto too |
-| [02_SESSION_LIFECYCLE.md](carplay/02_SESSION_LIFECYCLE.md) | session states, start ordering, the app-driven SETUP relay, teardown |
+| [01_OCBM_PROTOCOL.md](carplay/01_OCBM_PROTOCOL.md) | the OCBM envelope, channel ids, seam framing, backpressure, the retired numbers |
+| [02_SESSION_LIFECYCLE.md](carplay/02_SESSION_LIFECYCLE.md) | session states, start ordering, teardown |
 | [03_SDK_GROUND_TRUTH.md](carplay/03_SDK_GROUND_TRUTH.md) | what Apple's licensed SDK says; conformance and Simulator verification |
 | [04_CAPABILITIES_AND_CONFIG.md](carplay/04_CAPABILITIES_AND_CONFIG.md) | app-driven doctrine, the YAML VehicleConfig framework, field glossary, capability dossiers |
 | [05_METADATA_AND_CONTROLS.md](carplay/05_METADATA_AND_CONTROLS.md) | the metadata surface, iAP2 declaration rules, the DataStream/RCS carrier |
 | [06_AV_PIPELINE.md](carplay/06_AV_PIPELINE.md) | audio (capability + pipeline), video, cornerMasks, touch/HID uplink |
 | [07_PHONE_SIDE.md](carplay/07_PHONE_SIDE.md) | iPhone-side behaviour we cannot change |
-
-## androidauto/ — the Android Auto protocol and session
-
-| File | Owns |
-|---|---|
-| [00_ARCHITECTURE.md](androidauto/00_ARCHITECTURE.md) | scope, why AA differs from CarPlay, the stock stack, the GAL credential, the box/host split, video geometry |
-| [01_SESSION_AND_AV.md](androidauto/01_SESSION_AND_AV.md) | what works today, resolved defects and their causes, open items |
-| [02_ARBITRATION.md](androidauto/02_ARBITRATION.md) | CarPlay vs Android Auto — phone-type detection, the single owner flag, closed failure modes |
-| [03_WIRELESS.md](androidauto/03_WIRELESS.md) | wireless Android Auto — unbuilt; the transport it needs and what is reusable |
 
 ## wireless/ — the wireless transport
 
@@ -55,7 +46,7 @@ Rules that keep it that way:
 | [05_AUDITS.md](ops/05_AUDITS.md) | code audits and their remediation |
 | [06_CORRECTIONS_LEDGER.md](ops/06_CORRECTIONS_LEDGER.md) | historical record; `R-<doc>-<n>` ids key to the pre-consolidation numbering |
 | [07_AUTHORIZATION.md](ops/07_AUTHORIZATION.md) | scope/authorization statement and session framing |
-| [08_FUTURE_TASKS.md](ops/08_FUTURE_TASKS.md) | owner-directed planned work that is not a defect (settings redesign, AA metadata services, mSBC) |
+| [08_FUTURE_TASKS.md](ops/08_FUTURE_TASKS.md) | owner-directed planned work that is not a defect |
 | ops/captures/ | raw session captures kept as evidence |
 
 ## Where the old numbers went
@@ -63,5 +54,6 @@ Rules that keep it that way:
 `docs/56` → carplay/04 · `docs/45`, `docs/47`, `docs/20_METADATA` → carplay/05 · `docs/13`,
 `docs/43`, `docs/49` → carplay/03 · `docs/27`, `docs/62`, `docs/23`, `docs/52` → carplay/06 ·
 `docs/20_WIRELESS`, `docs/29–39` → wireless/00 · `docs/40`, `docs/41`, `docs/51`, `docs/57` →
-wireless/01 · `docs/60` → androidauto/00+01, `docs/61` → androidauto/02 (both moved out of host/02 on 2026-08-31 when Android Auto got its own category) · `docs/25`, `docs/48`, `docs/50` → ops/05 ·
+wireless/01 · `docs/60`, `docs/61` → androidauto/ (removed in OCBM 1.0.5 with Android Auto; at tag
+[v1.0.4](https://github.com/enigy/ocbm/tree/v1.0.4/docs/androidauto)) · `docs/25`, `docs/48`, `docs/50` → ops/05 ·
 `REVISIONS.md` → ops/06. Full map: the `<!-- absorbed: … -->` marker at the head of every section.

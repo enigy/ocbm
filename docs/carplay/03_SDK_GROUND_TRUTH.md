@@ -311,8 +311,8 @@ So **docs/carplay/05_METADATA_AND_CONTROLS.md §III.4's claim is CONFIRMED, not 
 - **`"iAPChannel"` in the SETUP-response `enabledFeatures` — LOAD-BEARING. Keep it.** The phone-side
   consumer of the negotiated state, `carEndpoint_createiAPChannelIfNeeded` ("Creating RCS channel for
   iAP", clientTypeUUID `E9459FD0-…`), is what opens the stream-130 DataStream docs/carplay/05_METADATA_AND_CONTROLS.md proved is the real
-  carrier. Stripping it plausibly costs the whole tunnel, silently. `relay.rs` and `setup_driver.rs`
-  already preserve it against the host's authoring path; that is correct.
+  carrier. Stripping it plausibly costs the whole tunnel, silently. The box emits it itself on wireless
+  (`relay.rs` and `setup_driver.rs` preserved it against host authoring until OCBM 1.0.5 retired them).
 - **`iAPChannelInfo = {}` in `/info` — probably inert, but legal and harmless; leave it.** It is a valid
   receiver-side key, but appears in **no** phone-side inventory: not in CarKit's `/info` list
   (`CarKit.strings.txt:1255-1266`) and not in `carEndpoint_validateInfoResponseKeyPresentForFeature`'s

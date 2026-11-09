@@ -125,7 +125,7 @@ Two extraction details that only testing revealed:
 ##### The SCO/HFP lines are extracted PER BRANCH, and that is not the same problem (2026-09-03)
 
 `RADIO_BT_SCO_MTU_CMD` and `RADIO_BT_SCO_ROUTE_CMD` join the descriptor, carrying the vendor's own
-post-attach SCO setup so `sco_on` can put it back after the daemon's controller reset. The insmod
+post-attach SCO setup, which `bt_on` applies as the stock attach does. The insmod
 and attach lines are discriminated *for free* — by which modules the unit's tarball holds and which
 attach helper it ships. **The SCO lines are not.** They appear in several chipset branches with
 different contents:
@@ -160,7 +160,7 @@ rewrite; an unknown SDIO id refuses both lines.
 
 #### `ccpa/rootfs/script/radio_hal.sh` — the seam
 
-Verbs `probe | status | wifi_ap_on | wifi_ap_off | bt_on | bt_off | sco_on`.
+Verbs `probe | status | wifi_ap_on | wifi_ap_off | bt_on | bt_off | preload`.
 Exit `0` converged now · `1` ran and failed · `2` already converged · `3` unsupported on this
 unit. Single-flight `mkdir` locks per subsystem; state published atomically to
 `/tmp/.radio_wlan_state` and `/tmp/.radio_bt_state`.
@@ -330,16 +330,13 @@ That makes §7's Rust item load-bearing risk rather than tidiness.
 
 ### 6c. What the box does with app-pushed config
 
-The app pushes exactly three Wi-Fi keys — `wifi_ssid`, `wifi_pass`, `wifi_channel` — and
-`apply_host_wifi_creds()` rebuilds `/etc/hostapd.conf` from a pristine `.stock` snapshot with
-them (rebuild, not sed-substitute, because an SSID or passphrase can contain regex/delimiter
-characters). What survives after that depends on the role:
-
-| | bridge role (`wifi_ap:false`) | box-AP role (`wifi_ap:true`) |
-|---|---|---|
-| SSID | honored | **overwritten** with `ccpa-<4hex>` |
-| passphrase | honored | honored (written only when absent or <8 chars) |
-| channel | honored | honored (unless `/etc/wifi_use_24G` forces ch 6) |
+The app pushes no Wi-Fi keys. Until OCBM 1.0.5 the supervisor's `apply_host_wifi_creds()` took
+`wifi_ssid`/`wifi_pass`/`wifi_channel` for the GM bridge role (`wifi_ap:false`, where the box handed
+the iPhone the vehicle's hotspot) and rebuilt `/etc/hostapd.conf` from a `.stock` snapshot; Carlink
+never sent them. The role is gone, and the supervisor puts a bridge-role adapter's own
+`/etc/hostapd.conf.stock` back once (`restore_stock_hostapd`). The box's AP is always its own:
+`radio_ap_up.sh` names it `ccpa-<4hex>`, keeps the passphrase (writing one only when absent or <8
+chars) and the channel (unless `/etc/wifi_use_24G` forces ch 6).
 
 The box-AP SSID overwrite is long-standing — the old `wlan_on.sh` did the identical `sed` — but
 it sits awkwardly against docs/carplay/04_CAPABILITIES_AND_CONFIG.md's doctrine that configurable CarPlay state is app-driven and
@@ -348,7 +345,7 @@ app cannot override it. Left as-is for now because changing it would alter behav
 IW416 baseline too, but it is a doctrine gap, not a design decision.
 
 **Bluetooth: the app pushes no name at all.** There is no `bt_name` key; the box self-derives
-`ccpa-<4hex>`. Naming is a *box* concern in both roles, so an app that wants to brand the BT
+`ccpa-<4hex>`. Naming is a *box* concern, so an app that wants to brand the BT
 identity currently cannot.
 
 #### One box, one name — the intent, and why it is NOT yet achieved
@@ -357,9 +354,7 @@ Wi-Fi and Bluetooth must advertise the same `ccpa-<4hex>`, and deriving it per-r
 achieve that. The sources disagree: on the RTL8822CS unit the Wi-Fi MAC and the BT controller
 address share no octets at all (Realtek programs no `bd_addr`, so the controller uses its own
 efuse), so the two derivations yield different suffixes. Which name a radio picked would depend on
-which radio happened to be up when it was asked — and in the BT-only bridge role the WLAN driver is
-never loaded at all, so Bluetooth would silently take the *other* name. It could also change between
-boots, and the phone stores the name in its bonded record.
+which radio happened to be up when it was asked. It could also change between boots, and the phone stores the name in its bonded record.
 
 So the **shell** side resolves the identity once and persists it to `/etc/carplay_ident`:
 `radio_hal.sh`'s `box_name()` writes it and passes it to `radio_ap_up.sh` as `RADIO_BOX_NAME`, and
@@ -371,8 +366,7 @@ if every source fails the next call retries rather than freezing `ccpa-0000` int
 > `radio_ap_up.sh` are its only readers; `btd`, `bt_on.sh` and `ocbmd` each derive a
 > name independently, and `btd` overwrites the advertised BT name every session — so
 > the divergence §6c claims to have eliminated is still live. Closing it is tracked in §7, not here.
-> Full detail, including the platform split (`hciconfig` on the CCPA, raw HCI only on the Raspberry
-> Pi under `BT_HCI_BACKEND=native`) and the correction history behind it:
+> Full detail and the correction history behind it:
 > [../ops/06_CORRECTIONS_LEDGER.md](../ops/06_CORRECTIONS_LEDGER.md) `R-57-1`.
 
 ### 6d. What single-line extraction cannot represent — and why that was dangerous
@@ -426,13 +420,12 @@ because BT attach waits for WLAN on this part, Bluetooth with it. Both forms now
 * Rust parameterisation: `WLAN_IFACE`/`AP_IP` from the seam (`av.rs:63,66`), the identity chain
   (`box_identity.rs`'s `hardware_id()` :15, `iap2-core/src/message.rs`'s `device_suffix()` :215 — a
   live bug on IW416 too, since `/sys/class/net/wlan0/address` is absent whenever the driver is
-  unloaded, which under on-demand radios is most of the time), and the hardcoded Raspberry Pi BT MAC
-  at `bt_driver.rs:61`. **Added 2026-08-16:** that same chain is why §6c's "one box, one name" is
+  unloaded, which under on-demand radios is most of the time). **Added 2026-08-16:** that same chain is why §6c's "one box, one name" is
   **not yet achieved**. `/etc/carplay_ident` is read only by `radio_hal.sh` and `radio_ap_up.sh`;
   `btd` (`main.rs` → `bt_bringup::bring_up`), `bt_on.sh` and `ocbmd`'s `bt_name_from()`
   each derive independently, and because the supervisor execs `btd` *after*
   `radio_hal.sh bt_on` the controller ends up advertising `CarLink-<suffix>` rather than the seam's
-  `ccpa-<4hex>`. In the BT-only bridge role the suffixes can differ too, not just the prefixes.
+  `ccpa-<4hex>`.
   Closing it means the Rust side reading the ident file first — a behaviour change, so it is listed
   here rather than done. **31 Oct 2026, the dev adapter (IW416):** the iPhone listed `btd`'s
   `CarLink-fd6c`, `wlan0`'s suffix; the ident file and the SSID read `ccpa-fe01`, from `sta0`; and
@@ -712,38 +705,15 @@ BLE power) — strong evidence it was a cargo-culted leftover rather than intent
    `up`, forcing `hci_dev_do_open` regardless of what the boot scripts did to the controller. This makes
    the daemon self-sufficient rather than dependent on script history.
 
-#### Side effect — REPAIRED 2026-09-03 (this section used to say "accepted")
+#### Side effect — accepted
 
 The controller is `hciattach`'d over UART, so it carries `HCI_QUIRK_RESET_ON_CLOSE` — the `down` makes
 the kernel issue a real HCI_Reset on close, and the `up` re-reads `Read_Buffer_Size`. That discards
-`attach_bluetooth.sh`'s HFP setup (`scomtu 240:32` plus the SCO-routing and BLE-power vendor commands).
-
-**This section used to read "deliberately not re-issued: CarPlay carries all audio — including
-telephony — over the AirPlay/WiFi session, never over SCO/HFP, so nothing in the proven path depends
-on them."** Every clause of that is still true *of CarPlay* and the conclusion no longer holds,
-because wireless **Android Auto** does the opposite: gearhead routes calls AND the Assistant through
-the connected Bluetooth headset (`kxr.java:118-150`), so the audio arrives on an (e)SCO channel on our
-own HFP link. The discarded setup is load-bearing again.
-
-**The repair** (`bt_bringup::restore_sco_setup`): after the `up`, the daemon runs
-`timeout 20 sh /script/radio_hal.sh sco_on`, which re-applies the *unit's own* extracted SCO lines.
-(That `scomtu 240:32` is `mtu:pkts` — 240 bytes over 32 packets — so it comfortably carries the 60 B
-transparent-eSCO writes HFP **wideband** needs; `sco_send_frame` only rejects a write longer than the
-MTU. `sco_audio` still logs an `EINVAL`/`EMSGSIZE` uplink write once, with the downlink packet size,
-because a unit whose scomtu was reset to something smaller would otherwise be a silent mute.)
-Three properties, each deliberate:
-
-* **It never composes raw HCI itself.** Which command a unit needs is a per-chipset fact only that
-  unit's dispatcher knows; `0x3f 0x1c …` is BCM4358's and `0x3f 0x1d 0x00` is NXP's, and firing
-  either at the wrong controller is precisely what the seam exists to prevent.
-* **It is bounded.** `sco_on` takes radio_hal's `bt` lock, and `bt_on` can legitimately hold that
-  lock for minutes; `bring_up` is on the session's critical path, so an unbounded call would stall a
-  session start behind a bring-up already doing the work. Exit 124 is logged as a timeout.
-* **It is never fatal.** No mapping → exit 3, logged, Bluetooth still comes up. A box with no SCO
-  loses call audio; a box that refuses to bring Bluetooth up loses everything.
-
-The BLE-power command is deliberately NOT restored: nothing in this stack uses BLE, and re-issuing a
-vendor-opaque power write for no consumer is an untested write to the controller for no gain.
+`attach_bluetooth.sh`'s SCO setup (`scomtu 240:32` plus the SCO-routing and BLE-power vendor
+commands), which is deliberately not re-issued: CarPlay carries all audio — including telephony —
+over the AirPlay/WiFi session, never over SCO/HFP, so nothing in the proven path depends on them.
+(From 2026-09-03 to OCBM 1.0.5 btd re-applied the SCO lines after the `up` through `radio_hal.sh
+sco_on`, for wireless Android Auto's Bluetooth call audio. Both are retired.)
 
 Note also that `bring_up` runs **once per active session** (re-entered from the arbiter loop on every
 wired→wireless handback), not once per process. The down/up is safe because within
@@ -786,11 +756,10 @@ every unrecognized event. Now:
   once and publishes `BTP_PAIR_REJECTED` (`ocbm-proto`) via a callback hook `ssp_agent::run` takes
   (`bt-common` has no dependency on `ocbm-proto`/`bt_driver`; the wireless daemon wires the hook to
   `bt_driver::publish_bt_phase`). The counter resets on `DEVICE_DISCONNECTED` or `NEW_LINK_KEY`.
-- **Connect hold.** Both RFCOMM backends' `connect_to` (`bt-common::rfcomm.rs`, which the CCPA
-  supervisor runs, and `rfcomm_uspace.rs`) go through `rfcomm_uspace::pairing_aware_connect`:
+- **Connect hold.** `bt-common::rfcomm::connect_to` goes through `pairing_aware_connect`:
   connect non-blocking and poll. While `/tmp/pairing_code` is fresh for this attempt (mtime ≥ the
   attempt's start; `ssp_agent` writes it on `USER_CONFIRM_REQUEST`) the deadline stretches to
-  `rfcomm_uspace::PAIRING_HOLD_SECS` (60 s) so the phone-side tap can land, latched for the rest of
+  `rfcomm::PAIRING_HOLD_SECS` (60 s) so the phone-side tap can land, latched for the rest of
   the attempt. When the rejection streak fires, `ssp_agent` also clears the code and writes
   `/tmp/pair_rejected`; `connect_to` sees it and returns `PermissionDenied` immediately.
   `reconnect.rs` maps that to `Attempt::PairRejected`: stop paging the remaining bonds, sleep
@@ -803,8 +772,8 @@ every unrecognized event. Now:
   instead). Dev bench, 2 Nov: 32 s after a power cut the first-called iPhone accepted the page and
   reset it 4 s later, and the walk handed CarPlay to the second phone; `FIRST_RETRY_SECS` only helps
   when no phone in the round connects.
-- **Bonding intent.** Both backends request `BT_SECURITY_MEDIUM` (general bonding) on the outgoing
-  socket (`rfcomm_uspace::request_bonding`) so a box-initiated connect's own side asks for a
+- **Bonding intent.** `connect_to` requests `BT_SECURITY_MEDIUM` (general bonding) on the outgoing
+  socket (`rfcomm::request_bonding`) so a box-initiated connect's own side asks for a
   persistent key (`store_hint=1`); without it the kernel reported `store_hint=0` and a freshly
   authenticated key was never written, so the next boot would have prompted again. `ssp_agent`
   still honours whatever hint the kernel returns, as BlueZ does.

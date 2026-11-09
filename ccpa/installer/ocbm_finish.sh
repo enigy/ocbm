@@ -16,7 +16,8 @@
 # `final` that still finds it runs this again. ocbm_revert.sh takes the same lock, so a go-back and a
 # finish never interleave.
 #
-# What goes is tools/ncm_base_install.sh's strip set (a test keeps the lists equal): the vendor
+# What goes is the hand installer's strip set (tools/ncm_base_install.sh, at tag v1.0.4; the lists
+# are pinned by tools/ocbm_stageb_test.sh): the vendor
 # programs (SBIN_A), scripts (SCRIPT_A, but not the stock stick updater, UPDATER), config and logos
 # (ETC_A, /etc/boa), and the vendor and toolchain libraries (LIB_VENDOR, LIB_DEV) that no surviving file
 # names, plus start_main_service.stock.sh. Every candidate passes is_radio() first, and no Carlinkit
@@ -76,7 +77,7 @@ KILL_PROCS="ARMadb-driver ARMiPhoneIAP2 ARMAndroidAuto ARMHiCar ARMandroid_Mirro
 AutomaticTest boa boxNetworkService boxHUDServer colorLightDaemon mdnsd riddle_top usbmuxd \
 fakeiOSDevice fakeCarLife fakeAADevice"
 # The stock stick updater stays (Scott, 3 Nov: a final adapter runs an A15W_Update.img from a stick as
-# stock does, Carlinkit's own included). SCRIPT_A, which must equal ncm_base_install.sh's, names these;
+# stock does, Carlinkit's own included). SCRIPT_A, which equals ncm_base_install.sh's, names these;
 # the loop below skips them. The chain, traced on the Mac from both factory dumps: udisk_insert.sh and
 # udisk_hotplug.sh call update_box.sh, which decrypts with ARMimg_maker (static; SBIN_A spares it),
 # runs the image's tmp/once.sh, then quickly_update.sh (check_update.sh, smart_copy.sh), and for .hwfs

@@ -1102,7 +1102,7 @@ static multi-view-area) are documented with their implementation cost + teardown
   also switch natively with no button at all: GM's CT5 sets `transitionControl=false` and calls
   `UpdateViewArea` itself. Only areas listed in `adjacentViewAreas` may be requested. [SIM]/[WWDC]/[CT5]
 - **Android Auto has NO equivalent** (verified 2026-09-05 against the DHU binary — see
-  `../androidauto/01_SESSION_AND_AV.md`, "AA HAS NO RUNTIME GEOMETRY CHANGE"). AA fixes its geometry
+  [`androidauto/01_SESSION_AND_AV.md` at tag v1.0.4](https://github.com/enigy/ocbm/blob/v1.0.4/docs/androidauto/01_SESSION_AND_AV.md), "AA HAS NO RUNTIME GEOMETRY CHANGE"). AA fixes its geometry
   at negotiation: margins, content insets, and a `video_configs` priority list gearhead resolves once.
   So this feature is CarPlay-exclusive, and the app-side design must not assume the two projections
   are symmetric here — `AACapability` computes its geometry once and hands over an immutable value,

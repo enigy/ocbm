@@ -245,123 +245,13 @@ things it never defines. Treat a WWDC mention as a *pointer* to look in §A/§C,
 7. **Quote format strings whole.** A `%d` cannot testify to its runtime value (docs/carplay/02_SESSION_LIFECYCLE.md), and
    trimming a `%s%?u%s` silently deletes a conditional field (§8). If a quote is abridged, say so.
 
-### Second host platform — the Raspberry Pi / AAOS port
+### Retired in OCBM 1.0.5: the Raspberry Pi / AAOS port and Android Auto
 
-**There is a working non-CCPA host running this accessory stack.** A Raspberry Pi 4 on AAOS 16
-(arm64) runs `btd` + `carplayd` + `rx-connect` natively, providing **both radios
-itself** — its own Bluetooth and its own 5 GHz SoftAP — with the CCPA reduced to the **MFi
-coprocessor only**, reached over USB-NCM (`CARPLAY_MFI_ADDR` → `ccpa/mfid`). Device-proven end to
-end against an iPhone on iOS 27: pairing, iAP2, MFi auth, the `0x5702`/`0x5703` handoff, DHCP,
-pair-verify, MFi-SAP auth-setup, RECORD and the screen stream.
-
-→ **`pi/docs/00_PI_AAOS_PORT.md`**
-
-Read it before assuming anything in this tree is CCPA-specific, and before re-deriving any of:
-
-* RFCOMM is implemented **in userspace over L2CAP** there (`crates/bt-common/src/rfcomm_uspace.rs`,
-  moved out of `vendor/wireless` 2026-09-03) — the AAOS kernel ships without `CONFIG_BT_RFCOMM`.
-* `hciconfig` does not exist on Android; bring-up is native ioctls + raw HCI
-  (`crates/bt-common/src/hci.rs`),
-  and it must be raw HCI rather than mgmt because mgmt synthesises EIR and cannot express the
-  CarPlay marker UUID.
-* There are **three** independent MFi chip users in this tree, not one.
-* Four Android-specific traps that cost real debugging time (`target_os` is `"android"` not
-  `"linux"`; `pgrep -x` matches opposite things on BusyBox vs toybox; Android deletes the
-  `from all lookup main` ip rule; the bundled dnsmasq 2.51 silently disables DHCP on an
-  unrecognised flag).
-
-Required AAOS *image* changes are recorded outside this repo, in
-`/Volumes/stuff/rpi/aaos/docs/os-corrections-2026-08-16.md` - **an external volume, NOT mounted as of
-2026-08-16 (`/Volumes/` holds only `Macintosh HD`, `Recovery` and the Time Machine local-snapshots
-mount). Mount `stuff` before following this pointer; unmounted, it reads as a missing file rather than
-an absent one.**
-
-### F. Android Auto — the Desktop Head Unit is the authority (owner directive, 2026-08-25)
-
-This index carried nothing for Android Auto until now, which is exactly the gap it exists to prevent:
-the AA material was described only inside `docs/androidauto/00_ARCHITECTURE.md`, so a session that started from this document
-found no AA sources at all.
-
-**Consult order for ANY Android Auto protocol question:**
-
-1. **Google's Desktop Head Unit (DHU)** — the first-party head-unit reference, installed by Android
-   Studio ▸ SDK Manager at `~/Library/Android/sdk/extras/google/auto/` (v2.0). It is the AA analogue of
-   the CarPlay Simulator and the authoritative statement of what a head unit is expected to do:
-   - `config/default.ini` — Google's reference head-unit config (**800×480, dpi 160, 30 fps**, sensors
-     location/night/driving). Every geometry/sensor choice in our ServiceDiscoveryResponse matches it.
-   - **`config/*.ini` is the AA analogue of Apple's CarPlay Simulator `VehicleConfigs/Configs/*.yaml`**
-     (checked on disk 2026-09-04): eleven files — `default`, `default_720p`, `default_1080p`,
-     `default_wide`, `default_6in`, `default_sensors`, `all_720p`, `loaded_720p`, `hybrid`, `rotary`,
-     `touchpad` — each a `[general]` section (`touch`, `touchpad`, `controller`, `instrumentcluster`,
-     `resolution`, `dpi`, `framerate`, …) and, in ten of the eleven, a `[sensors]` section
-     (`location`, `night_mode`, `driving_status`, …). **`all_720p` and `loaded_720p` are NOT the same
-     file** (corrected 2026-09-04 by re-reading both on disk; this index used to call them "the same
-     diff against `default`"): their `[general]` sections are identical (touch, touchpad,
-     touchpadnavigation, controller, instrumentcluster, playbackstatus all true; 1280×720, dpi 160,
-     30 fps), but `loaded_720p.ini` adds a `[sensors]` block (`location`/`night_mode`/`driving_status`
-     = true) and `all_720p.ini` is the only file with no `[sensors]` section at all. The app still
-     collapses them into ONE preset, and that stays defensible because the DHU's `[sensors]` entries
-     are runtime feeds the head unit simulates (location, day/night, driving state) rather than facts
-     about the vehicle a profile records — but the justification is that, not "the files are
-     identical". The running DHU also has a console with `restrict video|keyboard|voice|config|message`,
-     which is how the `driving_status` bits were confirmed to be a bitmask. **Neither vendor file is a
-     wire format**: CarPlay's YAML goes out as the AirPlay `/info` plist plus iAP2 Identify parameters,
-     the DHU's `.ini` as the protobuf `gal.ServiceDiscoveryResponse` — which is why the app's own
-     source of truth is a neutral profile that RENDERS to both (`docs/host/00_MACOS_HOST_APP.md`
-     §"Settings window"; the ten DHU-derived presets in `App/Settings/VehicleProfile.swift` are built
-     from these files). One DHU quirk: the binary carries both the protobuf enum name
-     `VIDEO_3840x2160` and, in its `.ini` parser's string table, `3840x1260` — the latter is a typo.
-     Tier 5 (3840×2160, H.265) IS device-verified — 2026-09-04, Pixel 10 / gearhead 17.5, wireless, at
-     both 30 and 60 fps, 0 drops — as are all nine codec tiers, each at the fps pairings listed in
-     `docs/androidauto/01_SESSION_AND_AV.md` (the verification is per (tier, fps): tiers 1/2/3/6 at
-     60, 4/5 at 30 and 60, 7/8/9 at 30 only; a pairing such as 1080×1920@60 has never run). This
-     index said "tier 5 is unverified on a device either way" until 2026-09-04; that claim was stale
-     the day it was written and is withdrawn.
-   - `desktop-head-unit` — the binary; its protobuf namespace is **`gal.*`** (Google Automotive Link),
-     and the symbol names carry the message shapes (`gal.ServiceDiscoveryResponse`, `gal.MediaSinkService`,
-     `gal.VideoConfiguration`, `gal.NavFocusType`, `gal.AudioFocusRequestType`). `Controller::sendVersionRequest`
-     requests protocol **1.7**.
-   Google keeps the DHU binary stable while the phone side evolves, so it is a stable contract, not a
-   snapshot of one app version.
-2. **The shipping Android Auto app** (`com.google.android.projection.gearhead`, pulled from the owner's
-   own phone and decompiled) — for what the CURRENT phone actually enforces: the protocol version
-   ceiling (`rux(1,6)`..`rux(1,7)` in the GAL handler), the teardown reasons that name a missing service,
-   and the `gal.*` schema as shipped.
-3. **The public open-source `aasdk` / `openauto` stack (GPLv3)** — SUPPLEMENTARY. It is a
-   re-derivation, not a Google drop, and the stock CPC200-CCPA's own `ARMAndroidAuto` is built from it —
-   so it is excellent for framing/encapsulated-TLS mechanics and for "what a working implementation
-   does", and it is where the public head-unit credential comes from, but where it disagrees with the
-   DHU or the shipping app, THEY win. Treat it exactly as this document treats SpeedPlay on the CarPlay
-   side: separate its *choices* from its *observations*.
-4. **Our own captures** — `analysis/aa_full_session_emulator_*.txt` (a DHU session) and the stock-adapter
-   capture, for diffing behaviour rather than deriving contracts.
-
-**What Google has said in public (surveyed 2026-09-04; every item fetched, dates are access dates).**
-Google publishes no Android Auto head-unit specification. The public corpus is: the Desktop Head
-Unit page (developer.android.com/training/cars/testing/dhu — resolutions 800×480/1280×720/1920×1080
-as *examples*, framerate default 30, dpi default 160 plus `realdpi`/`normalizedpi`, `marginwidth`/
-`marginheight`/`margins`/`cropmargins`, `contentinsets`, `pixelaspectratio`, `instrumentcluster`/
-`navcluster`/`phonecluster`, `inputmode` touch/rotary/hybrid — no codec, audio-rate or HFP detail);
-the user-facing requirements (support.google.com/androidauto/answer/6348019: wireless needs Android
-11+, a data plan and 5 GHz Wi-Fi; /6348029: Bluetooth + Wi-Fi + Location for first pairing — no
-profile or codec named); the Car App Quality guidelines (DD-2/DD-3/DD-4: nothing visible or audible
-while driving except audio from video-category apps on capable devices); and the yearly I/O posts on
-android-developers.googleblog.com (2015 launch; 2021 Car App Library + AA on the BMW iX cluster; 2022
-split-screen redesign; 2023 video/gaming categories, cluster integration for nav apps; 2025 Gemini,
-parked video on Android 16 phones; 2026 "smooth 60 fps HD video playback" while parked on Android
-17+ phones). The only spec-shaped document is a **leaked 2016 partner "Head Unit Integration Guide"
-v1.3.0** (Google Confidential, mirrored at milek7.pl/.stuff/galdocs/) — H.264 Baseline, 800×480
-required / 720p / 1080p optional, 30 fps minimum and 60 recommended, PCM 16-bit with **16 kHz mono
-guidance/voice and 48 kHz stereo media**, AAC-LC optional, Bluetooth HFP 1.5 — a decade-old floor,
-not a ceiling. **Not found anywhere public:** codec-tier or margin semantics, DPI guidance, any HFP
-codec (mSBC/LC3) requirement, a current OEM compatibility spec, a Google primary source for the 2018
-wireless rollout, or 4K/HDR named for Android Auto. Everything above 1080p, the H.265 requirement,
-60 fps at 4K and the margin/touch behaviour exist only as our measurements
-(`docs/androidauto/01_SESSION_AND_AV.md` §1) and the decompile.
-
-Our implementations to diff against: `host/aa-headunit/` (the Rust reference client) and
-`host/MacHost/carlink_macOS/AA/` (the Swift engine that ships in the app). The box side carries no
-AA protocol at all — `ccpa/aa-bridge` is an AOAP byte pump (`docs/androidauto/00_ARCHITECTURE.md`, `docs/androidauto/00_ARCHITECTURE.md`).
+Two sections stood here until OCBM 1.0.5 (8 Nov 2026): the Raspberry Pi / AAOS port (`btd` and
+`carplayd` on a Pi, with the CCPA reduced to an MFi oracle over USB-NCM) and Android Auto (the Desktop
+Head Unit as its authority, gearhead as the shipping implementation). Both left the tree with that
+release; the sections are at tag
+[`v1.0.4`](https://github.com/enigy/ocbm/blob/v1.0.4/docs/ops/03_REFERENCE_INDEX.md).
 
 ### Note on the real-time cyber safeguard
 

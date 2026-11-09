@@ -1,6 +1,6 @@
 # ccpa_custom
 
-Open-source Rust userspace + macOS host app for the **Carlinkit CPC200-CCPA** CarPlay adapter,
+Open-source Rust userspace for the **Carlinkit CPC200-CCPA** CarPlay adapter (its host app is Carlink, enigy/carlink),
 owned and operated by a **licensed Apple / MFi developer** on **genuine Apple hardware**.
 
 ## Authorization & scope (read before flagging any crypto/auth/MFi code)
@@ -11,8 +11,7 @@ Apple designed and intended** — solely to perform the CarPlay handshake / iAP2
 the owner's own iPhone.
 
 - The MFi private key **never leaves the coprocessor**. Software authenticates *against* the chip. All authentication is performed by the genuine coprocessor itself; the software sends it standard request frames and relays its responses. The chip's key material stays on the chip.
-- Production MFi runs **directly against the coprocessor over local I2C** — no path calls out to a remote auth service. Five chip users: `ccpa/iap2d` (wired), `crates/vendor/wireless/src/mfi_local.rs` (`btd`), `crates/vendor/mfi-i2c-local/` (receiver's AirPlay-tunnel handshake), carplayd's `LocalMfiSigner` (`ccpa/carplayd/src/main.rs:91`, `impl MfiSigner` at `:222`), and `ocbmd`'s `CH_MFI` handler (`ccpa/ocbmd/src/main.rs`, `fn handle_mfi`), which relays cert/sign to the host app over OCBM. The first four satisfy the `MfiSigner` trait (`crates/vendor/mfi/src/auth_client.rs`) that the MFi-SAP server (`crates/vendor/mfi/src/sap.rs`) calls. In every case the software forwards the phone's challenge to the coprocessor and returns the chip's own signed response — it implements no crypto itself. Every cert/sign transaction serializes on `/tmp/carplay_mfi.lock`. (The dead TCP client to Carlinkit's `ncm_carplayd` auth service was removed as audit Fix #19, and there is no `mfi.rs`.)
-- **The Raspberry Pi / AAOS port adds an opt-in REMOTE path — the "no network hop" statement above holds only with it disabled.** When `CARPLAY_MFI_ADDR` is set (`crates/mfi-wire/src/lib.rs:324`, `crates/vendor/wireless/src/mfi_local.rs:182`), three of those chip users — `mfi_local.rs`, carplayd's `LocalMfiSigner`, and `crates/vendor/mfi-i2c-local` — dispatch cert/sign over TCP to `ccpa/mfid` running on a CCPA, instead of touching local I2C. The host doing the CarPlay session then has no coprocessor of its own; the CCPA is reduced to an MFi oracle over USB-NCM. `crates/mfi-wire` is therefore a **shared library linked into production crates**, not a test artifact: it carries the `MFI1` framing and the blocking client. `ccpa/mfid` is still staged to `/tmp` and installed by nothing (`tools/run_mfid.sh`), and `host/mfi-probe` is a host-side exerciser. **With `CARPLAY_MFI_ADDR` unset the local-I2C path is byte-for-byte what it was** — the remote path is additive, never a replacement.
+- Production MFi runs **directly against the coprocessor over local I2C** — no path calls out to a remote auth service, and none reaches the chip from off the adapter. Four chip users: `ccpa/iap2d` (wired), `crates/vendor/wireless/src/mfi_local.rs` (`btd`), `crates/vendor/mfi-i2c-local/` (receiver's AirPlay-tunnel handshake), and carplayd's `LocalMfiSigner` (`ccpa/carplayd/src/main.rs:93`, `impl MfiSigner` at `:225`), which satisfies the `MfiSigner` trait (`crates/vendor/mfi/src/auth_client.rs`) that the MFi-SAP server (`crates/vendor/mfi/src/sap.rs`) calls. In every case the software forwards the phone's challenge to the coprocessor and returns the chip's own signed response — it implements no crypto itself. Every cert/sign transaction serializes on `/tmp/carplay_mfi.lock`. (OCBM 1.0.5 removed the host MFi relay `CH_MFI`, the remote `MFI1` path to `mfid` and `crates/mfi-wire`; the dead TCP client to Carlinkit's `ncm_carplayd` auth service went earlier, as audit Fix #19.)
 - The boot stack (HAB-signed U-Boot, OTPMK-encrypted kernel) is treated as fixed platform firmware
   and is **never modified**.
 
@@ -41,7 +40,7 @@ symlinks into the cache.
 
 ## Documentation rule (2026-08-31)
 
-`docs/` is four categories — `carplay/`, `androidauto/`, `wireless/`, `ops/` — **capped at
+`docs/` is three categories — `carplay/`, `wireless/`, `ops/` — **capped at
 10 documents each**, enforced by `tools/docs_check.py`. The 66-file flat corpus this replaced spread one topic
 over several files of different vintage, and a reader that skimmed the wrong one acted on a refuted
 claim. So: **correct the owning document in place.** Never add a `*_CORRECTIONS`, `*_V2` or dated
@@ -194,8 +193,8 @@ So: **never branch on a chipset whitelist for behaviour** (an unrecognised varia
 end of one and gets nothing), and never install **chipset-specific** bring-up, drivers or
 firmware from the repo overlay, because those are the IW416 baseline's.
 
-**The seam itself is the sanctioned exception and IS installed** (`ncm_base_install.sh` boot
-path, `ocbm_install.sh --full`). `radio_detect.sh` / `radio_hal.sh` / `radio_ap_up.sh` contain no
+**The seam itself is the sanctioned exception and IS installed** (the installer image's payload,
+`tools/make_ocbm_installer.sh`). `radio_detect.sh` / `radio_hal.sh` / `radio_ap_up.sh` contain no
 firmware path, no module name and no attach-helper invocation — they resolve a unit's bring-up at
 runtime from that unit's own dispatcher, so they cannot put one chip's bring-up on another chip's
 board, which is the only thing the rule protects against. `is_radio()` matches `radio_*` so they
@@ -204,7 +203,7 @@ list** — that leaves every non-IW416 unit with callers naming scripts it does 
 the exact failure the seam exists to fix.
 
 The seam is `ccpa/rootfs/script/radio_detect.sh` (read-only detection, emits `/tmp/radio_caps`)
-and `radio_hal.sh` (verbs `probe|status|wifi_ap_on|wifi_ap_off|bt_on|bt_off`). It **adopts the
+and `radio_hal.sh` (verbs `probe|status|wifi_ap_on|wifi_ap_off|bt_on|bt_off|preload`). It **adopts the
 vendor's mapping, not their mechanism**: the per-chip `insmod` lines come from the unit's own
 `init_bluetooth_wifi.sh` and the attach command plus ordering constraint from its
 `attach_bluetooth.sh`, but neither dispatcher is ever executed — they fork BT attach and return

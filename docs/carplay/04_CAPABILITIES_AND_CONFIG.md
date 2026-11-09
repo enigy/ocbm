@@ -39,9 +39,9 @@ Issued by the owner on 2026-08-10 (EV-telematics research session):
    guards: `radio_hal.sh` `do_preload`.
 4. **Box placement is earned, never designed-in.** The only path for functionality onto the box:
    implement app-driven first → it demonstrably FAILS under excessive testing → the owner explicitly
-   approves the move. (The box-driven SETUP local response — kept as a sticky fallback after
-   app-driven SETUP was implemented, measured, and validated — is the model of this pattern done
-   right.)
+   approves the move. (Box-driven SETUP is the one placement made the other way, by decision: the
+   app-driven relay was implemented, measured and validated, Carlink never authored a SETUP, and OCBM
+   1.0.5 retired the relay. The box answers SETUP only by rendering the pushed config.)
 
 ### 2. The placement test (apply to every new feature)
 
@@ -52,8 +52,7 @@ The box gets new code ONLY if the feature is:
 - an **earned fallback** per directive 4 (measured app-driven failure + owner approval).
 
 Everything else — every value, set, toggle, tier, default, geometry, format list, name, declaration
-content — is app-authored, app-held, and pushed to the box, with the box as a relay/renderer. The
-`CH_RTSP` app-driven SETUP relay is the proven template for "app authors, box frames."
+content — is app-authored, app-held, and pushed to the box, with the box as a relay/renderer.
 
 **Corollary — single source of truth.** The app's YAML config is the single source of truth for all
 capability/configuration content (this resolves a long-standing contradiction: some docs previously
@@ -135,32 +134,13 @@ box deciding policy — it is the box declining to put a malformed frame on a wi
   fallback" bar in full. It stands as a **sequencing constraint** — pushed config needs
   per-transport-arm applicability (wired vs wireless) until wireless Identify growth is
   re-validated — not as an exception to the doctrine.
-- **Wireless SETUP — RESOLVED 2026-08-10 by owner directive: FLIPPED.** App-driven SETUP now runs
-  on BOTH transports; the box-side gate lost its `!wireless` term. This was milestone sequencing,
-  never a design preference — but it DID require one protocol change, and the first attempt was
-  rejected at the gate for missing it. Two layers behave differently:
-  **Streams (phase 2) — echo.** The host authors only the types it knows (video 110/111, audio
-  100-102) and passes the box's own local answer through for anything else, notably the type-130 RCS
-  DataStream that only wireless carries. That layer genuinely needed nothing **from the host** — the
-  echo is correct and remains so. **⚠️ Corrected 2026-08-10: the BOX's own local answer for type 130
-  was itself broken at the time this was written**, so "needed nothing" was true of the relay and
-  false of the thing being relayed. A scid guard had been rejecting every type-130 SETUP since
-  2026-07-31, so the local answer the host was faithfully passing through contained no 130 entry at
-  all. See docs/carplay/05_METADATA_AND_CONTROLS.md §8. Related: the oracle compared `streams[].type` only, so a host answer that kept
-  the type and dropped `streamID` would also have diffed clean — widened to a per-stream key set the
-  same day (`relay.rs::setup_surface`).
-  **Features (phase 1) — union, and this is the part that bit.** `authorPhase1` does not echo
-  `enabledFeatures`, it AUTHORS it, and the app can only emit six tokens. On wireless the box emits
-  two more — `iAPChannel` and `sessionManagement`, env-gated at the wireless spawn site with no
-  config key. Overwriting would have STRIPPED `iAPChannel`, and `/info` advertises `iAPChannelInfo`
-  while iOS 400s every `iAPSendMessage` unless the echo carries the token (device-observed 3/3) —
-  the iAP2 tunnel's DETECT+SYN rides that command, so every wireless session would have come up
-  looking healthy with a dead tunnel. Both authoring twins now PRESERVE any token outside the host's
-  vocabulary, with a wireless-shaped fixture in each.
-  **DEBT (workstream C/D):** the app now emits two tokens it cannot see, audit or disable. The
-  doctrine-faithful end state is per-transport app config keys for them (B4's `wired:`/`wireless:`
-  shape); `OPEN_FLAG_WIRELESS` already gives the host the transport it would need.
-  The box's local response remains the sticky fallback on any relay failure, on both arms.
+- **Wireless SETUP.** App-driven SETUP ran on both transports from 2026-08-10 until OCBM 1.0.5 retired
+  the relay (see directive 4). What it taught stands: on wireless the box emits two `enabledFeatures`
+  tokens the app has no key for, `iAPChannel` and `sessionManagement`, and stripping `iAPChannel`
+  makes iOS 400 every `iAPSendMessage` (device-observed 3/3), killing the iAP2 tunnel's DETECT+SYN.
+  The box now emits them itself. **DEBT (workstream C/D):** they are still env-gated at the wireless
+  spawn site with no config key; the doctrine-faithful end state is per-transport app config keys
+  (B4's `wired:`/`wireless:` shape).
 
 ### 4. Doctrine sweep (2026-08-10)
 
@@ -445,9 +425,8 @@ own schema rather than Apple's: the key had no consumer in `VehicleConfig` becau
 Message key, and `info.rs` had simply never emitted one.
 
 Steering side of the vehicle: on = right-hand-drive.
-**Android Auto: live since 2026-09-04** (declared as `driver_position`, wire 2 / 1 / 3 for left / right /
-center, rail side device-verified — see `docs/androidauto/01_SESSION_AND_AV.md`; `center` has no legacy
-Bool reading and is the reason the app's neutral `driverPosition` is a ternary).
+(Android Auto declared it as `driver_position` until OCBM 1.0.5 retired Android Auto; that is why the
+app's neutral `driverPosition` is a ternary, `center` having no Bool reading.)
 **CarPlay: a supported `/info` key — implementation landing 2026-09-05, UNVERIFIED on a device.**
 
 **CORRECTED 2026-09-05 — this entry was wrong about CarPlay.** From 2026-08-01 it said "it is not an
