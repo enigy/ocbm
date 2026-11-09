@@ -46,7 +46,8 @@ if grep -q '^# OCBM_STAGE_C_PLACEHOLDER' "$REPO/ccpa/installer/ocbm_finish.sh"; 
 fi
 # The programs and boot scripts the image places, beside the one-file install's own scripts. Pinned here since the
 # hand-install manifest (tools/ocbm_install.sh) left main (decision 4, 8 Nov): a change to the set is deliberate.
-want="script/ocbm_boot.sh
+want="etc/ocbm/retired.list
+script/ocbm_boot.sh
 script/phone_reset.sh
 script/projection_up.sh
 script/radio_ap_up.sh
@@ -56,7 +57,6 @@ script/run_ocbmd.sh
 script/run_supervisor.sh
 script/session_supervisor.sh
 usr/bin/iap_role_switch
-usr/sbin/aa-bridge
 usr/sbin/btd
 usr/sbin/carplayd
 usr/sbin/iap2d
@@ -274,9 +274,11 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
     "the earlier try's flash backup is kept, not dumped over with the changed flash"
   head -c 100 "$B/mtd2.bin" > "$B/x"; mv "$B/x" "$B/mtd2.bin"
   r2="$T/$sh-badbk"; make_box "$r2"; mkdir -p "$r2/stick/OCBM_BACKUP"; cp -R "$B" "$r2/stick/OCBM_BACKUP/"
+  bad="$(cksum "$r2/stick/OCBM_BACKUP/ABCDEF0123456789"/*)"; snap "$r2/root" > "$r2/b4"
   run_once "$sh" "$r2"; rc=$?
-  check '[ $rc = 0 ] && ( cd "$r2/stick/OCBM_BACKUP/ABCDEF0123456789" && sha256sum -c SHA256SUMS >/dev/null 2>&1 ) && cmp -s "$r2/dev/mtd2" "$r2/stick/OCBM_BACKUP/ABCDEF0123456789/mtd2.bin"' \
-    "a damaged earlier backup is taken again"
+  # Never written over (8 Nov): it may be the only copy of the factory flash. Refused, with nothing changed.
+  check '[ $rc = 1 ] && [ "$(cksum "$r2/stick/OCBM_BACKUP/ABCDEF0123456789"/*)" = "$bad" ] && [ "$(snap "$r2/root")" = "$(cat "$r2/b4")" ] && grep -q "never writes over one" "$r2/install.log"' \
+    "a backup on the stick that doesn't check out is never written over: refused, nothing changed"
 
   echo "== $sh: install on an adapter restored to stock, with the radio seam left behind"
   r="$T/$sh-restored"; make_box "$r"
@@ -310,6 +312,12 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   check '[ $rc = 0 ] && [ -e "$r/root/lib/libz.so.1.2.11" ] && [ -L "$r/root/lib/libz.so" ] && [ -e "$r/root/script/custom_init.sh" ] && [ ! -e "$r/root/usr/sbin/dropbear" ]' \
     "but libz stays while a kept program names it, and custom_init.sh while the stock start script calls it"
   check '[ "$(grep -c "keep /lib/libz.so.1.2.11" "$r/install.log")" = 1 ]' "the guard's scan runs once an install, not again at make_room"
+
+  echo "== $sh: installed over an earlier OCBM, the programs this version retired go (retired.list, 8 Nov)"
+  r="$T/$sh-retire"; make_box "$r"; blob "$r/root/usr/sbin/aa-bridge" 3000; chmod 755 "$r/root/usr/sbin/aa-bridge"
+  run_once "$sh" "$r"; rc=$?
+  check '[ $rc = 0 ] && installed "$r" && [ ! -e "$r/root/usr/sbin/aa-bridge" ] && grep -q "retired /usr/sbin/aa-bridge" "$r/install.log"' \
+    "aa-bridge goes, and the log says so"
 
   echo "== $sh: a report Stage B still owes the stick, at the start the image installs at (the truck, 4 Nov)"
   # The revert ran with no stick in; at the next stock start the dispatcher's deliver() and this install meet.

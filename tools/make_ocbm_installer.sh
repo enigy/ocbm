@@ -22,7 +22,7 @@ die() { printf 'make_ocbm_installer: %s\n' "$*" >&2; exit 1; }
 
 payload() {  # SOURCE|PATH-ON-BOX: the programs and boot scripts, then Stage B/C
   local b s
-  for b in ocbmd iap2d carplayd btd aa-bridge; do echo "$BIN_DIR/$b|usr/sbin/$b"; done
+  for b in ocbmd iap2d carplayd btd; do echo "$BIN_DIR/$b|usr/sbin/$b"; done
   echo "$IRS_BIN|usr/bin/iap_role_switch"
   echo "$REPO/ccpa/rootfs/script/ocbm_boot.sh|script/ocbm_boot.sh"
   echo "$REPO/tools/run_ocbmd.sh|script/run_ocbmd.sh"
@@ -30,6 +30,7 @@ payload() {  # SOURCE|PATH-ON-BOX: the programs and boot scripts, then Stage B/C
   for s in session_supervisor projection_up phone_reset run_supervisor; do echo "$REPO/tools/$s.sh|script/$s.sh"; done
   for s in ocbm_dispatch ocbm_selftest ocbm_revert ocbm_finish ocbm_update ocbm_restore; do echo "$INSTALLER_DIR/$s.sh|script/$s.sh"; done
   echo "$REPO/tools/stock_restore_box.sh|script/stock_restore_box.sh"   # ocbm_restore.sh's engine: back to stock from a stick
+  echo "$INSTALLER_DIR/retired.list|etc/ocbm/retired.list"   # what later versions dropped: a commit and once.sh delete it
 }
 
 if [ "${1:-}" = --list ]; then payload | cut -d'|' -f2; exit 0; fi

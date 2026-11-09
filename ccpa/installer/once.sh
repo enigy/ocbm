@@ -11,11 +11,13 @@
 #                part way) are removed first, so the room is measured: nothing uses them while no
 #                mode is set, and a refusal then says so.
 #   2 backup     stick: mtd0-2 to OCBM_BACKUP/<id>/, each read back against its SHA-256 (a complete one
-#                from an earlier try is kept: it predates every change); both
+#                from an earlier try is kept: it predates every change; one that doesn't check out is
+#                never written over: a refusal); both
 #                routes: /etc/ocbm/identity.tgz. A failed backup is a refusal.
 #   3 make room  delete prune.list (HiCar, Android Mirror, test leftovers, web UI pages); stock
 #                CarPlay and Android Auto keep working. Removed paths go to /etc/ocbm/pruned.txt.
-#   4 place      each payload file as .new, checked against SHA256SUMS, then renamed
+#   4 place      each payload file as .new, checked against SHA256SUMS, then renamed; then the files
+#                an earlier OCBM placed that this one retired (/etc/ocbm/retired.list) are deleted
 #   5 arm        keep start_main_service.stock.sh, write /script/ocbm_mode=trial, then the one
 #                boot-critical write: rename the dispatcher over start_main_service.sh. Power lost
 #                before that rename leaves an adapter that boots stock, and running this again
@@ -252,7 +254,7 @@ DIRS
 under_root() { case "$1" in "$ROOT"/?*) return 0 ;; esac; return 1; }
 payload_files() {  # what the place step writes: the manifest's usr/sbin, usr/bin and script files
   while read -r sum rel; do
-    case "$rel" in script/ocbm_dispatch.sh) ;; usr/sbin/*|usr/bin/*|script/*) echo "$rel" ;; esac
+    case "$rel" in script/ocbm_dispatch.sh) ;; usr/sbin/*|usr/bin/*|script/*|etc/ocbm/retired.list) echo "$rel" ;; esac
   done < "$PAYLOAD/SHA256SUMS"
 }
 
@@ -324,7 +326,7 @@ fi
 grep -q "^$MARK" "$PAYLOAD/script/ocbm_dispatch.sh" 2>/dev/null \
   || refuse "The image has no OCBM start script: it is damaged or incomplete."
 while read -r sum rel; do
-  case "$rel" in script/ocbm_dispatch.sh) continue ;; usr/sbin/*|usr/bin/*|script/*) ;; *) continue ;; esac
+  case "$rel" in script/ocbm_dispatch.sh) continue ;; usr/sbin/*|usr/bin/*|script/*|etc/ocbm/retired.list) ;; *) continue ;; esac
   # The radio seam (script/radio_*.sh) is ours even without /etc/ocbm: stock never ships it, and every
   # tool that takes OCBM off keeps it through is_radio(), stock_restore.sh included. An adapter restored
   # to stock still has it (the factory adapter, 29 Oct), so it is replaced like the rest of the payload.
@@ -404,6 +406,10 @@ if [ "$ROUTE" = stick ]; then
   if [ "$(grep -cE '^[0-9a-f]{64}  mtd[012]\.bin$' "$B/SHA256SUMS" 2>/dev/null)" = 3 ] \
      && (cd "$B" && sha256sum -c SHA256SUMS >/dev/null 2>&1); then
     say "flash backup: kept the earlier one in OCBM_BACKUP/$id"
+  elif [ -n "$(ls -A "$B" 2>/dev/null)" ]; then
+    # Something is in this adapter's backup folder and it doesn't check out: it may be the only copy of the
+    # factory flash (the truck's stick, 8 Nov), so it is never written over. Nothing has changed yet.
+    refuse "The stick already holds a flash backup of this adapter in OCBM_BACKUP/$id that doesn't check out, and an install never writes over one. Keep that stick safe and install from another USB stick."
   else
   mkdir -p "$B" || fail_backup "cannot write to the stick"
   rm -f "$B/SHA256SUMS"
@@ -463,6 +469,14 @@ while read -r sum rel; do
   fi
 done < "$PAYLOAD/SHA256SUMS"
 sync
+# Installed over an earlier OCBM: the files this version no longer ships go (the payload's retired.list).
+if [ -f "$PAYLOAD/etc/ocbm/retired.list" ]; then
+  sed 's/#.*//' "$PAYLOAD/etc/ocbm/retired.list" | while read -r t; do
+    case "$t" in *..*) continue ;; usr/sbin/?*|usr/bin/?*|script/?*) ;; *) continue ;; esac
+    [ -e "$ROOT/$t" ] && rm -f "$ROOT/$t" && say "retired /$t"
+  done
+  sync
+fi
 say "placed the OCBM files"
 
 # ---------------------------------------------------------------------------------------------

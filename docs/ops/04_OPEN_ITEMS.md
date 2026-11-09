@@ -766,7 +766,7 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
   (`wrapLatencyMs`/`handoffLatencyMs`, `wraplat=` in `AVmon`, replacing the V5 `declat`/`decodeLatencyMs`
   names, which measured a buffer wrap, not decode). **Next relaunch must confirm:** the start-of-session
   enqueue-queue burst is gone, `dropFps`≈0 in steady state, and `handoffLatencyMs` stays inside one
-  frame interval. Detail: [`../host/00_MACOS_HOST_APP.md`](../host/00_MACOS_HOST_APP.md) "Host decode
+  frame interval. Detail: [`../host/00_MACOS_HOST_APP.md`](https://github.com/enigy/ocbm/blob/v1.0.4/docs/host/00_MACOS_HOST_APP.md) "Host decode
   pipeline".
 
 > **Also see [../ops/04_OPEN_ITEMS.md](../ops/04_OPEN_ITEMS.md) Phase 4**
@@ -1397,7 +1397,7 @@ still open is §4 of this file, not this list.
   `UsbHostManagementActivity` trampoline). A standalone proof module also exists in
   `host/CarlinkAndroid/usbhandler`. Full analysis, evidence, refuted alternatives and the endpoint
   correction (`0x81/0x01`, not `0x83/0x02`):
-  [`../host/01_ANDROID_AND_AAOS.md`](../host/01_ANDROID_AND_AAOS.md).
+  [`../host/01_ANDROID_AND_AAOS.md`](https://github.com/enigy/carlink/blob/main/docs/ANDROID_AND_AAOS.md).
   Adapter side needs no change (the `0x1314:0x2d00` identity is already correct — docs/carplay/00_ARCHITECTURE.md).
 
 ### Android host app (`host/CarlinkAndroid`) — 2026-09-18 session

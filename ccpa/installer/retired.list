@@ -1,0 +1,8 @@
+# retired.list — files earlier OCBM versions placed that this version no longer ships. One path per
+# line, relative to /, under usr/sbin, usr/bin or script (nothing else is ever deleted). Shipped as
+# /etc/ocbm/retired.list in the image's payload and in every update package:
+#   - ocbm_dispatch.sh's update_commit deletes them once an update has passed its self-test, so a
+#     rollback still has them;
+#   - once.sh deletes them when it installs over an earlier OCBM.
+# Lines are only ever added. A path that comes back in a later version must leave this list first.
+usr/sbin/aa-bridge

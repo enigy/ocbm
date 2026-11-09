@@ -61,12 +61,6 @@ fi
 $BOX_CARGO zigbuild $BOX_STD --target armv7-unknown-linux-musleabihf --release -p btd
 echo "built  target/armv7-unknown-linux-musleabihf/release/btd  ($(wc -c < target/armv7-unknown-linux-musleabihf/release/btd) bytes, armv7 static)"
 
-# aa-bridge (Android Auto AOAP pump, docs/androidauto/00_ARCHITECTURE.md) — shipped box binary, in the image.
-$BOX_CARGO zigbuild $BOX_STD --target armv7-unknown-linux-musleabihf --release -p aa-bridge
-# NOTE: no aa-wireless line. Wireless Android Auto is a LIBRARY linked into btd, not a
-# daemon of its own — see ccpa/aa-wireless/src/lib.rs. It builds as part of that binary.
-echo "built  target/armv7-unknown-linux-musleabihf/release/aa-bridge  ($(wc -c < target/armv7-unknown-linux-musleabihf/release/aa-bridge) bytes, armv7 static)"
-
 # iap_role_switch (phone-side 0x51 USB host-role switch helper) — static armv7 C, built with zig cc.
 if command -v zig >/dev/null 2>&1; then
   zig cc -target arm-linux-musleabihf -static -Os -s -o accessory_init/iap_role_switch.armv7 accessory_init/iap_role_switch.c

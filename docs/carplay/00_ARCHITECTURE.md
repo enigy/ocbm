@@ -176,7 +176,7 @@ the app.
 > `pm list permissions -f`. `:app` substitutes an active `MediaSession`, `Notification.CallStyle`,
 > `CarAppFocusManager` and a permission-free `CarUxRestrictionsManager` listener instead; cluster
 > turn-by-turn video and `CH_ALT_VIDEO` on a cluster display are consequently out of reach for it.
-> Full detail: [`../host/01_ANDROID_AND_AAOS.md`](../host/01_ANDROID_AND_AAOS.md) and
+> Full detail: [`../host/01_ANDROID_AND_AAOS.md`](https://github.com/enigy/carlink/blob/main/docs/ANDROID_AND_AAOS.md) and
 > `host/CarlinkAndroid/OCBMANDROID.md`.
 
 ### Vendored assets (CORRECTED 2026-08-10 — the previous text pointed at an archived directory and at

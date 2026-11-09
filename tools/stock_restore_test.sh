@@ -330,11 +330,13 @@ onefile_tests() {  # $1 shell
   rm -rf "$T/rsstock"; cp -pR "$T/stock" "$T/rsstock"; echo 2025.10.15.1127 > "$T/rsstock/etc/software_version"
   python3 -I "$HERE/jffs2_extract_test.py" --make-image "$T/rsstock" "$T/rsstock.bin"
   r="$T/rs"; stick_box "$r" "$T/rsstock.bin"; m="$(cksum "$r/dev/mtd0" "$r/dev/mtd1")"
+  # A program an update left behind (aa-bridge, before 1.0.5's retire list): the restore takes it away too.
+  blob "$r/root/usr/sbin/aa-bridge" 3000; chmod 755 "$r/root/usr/sbin/aa-bridge"
   run_restore "$r"; rc=$?
   check '[ $rc -eq 0 ] && restore_says "$r" "BACK TO STOCK" && [ -e "$r/rebooted" ] && [ -e "$r/stick/OCBM_RESTORE.done" ] && [ ! -e "$r/stick/OCBM_RESTORE.txt" ]' \
     "a final adapter goes back to stock from its stick's backup, reports it and restarts; restore_watch's note goes"
-  check '! is_dispatcher "$r/root" && cmp -s "$r/root/usr/sbin/ARMHiCar" "$T/stock/usr/sbin/ARMHiCar" && [ ! -e "$r/root/usr/sbin/ocbmd" ] && [ ! -e "$r/root/etc/ocbm" ]' \
-    "the rootfs is the factory's, extras included, OCBM gone"
+  check '! is_dispatcher "$r/root" && cmp -s "$r/root/usr/sbin/ARMHiCar" "$T/stock/usr/sbin/ARMHiCar" && [ ! -e "$r/root/usr/sbin/ocbmd" ] && [ ! -e "$r/root/etc/ocbm" ] && [ ! -e "$r/root/usr/sbin/aa-bridge" ]' \
+    "the rootfs is the factory's, extras included, OCBM gone, a leftover program too"
   check '[ ! -e "$r/root/script/stock_restore_box.sh" ] && grep -q RESTORE_VERIFIED "$r/run/ocbm_restore_verify.txt"' \
     "apply removes the engine from the rootfs, and verify still runs, from its copy in RAM"
   check '[ "$(cksum "$r/dev/mtd0" "$r/dev/mtd1")" = "$m" ] && [ ! -d "$r/run/ocbm-restore" ]' "mtd0 and mtd1 are only read; the decoded backup is gone from RAM"

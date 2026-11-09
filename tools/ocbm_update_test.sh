@@ -38,6 +38,7 @@ old_tree() {  # $1 dir
   printf 'old-ocbmd\n' > "$1/usr/sbin/ocbmd"
   printf 'old-carplayd\n' > "$1/usr/sbin/carplayd"
   printf 'btd-same\n' > "$1/usr/sbin/btd"
+  printf 'old-oldprog\n' > "$1/usr/sbin/oldprog"   # a program the new version no longer ships
   cp "$INST/ocbm_dispatch.sh" "$1/script/ocbm_dispatch.sh"
   cp "$INST/ocbm_update.sh" "$1/script/ocbm_update.sh"
   chmod 755 "$1"/usr/sbin/* "$1"/script/*
@@ -72,15 +73,18 @@ echo 'PASSED in 3 s'"
   : > "$d/proc/mounts"
   echo "42.17 80.00" > "$d/proc/uptime"
 }
-# A package that takes $OLD to $NEW: new ocbmd, a new program (aa-bridge), the same btd, and with
-# $2 = dispatch a changed start script too. $3 = from_min. $4 = what to leave out of files/.
+# A package that takes $OLD to $NEW: new ocbmd, a new program (newprog), the same btd, oldprog retired
+# (etc/ocbm/retired.list), and with $2 = dispatch a changed start script too. $3 = from_min. $4 = what to
+# leave out of files/.
 make_pkg() {  # $1 out file, $2 extra ('' | dispatch), $3 from_min, $4 omit
   local w="$T/pkg.$$" k
   rm -rf "$w"; mkdir -p "$w/new"
   old_tree "$w/new"
   printf 'new-ocbmd\n' > "$w/new/usr/sbin/ocbmd"
-  printf 'new-aa-bridge\n' > "$w/new/usr/sbin/aa-bridge"
-  chmod 755 "$w/new/usr/sbin/aa-bridge"
+  printf 'new-newprog\n' > "$w/new/usr/sbin/newprog"
+  chmod 755 "$w/new/usr/sbin/newprog"
+  rm -f "$w/new/usr/sbin/oldprog"
+  mkdir -p "$w/new/etc/ocbm"; printf '# retired\nusr/sbin/oldprog\n' > "$w/new/etc/ocbm/retired.list"
   [ "$2" = dispatch ] && printf '\n# changed in %s\n' "$NEW" >> "$w/new/script/ocbm_dispatch.sh"
   mkdir -p "$w/pkg"
   sums_of "$w/new" > "$w/pkg/SHA256SUMS"
@@ -115,13 +119,15 @@ stick_says() { grep -q "^OCBM update: $2" "$1/stick/OCBM_RESULT.txt" 2>/dev/null
 restart() { reap; rm -rf "${1:?}/run"; mkdir -p "$1/run"; rm -f "$1"/m.* "$1/rebooted"; }  # power cycle: /tmp is gone
 content() { cat "$1/root/$2" 2>/dev/null; }
 is_old() {  # $1 dir: the old version in place, nothing of the update left
-  [ "$(content "$1" usr/sbin/ocbmd)" = old-ocbmd ] && [ ! -e "$1/root/usr/sbin/aa-bridge" ] \
+  [ "$(content "$1" usr/sbin/ocbmd)" = old-ocbmd ] && [ ! -e "$1/root/usr/sbin/newprog" ] \
+    && [ "$(content "$1" usr/sbin/oldprog)" = old-oldprog ] && [ ! -e "$1/root/etc/ocbm/retired.list" ] \
     && cmp -s "$1/root/script/start_main_service.sh" "$1/old/script/ocbm_dispatch.sh" \
     && [ "$(content "$1" etc/ocbm/installed_version)" = "$OLD" ] && [ ! -e "$1/root/etc/ocbm/update_pending" ] \
     && [ -z "$(find "$1/root" -name '*.prev' -o -name '*.new' | head -1)" ]
 }
-is_new() {  # $1 dir: the update kept, its .prev copies gone
-  [ "$(content "$1" usr/sbin/ocbmd)" = new-ocbmd ] && [ "$(content "$1" usr/sbin/aa-bridge)" = new-aa-bridge ] \
+is_new() {  # $1 dir: the update kept, its .prev copies gone, the program it retired deleted
+  [ "$(content "$1" usr/sbin/ocbmd)" = new-ocbmd ] && [ "$(content "$1" usr/sbin/newprog)" = new-newprog ] \
+    && [ ! -e "$1/root/usr/sbin/oldprog" ] \
     && [ "$(content "$1" usr/sbin/btd)" = btd-same ] \
     && [ "$(content "$1" etc/ocbm/installed_version)" = "$NEW" ] && [ ! -e "$1/root/etc/ocbm/update_pending" ] \
     && [ -z "$(find "$1/root" -name '*.prev' -o -name '*.new' | head -1)" ]
@@ -146,6 +152,16 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   check 'waitfor "is_new \"$d\"" 5' "the trial passes and a host is answered: the update is kept, installed_version moves on"
   check 'result_is "$d" "committed $NEW (from $OLD)"' "update_result: committed"
   check '[ ! -e "$d/rebooted" ] && [ -e "$d/m.boot" ] && [ "$(cat "$d/root/script/ocbm_mode")" = final ]' "no restart; still final"
+
+  # The retire list (8 Nov): a commit a power cut stopped part way finishes at the next start, retired files and all.
+  echo "== $sh: a power cut mid-commit: the next start finishes it, the retired program deleted"
+  d="$T/$sh-cutcommit"; make_box "$d" final; make_pkg "$d/run/ocbm-update.tgz" dispatch
+  update "$sh" "$d"
+  check '[ "$(content "$d" usr/sbin/oldprog)" = old-oldprog ]' "placed: the retired program is still there during the trial"
+  echo committing >> "$d/root/etc/ocbm/update_pending"; rm -f "$d/root/usr/sbin/ocbmd.prev"   # cut after the first .prev went
+  restart "$d"; boot "$sh" "$d"
+  check 'waitfor "is_new \"$d\"" 5 && result_is "$d" "committed $NEW (from $OLD)"' "committed at the next start, oldprog deleted"
+  check 'grep -q "retired /usr/sbin/oldprog" "$d/run/box.log"' "the log says what was retired"
 
   # Kept only once ocbmd has answered a host: the self-test needs none, and an update that breaks the
   # accessory link passes it (the Mac, 4 Nov: 1.0.2's dispatcher committed before the first HELLO, and an
@@ -192,7 +208,7 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   echo "== $sh: an update whose self-test fails goes back to the version it replaced"
   d="$T/$sh-fail"; make_box "$d" final; make_pkg "$d/run/ocbm-update.tgz" dispatch
   update "$sh" "$d"; restart "$d"; touch "$d/st.fail"; boot "$sh" "$d"
-  check 'waitfor "is_old \"$d\" && [ -e \"$d/rebooted\" ]" 5' "the old version back, aa-bridge gone, and a restart"
+  check 'waitfor "is_old \"$d\" && [ -e \"$d/rebooted\" ]" 5' "the old version back, newprog gone, oldprog kept, and a restart"
   check 'result_is "$d" "rolled_back $NEW: its start-up self-test failed"' "update_result: rolled_back, with the reason"
   check '[ "$(cat "$d/root/script/ocbm_mode")" = final ]' "still final"
 
@@ -377,9 +393,10 @@ fi
 
 echo "== make_ocbm_update.sh"
 b="$T/build"; mkdir -p "$b/bin" "$b/inst" "$b/from" "$b/out"
-for f in ocbmd iap2d carplayd btd aa-bridge; do printf '%s v1\n' "$f" > "$b/bin/$f"; done
+for f in ocbmd iap2d carplayd btd; do printf '%s v1\n' "$f" > "$b/bin/$f"; done
 printf 'irs\n' > "$b/irs"
 for f in ocbm_dispatch ocbm_selftest ocbm_revert ocbm_finish ocbm_update ocbm_restore; do cp "$INST/$f.sh" "$b/inst/$f.sh"; done
+cp "$INST/retired.list" "$b/inst/retired.list"
 echo 1.0.0 > "$b/inst/VERSION"
 printf 'final_kb=3900\ntrial_kb=1252\n' > "$b/inst/update_budget"
 export BIN_DIR="$b/bin" IRS_BIN="$b/irs" INSTALLER_DIR="$b/inst"
@@ -406,7 +423,7 @@ check 'gzip -dc "$pk" | tar -tvf - | awk "\$2 == \"root/root\" || (\$3 == \"root
 printf 'final_kb=3900\ntrial_kb=300\n' > "$b/inst/update_budget"
 out=$("$REPO/tools/make_ocbm_update.sh" --from "$b/from/SHA256SUMS" "$b/out" 2>&1); rc=$?
 rm -rf "$b/x"; mkdir -p "$b/x" && (cd "$b/x" && gzip -dc "$pk" | tar -xf -)
-check '[ $rc = 0 ] && grep -qx "trial=no" "$b/x/ROOM" && echo "$out" | grep -q "going back to stock and converting again"' \
+check '[ $rc = 0 ] && grep -qx "trial=no" "$b/x/ROOM" && echo "$out" | grep -q "finishing their install first"' \
   "over the trial budget: built, marked trial=no"
 printf 'final_kb=200\ntrial_kb=100\n' > "$b/inst/update_budget"
 check '! "$REPO/tools/make_ocbm_update.sh" --from "$b/from/SHA256SUMS" "$b/out" >/dev/null 2>&1' "over the final budget: no package (no adapter could take it)"

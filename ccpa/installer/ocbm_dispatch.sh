@@ -151,9 +151,21 @@ put() {  # $1 file, $2 its one line: written .new + rename, so a power cut leave
   { echo "$2" > "$1.new" && mv -f "$1.new" "$1"; } 2>/dev/null
 }
 
+retire() {  # $1 a retired.list: delete the files it names that this adapter still has (usr/sbin, usr/bin, script only)
+  [ -f "$1" ] || return 0
+  sed 's/#.*//' "$1" | while read -r t; do
+    case "$t" in *..*) continue ;; usr/sbin/?*|usr/bin/?*|script/?*) ;; *) continue ;; esac
+    [ -e "$ROOT/$t" ] || [ -e "$ROOT/$t.prev" ] || continue
+    rm -f "$ROOT/$t" "$ROOT/$t.prev" && log "retired /$t"
+  done
+}
+
 update_commit() {  # the update passed its self-test and ocbmd answered a host (or a power cut stopped its commit): keep it
   grep -qx committing "$U" || { echo committing >> "$U"; sync; }
   awk '$1 == "replace" { print $2 }' "$U" | while read -r t; do rm -f "$ROOT/$t.prev"; done
+  # Files this version no longer ships go only now, once it is kept: a rollback before this still has them.
+  # The commit runs again after a power cut, and deleting what is already gone is nothing.
+  retire "$EO/retired.list"; sync
   to=$(journal to); from=$(journal from)
   put "$EO/installed_version" "$to"
   put "$EO/update_result" "committed $to (from $from)"

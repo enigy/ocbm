@@ -16,7 +16,7 @@
 # Room: the files that change, at JFFS2's ~0.7 of their size, plus the 384 KB spare, must fit
 # final_kb in ccpa/installer/update_budget, or the build fails: no adapter could take the package.
 # Over trial_kb it says so, and writes trial=no in the package's ROOM file: Carlink then updates
-# trial adapters by going back to stock and converting again.
+# trial adapters by finishing their install first (Remove stock firmware), which frees the room.
 #
 # Build the box binaries first (build.sh), as for tools/make_ocbm_installer.sh, whose payload list
 # this uses (--sources). Test hooks (tools/ocbm_update_test.sh): BIN_DIR IRS_BIN INSTALLER_DIR BUDGET.
@@ -86,7 +86,7 @@ echo "$from_ver" > "$stage/pkg/FROM_MIN"
 trial=yes
 if [ "$need_kb" -gt "$trial_kb" ]; then
   trial=no
-  echo "make_ocbm_update: about $need_kb KB is more than a trial adapter has ($trial_kb KB): Carlink updates trial adapters by going back to stock and converting again" >&2
+  echo "make_ocbm_update: about $need_kb KB is more than a trial adapter has ($trial_kb KB): Carlink updates trial adapters by finishing their install first (Remove stock firmware)" >&2
 fi
 printf 'need_kb=%s\ntrial=%s\n' "$need_kb" "$trial" > "$stage/pkg/ROOM"
 

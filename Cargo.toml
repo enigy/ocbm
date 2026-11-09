@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/ocbm-proto", "crates/box-common", "crates/bt-common", "ccpa/ocbmd", "ccpa/iap2d", "ccpa/carplayd", "ccpa/aa-bridge", "ccpa/aa-wireless", "host/ocbm-host", "crates/vendor/wireless",
+members = ["crates/ocbm-proto", "crates/box-common", "crates/bt-common", "ccpa/ocbmd", "ccpa/iap2d", "ccpa/carplayd", "ccpa/aa-wireless", "host/ocbm-host", "crates/vendor/wireless",
     # The remote MFi wire format, linked into btd and carplayd until phase C6 removes the remote path.
     "crates/mfi-wire",
 ]
