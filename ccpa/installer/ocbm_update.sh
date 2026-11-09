@@ -64,8 +64,8 @@ mkdir -p "$RUN"
 mkdir "$RUN/ocbm_mode.lock" 2>/dev/null || { log "refused: a go-back, the finish or another update is running"; exit 1; }
 unlock() { rmdir "$RUN/ocbm_mode.lock" 2>/dev/null; }
 clean() {  # what this run (or one a power cut stopped before its journal) left behind
-  [ -f "$U" ] || find "$ROOT/script" "$ROOT/usr/sbin" "$ROOT/usr/bin" -name '*.new' -type f 2>/dev/null \
-    | while read -r f; do rm -f "$f"; done
+  [ -f "$U" ] || { find "$ROOT/script" "$ROOT/usr/sbin" "$ROOT/usr/bin" -name '*.new' -type f 2>/dev/null \
+    | while read -r f; do rm -f "$f"; done; rm -f "$EO/retired.list.new"; }
   rm -rf "$WORK"
 }
 refuse() {
@@ -177,8 +177,9 @@ step place
 while read -r want rel; do
   t=$(target "$rel")
   mkdir -p "$(dirname "$ROOT/$t")"
-  # Every payload file is a program or a script: 755, owned by whoever runs this (root on the adapter).
-  { cp "$WORK/files/$rel" "$ROOT/$t.new" && chmod 755 "$ROOT/$t.new" && [ "$(sum_of "$ROOT/$t.new")" = "$want" ]; } 2>/dev/null \
+  # A program or a script: 755, owned by whoever runs this (root on the adapter). The retire list: 644.
+  case "$t" in etc/*) m=644 ;; *) m=755 ;; esac
+  { cp "$WORK/files/$rel" "$ROOT/$t.new" && chmod $m "$ROOT/$t.new" && [ "$(sum_of "$ROOT/$t.new")" = "$want" ]; } 2>/dev/null \
     || refuse "Could not write /$t (the flash may be full). Nothing was changed."
 done < "$list"
 sync

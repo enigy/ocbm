@@ -31,7 +31,7 @@ KEPT="usr/sbin/boa etc/boa/boa.conf etc/mime.types usr/sbin/i2cset usr/sbin/i2cd
 
 # --- build an image from stand-ins ---------------------------------------------------------
 mkdir -p "$T/bin"
-for b in ocbmd iap2d carplayd btd aa-bridge; do blob "$T/bin/$b" 70000; done
+for b in ocbmd iap2d carplayd btd; do blob "$T/bin/$b" 70000; done
 blob "$T/irs" 20000
 cp -R "$REPO/ccpa/installer" "$T/inst"
 echo "== build"
@@ -125,7 +125,8 @@ installed() {  # $1 dir: the armed state, complete
   [ "$(cat "$R/script/ocbm_mode" 2>/dev/null)" = trial ] || return 1
   for rel in $(bash "$HERE/make_ocbm_installer.sh" --list); do
     [ "$rel" = script/ocbm_dispatch.sh ] && continue
-    cmp -s "$T/img/tmp/ocbm/$rel" "$R/$rel" && [ -x "$R/$rel" ] || return 1
+    cmp -s "$T/img/tmp/ocbm/$rel" "$R/$rel" || return 1
+    case "$rel" in etc/*) ;; *) [ -x "$R/$rel" ] || return 1 ;; esac
   done
 }
 stock_boot() { [ "$(cat "$1/root/script/start_main_service.sh")" = "$STOCK_SMS" ]; }

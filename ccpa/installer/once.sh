@@ -459,9 +459,9 @@ say "flash after making room: $free2 KB free"
 # ---------------------------------------------------------------------------------------------
 step place
 while read -r sum rel; do
-  case "$rel" in script/ocbm_dispatch.sh) continue ;; usr/sbin/*|usr/bin/*|script/*) ;; *) continue ;; esac
+  case "$rel" in script/ocbm_dispatch.sh) continue ;; usr/sbin/*|usr/bin/*|script/*) mode=755 ;; etc/ocbm/retired.list) mode=644 ;; *) continue ;; esac
   dest="$ROOT/$rel"
-  if cp "$PAYLOAD/$rel" "$dest.new" && chmod 755 "$dest.new" && [ "$(sum_of "$dest.new")" = "$sum" ]; then
+  if cp "$PAYLOAD/$rel" "$dest.new" && chmod $mode "$dest.new" && [ "$(sum_of "$dest.new")" = "$sum" ]; then
     mv -f "$dest.new" "$dest"
   else
     rm -f "$dest.new"
