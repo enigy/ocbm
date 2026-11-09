@@ -115,7 +115,7 @@ written `OCBM_RESULT.txt`. Check it:
 ./target/release/ocbm-host install 1314 2d00 info
 ```
 
-Expect `caps=0x000007ff` in the `HELLO_ACK` line, which includes `CAP_INSTALL` (`0x100`) and
+Expect `caps=0x000007d1` in the `HELLO_ACK` line (OCBM 1.0.5 and later; `0x000007ff` before), which includes `CAP_INSTALL` (`0x100`) and
 `CAP_UPDATE` (`0x200`), and `"install":"trial"` and `"update":"none"` in the JSON.
 
 Take the stick out before driving and keep it: `OCBM_BACKUP` is the adapter's way back to stock from

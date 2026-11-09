@@ -22,18 +22,8 @@ pub const MAX_PAYLOAD: usize = 65536;
 
 // channels
 pub const CH_CTRL: u16 = 0x0000;
-pub const CH_MFI: u16 = 0x0001;
-/// Length of the OPTIONAL 1-byte MFi correlation tag, appended after the declared payload of a
-/// CH_MFI request and echoed on the response (`ocbmd::handle_mfi`). The reply carries no opcode echo
-/// and no request id, so a host with two concurrent chip users could otherwise correlate only by
-/// payload length — which cannot tell two 128-byte signatures apart, and a late reply to a timed-out
-/// sign then answers the wrong digest. Additive in both directions: a peer that sends no tag gets
-/// none back and keeps the old length-correlation behaviour.
-pub const MFI_TAG_LEN: usize = 1;
 pub const CH_CONSOLE: u16 = 0x0002;
-pub const CH_IP: u16 = 0x0010;
 pub const CH_FILE: u16 = 0x0011; // host->box file push (reliable binary deploy), see FILE_* sub-frames
-pub const CH_ETH: u16 = 0x0012; // raw L2 ethernet frames bridged box<->host (each payload = one frame)
 pub const CH_VIDEO: u16 = 0x0020; // box->host A/V: MAIN screen video. Forward-encrypted (ChaCha20-Poly1305) with seq+SEAM_MAGIC seam framing; the host decrypts + decodes (OCBM_FWD_ENC model). Box seam :9001
 pub const CH_MEDIA_AUDIO: u16 = 0x0021; // box->host A/V: media audio, same forward-encrypted seam framing (box hands the per-stream key; host decrypts). Box seam :9002
 pub const CH_ALT_AUDIO: u16 = 0x0022; // box->host A/V: voice-sink streams (telephony/speechRecognition/alert/default), same seam framing as media
@@ -81,8 +71,17 @@ pub const CH_LOG: u16 = 0x0042; // box->host ONLY: the box's universal log (/tmp
                                 // Payload = one or more back-to-back entries, each
                                 // [source u8][flags u8][seq u16 LE][unix_ms u64 LE][len u16 LE][text len B]
                                 // (see `encode_log_entry`). Off by default; the host arms it with CT_LOG_CTL.
-pub const CH_ECHO: u16 = 0x00FF;
-pub const CH_DISCARD: u16 = 0x0FFF; // box parses + drops silently (uplink benchmark sink)
+
+// Retired numbers (OCBM 1.0.5, the CarPlay-only cleanup). Reserved: never reuse one, because an older
+// Carlink, the box's older builds and Carlink's protocol checker would read it the old way. Kept here as a
+// table, not as constants, so a client that still defines one sees a gap, not a clash.
+//
+//   channels   CH_MFI 0x0001 (the host MFi relay; the chip's only users are the box's own daemons),
+//              CH_IP 0x0010 (the userspace TCP/UDP relay), CH_ETH 0x0012 (the raw ncm0 bridge),
+//              CH_ECHO 0x00FF and CH_DISCARD 0x0FFF (the throughput benches)
+//   control    CT_SRC 0x04 (the downlink flood), CT_ETH_START 0x06 and CT_ETH_STOP 0x07
+//   caps       CAP_ECHO 0x0000_0002, CAP_MFI 0x0000_0004, CAP_IP 0x0000_0008, CAP_ETH 0x0000_0020
+//   CH_IP      IP_OPEN 0x01, IP_DATA 0x02, IP_CLOSE 0x03, IP_OPEN_UDP 0x04
 
 // flags
 pub const F_SOM: u8 = 0x01;
@@ -116,10 +115,7 @@ pub const CT_HELLO: u8 = 0x01; // host->box [CT_HELLO][ver][instance u32 LE] —
                                // from a genuine reattach by the SAME host, which can still warm-reuse.
 pub const CT_HELLO_ACK: u8 = 0x02;
 pub const CT_MODE_SELECT: u8 = 0x03;
-pub const CT_SRC: u8 = 0x04; // [CT_SRC][u32 ms LE] -> box floods CH_ECHO for downlink benchmark
 pub const CT_SETTIME: u8 = 0x05; // [CT_SETTIME][u64 unix_seconds LE] -> box sets its clock (no RTC battery)
-pub const CT_ETH_START: u8 = 0x06; // [CT_ETH_START][iface bytes?] -> box bridges that netdev (default "ncm0") onto CH_ETH
-pub const CT_ETH_STOP: u8 = 0x07; // [CT_ETH_STOP] -> box tears the raw-frame bridge down
 
 // Session-control (docs/carplay/02_SESSION_LIFECYCLE.md lifecycle): the host app is the session's reason to exist. It SUBSCRIBEs
 // (announces a live receiver + pushes its ephemeral YAML config), HEARTBEATs to prove liveness, and
@@ -399,27 +395,12 @@ pub const MODE_CONSOLE: u8 = 0x01;
 
 // capability bits
 pub const CAP_CONSOLE: u32 = 0x0000_0001;
-pub const CAP_ECHO: u32 = 0x0000_0002;
-pub const CAP_MFI: u32 = 0x0000_0004;
-pub const CAP_IP: u32 = 0x0000_0008;
 pub const CAP_FILE: u32 = 0x0000_0010;
-pub const CAP_ETH: u32 = 0x0000_0020; // box can bridge a raw-ethernet netdev (ncm0) over CH_ETH
 pub const CAP_PHONE_POLICY: u32 = 0x0000_0040; // box takes MGMT_SET_POLICY / MGMT_CONNECT_DEVICE
 pub const CAP_PAIR_WINDOW: u32 = 0x0000_0080; // box takes MGMT_PAIR_WINDOW and gates pairing behind it
 pub const CAP_INSTALL: u32 = 0x0000_0100; // box takes MGMT_INSTALL_CONFIRM / MGMT_GO_STOCK and reports "install" in MGMT_INFO
 pub const CAP_UPDATE: u32 = 0x0000_0200; // box takes MGMT_UPDATE and reports "update" in MGMT_INFO
 pub const CAP_PHONE_SWITCH: u32 = 0x0000_0400; // box takes MGMT_SWITCH_DEVICE: Connect may end another phone's wireless session
-
-// OCBM_CH_IP stream-mux sub-frame types. Payload = [type u8][conn_id u16 LE][data].
-// AAOS has no NCM, so L3 is done in userspace over this channel (no kernel TUN needed).
-//
-// The OPEN target is an "ip:port" LITERAL, never a hostname: the box relays it on its
-// single-threaded dispatch loop, and resolving a name there is an unbounded getaddrinfo the
-// per-connect deadline does not cover. A non-literal target is refused with IP_CLOSE.
-pub const IP_OPEN: u8 = 0x01; // TCP: data = target "ip:port"; box connect()s and relays
-pub const IP_DATA: u8 = 0x02; // data = stream bytes (TCP) or one datagram (UDP)
-pub const IP_CLOSE: u8 = 0x03; // no data
-pub const IP_OPEN_UDP: u8 = 0x04; // UDP: data = target "ip:port"; box binds + connect()s a UdpSocket
 
 // OCBM_CH_FILE sub-frame types. Host pushes one file at a time to the box so binary
 // deploys ride the reliable accessory pipe instead of corruption-prone base64-over-UART.
@@ -1135,7 +1116,7 @@ mod tests {
     #[test]
     fn ch_log_and_ct_log_ctl_do_not_collide() {
         assert_eq!(CH_LOG, 0x0042);
-        for ch in [CH_CTRL, CH_MFI, CH_CONSOLE, CH_MGMT, CH_RTSP, CH_ECHO, CH_DISCARD] {
+        for ch in [CH_CTRL, CH_CONSOLE, CH_MGMT, CH_RTSP, CH_FILE] {
             assert_ne!(CH_LOG, ch);
         }
         // CT_LOG_CTL extends the CT_* space to 0x1B; docs/carplay/01_OCBM_PROTOCOL.md quotes that range.
@@ -1172,9 +1153,9 @@ mod tests {
     #[test]
     fn roundtrip() {
         let mut buf = [0u8; 64];
-        let n = frame(&mut buf, CH_ECHO, F_SOM | F_EOM, 7, b"hello");
+        let n = frame(&mut buf, CH_CONSOLE, F_SOM | F_EOM, 7, b"hello");
         let h = Header::parse(&buf[..HDR_LEN]).unwrap();
-        assert_eq!(h.channel, CH_ECHO);
+        assert_eq!(h.channel, CH_CONSOLE);
         assert_eq!(h.length, 5);
         assert_eq!(h.seq, 7);
         assert_eq!(&buf[HDR_LEN..n], b"hello");
@@ -1213,7 +1194,7 @@ mod tests {
         // Two whole frames delivered in ONE push must both come out via successive next() calls.
         let mut r = Reassembler::new();
         let (mut a, mut b) = ([0u8; 64], [0u8; 64]);
-        let na = frame(&mut a, CH_MFI, F_SOM | F_EOM, 1, b"one");
+        let na = frame(&mut a, CH_MGMT, F_SOM | F_EOM, 1, b"one");
         let nb = frame(&mut b, CH_CTRL, F_SOM | F_EOM, 2, b"two!!");
         let mut both = Vec::new();
         both.extend_from_slice(&a[..na]);
@@ -1221,7 +1202,7 @@ mod tests {
         r.push(&both);
         let mut out = vec![0u8; MAX_PAYLOAD];
         let (c1, _, l1) = r.next(&mut out).unwrap();
-        assert_eq!((c1, &out[..l1]), (CH_MFI, &b"one"[..]));
+        assert_eq!((c1, &out[..l1]), (CH_MGMT, &b"one"[..]));
         let (c2, _, l2) = r.next(&mut out).unwrap();
         assert_eq!((c2, &out[..l2]), (CH_CTRL, &b"two!!"[..]));
         assert!(r.next(&mut out).is_none());
@@ -1245,7 +1226,7 @@ mod tests {
         let mut r = Reassembler::new();
         let (mut a, mut b) = ([0u8; 64], [0u8; 64]);
         let na = frame(&mut a, CH_CTRL, F_SOM | F_EOM, 1, b"aa");
-        let nb = frame(&mut b, CH_ECHO, F_SOM | F_EOM, 2, b"bb");
+        let nb = frame(&mut b, CH_CONSOLE, F_SOM | F_EOM, 2, b"bb");
         r.push(&a[..na]);
         r.push(&[0x4D, 0x00, 0x42, 0xFF, 0x11]); // junk, includes a 'M' (magic byte)
         r.push(&b[..nb]);
@@ -1253,7 +1234,7 @@ mod tests {
         let (c1, _, l1) = r.next(&mut out).unwrap();
         assert_eq!((c1, &out[..l1]), (CH_CTRL, &b"aa"[..]));
         let (c2, _, l2) = r.next(&mut out).unwrap();
-        assert_eq!((c2, &out[..l2]), (CH_ECHO, &b"bb"[..]));
+        assert_eq!((c2, &out[..l2]), (CH_CONSOLE, &b"bb"[..]));
     }
     #[test]
     fn oversize_declared_length_is_rejected_and_resyncs() {
@@ -1283,16 +1264,16 @@ mod tests {
         assert_eq!(crc32(b""), 0x0000_0000);
     }
     #[test]
-    fn eth_frame_roundtrips_through_reassembler() {
-        // A full 1514-byte ethernet frame (14 hdr + 1500 MTU) must survive CH_ETH framing.
+    fn a_1514_byte_frame_roundtrips_through_reassembler() {
+        // An odd-sized payload (once a full ethernet frame, 14 hdr + 1500 MTU) survives framing.
         let mut r = Reassembler::new();
         let frame_bytes: Vec<u8> = (0..1514u32).map(|i| (i ^ 0x5A) as u8).collect();
         let mut buf = vec![0u8; HDR_LEN + frame_bytes.len()];
-        let n = frame(&mut buf, CH_ETH, F_SOM | F_EOM, 3, &frame_bytes);
+        let n = frame(&mut buf, CH_FILE, F_SOM | F_EOM, 3, &frame_bytes);
         r.push(&buf[..n]);
         let mut out = vec![0u8; MAX_PAYLOAD];
         let (ch, _fl, l) = r.next(&mut out).unwrap();
-        assert_eq!(ch, CH_ETH);
+        assert_eq!(ch, CH_FILE);
         assert_eq!(&out[..l], &frame_bytes[..]);
     }
     #[test]

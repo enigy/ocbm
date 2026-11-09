@@ -1,14 +1,13 @@
 //! ocbmd — box-side OCBM daemon (Rust, armv7/musl). Owns `/dev/usb_accessory` and
-//! multiplexes CTRL (handshake), ECHO (loopback), CONSOLE (root PTY over bulk),
-//! MFI (genuine Apple MFi 2.0C authentication bridge over `/dev/i2c-1`), IP (userspace
-//! TCP/UDP mux), and FILE (verified binary deploy). See ../../docs/carplay/01_OCBM_PROTOCOL.md.
+//! multiplexes CTRL (handshake and session), CONSOLE (root PTY over bulk), FILE (verified file
+//! push and pull), MGMT, LOG, and the CarPlay A/V, input and mic seams to carplayd. See
+//! ../../docs/carplay/01_OCBM_PROTOCOL.md.
 
 use ocbm_proto as p;
-use std::collections::HashMap;
 use std::ffi::CStr;
 use std::fs::{File, OpenOptions};
 use std::io::{IoSlice, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
@@ -41,134 +40,10 @@ enum Kind {
     Acc,    // the reader thread's pipe: what the host sent ([`start_acc_relay`])
     AccOut, // the writer thread's pipe: room for output, or POLLERR once that thread has ended
     Pty,
-    Conn(u16),
-    Eth,
     Mic,             // the mic-uplink seam to carplayd (readable: `uplink on/off` back-channel)
     Rtsp,            // the SETUP-relay seam to carplayd (readable: box→host RS_OPEN/RS_REQ/RS_CLOSE bytes)
     AvListen(usize), // a local A/V seam listener (index into av_listeners)
     AvConn(usize),   // an accepted A/V seam connection (index into av_conns)
-}
-
-/// Raw L2 ethernet bridge for CH_ETH: an AF_PACKET socket on `ncm0` carries the iPhone's
-/// wired-CarPlay link-local IPv6 (mDNS/NDP/RTSP/AirPlay) frames verbatim over OCBM to the host,
-/// where they land on a virtual ethernet interface the receiver binds `fe80::` on. Raw AF_PACKET
-/// is Linux-only, so this is cfg-gated with a stub elsewhere (keeps host-side unit tests building).
-#[cfg(target_os = "linux")]
-mod eth {
-    use libc::c_void;
-    use std::os::unix::io::RawFd;
-    const ETH_P_ALL: u16 = 0x0003;
-    const PACKET_OUTGOING: u8 = 4;
-
-    /// Open a non-blocking AF_PACKET SOCK_RAW socket bound to `ifname`, or None if absent.
-    pub fn open(ifname: &str) -> Option<RawFd> {
-        let mut cname = [0u8; 32];
-        let b = ifname.as_bytes();
-        if b.is_empty() || b.len() >= cname.len() {
-            return None;
-        }
-        cname[..b.len()].copy_from_slice(b);
-        let idx = unsafe { libc::if_nametoindex(cname.as_ptr() as *const libc::c_char) };
-        if idx == 0 {
-            return None; // interface doesn't exist (yet)
-        }
-        let proto = (ETH_P_ALL.to_be()) as libc::c_int;
-        // SOCK_CLOEXEC so this raw socket does not leak into the CONSOLE root shell on execv.
-        let fd =
-            unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW | libc::SOCK_CLOEXEC, proto) };
-        if fd < 0 {
-            return None;
-        }
-        let mut sll: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
-        sll.sll_family = libc::AF_PACKET as u16;
-        sll.sll_protocol = ETH_P_ALL.to_be();
-        sll.sll_ifindex = idx as i32;
-        let r = unsafe {
-            libc::bind(
-                fd,
-                &sll as *const _ as *const libc::sockaddr,
-                std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
-            )
-        };
-        if r < 0 {
-            unsafe { libc::close(fd) };
-            return None;
-        }
-        unsafe {
-            let fl = libc::fcntl(fd, libc::F_GETFL);
-            libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK);
-        }
-        Some(fd)
-    }
-
-    /// Receive the next INCOMING frame (Some(len)), internally skipping frames we sent
-    /// ourselves (PACKET_OUTGOING) so a bridged frame can't loop back out over OCBM. Returns
-    /// None only when the socket is drained (would-block) or errors — so a caller can batch-drain.
-    pub fn recv_frame(fd: RawFd, buf: &mut [u8]) -> Option<usize> {
-        loop {
-            let mut sa: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
-            let mut salen = std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t;
-            let n = unsafe {
-                libc::recvfrom(
-                    fd,
-                    buf.as_mut_ptr() as *mut c_void,
-                    buf.len(),
-                    // MSG_TRUNC makes recvfrom report the REAL frame length rather than the copied
-                    // one, so an oversize frame can be detected instead of being bridged truncated
-                    // (a silently corrupt frame is worse than a dropped one).
-                    libc::MSG_TRUNC,
-                    &mut sa as *mut _ as *mut libc::sockaddr,
-                    &mut salen,
-                )
-            };
-            if n <= 0 {
-                return None; // drained / error
-            }
-            if sa.sll_pkttype == PACKET_OUTGOING {
-                continue; // our own transmitted frame echoed back — skip and read the next
-            }
-            if n as usize > buf.len() {
-                continue; // did not fit: drop it rather than bridge a truncated frame
-            }
-            return Some(n as usize); // a real inbound frame
-        }
-    }
-
-    /// Send one frame onto the bound interface (host -> iPhone direction).
-    pub fn send_frame(fd: RawFd, data: &[u8]) {
-        unsafe { libc::send(fd, data.as_ptr() as *const c_void, data.len(), 0) };
-    }
-
-    pub fn close(fd: RawFd) {
-        unsafe { libc::close(fd) };
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-mod eth {
-    use std::os::unix::io::RawFd;
-    pub fn open(_ifname: &str) -> Option<RawFd> {
-        None
-    }
-    pub fn recv_frame(_fd: RawFd, _buf: &mut [u8]) -> Option<usize> {
-        None
-    }
-    pub fn send_frame(_fd: RawFd, _data: &[u8]) {}
-    pub fn close(_fd: RawFd) {}
-}
-
-/// A relayed CH_IP connection — TCP stream or UDP datagram socket.
-enum Conn {
-    Tcp(TcpStream),
-    Udp(UdpSocket),
-}
-impl Conn {
-    fn raw_fd(&self) -> RawFd {
-        match self {
-            Conn::Tcp(s) => s.as_raw_fd(),
-            Conn::Udp(s) => s.as_raw_fd(),
-        }
-    }
 }
 
 /// An in-progress CH_FILE push. Bytes land in a `.ocbm.part` temp; on a verified close
@@ -295,213 +170,13 @@ impl FileState {
     }
 }
 
-// ---- MFi authentication bridge over I2C (/dev/i2c-1 @0x11) — ported from the ncm_carplayd MFi auth helper ----
-const I2C_M_RD: u16 = 0x0001;
-const I2C_RDWR: libc::c_int = 0x0707;
-
-#[repr(C)]
-struct I2cMsg {
-    addr: u16,
-    flags: u16,
-    len: u16,
-    buf: *mut u8,
-}
-#[repr(C)]
-struct I2cRdwr {
-    msgs: *mut I2cMsg,
-    nmsgs: u32,
-}
-
-struct Mfi {
-    fd: RawFd,
-    addr: u16,
-}
-
-/// Bounded `flock` on `/tmp/carplay_mfi.lock`, the same file `carplayd`, `iap2d`,
-/// `btd` and `mfi-i2c-local` use.
-///
-/// `ocbmd` is the FIFTH chip user and took no lock at all — so a CH_MFI `sign` from the host could
-/// interleave its stateful write-challenge / poll / read-signature sequence with any other daemon's,
-/// corrupting both. The serialization guarantee every "four chip users" comment in the tree asserts
-/// was simply not complete. Same corruption class the 2026-07-25 QC pass fixed for `carplayd`.
-///
-/// Bounded, not `LOCK_EX`: a wedged peer must not hang the OCBM dispatch loop, which also carries
-/// video, audio and the console.
-struct MfiLock(RawFd);
-
-impl MfiLock {
-    fn acquire() -> Option<MfiLock> {
-        const DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
-        let fd = unsafe {
-            libc::open(
-                c"/tmp/carplay_mfi.lock".as_ptr(),
-                libc::O_CREAT | libc::O_RDWR | libc::O_CLOEXEC,
-                0o600,
-            )
-        };
-        if fd < 0 {
-            return None;
-        }
-        let start = std::time::Instant::now();
-        loop {
-            if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-                return Some(MfiLock(fd));
-            }
-            if start.elapsed() >= DEADLINE {
-                eprintln!("[mfi] lock busy >10s — another chip user is wedged; refusing");
-                unsafe { libc::close(fd) };
-                return None;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-    }
-}
-
-impl Drop for MfiLock {
-    fn drop(&mut self) {
-        unsafe {
-            libc::flock(self.0, libc::LOCK_UN);
-            libc::close(self.0);
-        }
-    }
-}
-
-impl Mfi {
-    fn open() -> Option<Mfi> {
-        // O_CLOEXEC so the MFi chip handle does not leak into the CONSOLE root shell on execv.
-        let fd = unsafe { libc::open(c"/dev/i2c-1".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
-        if fd < 0 {
-            None
-        } else {
-            Some(Mfi { fd, addr: 0x11 })
-        }
-    }
-    fn rd(&self, reg: u8, out: &mut [u8]) -> bool {
-        let mut r = reg;
-        let mut msgs = [
-            I2cMsg {
-                addr: self.addr,
-                flags: 0,
-                len: 1,
-                buf: &mut r,
-            },
-            I2cMsg {
-                addr: self.addr,
-                flags: I2C_M_RD,
-                len: out.len() as u16,
-                buf: out.as_mut_ptr(),
-            },
-        ];
-        let mut x = I2cRdwr {
-            msgs: msgs.as_mut_ptr(),
-            nmsgs: 2,
-        };
-        for _ in 0..5 {
-            if unsafe { libc::ioctl(self.fd, I2C_RDWR as _, &mut x) } >= 0 {
-                return true;
-            }
-            unsafe { libc::usleep(5000) };
-        }
-        false
-    }
-    fn wr(&self, reg: u8, data: &[u8]) -> bool {
-        let mut b = Vec::with_capacity(1 + data.len());
-        b.push(reg);
-        b.extend_from_slice(data);
-        let mut msg = I2cMsg {
-            addr: self.addr,
-            flags: 0,
-            len: b.len() as u16,
-            buf: b.as_mut_ptr(),
-        };
-        let mut x = I2cRdwr {
-            msgs: &mut msg,
-            nmsgs: 1,
-        };
-        for _ in 0..5 {
-            if unsafe { libc::ioctl(self.fd, I2C_RDWR as _, &mut x) } >= 0 {
-                return true;
-            }
-            unsafe { libc::usleep(5000) };
-        }
-        false
-    }
-    /// CopyCertificate: reg 0x30 = length (2 BE), reg 0x31 = cert bytes.
-    fn cert(&self) -> Option<Vec<u8>> {
-        let _lock = MfiLock::acquire()?; // serialize the whole cert read vs the other four users
-        let mut lb = [0u8; 2];
-        if !self.rd(0x30, &mut lb) {
-            return None;
-        }
-        let n = ((lb[0] as usize) << 8) | lb[1] as usize;
-        if n == 0 || n > 2048 {
-            return None;
-        }
-        let mut o = vec![0u8; n];
-        if !self.rd(0x31, &mut o) {
-            return None;
-        }
-        Some(o)
-    }
-    /// CreateSignature: write challenge (0x20 len, 0x21 data), go (0x10=1), poll 0x10 bit4, read 0x11 len / 0x12 sig.
-    fn sign(&self, chal: &[u8]) -> Option<Vec<u8>> {
-        let _lock = MfiLock::acquire()?; // hold across the ENTIRE stateful challenge/poll/read sequence
-        let clen = chal.len();
-        if !self.wr(0x20, &[(clen >> 8) as u8, clen as u8]) {
-            return None;
-        }
-        if !self.wr(0x21, chal) {
-            return None;
-        }
-        if !self.wr(0x10, &[0x01]) {
-            return None;
-        }
-        unsafe { libc::usleep(100_000) };
-        let mut done = false;
-        // Bounded by WALL CLOCK, not iteration count — the same defect audit #8 fixed in
-        // `mfi-i2c-local`. `for _ in 0..200` with a 10 ms sleep looks like ~2.1 s, and is, but only
-        // while every status read succeeds. The status read is itself `for _ in 0..5` with a 5 ms
-        // sleep, so under chip NAK each iteration costs ~35 ms and the loop runs ~7.1 s — and with
-        // the caller's retries that is ~21 s holding /tmp/carplay_mfi.lock, blowing through every
-        // other chip user's 10 s acquire deadline.
-        const SIGN_POLL_DEADLINE: std::time::Duration = std::time::Duration::from_millis(2500);
-        let poll_start = std::time::Instant::now();
-        while poll_start.elapsed() < SIGN_POLL_DEADLINE {
-            let mut st = [0u8; 1];
-            if self.rd(0x10, &mut st) && (st[0] & 0x10) != 0 {
-                done = true;
-                break;
-            }
-            unsafe { libc::usleep(10_000) };
-        }
-        if !done {
-            return None;
-        }
-        let mut sl = [0u8; 2];
-        if !self.rd(0x11, &mut sl) {
-            return None;
-        }
-        let n = ((sl[0] as usize) << 8) | sl[1] as usize;
-        if n == 0 || n > 256 {
-            return None;
-        }
-        let mut sig = vec![0u8; n];
-        if !self.rd(0x12, &mut sig) {
-            return None;
-        }
-        Some(sig)
-    }
-}
-
 struct Daemon {
     /// Where frames go to the host: the writer thread's pipe, which it copies onto `/dev/usb_accessory`
     /// ([`start_acc_relay`]); non-blocking, with a real POLLOUT. `/dev/null` in the tests.
     acc: File,
     seq: u32,
-    mfi: Option<Mfi>,
     ptm: Option<File>,
     file: FileState,
-    eth: Option<RawFd>, // AF_PACKET raw socket bridging ncm0 <-> CH_ETH (host-driven, on demand)
     // Local A/V ingest seam: the box AirPlay session (carplayd / AvSession) connects to these local
     // ports and streams A/V; ocbmd muxes each onto its OCBM channel to the host app. The reusable
     // box-session -> ocbmd -> OCBM path (payload is decoded now via AvSession; encrypted later).
@@ -514,8 +189,7 @@ struct Daemon {
     // byte-stream reassembly for that channel desyncs permanently. Connection lifecycle only — the seam
     // payload is still forwarded byte-for-byte untouched (box forwards, app processes).
     av_conns: Vec<(TcpStream, u16, bool)>,
-    conns: HashMap<u16, Conn>,
-    out_hi: OutQueue, // priority output FIFO: CTRL/MFI/RTSP (reliable, latency-sensitive)
+    out_hi: OutQueue, // priority output FIFO: CTRL/RTSP (reliable, latency-sensitive)
     out_console: OutQueue,                        // CH_CONSOLE — drained AFTER A/V so a console flood can't starve it (audit B3)
     // LIVE A/V — one queue PER stream so each video seam's read-gate keys on ITS OWN backlog, not a
     // shared one. A single shared FIFO coupled the two video streams + audio: the low-rate cluster
@@ -527,7 +201,7 @@ struct Daemon {
     out_audio: OutQueue,                          // CH_MEDIA_AUDIO + CH_ALT_AUDIO (never gated)
     out_log: OutQueue, // CH_LOG — below CONSOLE, above bulk: diagnostics must never delay the
     // control plane, A/V, or an interactive rescue console, but they should still beat a file pull.
-    out_lo: OutQueue,                             // bulk output FIFO: ECHO/IP/FILE/ETH (reliable)
+    out_lo: OutQueue,                             // bulk output FIFO: FILE (reliable)
     /// Universal-log tailer (`/tmp/box.log` -> CH_LOG). Off until the host sends `CT_LOG_CTL`.
     log: LogTail,
     /// Which queue is resting MID-FRAME on the shared accessory fd, if any. While set, that queue must
@@ -539,10 +213,6 @@ struct Daemon {
     lo_dropped: u64,        // reliable-bulk frames dropped because out_lo hit its OOM cap
     lo_capped: bool,        // currently over the out_lo cap (for transition-only logging)
     lo_resync: bool, // dropping bulk frames until the next F_SOM after a mid-message cap-clear (#567)
-    /// Set when a CT_HELLO cleared stale CH_IP sockets earlier in THIS dispatch pass, so the poll
-    /// loop does not send the new host an IP_CLOSE for a conn id that was the dead host's. Cleared at
-    /// the end of every pass.
-    hello_cleared_conns: bool,
     last_phone_check: Option<std::time::Instant>, // throttle the /tmp/phone_present stat (#673)
     // Session presence (docs/carplay/02_SESSION_LIFECYCLE.md lifecycle): the host app SUBSCRIBEs + HEARTBEATs; a watchdog declares
     // it gone if beats stop. `present` is the cross-process signal (also mirrored to /tmp/host_present)
@@ -913,13 +583,12 @@ fn parse_log_stamp(line: &[u8]) -> Option<(u64, &[u8])> {
 
 /// Connect to an `ip:port` target with a bounded deadline, then set the socket non-blocking so no
 /// subsequent read/write on it can stall the single-threaded poll loop (#789/#834/#846). A blocking
-/// connect to a dead/slow carplayd seam or an unreachable CH_IP target would otherwise wedge the whole
+/// connect to a dead/slow carplayd seam would otherwise wedge the whole
 /// daemon (and its OCBM console) for the OS default connect timeout.
 ///
 /// Literal addresses ONLY. `to_socket_addrs` on a hostname calls `getaddrinfo`, which has no
 /// deadline of its own and would block this thread past `timeout` — the ceiling above bounds the
-/// connect, not the resolve. Every in-tree target is a loopback literal (see `IP_OPEN` in
-/// ocbm-proto), so this only refuses a host asking the box to resolve for it.
+/// connect, not the resolve. Every target is one of carplayd's loopback seams.
 fn connect_seam(target: &str, timeout: Duration) -> Option<TcpStream> {
     let addr = target.parse::<SocketAddr>().ok()?;
     let s = TcpStream::connect_timeout(&addr, timeout).ok()?;
@@ -1999,7 +1668,7 @@ impl Daemon {
         // CH_RTSP rides out_hi with the control plane: the SETUP relay is the timing-critical
         // pair/SETUP/RECORD phase, and its whole failure model (3 s answer timeout → local fallback)
         // assumes the transport never queues it behind bulk traffic. Small, reliable, latency-first.
-        if matches!(ch, p::CH_CTRL | p::CH_MFI | p::CH_RTSP) {
+        if matches!(ch, p::CH_CTRL | p::CH_RTSP) {
             // Reliable priority queue. Capped so a stalled host can't OOM the box; on
             // overflow we clear it (pathological — a control frame lost beats the whole daemon OOM-killed).
             // Worst-case resident: CAP + up-to-64 KiB reclaim prefix + one 16 B header — the same bound
@@ -2022,7 +1691,7 @@ impl Daemon {
             // independent of projection, so a high-volume console (a left-running `dmesg -w`, a chatty log,
             // a large `cat`) sitting in out_hi would be drained strictly ahead of A/V and freeze 4K video +
             // audio for its duration. Same cap/clear/wire_owner discipline as out_hi; latency-critical
-            // control frames (CTRL/MFI/RTSP) stay at top priority above A/V.
+            // control frames (CTRL/RTSP) stay at top priority above A/V.
             if self.out_console.len() + n <= OUT_QUEUE_CAP {
                 self.out_console.push_frame(ch, flags, seq, payload);
             } else {
@@ -2162,13 +1831,6 @@ impl Daemon {
                     eprintln!("[ocbmd] out_lo cap hit ({OUT_QUEUE_CAP} B) — cleared + resyncing (host stalled)");
                     self.lo_capped = true;
                 }
-                // CH_IP carries the Android Auto TLS stream, where a gap is unrecoverable: the host's
-                // decrypt fails, or worse the phone silently stops receiving decryptable data and
-                // answers by RESETTING ITS OWN USB GADGET (gearhead's "no data received" reset-repair
-                // ladder), dropping out of accessory mode with no protocol teardown. Truncating those
-                // frames and carrying on is therefore not survivable for AA — close every relayed
-                // stream instead, which both ends already handle as a clean session end.
-                self.close_ip_conns_after_gap();
             }
         }
     }
@@ -2343,7 +2005,7 @@ impl Daemon {
     }
 
     /// Full session teardown to idle: drop presence + subscription + ephemeral cfg and close the
-    /// host-side relays (eth bridge, CH_IP sockets, mic/input/RTSP seams). THE host-gone routine —
+    /// host-side relays (mic/input/RTSP seams). THE host-gone routine —
     /// every way a session can end (`CT_STOP`, heartbeat loss) funnels through it so their teardown
     /// can't drift, and the `/tmp/host_present` 1->0 edge it writes is what makes the supervisor run
     /// its complete wireless teardown back to IDLE. (The transport-death exit paths cannot call it —
@@ -2387,10 +2049,6 @@ impl Daemon {
         // App loss resets the CT_RADIO inhibit: the next session's pushed config governs radios
         // afresh (docs/carplay/04_CAPABILITIES_AND_CONFIG.md — no stale app commands survive the app).
         let _ = std::fs::remove_file(RADIO_OFF_FLAG);
-        // Close the ncm0<->CH_ETH bridge if it was left open (fd/CPU leak across sessions; audit LOW).
-        if let Some(fd) = self.eth.take() {
-            unsafe { libc::close(fd) };
-        }
         // Drop the SETUP-relay seam: the departed host can no longer answer RS_REQs, and carplayd's
         // reader turns our EOF into HostGone → sticky local fallback for any in-flight exchange.
         self.rtsp_sock = None;
@@ -2404,15 +2062,6 @@ impl Daemon {
         // Stop streaming the log and drop what was buffered for a host that is no longer there.
         // The file itself keeps being capped — log_tick runs unsubscribed for exactly that reason.
         self.log_reset();
-        // Close orphaned CH_IP relay sockets (docs/ops/05_AUDITS.md): a departed host's TCP/UDP relays otherwise
-        // persist until the remote closes. No IP_CLOSE is sent — the host is, by definition, gone.
-        if !self.conns.is_empty() {
-            eprintln!(
-                "[ocbmd] session: closing {} orphaned CH_IP relay socket(s)",
-                self.conns.len()
-            );
-            self.conns.clear();
-        }
         // The one-file install: the session after the confirm is over, so stock goes now.
         finish_if_confirmed(INSTALL_MODE_FILE, start_install_finish);
     }
@@ -3284,168 +2933,6 @@ impl Daemon {
         );
     }
 
-    fn handle_mfi(&mut self, pl: &[u8]) {
-        if pl.len() < 3 {
-            return;
-        }
-        let op = pl[0];
-        let ilen = ((pl[1] as usize) << 8) | pl[2] as usize;
-        // Optional 1-byte correlation tag, appended AFTER the declared payload and echoed on the
-        // response. The reply carries no opcode echo and no request id, so a host with two concurrent
-        // chip users could only correlate by payload length — which cannot tell two 128-byte
-        // SIGNATURES apart, and a late reply to a timed-out sign then answers the wrong digest. The
-        // phone rejects that signature and drops the session, presenting as a crypto fault.
-        //
-        // Additive in both directions: we already ignored bytes past `3 + ilen`, and a host that does
-        // not send one simply gets no tag back and keeps its old length-correlation behaviour.
-        let tag: Option<u8> =
-            if pl.len() == 3 + ilen + p::MFI_TAG_LEN { Some(pl[3 + ilen]) } else { None };
-        let start = Instant::now();
-        let result: Option<Vec<u8>> = match op {
-            0x01 => self.mfi.as_ref().and_then(|m| m.cert()),
-            // Upper bound before the chip is touched: `I2cMsg::len` is a u16, so a 65536-byte
-            // challenge would wrap it to 0 and hand the coprocessor a zero-length write plus a "go".
-            // MFi 2.0C challenges are 20/32-byte digests; 1024 is generous.
-            0x02 if ilen > 0 && ilen <= 1024 && 3 + ilen <= pl.len() => {
-                self.mfi.as_ref().and_then(|m| m.sign(&pl[3..3 + ilen]))
-            }
-            _ => {
-                let mut resp = vec![0x02, 0, 0];
-                if let Some(t) = tag {
-                    resp.push(t);
-                }
-                self.send(p::CH_MFI, p::F_SOM | p::F_EOM, &resp);
-                return;
-            }
-        };
-        // Same trap as the CT_SRC bench (see CT_SRC below): a contended MFi request blocks this
-        // single-threaded dispatch for up to ~12 s (10 s MfiLock deadline + chip polling) while
-        // heartbeats sit unread in the kernel buffer — `presence_tick` would then see a stale
-        // `last_hb` and tear down a live session. If we measurably blocked, refresh `last_hb`
-        // (the host was alive throughout — we simply could not read its beats).
-        if start.elapsed() >= Duration::from_secs(1) && self.last_hb.is_some() {
-            self.last_hb = Some(Instant::now());
-        }
-        match result {
-            Some(data) => {
-                let mut resp = Vec::with_capacity(3 + data.len() + 1);
-                resp.push(0);
-                resp.push((data.len() >> 8) as u8);
-                resp.push(data.len() as u8);
-                resp.extend_from_slice(&data);
-                if let Some(t) = tag {
-                    resp.push(t);
-                }
-                self.send(p::CH_MFI, p::F_SOM | p::F_EOM, &resp);
-            }
-            // Errors carry the tag too — a misattributed FAILED is as damaging as a misattributed
-            // signature to a caller that does not retry.
-            None => {
-                let mut resp = vec![0x01, 0, 0];
-                if let Some(t) = tag {
-                    resp.push(t);
-                }
-                self.send(p::CH_MFI, p::F_SOM | p::F_EOM, &resp);
-            }
-        }
-    }
-
-    fn send_ip(&mut self, typ: u8, id: u16, data: &[u8]) {
-        let mut pl = Vec::with_capacity(3 + data.len());
-        pl.push(typ);
-        pl.extend_from_slice(&id.to_le_bytes());
-        pl.extend_from_slice(data);
-        self.send(p::CH_IP, p::F_SOM | p::F_EOM, &pl);
-    }
-
-    /// OCBM_CH_IP stream mux: OPEN (connect to target), DATA (relay), CLOSE.
-    /// Tear down every relayed CH_IP stream after the reliable queue dropped frames.
-    ///
-    /// Called from the `out_lo` cap-clear. Those queues carry the Android Auto TLS stream box->host;
-    /// once bytes are gone the stream cannot resynchronise, so continuing to relay is worse than
-    /// stopping — the host would decrypt garbage and the phone would see its data dry up. Dropping the
-    /// sockets makes both ends observe a normal end-of-stream: the host's AA session ends, aa-bridge
-    /// sees EOF, the owner flag clears, and the next mode event rebuilds a clean session.
-    fn close_ip_conns_after_gap(&mut self) {
-        if self.conns.is_empty() {
-            return;
-        }
-        eprintln!(
-            "[ocbmd] out_lo gap — closing {} relayed CH_IP stream(s); a TLS stream cannot survive a gap",
-            self.conns.len()
-        );
-        self.conns.clear();
-    }
-
-    fn handle_ip(&mut self, pl: &[u8]) {
-        if pl.len() < 3 {
-            return;
-        }
-        let typ = pl[0];
-        let id = u16::from_le_bytes([pl[1], pl[2]]);
-        let data = &pl[3..];
-        match typ {
-            p::IP_OPEN => {
-                // connect_seam blocks up to 2 s on an unreachable/black-holing host:port; if it measurably
-                // stalled, refresh last_hb so the watchdog doesn't miscount that stall as a lapsed heartbeat
-                // and tear down a live session (audit B3) — the same guard the MFi / file-pull / CT_SRC
-                // blocking paths already use.
-                let start = Instant::now();
-                let conn = std::str::from_utf8(data)
-                    .ok()
-                    .and_then(|t| connect_seam(t, Duration::from_secs(2)));
-                if start.elapsed() >= Duration::from_secs(1) && self.last_hb.is_some() {
-                    self.last_hb = Some(Instant::now());
-                }
-                match conn {
-                    Some(s) => {
-                        self.conns.insert(id, Conn::Tcp(s));
-                    }
-                    None => self.send_ip(p::IP_CLOSE, id, &[]),
-                }
-            }
-            p::IP_OPEN_UDP => {
-                let sock = std::str::from_utf8(data).ok().and_then(|t| {
-                    // Literal only, same reason as connect_seam: `connect(&str)` resolves, and
-                    // getaddrinfo would block the single-threaded poll loop with no deadline.
-                    let addr = t.parse::<SocketAddr>().ok()?;
-                    let s = UdpSocket::bind("0.0.0.0:0").ok()?;
-                    s.connect(addr).ok()?;
-                    s.set_nonblocking(true).ok()?; // poll-loop recv/send must never block
-                    Some(s)
-                });
-                match sock {
-                    Some(s) => {
-                        self.conns.insert(id, Conn::Udp(s));
-                    }
-                    None => self.send_ip(p::IP_CLOSE, id, &[]),
-                }
-            }
-            p::IP_DATA => {
-                // Non-blocking TCP relay (audit #4): write_all can partial-write then return WouldBlock,
-                // silently truncating this "reliable" stream (the old `let _ =` discarded the error). We
-                // keep no per-conn out-buffer in the poll loop, so on ANY short/failed write drop the
-                // connection and tell the host (IP_CLOSE) — a clean reset + retry beats silent corruption.
-                let drop = match self.conns.get_mut(&id) {
-                    Some(Conn::Tcp(s)) => s.write_all(data).is_err(),
-                    Some(Conn::Udp(s)) => {
-                        let _ = s.send(data); // one datagram (loss is expected for UDP)
-                        false
-                    }
-                    None => false,
-                };
-                if drop {
-                    self.conns.remove(&id);
-                    self.send_ip(p::IP_CLOSE, id, &[]);
-                }
-            }
-            p::IP_CLOSE => {
-                self.conns.remove(&id);
-            }
-            _ => {}
-        }
-    }
-
     /// Relay a CH_INPUT sub-frame (one HID event, e.g. INPUT_TOUCH) to carplayd's local ingest,
     /// length-prefixed (`[len u16 LE][payload]`) so carplayd frames it back out of the TCP stream.
     /// Lazy-connects; drops the socket on ANY failed/incomplete send so the next event reconnects with
@@ -3729,7 +3216,7 @@ impl Daemon {
         if pl.first() == Some(&p::FILE_PULL) {
             let start = Instant::now();
             self.handle_file_pull(&pl[1..]);
-            // Same trap as CT_SRC / handle_mfi: a paced pull can block this single-threaded
+            // A paced pull can block this single-threaded
             // dispatch for seconds while heartbeats sit unread — refresh `last_hb` so
             // `presence_tick` doesn't declare a live host gone right after a big pull.
             if start.elapsed() >= Duration::from_secs(1) && self.last_hb.is_some() {
@@ -3745,7 +3232,7 @@ impl Daemon {
     /// CH_FILE PULL: stream the file at `path_bytes` back to the host as FILE_DATA sub-frames, then a
     /// terminal FILE_ACK carrying the end-to-end CRC-32 + size (the host verifies). Path is validated
     /// exactly like FILE_OPEN (absolute, no `..`) so a pull can't escape the rootfs. The read loop is
-    /// PACED to the host's drain rate (same watermark as the CT_SRC bench): reading flash full-speed
+    /// PACED to the host's drain rate (a 256 KiB out_lo watermark): reading flash full-speed
     /// under USB contention repeatedly filled `out_lo` to its 1 MiB cap, whose clear-on-overflow lost a
     /// 1 MiB burst each time — a deterministic host-side CRC failure. A host that stops draining
     /// entirely is bounded by a deadline (abort, never a wedged dispatch loop).
@@ -3797,8 +3284,7 @@ impl Daemon {
                     d.extend_from_slice(&buf[..n]);
                     self.send(p::CH_FILE, p::F_SOM | p::F_EOM, &d);
                     self.drain(); // flush this frame before reading the next (bounded out_lo)
-                    // Pace the flash read to the host's drain rate (same watermark as the CT_SRC
-                    // bench): without this, `out_lo` hits its 1 MiB cap under USB contention and the
+                    // Pace the flash read to the host's drain rate (a 256 KiB watermark): without this, `out_lo` hits its 1 MiB cap under USB contention and the
                     // cap-clear loses a 1 MiB burst — a deterministic host-side CRC failure.
                     let stall = Instant::now();
                     while self.out_lo.len() > 262_144 {
@@ -4135,30 +3621,9 @@ impl Daemon {
                     self.lo_capped = false;
                     self.av_backpressured = false;
                     self.seq = 0;
-                    // A NEW host attached, so any CH_IP relay socket still open belongs to the
-                    // PREVIOUS one. Nothing else drops them: this reattach path clears the output
-                    // queues but not `conns`, and the conns map is otherwise cleared only on CT_STOP,
-                    // go_idle, or an out_lo gap. A host that died without CT_STOP and relaunched
-                    // inside the heartbeat grace therefore left its corpse's socket being pumped,
-                    // while the new host's IP_OPEN sat unaccepted in aa-bridge's backlog (the bridge
-                    // serves ONE client per prepared accessory) — Android Auto retried forever.
-                    // Conn ids are per-ATTEMPT on the host side (0x00AA + gen&0x3F), so a stale
-                    // socket can never be adopted by the new host and there is nothing to preserve.
-                    // On a CarPlay session `conns` is empty and this is a literal no-op.
-                    if !self.conns.is_empty() {
-                        eprintln!(
-                            "[ocbmd] session: HELLO — dropping {} stale CH_IP relay socket(s) from the previous host",
-                            self.conns.len()
-                        );
-                        self.conns.clear();
-                        self.hello_cleared_conns = true;
-                    }
                     let mut caps =
-                        p::CAP_CONSOLE | p::CAP_ECHO | p::CAP_IP | p::CAP_FILE | p::CAP_ETH | p::CAP_PHONE_POLICY | p::CAP_PAIR_WINDOW
+                        p::CAP_CONSOLE | p::CAP_FILE | p::CAP_PHONE_POLICY | p::CAP_PAIR_WINDOW
                         | p::CAP_INSTALL | p::CAP_PHONE_SWITCH;
-                    if self.mfi.is_some() {
-                        caps |= p::CAP_MFI;
-                    }
                     if std::path::Path::new(UPDATE_SCRIPT).exists() {
                         caps |= p::CAP_UPDATE;
                     }
@@ -4235,49 +3700,6 @@ impl Daemon {
                     a[1..9].copy_from_slice(&secs.to_le_bytes());
                     a[9] = if ok { 0 } else { 1 }; // 0 = applied, 1 = settimeofday failed
                     self.send(p::CH_CTRL, p::F_SOM | p::F_EOM, &a);
-                } else if pl.len() >= 5 && pl[0] == p::CT_SRC {
-                    // Debug downlink flood (srcbench). CAP the host-supplied duration: this loop blocks the
-                    // single-threaded poll for the whole window, so a bogus/huge value must not wedge the
-                    // daemon (and its heartbeat) for minutes/days.
-                    // QC 2026-07-25: the cap used to be 30 s, which is LONGER than HEARTBEAT_GRACE
-                    // (10 s). Because this loop blocks the single-threaded dispatch, heartbeats
-                    // arriving during the bench sit unread in the kernel buffer while `presence_tick`
-                    // — which runs immediately after this pass — sees a stale `last_hb`. Any bench
-                    // past the grace therefore declared the host GONE, dropped the subscription and
-                    // deleted the ephemeral config, after which the buffered heartbeats were read with
-                    // `subscribed == false` and ignored: the bench silently destroyed the live session.
-                    // Clamp well under the grace AND refresh `last_hb` afterwards (the host really was
-                    // alive throughout — we simply could not read its heartbeats).
-                    let ms = (u32::from_le_bytes([pl[1], pl[2], pl[3], pl[4]]) as u128)
-                        .min(HEARTBEAT_GRACE.as_millis() / 2);
-                    let payload = vec![0xA5u8; 32768]; // downlink flood: box->host
-                    let start = Instant::now();
-                    while start.elapsed().as_millis() < ms {
-                        self.send(p::CH_ECHO, p::F_SOM | p::F_EOM, &payload);
-                        // backpressure: keep the queue bounded, paced to the host's drain rate
-                        // (poll POLLOUT rather than busy-spinning drain() against EAGAIN)
-                        while self.out_lo.len() > 262_144 && start.elapsed().as_millis() < ms {
-                            self.wait_acc_writable(Duration::from_millis(10));
-                            self.drain();
-                        }
-                    }
-                    if self.last_hb.is_some() {
-                        self.last_hb = Some(Instant::now());
-                    }
-                } else if pl.first() == Some(&p::CT_ETH_START) {
-                    // begin bridging a netdev's raw L2 frames onto CH_ETH (default ncm0)
-                    let ifn = if pl.len() > 1 {
-                        std::str::from_utf8(&pl[1..]).unwrap_or("ncm0")
-                    } else {
-                        "ncm0"
-                    };
-                    if self.eth.is_none() {
-                        self.eth = eth::open(ifn);
-                    }
-                } else if pl.first() == Some(&p::CT_ETH_STOP) {
-                    if let Some(fd) = self.eth.take() {
-                        eth::close(fd);
-                    }
                 } else if pl.first() == Some(&p::CT_SUBSCRIBE) {
                     // A replaced host — one whose predecessor died WITHOUT CT_STOP — owes a clean
                     // re-arm: its carplayd is gone (or bound to the dead host) and presence never
@@ -4497,20 +3919,12 @@ impl Daemon {
                     );
                 }
             }
-            p::CH_ECHO => self.send(p::CH_ECHO, flags, pl),
             p::CH_CONSOLE => {
                 if let Some(ptm) = self.ptm.as_mut() {
                     let _ = ptm.write_all(pl);
                 }
             }
-            p::CH_MFI => self.handle_mfi(pl),
-            p::CH_IP => self.handle_ip(pl),
             p::CH_FILE => self.handle_file(pl),
-            p::CH_ETH => {
-                if let Some(fd) = self.eth {
-                    eth::send_frame(fd, pl); // send frame onto ncm0 (host -> iPhone)
-                }
-            }
             p::CH_INPUT => self.forward_input(pl), // HID input host -> carplayd -> iPhone (task #20)
             p::CH_MIC => self.forward_mic(pl), // mic PCM host -> carplayd -> iPhone (type-100 uplink)
             p::CH_RTSP => self.forward_rtsp(pl), // SETUP-relay bytes host -> carplayd (RS_RESP/RS_ERR)
@@ -4977,18 +4391,6 @@ fn main() {
             eprintln!("open {}: {}", ACC_DEV, e);
             std::process::exit(1);
         });
-    let mfi = Mfi::open();
-    if let Some(ref m) = mfi {
-        // Warm-up (DeviceVersion) under /tmp/carplay_mfi.lock, like every other chip access. ocbmd
-        // respawns on every `ocbm-host` command, so this runs far more often than "once at boot" —
-        // unlocked it can land inside carplayd's HELD write-challenge/trigger/poll/read sequence and
-        // corrupt both transactions. Skipped, not forced, if the lock is unavailable: a warm-up read
-        // is not worth stepping on a live handshake.
-        if let Some(_lock) = MfiLock::acquire() {
-            let mut v = [0u8; 1];
-            let _ = m.rd(0x00, &mut v);
-        }
-    }
     // The accessory is read and written by two relay threads through pipes, where this unit's driver
     // allows it; this loop then only ever touches the pipes, which poll and refuse to block as asked.
     // O_NONBLOCK on the device itself never worked: see [`start_acc_relay`]. A driver that serializes
@@ -5043,13 +4445,10 @@ fn main() {
     let mut d = Daemon {
         acc: to_host,
         seq: 0,
-        mfi,
         ptm: None,
         file: FileState::default(),
-        eth: None,
         av_listeners,
         av_conns: Vec::new(),
-        conns: HashMap::new(),
         out_hi: OutQueue::default(),
         out_console: OutQueue::default(),
         out_video: OutQueue::default(),
@@ -5064,7 +4463,6 @@ fn main() {
         lo_dropped: 0,
         lo_capped: false,
         lo_resync: false,
-        hello_cleared_conns: false,
         last_phone_check: None,
         subscribed: false,
         last_hb: None,
@@ -5105,10 +4503,9 @@ fn main() {
     let mut reasm = p::Reassembler::new();
     let mut rbuf = vec![0u8; p::HDR_LEN + p::MAX_PAYLOAD];
     let mut plbuf = vec![0u8; p::MAX_PAYLOAD];
-    // Hoisted out of the Kind::Conn / Kind::AvConn dispatch arms (perf): each declared a fresh
-    // ~64 KiB stack array, whose zero-init on EVERY readable wake wipes the Cortex-A7's whole L1D.
+    // Hoisted out of the Kind::AvConn dispatch arm (perf): it declared a fresh ~64 KiB stack array,
+    // whose zero-init on EVERY readable wake wipes the Cortex-A7's whole L1D.
     // Reuse is safe: contents are always overwritten by the read and only buf[..n] is consumed.
-    let mut connbuf = vec![0u8; p::MAX_PAYLOAD - 3];
     let mut avbuf = vec![0u8; p::MAX_PAYLOAD];
     // Initialize the presence flag to "0" at startup: `present` starts false but set_present is
     // edge-guarded, so without this an ocbmd restart could leave a stale "1" from a prior crash.
@@ -5141,7 +4538,7 @@ fn main() {
     let mut kinds: Vec<Kind> = Vec::new();
     loop {
         // rebuild the pollfd set each pass: the accessory relay's two pipes (+POLLOUT if backlog) and the
-        // device itself (hangup only) + PTY + live conns
+        // device itself (hangup only) + PTY + the seams
         let want_out = !d.out_hi.is_empty()
             || !d.out_video.is_empty()
             || !d.out_alt_video.is_empty()
@@ -5176,14 +4573,6 @@ fn main() {
             });
             kinds.push(Kind::Pty);
         }
-        if let Some(fd) = d.eth {
-            fds.push(libc::pollfd {
-                fd,
-                events: libc::POLLIN,
-                revents: 0,
-            });
-            kinds.push(Kind::Eth);
-        }
         if let Some(s) = d.mic_sock.as_ref() {
             // Poll the mic seam read-side only (writes are best-effort in forward_mic) so the
             // `uplink on/off` back-channel reaches the host promptly.
@@ -5203,14 +4592,6 @@ fn main() {
                 revents: 0,
             });
             kinds.push(Kind::Rtsp);
-        }
-        for (id, s) in d.conns.iter() {
-            fds.push(libc::pollfd {
-                fd: s.raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            });
-            kinds.push(Kind::Conn(*id));
         }
         for (idx, (l, _)) in d.av_listeners.iter().enumerate() {
             fds.push(libc::pollfd {
@@ -5287,17 +4668,8 @@ fn main() {
                 if re & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
                     match kinds[i] {
                         Kind::Pty => d.ptm = None, // console shell exited → drop the master pty
-                        Kind::Eth => {
-                            if let Some(fd) = d.eth.take() {
-                                unsafe { libc::close(fd) };
-                            }
-                        }
                         Kind::Mic => d.drop_mic_seam("poll HUP/ERR"), // ensure_mic_seam reconnects on the next tick
                         Kind::Rtsp => d.rtsp_sock = None, // ensure_rtsp_seam reconnects on the next tick
-                        Kind::Conn(id) => {
-                            d.conns.remove(&id);
-                            d.send_ip(p::IP_CLOSE, id, &[]);
-                        }
                         Kind::AvConn(idx) => av_close.push(idx),
                         Kind::AvListen(_) => {} // a listen socket hangup shouldn't occur; nothing to drop
                         Kind::Acc | Kind::AccOut => {
@@ -5376,75 +4748,6 @@ fn main() {
                         Ok(n) => d.send(p::CH_CONSOLE, p::F_SOM | p::F_EOM, &t[..n]),
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {} // no data yet
                         Err(_) => d.ptm = None,
-                    }
-                }
-                Kind::Eth => {
-                    if let Some(fd) = d.eth {
-                        let mut fb = [0u8; 2048]; // one ethernet frame (MTU 1500 + hdr)
-                                                  // batch-drain the raw socket this wake; recv_frame skips our own sent frames
-                        for _ in 0..256 {
-                            match eth::recv_frame(fd, &mut fb) {
-                                Some(n) => d.send(p::CH_ETH, p::F_SOM | p::F_EOM, &fb[..n]),
-                                None => break,
-                            }
-                        }
-                    }
-                }
-                Kind::Conn(id) => {
-                    // MAX_PAYLOAD - 3: send_ip prepends a 3-byte sub-header (typ + id u16), so the
-                    // framed payload is read.len() + 3. Reading a full MAX_PAYLOAD would produce a
-                    // 65539-byte frame that the receiver's Reassembler rejects (> MAX_PAYLOAD) —
-                    // silently dropping a full TCP read on this RELIABLE relay (and panicking the
-                    // debug-build frame() assert). Cap the read so the framed payload fits exactly.
-                    // `connbuf` is hoisted above the loop — see its comment (L1D wipe per wake).
-                    // (bytes, should_close)
-                    let outcome = match d.conns.get_mut(&id) {
-                        Some(Conn::Tcp(s)) => match s.read(&mut connbuf) {
-                            Ok(0) => (0usize, true), // TCP EOF -> close
-                            Ok(n) => (n, false),
-                            // audit Fix #4: a spurious level-triggered POLLIN wake can surface
-                            // WouldBlock/Interrupted on a healthy relay socket — NOT connection death
-                            // (the sibling UDP/AvConn/Pty/Acc arms already special-case it). Only a hard
-                            // error closes.
-                            Err(ref e)
-                                if matches!(
-                                    e.kind(),
-                                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
-                                ) =>
-                            {
-                                (0usize, false)
-                            }
-                            Err(_) => (0usize, true), // real error -> close
-                        },
-                        Some(Conn::Udp(s)) => match s.recv(&mut connbuf) {
-                            Ok(n) => (n, false), // datagram; UDP never auto-closes
-                            Err(_) => (0, false),
-                        },
-                        // Already gone. The poll set was built BEFORE this pass, so the only way a
-                        // `Kind::Conn` id is missing now is that something earlier in this same pass
-                        // removed it — the host's own IP_CLOSE, a CT_STOP, or the HELLO clear. In
-                        // every one of those the peer already knows, so closing again is dead
-                        // traffic (and an id a relaunched host has since reused).
-                        None => (0, false),
-                    };
-                    if outcome.0 > 0 {
-                        d.send_ip(p::IP_DATA, id, &connbuf[..outcome.0]);
-                    } else if outcome.1 {
-                        d.conns.remove(&id);
-                        // QC 2026-07-25 follow-up: only notify a host that is still there. A `CT_STOP`
-                        // handled EARLIER IN THIS SAME dispatch pass now clears `conns` (orphaned-socket
-                        // fix), so a `Kind::Conn` entry dispatched after it finds `None` -> `(0, true)`
-                        // and would queue an IP_CLOSE toward a host that just STOPped. Harmless (out_lo
-                        // is cleared on the next HELLO) but pure dead traffic. The heartbeat-loss clear
-                        // has no such window — it runs in `presence_tick`, after the dispatch loop.
-                        // ...and the HELLO-triggered clear inverts that reasoning: there `present`
-                        // is TRUE (a new host just attached), so this would deliver an IP_CLOSE for a
-                        // DEAD conn id to the NEW host — and the ids collide, because the host's
-                        // generation counter restarts per process, so a relaunched app's first
-                        // attempt reuses the same id and its transport would adopt the close.
-                        if d.present && !d.hello_cleared_conns {
-                            d.send_ip(p::IP_CLOSE, id, &[]);
-                        }
                     }
                 }
                 Kind::Mic => {
@@ -5527,9 +4830,6 @@ fn main() {
             d.av_conns.retain(|(_, c, _)| *c != ch);
             d.av_conns.push((s, ch, true));
         }
-        // The HELLO-cleared-conns suppression is scoped to ONE dispatch pass: by the next wake the
-        // stale ids are gone from `conns`, so a genuine close for a NEW id must be delivered normally.
-        d.hello_cleared_conns = false;
         // Watchdog AFTER the dispatch loop: any heartbeat that arrived in this wake has now refreshed
         // `last_hb`, so we never spuriously tear down a live session on a beat that already landed.
         d.presence_tick(Instant::now());
@@ -5665,13 +4965,10 @@ mod tests {
         Daemon {
             acc: OpenOptions::new().write(true).open("/dev/null").unwrap(),
             seq: 0,
-            mfi: None,
             ptm: None,
             file: FileState::default(),
-            eth: None,
             av_listeners: Vec::new(),
             av_conns: Vec::new(),
-            conns: HashMap::new(),
             out_hi: OutQueue::default(),
             out_console: OutQueue::default(),
             out_video: OutQueue::default(),
@@ -5686,7 +4983,6 @@ mod tests {
             lo_dropped: 0,
             lo_capped: false,
             lo_resync: false,
-            hello_cleared_conns: false,
             last_phone_check: None,
             subscribed: false,
             last_hb: None,
@@ -5735,7 +5031,7 @@ mod tests {
         }
     }
 
-    /// Pop everything queued on the priority (CTRL/MFI/RTSP) queue as `(channel, flags, payload)`,
+    /// Pop everything queued on the priority (CTRL/RTSP) queue as `(channel, flags, payload)`,
     /// parsed back through a real `Reassembler` so the header the host would actually see is the
     /// thing under test.
     fn sent(d: &mut Daemon) -> Vec<(u16, u8, Vec<u8>)> {
@@ -6428,68 +5724,6 @@ mod tests {
         pl
     }
 
-    // ---- CH_MFI correlation tag (2026-08-27) --------------------------------------------------
-    //
-    // The reply carries no opcode echo and no request id. The tag is the ONLY thing that can tell
-    // two 128-byte signature replies apart, so every reply shape has to echo it or the host falls
-    // back to length correlation and can answer the wrong digest.
-
-    #[test]
-    fn mfi_error_reply_echoes_the_request_tag() {
-        let mut d = td(); // mfi: None -> every op fails -> status 0x01
-        d.handle_mfi(&[0x01, 0, 0, 0x5A]);
-        let f = sent(&mut d);
-        assert_eq!(f.len(), 1);
-        assert_eq!(f[0].0, p::CH_MFI);
-        assert_eq!(f[0].2, vec![0x01, 0, 0, 0x5A], "FAILED reply must carry the tag");
-    }
-
-    #[test]
-    fn mfi_sign_reply_echoes_the_tag_past_the_digest() {
-        let mut d = td();
-        let mut req = vec![0x02, 0, 20];
-        req.extend_from_slice(&[0xAB; 20]);
-        req.push(0x7F);
-        d.handle_mfi(&req);
-        let f = sent(&mut d);
-        assert_eq!(f[0].2, vec![0x01, 0, 0, 0x7F]);
-    }
-
-    #[test]
-    fn mfi_unknown_opcode_reply_echoes_the_tag() {
-        let mut d = td();
-        d.handle_mfi(&[0x77, 0, 0, 0x33]);
-        let f = sent(&mut d);
-        assert_eq!(f[0].2, vec![0x02, 0, 0, 0x33], "unknown-op reply must carry the tag");
-    }
-
-    #[test]
-    fn mfi_untagged_request_gets_an_untagged_reply() {
-        // Wire compatibility both ways: an older host that sends no tag must see byte-for-byte the
-        // reply it always saw, or its length correlation breaks.
-        let mut d = td();
-        d.handle_mfi(&[0x01, 0, 0]);
-        assert_eq!(sent(&mut d)[0].2, vec![0x01, 0, 0]);
-
-        let mut req = vec![0x02, 0, 20];
-        req.extend_from_slice(&[0xAB; 20]);
-        d.handle_mfi(&req);
-        assert_eq!(sent(&mut d)[0].2, vec![0x01, 0, 0]);
-
-        d.handle_mfi(&[0x77, 0, 0]);
-        assert_eq!(sent(&mut d)[0].2, vec![0x02, 0, 0]);
-    }
-
-    #[test]
-    fn mfi_short_or_lying_frame_never_panics() {
-        let mut d = td();
-        d.handle_mfi(&[]); // below the 3-byte header
-        d.handle_mfi(&[0x01, 0]);
-        d.handle_mfi(&[0x02, 0xFF, 0xFF, 1, 2, 3]); // ilen 65535, 3 bytes present
-        d.handle_mfi(&[0x02, 0, 5, 1, 2]); // ilen 5, 2 bytes present
-        d.handle_mfi(&[0x02, 0, 0]); // sign with a zero-length digest
-    }
-
     // ---- F_REPLAY on the state mirrors (2026-08-27) -------------------------------------------
 
     #[test]
@@ -6645,9 +5879,7 @@ mod tests {
             assert!(!d.host_replaced, "a latched replacement must not outlive the session");
             assert!(d.rearm_deadline.is_none());
             assert!(!d.log.enabled, "the log stream must be disarmed");
-            assert!(d.conns.is_empty(), "orphaned CH_IP relays must be closed");
             assert!(d.rtsp_sock.is_none() && d.mic_sock.is_none() && d.input_sock.is_none());
-            assert!(d.eth.is_none());
         }
         // ...and the flag the supervisor actually reads says GONE. Safe to assert on the shared path
         // because `presence_flag_lock` is held: `lost` wrote it last, and it wrote 0.

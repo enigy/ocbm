@@ -1,9 +1,6 @@
 //! ocbm-host — host-side OCBM client (rusb/libusb). Claims the accessory interface and
 //! speaks OCBM v1 over the discovered bulk endpoints.
 //!   ocbm-host hello   [vid pid]                  handshake (HELLO -> HELLO_ACK)
-//!   ocbm-host echo    [vid pid] [secs] [xfer]    ECHO round-trip throughput
-//!   ocbm-host rtt     [vid pid] [secs]           ECHO round-trip LATENCY percentiles (per payload size)
-//!   ocbm-host mfi     [vid pid]                  genuine MFi 2.0C cert + signature
 //!   ocbm-host console [vid pid]                  MODE_SELECT CONSOLE -> root-shell bridge
 //!   ocbm-host settime [vid pid]                  push host wall clock -> box (no RTC battery)
 //!   ocbm-host ncm     [vid pid]                  CH_MGMT ENTER_NCM -> box reboots into USB-NCM maintenance
@@ -11,7 +8,6 @@
 //!                                                `rm /script/ncm_only; reboot` over ssh.
 //!   ocbm-host push  [vid pid] <local> <remote> [mode-octal]   verified file deploy (default mode 755)
 //!   ocbm-host pull  [vid pid] <remote> <local> [mode-octal]   verified file retrieval (box -> host)
-//!   ocbm-host bridge [vid pid] [iface]         bridge the box netdev (default ncm0) over CH_ETH; decode frames
 //!   ocbm-host setup-relay [vid pid] [secs] <cfg.yaml> [--author] [--mute-once]
 //!                                               app-driven SETUP relay harness: subscribe with a YAML
 //!                                               containing `accessoryConfig.appDrivenSetup: true` (see
@@ -239,164 +235,6 @@ fn push_time(link: &mut Link) -> bool {
     false
 }
 
-fn mode_echo(link: &mut Link, secs: u64, xfer: usize) {
-    let xfer = xfer.min(p::MAX_PAYLOAD);
-    let pl = vec![0xA5u8; xfer];
-    let mut out = vec![0u8; p::MAX_PAYLOAD];
-    let (mut bytes, mut mism) = (0u64, 0u64);
-    let t0 = Instant::now();
-    let end = t0 + Duration::from_secs(secs);
-    while Instant::now() < end {
-        if !link.send(p::CH_ECHO, p::F_SOM | p::F_EOM, &pl) {
-            eprintln!("send fail");
-            break;
-        }
-        match link.recv(&mut out, Instant::now() + Duration::from_secs(2)) {
-            Some((ch, _, l)) if ch == p::CH_ECHO && l == xfer && out[..l] == pl[..] => {
-                bytes += xfer as u64
-            }
-            _ => mism += 1,
-        }
-    }
-    let dt = t0.elapsed().as_secs_f64();
-    println!(
-        "ECHO round-trip: {} bytes in {:.2}s => {:.1} Mbps (payload each way), mismatches={}",
-        bytes,
-        dt,
-        bytes as f64 * 8.0 * 2.0 / 1e6 / dt,
-        mism
-    );
-}
-
-/// CH_ECHO round-trip LATENCY (the docs/ops/04_OPEN_ITEMS.md SETUP-relay gate item — no RTT number existed anywhere;
-/// `mode_echo` times only aggregate throughput, never an individual iteration). Serialized ping-pong
-/// with per-iteration timing; reports p50/p90/p99/max + timeouts per payload size.
-///
-/// Interpretation bound: CH_ECHO rides ocbmd's lowest-priority out_lo queue, while the SETUP relay
-/// (CH_RTSP) will ride out_hi, which drains first — so these numbers are an UPPER bound on the relay's
-/// transport latency. A pass here is a strong pass; do not treat a marginal number as a relay fail
-/// without an out_hi measurement.
-fn mode_rtt(link: &mut Link, secs: u64) {
-    // 64 B ≈ the marker-only floor; 4 KiB ≈ a phase-1 SETUP plist; 16 KiB ≈ a large phase-2/streams
-    // exchange; MAX_PAYLOAD = the single-frame ceiling (a bigger relay message spans OCBM frames).
-    let sizes: [usize; 4] = [64, 4096, 16384, p::MAX_PAYLOAD];
-    let mut out = vec![0u8; p::MAX_PAYLOAD];
-    println!("RTT over CH_ECHO — {secs} s per payload size (serialized; echo rides out_lo → upper bound)");
-    for &sz in &sizes {
-        let mut pl = vec![0xA5u8; sz];
-        let mut samples: Vec<u64> = Vec::new();
-        let mut timeouts = 0u64;
-        let end = Instant::now() + Duration::from_secs(secs);
-        let mut ping: u32 = 0;
-        while Instant::now() < end {
-            // Tag each ping so a stale echo (reattach leftovers, a late reply after a timeout) can
-            // never be credited to the wrong iteration — the same drain-until-ours discipline as
-            // do_hello/push_time.
-            ping = ping.wrapping_add(1);
-            pl[..4].copy_from_slice(&ping.to_le_bytes());
-            let t = Instant::now();
-            if !link.send(p::CH_ECHO, p::F_SOM | p::F_EOM, &pl) {
-                eprintln!("[rtt] send fail at {sz} B — aborting this size");
-                break;
-            }
-            let deadline = t + Duration::from_secs(2);
-            let mut got = false;
-            while let Some((ch, _, l)) = link.recv(&mut out, deadline) {
-                if ch == p::CH_ECHO && l == sz && out[..4] == pl[..4] {
-                    samples.push(t.elapsed().as_micros() as u64);
-                    got = true;
-                    break;
-                }
-                // else: stale/foreign frame — keep draining toward our echo
-            }
-            if !got {
-                timeouts += 1;
-            }
-        }
-        samples.sort_unstable();
-        if samples.is_empty() {
-            println!("  {sz:>6} B: NO samples (timeouts={timeouts})");
-            continue;
-        }
-        // Nearest-rank on the sorted samples; n is small enough that exact interpolation adds nothing.
-        let pct = |p: f64| samples[((samples.len() - 1) as f64 * p).round() as usize] as f64 / 1000.0;
-        println!(
-            "  {sz:>6} B: n={:<6} p50={:.2} ms  p90={:.2} ms  p99={:.2} ms  max={:.2} ms  timeouts={timeouts}",
-            samples.len(),
-            pct(0.50),
-            pct(0.90),
-            pct(0.99),
-            *samples.last().unwrap() as f64 / 1000.0,
-        );
-    }
-    println!("gate (plan): PASS p99 ≤ 50 ms under A/V load · MARGINAL 50–250 ms · FAIL > 250 ms or 1 s stalls");
-}
-
-fn mode_mfi(link: &mut Link) {
-    let mut out = vec![0u8; p::MAX_PAYLOAD];
-    link.send(p::CH_MFI, p::F_SOM | p::F_EOM, &[0x01, 0, 0]); // CopyCertificate
-    match link.recv(&mut out, Instant::now() + Duration::from_secs(3)) {
-        Some((ch, _, l)) if ch == p::CH_MFI && l >= 3 => {
-            let (st, n) = (out[0], ((out[1] as usize) << 8) | out[2] as usize);
-            if st == 0 {
-                println!("MFI cert: {} bytes  first8={}", n, hex8(&out[3..]));
-                // Dump the DER so the certificate's SERIAL NUMBER can be read off it. That serial
-                // is not a curiosity: iOS 27 keys the CarPlay vehicle record on it
-                // (CRVehicle.certificateSerialNumber, CRVehicleAccessoryManager.vehiclesBySerialNumber,
-                // CARSession._MFiCertificateSerialNumber), so two adapters presenting the same MFi
-                // cert serial collapse into ONE entry in Settings > General > CarPlay, with the name
-                // following whichever connected last. Reading it is the only way to tell a genuine
-                // per-chip provisioning from a shared/cloned one.
-                //   openssl pkcs7 -inform DER -in mfi_cert.der -print_certs | openssl x509 -noout -serial
-                if let Some(path) = std::env::var_os("OCBM_MFI_CERT_OUT") {
-                    // Bound by the RECEIVED payload `l`, not the reusable 64 KiB buffer: a reply
-                    // whose declared `n` overran `l` would append stale bytes to the DER.
-                    match std::fs::write(&path, &out[3..3 + n.min(l - 3)]) {
-                        Ok(()) => println!("MFI cert written to {}", path.to_string_lossy()),
-                        Err(e) => eprintln!("MFI cert write failed: {e}"),
-                    }
-                }
-            } else {
-                println!("MFI cert error status={}", st);
-            }
-        }
-        _ => println!("MFI cert: no response"),
-    }
-    let mut sreq = vec![0x02u8, 0, 20];
-    sreq.extend_from_slice(&[0x5Au8; 20]); // 20-byte digest
-    link.send(p::CH_MFI, p::F_SOM | p::F_EOM, &sreq);
-    match link.recv(&mut out, Instant::now() + Duration::from_secs(5)) {
-        Some((ch, _, l)) if ch == p::CH_MFI && l >= 3 => {
-            let (st, n) = (out[0], ((out[1] as usize) << 8) | out[2] as usize);
-            if st == 0 {
-                println!("MFI sign: {}-byte signature  first8={}", n, hex8(&out[3..]));
-            } else {
-                println!("MFI sign error status={}", st);
-            }
-        }
-        _ => println!("MFI sign: no response"),
-    }
-}
-
-/// `MGMT_ENTER_NCM` — ask the box to reboot into USB-NCM maintenance mode.
-///
-/// WHY THIS EXISTS: the opcode has been in `ocbm-proto` and handled by `ocbmd` since the CCPA tab
-/// shipped, but the ONLY way to send it was the macOS app (its "Enter NCM maintenance mode" button
-/// or the `carlink://box/enter-ncm` URL). That made every box deploy a manual mode flip: open the
-/// app, click, close the app so it releases the USB device, then push. With this verb the whole
-/// cycle scripts — see `tools/box_deploy.sh`, which latches on over OCBM, flips the box, waits for
-/// ssh and pushes over scp.
-///
-/// The box ACKs BEFORE it reboots (`ocbmd` arms `/script/ncm_only`, ACKs, then reboots), so a
-/// received ACK means "accepted", not "already in NCM" — the caller must poll for the NCM address.
-/// A missing ACK is reported rather than assumed: on a box that never armed the flag, a caller that
-/// blindly waited would hang for its whole timeout with no idea why.
-/// The one-file install's management verbs, for the bench: `info` prints MGMT_INFO (its `install`
-/// key is the mode), `confirm` sends MGMT_INSTALL_CONFIRM as the Carlink3 build with the way back
-/// would, and `stock` sends MGMT_GO_STOCK. `confirm` is what lets the box remove the Carlinkit stack
-/// after the session ends, so only send it when that is meant. From this tool the box never sees
-/// that session end (ocbm-host never subscribes, so no heartbeat lapses, and the transport stays
-/// up): replug the adapter, and the finish runs at its next start (dev adapter, 4 Nov).
 fn mode_install(link: &mut Link, what: &str) {
     let verb = match what {
         "info" => p::MGMT_GET_INFO,
@@ -513,52 +351,6 @@ fn mode_console(link: &mut Link) {
 
 /// IP stream channel: OPEN a connection to a box-side target and print what it returns.
 /// (First-cut validation; a full local-listener `forward` mode builds on this.)
-fn mode_ip(link: &mut Link, target: &str, payload: Option<&str>) {
-    // "udp:host:port" opens a datagram conn; otherwise TCP.
-    let (op, tgt) = match target.strip_prefix("udp:") {
-        Some(t) => (p::IP_OPEN_UDP, t),
-        None => (p::IP_OPEN, target),
-    };
-    let mut pl = vec![op];
-    pl.extend_from_slice(&1u16.to_le_bytes());
-    pl.extend_from_slice(tgt.as_bytes());
-    link.send(p::CH_IP, p::F_SOM | p::F_EOM, &pl);
-    eprintln!(
-        "[ip] OPEN({}) conn 1 -> {}",
-        if op == p::IP_OPEN_UDP { "udp" } else { "tcp" },
-        tgt
-    );
-    if let Some(msg) = payload {
-        let mut d = vec![p::IP_DATA];
-        d.extend_from_slice(&1u16.to_le_bytes());
-        d.extend_from_slice(msg.as_bytes());
-        link.send(p::CH_IP, p::F_SOM | p::F_EOM, &d);
-        eprintln!("[ip] sent {} bytes", msg.len());
-    }
-    let mut out = vec![0u8; p::MAX_PAYLOAD];
-    let deadline = Instant::now() + Duration::from_secs(3);
-    let mut got = 0usize;
-    while Instant::now() < deadline {
-        if let Some((ch, _, l)) = link.recv(&mut out, Instant::now() + Duration::from_millis(500)) {
-            if ch == p::CH_IP && l >= 3 {
-                match out[0] {
-                    p::IP_DATA => {
-                        got += l - 3;
-                        print!("{}", String::from_utf8_lossy(&out[3..l]));
-                    }
-                    p::IP_CLOSE => {
-                        eprintln!("[ip] conn closed by box");
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-    eprintln!("\n[ip] {} bytes received from {}", got, target);
-}
-
-/// Read one FILE_ACK (status, crc, size) within `secs`, ignoring other channel traffic.
 fn recv_file_ack(link: &mut Link, secs: u64) -> Option<(u8, u32, u32)> {
     let mut out = vec![0u8; p::MAX_PAYLOAD]; // full-size per the reassembler contract
     let deadline = Instant::now() + Duration::from_secs(secs);
@@ -721,112 +513,6 @@ fn mode_push(link: &mut Link, local: &str, remote: &str, mode: u32) -> bool {
 
 /// Decode a bridged ethernet frame into a one-line summary — enough to confirm the iPhone's
 /// wired-CarPlay discovery (link-local IPv6: NDP/RS/RA + mDNS) is traversing OCBM to the Mac.
-fn describe_frame(f: &[u8], n: u64) -> String {
-    if f.len() < 14 {
-        return format!("#{n} runt {}B", f.len());
-    }
-    let ethertype = ((f[12] as u16) << 8) | f[13] as u16;
-    let mac = |b: &[u8]| {
-        b.iter()
-            .map(|x| format!("{:02x}", x))
-            .collect::<Vec<_>>()
-            .join(":")
-    };
-    let l2 = format!("{}->{}", mac(&f[6..12]), mac(&f[0..6]));
-    match ethertype {
-        0x86DD if f.len() >= 54 => {
-            let ip = &f[14..];
-            let nh = ip[6];
-            let v6 = |b: &[u8]| {
-                let mut s = String::new();
-                for i in (0..16).step_by(2) {
-                    if i > 0 {
-                        s.push(':');
-                    }
-                    s.push_str(&format!("{:x}", ((b[i] as u16) << 8) | b[i + 1] as u16));
-                }
-                s
-            };
-            let (src, dst) = (v6(&ip[8..24]), v6(&ip[24..40]));
-            let kind = match nh {
-                58 => "ICMPv6/NDP".to_string(),
-                // Require the 4-byte L4 header (ports at ip[40..44]) before reading it — the outer
-                // guard only ensures ip.len() >= 40, so an IPv6 frame of length 54..57 with nh 17/6
-                // would otherwise index out of bounds and panic on wire-controlled bridged input.
-                17 if ip.len() >= 44 => {
-                    let udp = &ip[40..];
-                    let dport = ((udp[2] as u16) << 8) | udp[3] as u16;
-                    if dport == 5353 {
-                        "mDNS".to_string()
-                    } else {
-                        format!("UDP:{dport}")
-                    }
-                }
-                6 if ip.len() >= 44 => {
-                    let tcp = &ip[40..];
-                    let dport = ((tcp[2] as u16) << 8) | tcp[3] as u16;
-                    format!("TCP:{dport}")
-                }
-                x => format!("nh{x}"),
-            };
-            format!("#{n} IPv6 {kind}  {src} -> {dst}  [{l2}] {}B", f.len())
-        }
-        0x0800 => format!("#{n} IPv4  [{l2}] {}B", f.len()),
-        t => format!("#{n} ethertype 0x{t:04x}  [{l2}] {}B", f.len()),
-    }
-}
-
-/// `bridge` (observe): tell the box to bridge ncm0 onto CH_ETH, then decode inbound frames.
-/// This is the step-1 verification that the iPhone's link-local traffic reaches the Mac over OCBM.
-/// (The feth+BPF injection that lets receiver_core bind fe80:: on it builds on this.)
-fn mode_bridge(link: &mut Link, iface: &str, secs: u64) {
-    let mut req = vec![p::CT_ETH_START];
-    req.extend_from_slice(iface.as_bytes());
-    link.send(p::CH_CTRL, p::F_SOM | p::F_EOM, &req);
-    let deadline = if secs > 0 {
-        Some(Instant::now() + Duration::from_secs(secs))
-    } else {
-        None
-    };
-    eprintln!(
-        "[bridge] CT_ETH_START({iface}) sent — observing bridged frames{}",
-        if secs > 0 {
-            format!(" for {secs}s")
-        } else {
-            " (forever)".into()
-        }
-    );
-    let mut out = vec![0u8; p::MAX_PAYLOAD];
-    let (mut nframes, mut nbytes) = (0u64, 0u64);
-    let mut last = Instant::now();
-    loop {
-        if let Some(d) = deadline {
-            if Instant::now() >= d {
-                break;
-            }
-        }
-        if let Some((ch, _, l)) = link.recv(&mut out, Instant::now() + Duration::from_millis(300)) {
-            if ch == p::CH_ETH {
-                nframes += 1;
-                nbytes += l as u64;
-                if nframes <= 60 || nframes % 50 == 0 {
-                    println!("{}", describe_frame(&out[..l], nframes));
-                }
-            }
-        }
-        if last.elapsed() >= Duration::from_secs(2) {
-            eprintln!("[bridge] {nframes} frames / {nbytes} bytes so far");
-            last = Instant::now();
-        }
-    }
-    link.send(p::CH_CTRL, p::F_SOM | p::F_EOM, &[p::CT_ETH_STOP]);
-    println!("[bridge] CT_ETH_STOP sent — total {nframes} frames / {nbytes} bytes");
-}
-
-/// `session` — act as the live host receiver for the lifecycle (docs/carplay/02_SESSION_LIFECYCLE.md): SUBSCRIBE (+ push an optional
-/// YAML config file), HEARTBEAT ~1/s to prove liveness, print the box's SESSION_EVENTs, and STOP cleanly
-/// on exit. Killing this process instead (no STOP) simulates a host crash → the box's heartbeat watchdog
-/// declares the host gone after the grace. Drives the box's presence state machine end to end.
 fn mode_session(link: &mut Link, secs: u64, cfg_path: Option<&str>) {
     let mut sub = vec![p::CT_SUBSCRIBE];
     match cfg_path.and_then(|p| std::fs::read(p).ok()) {
@@ -942,7 +628,7 @@ const SEAM_MAGIC: [u8; 4] = *b"SEAV";
 /// forwards as one length-prefixed message, small enough to reject a garbled length prefix.
 const SEAM_VID_MAX: usize = 4 * 1024 * 1024;
 
-fn mode_avdec(link: &mut Link, secs: u64, cfg_path: Option<&str>, rtt: bool) {
+fn mode_avdec(link: &mut Link, secs: u64, cfg_path: Option<&str>) {
     use chacha20poly1305::aead::{Aead, KeyInit, Payload};
     use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
     use std::io::Write;
@@ -977,16 +663,6 @@ fn mode_avdec(link: &mut Link, secs: u64, cfg_path: Option<&str>, rtt: bool) {
         None
     };
     let mut last = Instant::now();
-    // --rtt: interleave a CH_ECHO ping every ~100 ms DURING the live session. This is the
-    // under-A/V-load RTT the SETUP-relay gate actually cares about (docs/ops/04_OPEN_ITEMS.md); it must run in-process
-    // because the bulk pipe cannot be shared with a second measuring process. Pings are id-tagged and
-    // matched via a pending map — under load replies can arrive late/out of order, and a serialized
-    // wait would stall the A/V drain this mode exists to keep honest.
-    let mut ping_at = Instant::now() + Duration::from_millis(100);
-    let mut pings: std::collections::HashMap<u32, Instant> = std::collections::HashMap::new();
-    let mut ping_seq: u32 = 0;
-    let mut rtt_samples: Vec<u64> = Vec::new();
-    let mut rtt_lost = 0u64;
     loop {
         if let Some(d) = deadline {
             if Instant::now() >= d {
@@ -998,12 +674,6 @@ fn mode_avdec(link: &mut Link, secs: u64, cfg_path: Option<&str>, rtt: bool) {
                 buf.extend_from_slice(&out[..l]);
             } else if ch == p::CH_MEDIA_AUDIO || ch == p::CH_ALT_AUDIO {
                 abuf.extend_from_slice(&out[..l]); // v2 framing is scid-tagged — one drain serves both
-            } else if rtt && ch == p::CH_ECHO && l >= 4 {
-                let id = u32::from_le_bytes(out[..4].try_into().unwrap());
-                if let Some(t) = pings.remove(&id) {
-                    rtt_samples.push(t.elapsed().as_micros() as u64);
-                }
-                // an unknown id is a pruned-as-lost ping arriving very late — already counted in rtt_lost
             } else if ch == p::CH_CTRL && l >= 2 && out[0] == p::CT_SESSION_EVENT {
                 // Label all four event kinds (#637): the old two-way branch mislabeled the phone-presence
                 // events (0x03/0x04) as "HOST_GONE".
@@ -1019,21 +689,6 @@ fn mode_avdec(link: &mut Link, secs: u64, cfg_path: Option<&str>, rtt: bool) {
         if Instant::now() >= next_hb {
             link.send(p::CH_CTRL, p::F_SOM | p::F_EOM, &[p::CT_HEARTBEAT]);
             next_hb = Instant::now() + Duration::from_secs(1);
-        }
-        if rtt && Instant::now() >= ping_at {
-            ping_seq = ping_seq.wrapping_add(1);
-            let mut pp = [0xA5u8; 64];
-            pp[..4].copy_from_slice(&ping_seq.to_le_bytes());
-            let t = Instant::now();
-            if link.send(p::CH_ECHO, p::F_SOM | p::F_EOM, &pp) {
-                pings.insert(ping_seq, t);
-            }
-            ping_at = Instant::now() + Duration::from_millis(100);
-            // A ping outstanding > 5 s is lost, not late — prune so the map can't grow unbounded on a
-            // wedged link (5 s is far past the FAIL threshold either way).
-            let before = pings.len();
-            pings.retain(|_, sent| sent.elapsed() < Duration::from_secs(5));
-            rtt_lost += (before - pings.len()) as u64;
         }
         // Drain every complete length-prefixed message the reassembly buffer now holds.
         loop {
@@ -1203,26 +858,6 @@ fn mode_avdec(link: &mut Link, secs: u64, cfg_path: Option<&str>, rtt: bool) {
     }
     if fail > 0 || afail > 0 {
         println!("[avdec] ✗ decrypt failures — video {fail}, audio {afail}");
-    }
-    if rtt {
-        rtt_lost += pings.len() as u64; // still-outstanding at exit = lost
-        rtt_samples.sort_unstable();
-        if rtt_samples.is_empty() {
-            println!("[avdec] RTT under load: NO samples (lost={rtt_lost})");
-        } else {
-            let pct =
-                |p: f64| rtt_samples[((rtt_samples.len() - 1) as f64 * p).round() as usize] as f64 / 1000.0;
-            println!(
-                "[avdec] RTT under A/V load (64 B echo, out_lo → upper bound): n={} p50={:.2} ms p90={:.2} ms p99={:.2} ms max={:.2} ms lost={}",
-                rtt_samples.len(),
-                pct(0.50),
-                pct(0.90),
-                pct(0.99),
-                *rtt_samples.last().unwrap() as f64 / 1000.0,
-                rtt_lost
-            );
-            println!("[avdec] gate (plan): PASS p99 ≤ 50 ms · MARGINAL 50–250 ms · FAIL > 250 ms or 1 s stalls");
-        }
     }
     link.send(p::CH_CTRL, p::F_SOM | p::F_EOM, &[p::CT_STOP]);
     println!("[avdec] STOP sent — box tears the session down (holding pattern)");
@@ -1561,66 +1196,6 @@ fn mode_setup_relay(link: &mut Link, secs: u64, cfg_path: Option<&str>, author: 
 }
 
 /// One-way DOWNLINK (box->host): ask the box to flood, drain + count raw bulk bytes.
-fn mode_srcbench(link: &mut Link, secs: u64) {
-    let ms = (secs * 1000) as u32;
-    let mut req = vec![p::CT_SRC];
-    req.extend_from_slice(&ms.to_le_bytes());
-    link.send(p::CH_CTRL, p::F_SOM | p::F_EOM, &req);
-    let mut buf = vec![0u8; 262144];
-    let mut total = 0u64;
-    let t0 = Instant::now();
-    let end = t0 + Duration::from_secs(secs);
-    while Instant::now() < end {
-        if let Ok(n) = link
-            .h
-            .read_bulk(link.ep_in, &mut buf, Duration::from_millis(500))
-        {
-            total += n as u64;
-        }
-    }
-    let dt = t0.elapsed().as_secs_f64();
-    println!(
-        "SOURCE downlink box->host: {} bytes in {:.2}s => {:.1} Mbps",
-        total,
-        dt,
-        total as f64 * 8.0 / 1e6 / dt
-    );
-}
-
-/// One-way UPLINK (host->box): flood CH_DISCARD frames (box parses + drops); count accepted bytes.
-fn mode_sinkbench(link: &mut Link, secs: u64, xfer: usize) {
-    let xfer = xfer.min(p::MAX_PAYLOAD);
-    let payload = vec![0xA5u8; xfer];
-    let mut frame = vec![0u8; p::HDR_LEN + xfer];
-    let (mut total, mut seq) = (0u64, 0u32);
-    let t0 = Instant::now();
-    let end = t0 + Duration::from_secs(secs);
-    while Instant::now() < end {
-        let n = p::frame(
-            &mut frame,
-            p::CH_DISCARD,
-            p::F_SOM | p::F_EOM,
-            seq,
-            &payload,
-        );
-        seq = seq.wrapping_add(1);
-        match link
-            .h
-            .write_bulk(link.ep_out, &frame[..n], Duration::from_secs(2))
-        {
-            Ok(w) => total += w as u64,
-            Err(_) => break,
-        }
-    }
-    let dt = t0.elapsed().as_secs_f64();
-    println!(
-        "SINK uplink host->box: {} bytes in {:.2}s => {:.1} Mbps",
-        total,
-        dt,
-        total as f64 * 8.0 / 1e6 / dt
-    );
-}
-
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map(String::as_str).unwrap_or("hello");
@@ -1629,7 +1204,6 @@ fn main() {
     let pid = u16::from_str_radix(args.get(3).map(String::as_str).unwrap_or("2d00"), 16)
         .unwrap_or(0x2d00);
     let secs: u64 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(5);
-    let xfer: usize = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(16384);
 
     let mut link = open(vid, pid);
     // Nothing but HELLO goes out until the HELLO_ACK: a trial's ocbmd takes a host's first other frame
@@ -1642,9 +1216,6 @@ fn main() {
     push_time(&mut link);
     match mode {
         "settime" => {} // clock already pushed above; nothing more to do
-        "echo" => mode_echo(&mut link, secs, xfer),
-        "rtt" => mode_rtt(&mut link, secs),
-        "mfi" => mode_mfi(&mut link),
         "console" => mode_console(&mut link),
         "ncm" => mode_ncm(&mut link),
         // `install info|confirm|stock`, or with the ids first as the usage says. The verb used to be
@@ -1656,18 +1227,6 @@ fn main() {
             };
             mode_install(&mut link, what)
         }
-        "ip" => mode_ip(
-            &mut link,
-            args.get(4).map(String::as_str).unwrap_or("127.0.0.1:22"),
-            args.get(5).map(String::as_str),
-        ),
-        "srcbench" => mode_srcbench(&mut link, secs),
-        "sinkbench" => mode_sinkbench(&mut link, secs, xfer),
-        "bridge" => mode_bridge(
-            &mut link,
-            args.get(4).map(String::as_str).unwrap_or("ncm0"),
-            args.get(5).and_then(|s| s.parse().ok()).unwrap_or(0),
-        ),
         "av" => mode_av(
             &mut link,
             args.get(4).and_then(|s| s.parse().ok()).unwrap_or(0),
@@ -1675,9 +1234,7 @@ fn main() {
         "avdec" => mode_avdec(
             &mut link,
             args.get(4).and_then(|s| s.parse().ok()).unwrap_or(0),
-            // cfg path is positional; --rtt may appear anywhere after it
-            args.get(5).map(String::as_str).filter(|a| *a != "--rtt"),
-            args.iter().any(|a| a == "--rtt"),
+            args.get(5).map(String::as_str),
         ),
         "session" => mode_session(
             &mut link,
