@@ -1,14 +1,9 @@
 [workspace]
 resolver = "2"
 members = ["crates/ocbm-proto", "crates/box-common", "crates/bt-common", "ccpa/ocbmd", "ccpa/iap2d", "ccpa/carplayd", "ccpa/aa-bridge", "ccpa/aa-wireless", "host/ocbm-host", "crates/vendor/wireless",
-    # NCM bring-up instruments (not shipped, not installed — see ccpa/mfid/src/main.rs).
-    "crates/mfi-wire", "ccpa/mfid", "host/mfi-probe",
-    # Raspberry Pi target daemons (not shipped on the CCPA).
-    "pi/apdhcpd",
-    # C2Air (Allwinner V821, riscv32) board-specific code — not shipped on the CCPA, and deliberately
-    # the ONLY C2Air-specific Rust: ocbmd/iap2d/carplayd build for riscv32 from the shared sources
-    # with no board-specific changes. See c2air/README.md.
-    "c2air/btattach"]
+    # The remote MFi wire format, linked into btd and carplayd until phase C6 removes the remote path.
+    "crates/mfi-wire",
+]
 # Vendored external crates (copied in 2026-07-13 to make the project self-contained): carplayd's
 # receiver_core deps (from old/ncm_carplayd) + iap2d's carplay iAP2 core. Excluded from membership so
 # `--workspace` builds them only as path DEPENDENCIES with the features the project requests
