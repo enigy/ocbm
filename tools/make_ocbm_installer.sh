@@ -7,8 +7,7 @@
 #   tools/make_ocbm_installer.sh --sources   # print SOURCE|PATH-ON-BOX for each payload file
 #
 # Stages tmp/once.sh + tmp/finish.sh (Stage A, ccpa/installer/) and tmp/ocbm/: the box binaries and
-# scripts of `ocbm_install.sh --full` (keep the two lists in step: make_ocbm_installer's test
-# compares them), the Stage B/C scripts, prune.list and identity.list. Writes tmp/ocbm/VERSION,
+# scripts (tools/ocbm_installer_test.sh pins the set), the Stage B/C scripts, prune.list and identity.list. Writes tmp/ocbm/VERSION,
 # BUDGET (flash the payload needs on JFFS2) and SHA256SUMS, then wraps the tree with
 # make_update_img.sh. Build the box binaries first (build.sh).
 #
@@ -21,7 +20,7 @@ INSTALLER_DIR="${INSTALLER_DIR:-$REPO/ccpa/installer}"
 
 die() { printf 'make_ocbm_installer: %s\n' "$*" >&2; exit 1; }
 
-payload() {  # SOURCE|PATH-ON-BOX: ocbm_install.sh manifest() --full, then Stage B/C
+payload() {  # SOURCE|PATH-ON-BOX: the programs and boot scripts, then Stage B/C
   local b s
   for b in ocbmd iap2d carplayd btd aa-bridge; do echo "$BIN_DIR/$b|usr/sbin/$b"; done
   echo "$IRS_BIN|usr/bin/iap_role_switch"

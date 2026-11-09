@@ -336,10 +336,13 @@ echo 40 > '$d/run/ocbmd_heard'; exit 1"
   reap
 done
 
-echo "== ocbm_finish.sh keeps tools/ncm_base_install.sh's lists"
+# ocbm_finish.sh's strip lists were kept equal to tools/ncm_base_install.sh's; that hand installer left main
+# (decision 4, 8 Nov), so they are the only copy: each list is there, and names the stock programs it must.
+echo "== ocbm_finish.sh's strip lists"
 lists() { bash -c 'eval "$(sed -n "/^SBIN_A=/,/^KILL_PROCS=/p;/^KILL_PROCS=/,/^[A-Z_]*=\"[^\"]*\"$/p" "$1" | sed "/^KILL_LOOPS=/d")" 2>/dev/null
   for v in SBIN_A SCRIPT_A ETC_A LIB_VENDOR LIB_DEV KILL_PROCS; do eval "echo $v: \$$v"; done' _ "$1"; }
-check '[ "$(lists "$REPO/tools/ncm_base_install.sh")" = "$(lists "$INST/ocbm_finish.sh")" ] && [ -n "$(lists "$INST/ocbm_finish.sh" | grep "^SBIN_A: AppleCarPlay")" ]' \
-  "SBIN_A SCRIPT_A ETC_A LIB_VENDOR LIB_DEV KILL_PROCS match"
+L="$(lists "$INST/ocbm_finish.sh")"
+check '[ "$(echo "$L" | grep -cE "^[A-Z_]+: [^ ]")" = 6 ]' "SBIN_A SCRIPT_A ETC_A LIB_VENDOR LIB_DEV KILL_PROCS are all set"
+check 'echo "$L" | grep -q "^SBIN_A: AppleCarPlay " && echo "$L" | grep "^KILL_PROCS:" | grep -q " AppleCarPlay"' "they name Carlinkit's CarPlay program"
 
 [ "$fails" -eq 0 ] && echo "ocbm_stageb_test: all passed" || { echo "ocbm_stageb_test: $fails failed"; exit 1; }

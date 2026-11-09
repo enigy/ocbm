@@ -326,7 +326,11 @@ phase_revert() {
   detect
   case "$VIA" in
     ssh|telnet) say "already on NCM"; return 0 ;;
-    ocbm) /opt/homebrew/bin/bash "$REPO/tools/ocbm_install.sh" revert ;;
+    ocbm)
+      # A hand-installed adapter's revert is the hand installer's, which left main after 1.0.4 (MIGRATING.md).
+      [ -f "$REPO/tools/ocbm_install.sh" ] \
+        || die "reverting a hand-installed adapter needs tools/ocbm_install.sh: run this from a checkout of tag v1.0.4 (MIGRATING.md)"
+      /opt/homebrew/bin/bash "$REPO/tools/ocbm_install.sh" revert ;;
     *) die "no adapter on OCBM or NCM" ;;
   esac
   wait_ncm 60 || die "the adapter did not come back on NCM"

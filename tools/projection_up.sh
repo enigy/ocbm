@@ -34,7 +34,7 @@ fi
 for _t in iap_role_switch iap2d; do
   command -v "$_t" >/dev/null 2>&1 || {
     echo "[proj] BOX MISCONFIGURED: '$_t' is not installed (PATH=$PATH) — wired CarPlay cannot start."
-    echo "[proj] This is NOT a phone fault; no reset or reboot fixes it. Install it (tools/ocbm_install.sh)."
+    echo "[proj] This is NOT a phone fault; no reset or reboot fixes it. Reinstall OCBM (the installer image)."
     exit 2
   }
 done

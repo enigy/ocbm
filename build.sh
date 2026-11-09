@@ -61,8 +61,7 @@ fi
 $BOX_CARGO zigbuild $BOX_STD --target armv7-unknown-linux-musleabihf --release -p btd
 echo "built  target/armv7-unknown-linux-musleabihf/release/btd  ($(wc -c < target/armv7-unknown-linux-musleabihf/release/btd) bytes, armv7 static)"
 
-# aa-bridge (Android Auto AOAP pump, docs/androidauto/00_ARCHITECTURE.md) — shipped box binary: tools/ocbm_install.sh installs
-# $ARM/aa-bridge to /usr/sbin/aa-bridge, so it has to be built here or the install line finds nothing.
+# aa-bridge (Android Auto AOAP pump, docs/androidauto/00_ARCHITECTURE.md) — shipped box binary, in the image.
 $BOX_CARGO zigbuild $BOX_STD --target armv7-unknown-linux-musleabihf --release -p aa-bridge
 # NOTE: no aa-wireless line. Wireless Android Auto is a LIBRARY linked into btd, not a
 # daemon of its own — see ccpa/aa-wireless/src/lib.rs. It builds as part of that binary.
@@ -78,7 +77,7 @@ fi
 
 # Stage the non-cargo artifacts the installer needs next to the cargo output, so a build-farm
 # collector that only knows target/<triple>/release/ and dist/ still ships a complete set
-# (tools/ocbm_install.sh wants accessory_init/iap_role_switch.armv7; ocbm-host is the bench client).
+# (the image wants accessory_init/iap_role_switch.armv7; ocbm-host is the bench client).
 mkdir -p dist
 [ -f accessory_init/iap_role_switch.armv7 ] && cp -f accessory_init/iap_role_switch.armv7 dist/
 cp -f target/release/ocbm-host dist/

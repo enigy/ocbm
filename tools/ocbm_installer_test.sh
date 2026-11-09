@@ -44,9 +44,25 @@ check 'grep -q "^need_kb=[0-9]" "$T/img/tmp/ocbm/BUDGET"' "BUDGET carries need_k
 if grep -q '^# OCBM_STAGE_C_PLACEHOLDER' "$REPO/ccpa/installer/ocbm_finish.sh"; then
   check 'head -1 "$T/img/tmp/ocbm/VERSION" | grep -q "^1.0.0-bench ocbm "' "with the Stage C placeholder, VERSION says bench"
 fi
-want="$(grep -oE '\|/(usr/sbin|usr/bin|script)/[^|]+\|755' "$REPO/tools/ocbm_install.sh" | cut -d'|' -f2 | sed 's|^/||' | LC_ALL=C sort -u)"
+# The programs and boot scripts the image places, beside the one-file install's own scripts. Pinned here since the
+# hand-install manifest (tools/ocbm_install.sh) left main (decision 4, 8 Nov): a change to the set is deliberate.
+want="script/ocbm_boot.sh
+script/phone_reset.sh
+script/projection_up.sh
+script/radio_ap_up.sh
+script/radio_detect.sh
+script/radio_hal.sh
+script/run_ocbmd.sh
+script/run_supervisor.sh
+script/session_supervisor.sh
+usr/bin/iap_role_switch
+usr/sbin/aa-bridge
+usr/sbin/btd
+usr/sbin/carplayd
+usr/sbin/iap2d
+usr/sbin/ocbmd"
 have="$(bash "$HERE/make_ocbm_installer.sh" --list | grep -vE '^script/(ocbm_(dispatch|selftest|revert|finish|update|restore)|stock_restore_box)\.sh$' | LC_ALL=C sort -u)"
-check '[ "$want" = "$have" ]' "the payload is ocbm_install.sh --full's file set"
+check '[ "$want" = "$have" ]' "the payload is the pinned file set"
 mkdir -p "$T/noinst"; cp "$REPO/ccpa/installer/"* "$T/noinst/"; rm -f "$T/noinst/ocbm_dispatch.sh"
 check '! BIN_DIR="$T/bin" IRS_BIN="$T/irs" INSTALLER_DIR="$T/noinst" bash "$HERE/make_ocbm_installer.sh" "$T/out2" >/dev/null 2>&1' \
   "the builder refuses without the Stage B scripts"

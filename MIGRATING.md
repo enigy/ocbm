@@ -1,10 +1,15 @@
 # Migrating a hand-installed adapter to the one-file install
 
-This takes a CPC200-CCPA that was converted to OCBM by hand (`tools/ncm_base_install.sh`, then
-`tools/ocbm_install.sh`) to the one-file install: the layout Carlink installs on a stock adapter, and
+This takes a CPC200-CCPA that was converted to OCBM by hand ([`tools/ncm_base_install.sh`](https://github.com/enigy/ocbm/blob/v1.0.4/tools/ncm_base_install.sh), then
+[`tools/ocbm_install.sh`](https://github.com/enigy/ocbm/blob/v1.0.4/tools/ocbm_install.sh)) to the one-file install: the layout Carlink installs on a stock adapter, and
 the only one that takes updates over the air. It runs in two stages: back to stock from the
 adapter's own backup, then the one-file installer from a USB stick. It took about 30 minutes on the
 first adapter migrated, on 1 November 2026, to ocbm `052fd04`.
+
+The hand-install tools left main after OCBM 1.0.4 (8 Nov 2026): every link to them here goes to tag
+[`v1.0.4`](https://github.com/enigy/ocbm/tree/v1.0.4), the last release that carries them. Run steps 1 to 3
+from a checkout of that tag: `tools/stock_restore.sh` takes a hand-installed adapter back to stock
+through them. From step 4 on, main's tools work, as they do for any one-file install.
 
 You lose every phone pairing, so each phone pairs again, and the adapter's Bluetooth name may
 change. Its Wi-Fi password and other settings return to what the backup holds.
@@ -15,7 +20,7 @@ Not sure which install you have? A hand-installed adapter reports no `"install"`
 
 ## What you need
 
-- **The adapter's own `backup_pre/` folder**, written by `tools/ncm_base_install.sh backup` before
+- **The adapter's own `backup_pre/` folder**, written by [`tools/ncm_base_install.sh`](https://github.com/enigy/ocbm/blob/v1.0.4/tools/ncm_base_install.sh) `backup` before
   anything was stripped: `mtd0.bin`, `mtd1.bin`, `mtd2.bin`, `rootfs.tar.gz`, `manifest.txt` and
   `SHA256SUMS`. Without it this guide can't help; stock then needs an SPI programmer. It holds the
   adapter's Wi-Fi password and Bluetooth keys, so keep it private and out of every repository.
@@ -205,8 +210,8 @@ restore from it:
 ## Updating in place instead
 
 If you want new code but not over-the-air updates, a hand-installed adapter can stay as it is and take
-the new files with the tool that installed it. The first adapter did this the same evening, before
-its migration. Back up each file the installer places first (`ocbm-host pull 1314 2d00 <remote>
+the new files with the tool that installed it, [`tools/ocbm_install.sh`](https://github.com/enigy/ocbm/blob/v1.0.4/tools/ocbm_install.sh) at tag `v1.0.4` (check
+the tag out first). The first adapter did this the same evening, before its migration. Back up each file the installer places first (`ocbm-host pull 1314 2d00 <remote>
 <local>`), then:
 
 ```
