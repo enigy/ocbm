@@ -7,7 +7,8 @@
 #   tools/make_ocbm_installer.sh --sources   # print SOURCE|PATH-ON-BOX for each payload file
 #
 # Stages tmp/once.sh + tmp/finish.sh (Stage A, ccpa/installer/) and tmp/ocbm/: the box binaries and
-# scripts (tools/ocbm_installer_test.sh pins the set), the Stage B/C scripts, prune.list and identity.list. Writes tmp/ocbm/VERSION,
+# scripts (tools/ocbm_installer_test.sh pins the set), the Stage B/C scripts, prune.list, identity.list
+# and NOTICE.fdk-aac (Fraunhofer's licence for the libfdk-aac carplayd links, verbatim; not placed). Writes tmp/ocbm/VERSION,
 # BUDGET (flash the payload needs on JFFS2) and SHA256SUMS, then wraps the tree with
 # make_update_img.sh. Build the box binaries first (build.sh).
 #
@@ -40,6 +41,7 @@ OUT="${1:-$HOME/.cache/carlink-artifacts/ocbm_installer}"
 missing=""
 while IFS='|' read -r src dst; do [ -s "$src" ] || missing="$missing\n  $src"; done < <(payload)
 for f in once.sh finish.sh prune.list identity.list; do [ -s "$INSTALLER_DIR/$f" ] || missing="$missing\n  $INSTALLER_DIR/$f"; done
+[ -s "$REPO/ccpa/carplayd/fdk-aac.NOTICE" ] || missing="$missing\n  $REPO/ccpa/carplayd/fdk-aac.NOTICE"
 [ -z "$missing" ] || die "missing inputs:$(printf "$missing")
   (box binaries: run build.sh; ocbm_dispatch/selftest/revert/finish.sh are Stage B/C, milestones M3-M4)"
 grep -q '^# OCBM_DISPATCH' "$INSTALLER_DIR/ocbm_dispatch.sh" || die "ocbm_dispatch.sh lacks its '# OCBM_DISPATCH' line"
@@ -54,6 +56,7 @@ mkdir -p "$P"
 install -m 755 "$INSTALLER_DIR/once.sh" "$stage/tmp/once.sh"
 install -m 755 "$INSTALLER_DIR/finish.sh" "$stage/tmp/finish.sh"
 install -m 644 "$INSTALLER_DIR/prune.list" "$INSTALLER_DIR/identity.list" "$P/"
+install -m 644 "$REPO/ccpa/carplayd/fdk-aac.NOTICE" "$P/NOTICE.fdk-aac"   # carplayd links libfdk-aac: its licence travels with it
 while IFS='|' read -r src dst; do
   mkdir -p "$P/$(dirname "$dst")"
   install -m 755 "$src" "$P/$dst"

@@ -41,6 +41,7 @@ bash "$HERE/make_update_img.sh" unpack "$T/out/A15W_Update.img" "$T/u.tgz"
 mkdir -p "$T/img"; tar -xzf "$T/u.tgz" -C "$T/img"
 check '( cd "$T/img/tmp/ocbm" && sha256sum -c SHA256SUMS >/dev/null 2>&1 )' "the payload manifest verifies"
 check 'grep -q "^need_kb=[0-9]" "$T/img/tmp/ocbm/BUDGET"' "BUDGET carries need_kb"
+check 'cmp -s "$REPO/ccpa/carplayd/fdk-aac.NOTICE" "$T/img/tmp/ocbm/NOTICE.fdk-aac"' "the image carries libfdk-aac's NOTICE verbatim"
 if grep -q '^# OCBM_STAGE_C_PLACEHOLDER' "$REPO/ccpa/installer/ocbm_finish.sh"; then
   check 'head -1 "$T/img/tmp/ocbm/VERSION" | grep -q "^1.0.0-bench ocbm "' "with the Stage C placeholder, VERSION says bench"
 fi
