@@ -41,7 +41,7 @@ symlinks into the cache.
 
 ## Documentation rule (2026-08-31)
 
-`docs/` is five categories — `carplay/`, `androidauto/`, `wireless/`, `host/`, `ops/` — **capped at
+`docs/` is four categories — `carplay/`, `androidauto/`, `wireless/`, `ops/` — **capped at
 10 documents each**, enforced by `tools/docs_check.py`. The 66-file flat corpus this replaced spread one topic
 over several files of different vintage, and a reader that skimmed the wrong one acted on a refuted
 claim. So: **correct the owning document in place.** Never add a `*_CORRECTIONS`, `*_V2` or dated

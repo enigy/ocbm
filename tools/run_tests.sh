@@ -74,14 +74,5 @@ run "radio-detect" bash tools/radio_detect_test.sh
 # The box scripts' suites again under BusyBox's sh and awk, the adapter's (v1.32.1); skipped without it.
 run "busybox (the adapter's sh and awk)" sh tools/busybox_suites.sh
 
-# host/MacHost's own hardware-free Swift harness (tests/run_tests.sh) — no Xcode project, no
-# dongle. Skipped (not a failure) when the Swift toolchain isn't on this machine, since the rest of
-# this script is Rust-only and must still be runnable without Xcode installed.
-if command -v xcrun >/dev/null 2>&1 && xcrun --find swiftc >/dev/null 2>&1; then
-  run "host/MacHost (Swift)" bash host/MacHost/tests/run_tests.sh
-else
-  echo "=== host/MacHost (Swift) — SKIPPED (xcrun/swiftc not found)"
-fi
-
 [ "$fail" -eq 0 ] || { echo "FAILURES"; exit 1; }
 echo "all suites passed"

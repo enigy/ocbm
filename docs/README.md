@@ -43,13 +43,6 @@ Rules that keep it that way:
 | [00_WIRELESS_CARPLAY.md](wireless/00_WIRELESS_CARPLAY.md) | wireless session bring-up, WiFi handoff, the AirPlay/iAP2 tunnel |
 | [01_BT_AND_RADIO.md](wireless/01_BT_AND_RADIO.md) | the chipset-agnostic radio HAL, BT bring-up, pairing, reconnect |
 
-## host/ — the host applications
-
-| File | Owns |
-|---|---|
-| [00_MACOS_HOST_APP.md](host/00_MACOS_HOST_APP.md) | the shipping macOS app |
-| [01_ANDROID_AND_AAOS.md](host/01_ANDROID_AND_AAOS.md) | the Android projection app and AAOS integration |
-
 ## ops/ — running, verifying and governing the work
 
 | File | Owns |
