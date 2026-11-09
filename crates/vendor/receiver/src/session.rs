@@ -344,7 +344,7 @@ pub trait SessionDelegate: Send {
     /// The advertised main-display resolution/frame-rate (`DeviceConfig.display_width/height/max_fps`),
     /// threaded in the same way `ControlServer::display_width` already is — purely for the
     /// consolidated "SETUP negotiated" troubleshooting line; no delegate needs it to function. Default
-    /// no-op so `NoSession`/`RemoteSession` (which log their own SETUP summary) are unaffected.
+    /// no-op so `NoSession` is unaffected.
     fn set_resolution(&mut self, _w: i64, _h: i64, _fps: i64) {}
 }
 
@@ -571,13 +571,6 @@ impl AvSession {
         self.peer_addr = Some(addr);
     }
 
-    /// Read back the recorded peer address (see [`Self::set_peer_addr`]). Added for the app-driven
-    /// SETUP relay: `relay::RemoteSession` wraps this session and puts the peer in its RS_OPEN ctx
-    /// bplist. Pure accessor — the one visibility addition the relay needed; no functional change.
-    pub fn peer_addr(&self) -> Option<std::net::SocketAddr> {
-        self.peer_addr
-    }
-
     fn setup_phase1(&mut self, keep_alive: bool) -> Result<Vec<u8>, SetupError> {
         // Idempotent, per Apple's reference (see `control_setup`). A repeat phase-1 SETUP with no
         // intervening TEARDOWN returns the SAME ports rather than re-binding: the phone is already
@@ -757,9 +750,6 @@ impl AvSession {
         // env var (docs/wireless/00_WIRELESS_CARPLAY.md #2.1), not shared with CARPLAY_WIRELESS_METADATA — see info.rs's comment.
         if std::env::var("CARPLAY_SESSION_MGMT").is_ok() {
             feats.push(Value::String("sessionManagement".into()));
-        }
-        if crate::relay::features_reverse() {
-            feats.reverse();
         }
         self.negotiated_features = feats
             .iter()

@@ -1,7 +1,7 @@
 //! OCBM v1 wire codec — the Open CCPA Bulk Multiplexer envelope.
 //!
-//! Projection-agnostic: the same envelope carries CarPlay and Android Auto. Nothing here is specific
-//! to either.
+//! The envelope itself knows nothing of CarPlay; the channels and control messages below give it
+//! its meaning.
 //!
 //! 16-byte little-endian header + payload, carried over the `/dev/usb_accessory` bulk pipe:
 //! ```text
@@ -38,31 +38,6 @@ pub const CH_ALT_VIDEO: u16 = 0x0024; // box->host: the ALT / navigation (instru
 //   0x03 META_ARTWORK — payload = [artwork id u8][JPEG bytes] — album art via the iAP2 File-Transfer session
 //   0x04 META_CORNERMASK — payload = [u32 BE display_width_px][PNG bytes] — iOS's exact per-resolution topLeftCornerMask (docs/carplay/06_AV_PIPELINE.md); host renders the corner curve from it — from carplayd (receiver)
 pub const CH_MGMT: u16 = 0x0040; // box management (the app's "CCPA" tab). Request/response, see MGMT_* below.
-// CH_RTSP — the app-driven-SETUP relay seam (plan: app-driven SETUP, phase P1). ocbmd is a DUMB BYTE
-// PIPE on this channel: it chunks the box seam's bytes (carplayd relay listener, 127.0.0.1:9106) into
-// ≤64 KiB OCBM frames both ways; ALL message framing is endpoint-to-endpoint (carplayd ↔ host app),
-// which sidesteps MAX_PAYLOAD 64 KiB < RTSP MAX_BODY 256 KiB. Rides out_hi (latency-sensitive,
-// reliable — the pair/SETUP/RECORD phase is timing-critical).
-//
-// Seam framing (survives an out_hi cap-clear truncation, which has no resync policy — receivers scan
-// for the magic, exactly the CH_METADATA-v2 "META" pattern):
-//   [u32 BE 0x52545350 "RTSP"][u32 BE len][msg],  len ≤ 512 KiB (RELAY_SEAM_MAX)
-// Messages — common header [op u8][conn u32 LE][cseq u32 LE], then per-op payload (multibyte fields LE):
-//   0x01 RS_OPEN   box→host  [ver=1][flags b0=wireless][cfg_crc u32][ctx_len u32][ctx bplist
-//                            {peer, displayWidth, displayHeight}] — cfg_crc = crc32 of the YAML this
-//                            connection's /info was built from; host compares vs what it pushed.
-//   0x02 RS_REQ    box→host  [route u8][flags b0=NOTIFY][local_len u32][local-resp bplist][req bplist]
-//                            routes: 1=SETUP, 2=RECORD, 3=TEARDOWN(NOTIFY); 4-7 reserved.
-//   0x03 RS_RESP   host→box  [status u16][response body] — non-200 = host-reject → local fallback (v1).
-//   0x04 RS_CLOSE  box→host  [reason u8: 0=eof 1=hijack 2=error 3=reset]
-//   0x05 RS_ERR    host→box  [code u8] — box falls back to its local response.
-// `conn` is monotonic per carplayd process (hijack ⇒ new conn; the single FIFO guarantees
-// RS_CLOSE(old) precedes RS_OPEN(new)); the host drops messages for a non-current conn.
-// The RS_*/magic constants are defined authoritatively in `receiver::relay` and MIRRORED here (and in
-// the Swift/harness consumers) rather than imported — the same pattern as the META_* markers below:
-// the box's receiver crates do not link ocbm-proto, so each endpoint declares its own local consts and
-// this comment block is the cross-checked contract.
-pub const CH_RTSP: u16 = 0x0041; // box↔host: app-driven SETUP relay (RS_* over the "RTSP"-magic seam; box seam :9106)
 pub const CH_INPUT: u16 = 0x0030; // host->box: HID input (touch/buttons); ocbmd relays to carplayd -> iPhone
 pub const CH_MIC: u16 = 0x0031; // host->box: mic uplink PCM (S16LE, negotiated rate/ch). ocbmd relays each
                                 // payload to carplayd's mic-ingest seam; carplayd RTP-uplinks it to the iPhone
@@ -78,10 +53,15 @@ pub const CH_LOG: u16 = 0x0042; // box->host ONLY: the box's universal log (/tmp
 //
 //   channels   CH_MFI 0x0001 (the host MFi relay; the chip's only users are the box's own daemons),
 //              CH_IP 0x0010 (the userspace TCP/UDP relay), CH_ETH 0x0012 (the raw ncm0 bridge),
-//              CH_ECHO 0x00FF and CH_DISCARD 0x0FFF (the throughput benches)
+//              CH_ECHO 0x00FF and CH_DISCARD 0x0FFF (the throughput benches),
+//              CH_RTSP 0x0041 (the app-driven SETUP relay; its RS_* ops 0x01..=0x05 inside the "RTSP" seam)
 //   control    CT_SRC 0x04 (the downlink flood), CT_ETH_START 0x06 and CT_ETH_STOP 0x07
 //   caps       CAP_ECHO 0x0000_0002, CAP_MFI 0x0000_0004, CAP_IP 0x0000_0008, CAP_ETH 0x0000_0020
 //   CH_IP      IP_OPEN 0x01, IP_DATA 0x02, IP_CLOSE 0x03, IP_OPEN_UDP 0x04
+//   PM_*       PM_WIRED_AA 0x03 (aa-bridge), PM_WIRELESS_AA 0x04 (wireless Android Auto)
+//   LOG_SRC_*  LOG_SRC_AA_BRIDGE 4 (/tmp/aa-bridge.log)
+//   audio seam SEAM_PKT_PLAIN marker 0x03 (btd's SCO call audio), SEAM_FORMAT codec 4 (mSBC); CT_UPLINK
+//              codec 4 (mSBC)
 
 // flags
 pub const F_SOM: u8 = 0x01;
@@ -126,13 +106,12 @@ pub const CT_STOP: u8 = 0x11; // host->box [CT_STOP] -> receiver stopping (clean
 pub const CT_HEARTBEAT: u8 = 0x12; // host->box [CT_HEARTBEAT] -> liveness ping (send ~1/s)
 pub const CT_SESSION_EVENT: u8 = 0x13; // box->host [CT_SESSION_EVENT][SEV_*] -> presence transition
 pub const CT_UPLINK: u8 = 0x14; // box->host [CT_UPLINK][state u8][rate u32 LE][ch u8][codec u8] -> mic-uplink
-                                // gate. state 1=on (iPhone opened a type-100 input SETUP, or an HFP call
-                                // opened SCO; app starts capturing at rate/ch), 0=off (TEARDOWN; app stops).
+                                // gate. state 1=on (iPhone opened a type-100 input SETUP; app starts
+                                // capturing at rate/ch), 0=off (TEARDOWN; app stops).
                                 // Mirrors the receiver's `uplink on <rate> <ch> [codec]` / `uplink off`
                                 // back-channel across OCBM to the host app.
-                                // `codec` ADDED 2026-09-04 for HFP wideband: 0 = PCM S16LE (every CarPlay
-                                // uplink and HFP/CVSD), 4 = [`SEAM_CODEC_MSBC`] — the app must hand back
-                                // whole 60-byte mSBC eSCO packets (H2 + 57 B frame + 1 pad), not PCM.
+                                // `codec`: 0 = PCM S16LE, the only value the box sends (4, mSBC, is
+                                // retired: see the table at the top).
                                 // The ON payload is 8 bytes; the OFF payload stays the pre-2026-09-04
                                 // 7-byte all-zero form byte-identically (state 0 has no format to carry, and
                                 // an OFF is the one edge an older host must never mis-parse). Hosts parse ON
@@ -184,12 +163,8 @@ pub const CT_RADIO: u8 = 0x16; // host->box [CT_RADIO][0=radios off now | 1=radi
                                // implied by SUBSCRIBE + config push, and app loss powers radios off)
 pub const CT_PROJ_MODE: u8 = 0x19; // box->host [CT_PROJ_MODE][PM_*] -> WHICH projection transport owns the
                                    // box right now. Mirrors the box's single-owner arbitration flag
-                                   // `/tmp/projection_owner` (docs/androidauto/02_ARBITRATION.md), which session_supervisor and
-                                   // aa-bridge claim first-come-wins. Without it the app cannot know
-                                   // whether the box armed CarPlay or Android Auto, and had to be told by
-                                   // hand (the `AA_OCBM` env stand-in). On PM_WIRED_AA the app runs its own
-                                   // AA head-unit engine over CH_IP to the box's aa-bridge instead of the
-                                   // CarPlay decode path. Emitted on change and re-emitted to every fresh
+                                   // `/tmp/projection_owner`, which session_supervisor claims.
+                                   // Emitted on change and re-emitted to every fresh
                                    // SUBSCRIBE, same discipline as CT_BT_PHASE. Advisory: an unknown value
                                    // means "some transport owns the box" — never gate on ordering.
 pub const CT_BOX_HEALTH: u8 = 0x1A; // box->host [CT_BOX_HEALTH][flags u8] -> the box's own readiness, as
@@ -225,7 +200,7 @@ pub const BH_SSP: u8 = 0x02; // Secure Simple Pairing enabled on hci0
 pub const BH_IAP2D: u8 = 0x04; // iap2d running (wired CarPlay identify path)
 pub const BH_AIRPLAYD: u8 = 0x08; // carplayd running
 pub const BH_CARPLAY_WIRELESS: u8 = 0x10; // btd running (BT + AP bring-up supervisor)
-pub const BH_WLAN_AP: u8 = 0x20; // hostapd running — the box is raising its OWN AP (NOT the GM bridge role)
+pub const BH_WLAN_AP: u8 = 0x20; // hostapd running — the box is raising its own AP
 pub const BH_ROOTFS_OK: u8 = 0x40; // rootfs has headroom; clear means the box is close to full and may
                                    // fail to write logs, configs or the ephemeral session YAML
 pub const BH_PAIR_WINDOW: u8 = 0x80; // the Bluetooth pairing window is open (MGMT_PAIR_WINDOW): the box is
@@ -255,7 +230,6 @@ pub const LOG_SRC_BOX: u8 = 0;
 pub const LOG_SRC_AIRPLAYD: u8 = 1; // /tmp/carplayd.log (wired session)
 pub const LOG_SRC_AIRPLAYD_WL: u8 = 2; // /tmp/carplayd_wl.log (wireless session — a DIFFERENT file)
 pub const LOG_SRC_IAP2D: u8 = 3; // /tmp/iap2d.log
-pub const LOG_SRC_AA_BRIDGE: u8 = 4; // /tmp/aa-bridge.log
 pub const LOG_SRC_RX_CONNECT: u8 = 5; // RETIRED 2026-09-08 — rx-connect merged into carplayd
                                       // (its output is now /tmp/carplayd.log, LOG_SRC_AIRPLAYD).
                                       // The id stays reserved: wire ids are never reused.
@@ -284,7 +258,6 @@ pub fn log_source_name(id: u8) -> &'static str {
         LOG_SRC_AIRPLAYD => "airplayd",
         LOG_SRC_AIRPLAYD_WL => "airplayd-wl",
         LOG_SRC_IAP2D => "iap2d",
-        LOG_SRC_AA_BRIDGE => "aa-bridge",
         LOG_SRC_RX_CONNECT => "rx-connect",
         LOG_SRC_BT => "bt",
         LOG_SRC_RADIO_AP_DHCP => "radio_ap_dhcp",
@@ -316,11 +289,9 @@ pub const LOG_CAP_DEFAULT_KB: u16 = 256;
 /// Fixed header size of one CH_LOG entry: source, flags, seq, unix_ms, len.
 pub const LOG_ENTRY_HDR: usize = 14;
 
-pub const PM_NONE: u8 = 0x00; // idle — no projection session; either phone kind may claim the box
+pub const PM_NONE: u8 = 0x00; // idle — no projection session; a phone may claim the box
 pub const PM_WIRED_CP: u8 = 0x01; // wired CarPlay (projection_up -> iap2d + carplayd)
 pub const PM_WIRELESS_CP: u8 = 0x02; // wireless CarPlay (btd: BT + WiFi AP)
-pub const PM_WIRED_AA: u8 = 0x03; // wired Android Auto (aa-bridge AOAP pump; app drives AA over CH_IP)
-pub const PM_WIRELESS_AA: u8 = 0x04; // reserved — wireless Android Auto (docs/androidauto/03_WIRELESS.md, Phase 3, unbuilt)
 
 pub const SEV_HOST_PRESENT: u8 = 0x01; // subscribed + heartbeat-alive
 pub const SEV_HOST_GONE: u8 = 0x02; // STOP, or heartbeat watchdog expired
@@ -553,7 +524,6 @@ pub const APPEARANCE_MODE_DARK: u8 = 0x01;
 //   [SEAM_KEY   ][key 32][scid 8 LE]                        — per-stream ChaCha20 key  (len == 45)
 //   [SEAM_PKT   ][scid 8 LE][raw encrypted RTP packet]      — host decrypts    (len == 13 + pkt)
 //   [SEAM_FORMAT][scid 8 LE][codec u8][rate u32 LE][ch u8][bits u8][audio_type u8]    (len == 21)
-//   [SEAM_PKT_PLAIN][scid 8 LE][raw PCM]                    — NOT encrypted     (len == 13 + pcm)
 // MAGIC ADDED 2026-09-03, and it is what makes a re-SETUP survivable. ocbmd replaces a seam producer
 // WITHOUT draining the old one, so a host that reassembles the channel as one continuous byte stream
 // can be holding half a message when the new producer's first bytes arrive; before the magic the
@@ -568,52 +538,11 @@ pub const APPEARANCE_MODE_DARK: u8 = 0x01;
 // the identical wire — the box forwards encrypted RTP untouched either way).
 // Wire values (consumers parse these as raw byte literals):
 //   SEAM_MAGIC: 0x53 0x45 0x41 0x56 ("SEAV") — identical to the video seam's
-//   markers: 0x00 SEAM_KEY, 0x01 SEAM_PKT, 0x02 SEAM_FORMAT, 0x03 SEAM_PKT_PLAIN
-//   SEAM_FORMAT codec: 0 PCM, 1 AAC-LC, 2 AAC-ELD, 3 OPUS, 4 mSBC ([`SEAM_CODEC_MSBC`])
+//   markers: 0x00 SEAM_KEY, 0x01 SEAM_PKT, 0x02 SEAM_FORMAT (0x03 retired)
+//   SEAM_FORMAT codec: 0 PCM, 1 AAC-LC, 2 AAC-ELD, 3 OPUS (4 retired)
 //   SEAM_FORMAT audio_type (the SETUP audioType): 0 media, 1 telephony, 2 speechRecognition (Siri),
 //     3 alert, 4 default/absent, 5 compatibility (a MEDIA-carrying PCM fallback, deliberately not
 //     folded into 4 — see receiver::forward::tag_voice and docs/carplay/06_AV_PIPELINE.md)
-
-/// Audio-seam marker `0x03` — **an unencrypted PCM payload**: `[scid 8 LE][raw PCM]`.
-///
-/// The other three markers all belong to the AirPlay pipeline, where the box forwards the iPhone's
-/// own encrypted RTP untouched and hands the host a per-stream ChaCha20 key (`SEAM_KEY`) to
-/// decrypt it with. Bluetooth HFP call audio has no such packet: the SCO link delivers bare CVSD
-/// PCM that the CONTROLLER already decoded, there is no RTP header, no key and nothing to decrypt.
-/// Reusing `SEAM_PKT` for it would mean shipping plaintext down a lane whose whole contract is
-/// "look up the scid's key and decrypt" — the host would either fail the AEAD or, worse, feed
-/// garbage to the decoder. A distinct marker makes the difference explicit on the wire.
-///
-/// Producer today: `btd`'s `sco_audio`, on the voice seam (`:9003` → [`CH_ALT_AUDIO`]),
-/// preceded by one `SEAM_FORMAT` declaring `codec=0 PCM, rate=8000, ch=1, bits=16, audio_type=1
-/// telephony`. Payload is one 20 ms frame: 320 bytes of 8 kHz mono S16LE (host byte order is
-/// LITTLE-endian here — this is not the AirPlay PCM downlink, which is big-endian). When the AG
-/// negotiates WIDEBAND instead, the same marker carries one raw transparent-eSCO read under a
-/// `SEAM_FORMAT` of [`SEAM_CODEC_MSBC`] — see that constant; the payload is then a bitstream, not
-/// PCM, and is not aggregated.
-///
-/// A host that does not know this marker must SKIP the message by its length prefix, exactly as it
-/// would any unknown marker, and must not treat it as a desync.
-pub const SEAM_PKT_PLAIN: u8 = 0x03;
-
-/// `SEAM_FORMAT` codec `4` — **mSBC**, the HFP wideband-speech codec (HFP 1.6 §5.7.4).
-///
-/// The other codec values name something the box either produces as PCM or forwards as encrypted
-/// AirPlay RTP. This one is neither: when the AG negotiates mSBC the controller stops decoding and
-/// the SCO socket carries the AIR FRAMES — 60 B per 7.5 ms, each a 2-byte H2 header
-/// (`0x01`, then `0x08`/`0x38`/`0xC8`/`0xF8`), a 57-byte mSBC frame and one pad byte — which only a
-/// software decoder can turn into 16 kHz PCM. The box has no such decoder and deliberately does not
-/// grow one: it forwards each SCO read verbatim as one [`SEAM_PKT_PLAIN`], preceded by one
-/// `SEAM_FORMAT` of `codec 4, rate 16000, ch 1, bits 16, audio_type 1 telephony`.
-///
-/// Two consequences for the host, both load-bearing:
-///   * Packets are NOT aggregated to 20 ms and a payload is not necessarily a whole frame boundary.
-///     Resynchronise on the H2 header, never on the message length.
-///   * `rate`/`bits` describe the DECODED audio (16 kHz mono S16LE), not the payload.
-///
-/// A host that cannot decode mSBC must drop the stream rather than play the payload — the bytes are
-/// a compressed bitstream and rendering them as PCM is full-scale noise.
-pub const SEAM_CODEC_MSBC: u8 = 4;
 
 // touch phases
 pub const TOUCH_DOWN: u8 = 0x00;
@@ -1086,7 +1015,7 @@ mod tests {
     #[test]
     fn log_source_ids_are_unique_and_all_named() {
         let ids = [
-            LOG_SRC_BOX, LOG_SRC_AIRPLAYD, LOG_SRC_AIRPLAYD_WL, LOG_SRC_IAP2D, LOG_SRC_AA_BRIDGE,
+            LOG_SRC_BOX, LOG_SRC_AIRPLAYD, LOG_SRC_AIRPLAYD_WL, LOG_SRC_IAP2D,
             LOG_SRC_RX_CONNECT, LOG_SRC_RX_CONNECT_WL, LOG_SRC_CARPLAY_WIRELESS, LOG_SRC_BT,
             LOG_SRC_RADIO_AP_DHCP, LOG_SRC_RADIO_BT_ATTACH, LOG_SRC_INTERNAL,
         ];
@@ -1101,11 +1030,12 @@ mod tests {
         assert_eq!(
             [
                 LOG_SRC_BOX, LOG_SRC_AIRPLAYD, LOG_SRC_AIRPLAYD_WL, LOG_SRC_IAP2D,
-                LOG_SRC_AA_BRIDGE, LOG_SRC_RX_CONNECT, LOG_SRC_BT, LOG_SRC_RADIO_AP_DHCP,
+                LOG_SRC_RX_CONNECT, LOG_SRC_BT, LOG_SRC_RADIO_AP_DHCP,
                 LOG_SRC_RADIO_BT_ATTACH, LOG_SRC_RX_CONNECT_WL, LOG_SRC_CARPLAY_WIRELESS,
             ],
-            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+            [0, 1, 2, 3, 5, 6, 7, 8, 9, 10]
         );
+        assert_eq!(log_source_name(4), "?", "4 is retired (aa-bridge) and stays unnamed");
         assert_eq!(LOG_SRC_INTERNAL, 255);
         assert_eq!(log_source_name(LOG_SRC_BOX), "box");
         assert_eq!(log_source_name(LOG_SRC_CARPLAY_WIRELESS), "wl");
@@ -1116,9 +1046,10 @@ mod tests {
     #[test]
     fn ch_log_and_ct_log_ctl_do_not_collide() {
         assert_eq!(CH_LOG, 0x0042);
-        for ch in [CH_CTRL, CH_CONSOLE, CH_MGMT, CH_RTSP, CH_FILE] {
+        for ch in [CH_CTRL, CH_CONSOLE, CH_MGMT, CH_FILE] {
             assert_ne!(CH_LOG, ch);
         }
+        assert_ne!(CH_LOG, 0x0041, "CH_RTSP's number is retired, never reused");
         // CT_LOG_CTL extends the CT_* space to 0x1B; docs/carplay/01_OCBM_PROTOCOL.md quotes that range.
         assert_eq!(CT_LOG_CTL, 0x1B);
         assert_ne!(CT_LOG_CTL, CT_BOX_HEALTH);

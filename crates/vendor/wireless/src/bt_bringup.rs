@@ -121,11 +121,8 @@ fn run_with(mut cmd: Command, args: &[&str]) -> std::io::Result<()> {
 /// `bluetoothd` via systemd.
 fn stop_conflicting_daemons() {
     // `hfpd` is in this list because `bluetoothDaemon` starts it: it is the vendor's HFP/HSP
-    // implementation, and left running it is a SECOND owner of the profile this stack drives
-    // itself (hfp_hf.rs) and of the single SCO listener (sco_audio.rs `owns_path`). Two AT clients
-    // on one AG, or two claimants on one SCO path, fail as garbled or missing call audio rather
-    // than as an error anyone can see. It was already in `bt_off.sh` and the installer kill list;
-    // omitting it here was the gap.
+    // implementation, a second Bluetooth stack talking to the phone. It is also in `bt_off.sh` and
+    // the installer kill list.
     for d in ["hcid", "bluetoothDaemon", "sdpd", "hfpd"] {
         let _ = Command::new("killall").arg(d).status();
     }
@@ -151,75 +148,13 @@ fn hci_ldisc_registered() -> bool {
         .unwrap_or(true) // unreadable /proc: do not block bring-up on a diagnostic
 }
 
-/// Re-apply this unit's own post-attach SCO setup through the radio seam, after the DOWN->UP cycle
-/// above has reset it away.
-///
-/// BEST-EFFORT BY DESIGN, on every axis:
-///   * A unit whose vendor branch carries no SCO mapping exits 3 (`unsupported`) and that is a
-///     finding, not a failure -- CarPlay does not need SCO and Android Auto degrades to no call
-///     audio, which is strictly better than refusing to bring Bluetooth up at all.
-///   * The seam is absent entirely on the Pi/AAOS port and on a dev host. Missing script, missing
-///     `sh`, non-zero exit: all logged, none fatal.
-///
-/// Never composes the commands itself. `hcitool -i hci0 cmd 0x3f 0x1c 0x01 0x02 0x00 0x00 0x00` is
-/// BCM4358's and `0x3f 0x1d 0x00` is NXP's; firing either at the wrong controller is the exact
-/// class of mistake the seam exists to make impossible, so the choice stays in `radio_detect.sh`,
-/// which reads it out of the unit's own `attach_bluetooth.sh`.
-fn restore_sco_setup() {
-    const HAL: &str = "/script/radio_hal.sh";
-    if !std::path::Path::new(HAL).exists() {
-        return; // not a CCPA rootfs (Pi/AAOS port, or a dev host) -- nothing to restore
-    }
-    // BOUNDED, and that bound is load-bearing. `sco_on` takes radio_hal's per-subsystem `bt` lock,
-    // and `bt_on` can legitimately hold that lock for MINUTES against a wedged controller (its
-    // convergence poll is 30 × `timeout 5` across 4 attempts). `lock_take` gives up after 30 s, so
-    // an unbounded call here would stall `bring_up` — which runs once per active session, on the
-    // session's critical path — for half a minute behind a bring-up that is already doing the work.
-    // `timeout` is present on this platform (radio_hal.sh itself uses it); if it somehow is not,
-    // fall back to a direct call rather than silently skipping the restore.
-    let run = Command::new("timeout").args(["20", "sh", HAL, "sco_on"]).output();
-    let run = match run {
-        Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Command::new("sh").arg(HAL).arg("sco_on").output()
-        }
-        other => other,
-    };
-    match run {
-        Ok(out) => {
-            let code = out.status.code().unwrap_or(-1);
-            // The seam logs its own detail to stdout; carry the one-line verdict so a box.log
-            // reader does not have to correlate two files.
-            let detail = String::from_utf8_lossy(&out.stdout);
-            // Every line, not just the verdict (2026-10-20): radio_hal stamps each with uptime, and
-            // the lock wait and readback inside `sco_on` are part of the bring-up time being measured.
-            for line in detail.lines().filter(|l| !l.trim().is_empty()) {
-                eprintln!("[bt-bringup] {}", line.trim());
-            }
-            let last = detail.lines().last().unwrap_or("").trim();
-            match code {
-                0 => eprintln!("[bt-bringup] SCO setup restored after the down/up cycle ({last})"),
-                3 => eprintln!(
-                    "[bt-bringup] no SCO mapping for this unit -- HFP call audio will not work ({last})"
-                ),
-                124 => eprintln!(
-                    "[bt-bringup] radio_hal.sh sco_on timed out after 20s (the bt lock is held by a \
-                     concurrent bring-up) -- HFP call audio may be silent this session"
-                ),
-                _ => eprintln!("[bt-bringup] radio_hal.sh sco_on exited {code} ({last})"),
-            }
-        }
-        Err(e) => eprintln!("[bt-bringup] could not run {HAL} sco_on: {e} (HFP call audio may be silent)"),
-    }
-}
-
 /// One timed step of [`bring_up`]: an `@<unix_ms> ` write-time stamp (docs/carplay/01_OCBM_PROTOCOL.md
 /// CH_LOG, so the host's drive log keeps the real time) plus the time since bring-up began.
 ///
 /// Added 2026-10-20: a GM truck drive log showed 11.7 s from btd starting to "discoverable" on a
 /// warm reconnect (radio_hal had just reported hci0 converged), the largest single cost between the
 /// host's SUBSCRIBE and the first video frame. Nothing inside bring-up was timed, so which step
-/// spends it (the DOWN->UP controller reset, `hciconfig` calls, or the `radio_hal.sh sco_on`
-/// restore behind its `bt` lock) could not be told apart.
+/// spends it (the DOWN->UP controller reset or the `hciconfig` calls) could not be told apart.
 fn stamp(t0: std::time::Instant, what: &str) {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -270,40 +205,11 @@ pub fn bring_up(hci_dev: &str, name: &str) -> std::io::Result<()> {
     // bound socket or a live listener. During the quiet period `go_quiet`'s `noscan` prevents any new
     // inbound ACL, so no in-use connection can be severed either.
     //
-    // KNOWN SIDE EFFECT, NOW REPAIRED (2026-09-03): this controller is `hciattach`'d over UART, so it
-    // carries HCI_QUIRK_RESET_ON_CLOSE -- the `down` makes the kernel issue a real HCI_Reset on close,
-    // and the `up` re-reads Read_Buffer_Size. That discards `attach_bluetooth.sh`'s HFP setup (its
-    // `hciconfig scomtu 240:32` plus the vendor `hcitool` SCO-to-HCI routing command where its chipset
-    // branch has one).
-    //
-    // This comment used to end "deliberately NOT re-issued here: CarPlay carries ALL audio --
-    // including telephony -- over the AirPlay/WiFi session, never over SCO/HFP". That reasoning was
-    // sound and is now OBSOLETE: wireless ANDROID AUTO carries call and Assistant audio over
-    // Bluetooth HFP/SCO (`sco_audio`), so the discarded setup is load-bearing again. It is restored
-    // by `restore_sco_setup` below -- through the radio seam, never by this daemon composing raw HCI,
-    // because which commands a unit needs is a per-chipset fact only that unit's own dispatcher
-    // knows (docs/wireless/01_BT_AND_RADIO.md, the no-chipset-whitelist rule).
-    // Native backend (Raspberry Pi port): `hciconfig` is BlueZ userspace and does not exist on
-    // Android, so every operation below is done with ioctls + raw HCI command packets instead. The
-    // ORDER and the DOWN->UP cycle are identical — see the reasoning above, it is load-bearing.
-    if crate::hci::native_selected() {
-        let dev = crate::hci::dev_id(hci_dev)?;
-        let _ = crate::hci::dev_down(dev); // best-effort: already-down returns EALREADY
-        stamp(t0, "down");
-        crate::hci::dev_up(dev)?;
-        stamp(t0, "up");
-        let _ = crate::hci::write_ssp_mode(dev, true); // non-fatal, as with `hciconfig sspmode`
-        crate::hci::write_class_of_device(dev, CLASS_OF_DEVICE)?;
-        crate::hci::write_local_name(dev, name)?;
-        crate::hci::write_eir(dev, &eir_bytes(name))?;
-        crate::hci::set_scan(dev, crate::hci::SCAN_PAGE_AND_INQUIRY)?;
-        stamp(t0, "class, name, EIR, scan set");
-        restore_sco_setup();
-        stamp(t0, "SCO setup restored");
-        eprintln!("[btd] HCI bring-up OK dev={hci_dev} name={name}");
-        return Ok(());
-    }
-
+    // KNOWN SIDE EFFECT: this controller is `hciattach`'d over UART, so it carries
+    // HCI_QUIRK_RESET_ON_CLOSE -- the `down` makes the kernel issue a real HCI_Reset on close, and the
+    // `up` re-reads Read_Buffer_Size. That discards `attach_bluetooth.sh`'s SCO setup, which is
+    // harmless: CarPlay carries all audio, telephony included, over the AirPlay/Wi-Fi session, never
+    // over SCO.
     let _ = run_rt(&[hci_dev, "down"]);
     stamp(t0, "down");
     run_rt(&[hci_dev, "up"])?;
@@ -322,8 +228,6 @@ pub fn bring_up(hci_dev: &str, name: &str) -> std::io::Result<()> {
     // bring-up in three and sleeps the full 10 s request timeout (`hci::write_scan_enable`).
     crate::hci::write_scan_enable(crate::hci::dev_id(hci_dev)?, crate::hci::SCAN_PAGE_AND_INQUIRY)?;
     stamp(t0, "class, name, EIR, piscan set");
-    restore_sco_setup();
-    stamp(t0, "SCO setup restored");
     eprintln!("[btd] HCI bring-up OK dev={hci_dev} name={name}");
     Ok(())
 }
@@ -331,10 +235,6 @@ pub fn bring_up(hci_dev: &str, name: &str) -> std::io::Result<()> {
 /// Stop being discoverable/connectable -- used when the arbiter preempts this session in favor of
 /// wired, or on shutdown. Does not power the controller off (a future phase reuses it for RFCOMM).
 pub fn go_quiet(hci_dev: &str) -> std::io::Result<()> {
-    if crate::hci::native_selected() {
-        let dev = crate::hci::dev_id(hci_dev)?;
-        return crate::hci::set_scan(dev, crate::hci::SCAN_NONE);
-    }
     // Raw, not `hciconfig noscan`, for the same lost-wake-up reason as bring_up's scan enable.
     crate::hci::write_scan_enable(crate::hci::dev_id(hci_dev)?, crate::hci::SCAN_NONE)
 }

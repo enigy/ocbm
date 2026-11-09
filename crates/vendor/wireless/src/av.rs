@@ -90,10 +90,7 @@ pub fn expect_phone(peer: Option<[u8; 6]>) {
 const WLAN_IFACE: &str = "wlan0";
 /// The AP gateway hostapd/udhcpd serve on `wlan0` — the address the iPhone reaches carplayd at, and
 /// the A record rx-connect advertises. Matches `start_bluetooth_wifi.sh` (WLANIP default).
-///
-/// ONE definition, hoisted to `box-common` on 2026-09-04: wireless Android Auto ADVERTISES this
-/// address to the phone (`WifiStartRequest.ip_address`, `main.rs::aa_ap_params`) and `aa-bridge`
-/// BINDS its wireless pump to it, so a second literal anywhere is a silent handoff failure.
+/// One definition, in `box-common`.
 pub(crate) const AP_IP: &str = box_common::net::AP_IP;
 
 fn env_or(key: &str, default: &str) -> String {

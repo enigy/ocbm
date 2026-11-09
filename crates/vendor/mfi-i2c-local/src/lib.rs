@@ -91,7 +91,7 @@ impl MfiLock {
             let err = std::io::Error::last_os_error();
             eprintln!(
                 "[mfi-i2c-local] cannot OPEN the MFi lock at {} ({err}) — this host has no local chip \
-                 access; a remote signer is required. NOT lock contention.",
+                 access. NOT lock contention.",
                 String::from_utf8_lossy(&MFI_LOCK_PATH[..MFI_LOCK_PATH.len() - 1])
             );
             return Err(MfiError::LockUnavailable);
@@ -219,48 +219,24 @@ pub enum MfiError {
     /// Structurally different from [`MfiError::LockBusy`] and it must not be conflated with it, which
     /// is exactly what happened for months: both cases returned `None` from `MfiLock::acquire()`, the
     /// callers mapped every `None` to `LockBusy`, and the resulting log line said "another chip user
-    /// holds it". On Android there IS no other chip user and no lock — `/tmp` does not exist, `open`
-    /// fails `ENOENT`, and a hard structural failure read as transient contention across three
-    /// separate evidence captures from 2026-07-22 onward.
+    /// holds it". A host without a writable `/tmp` fails `open`, and that hard structural failure
+    /// read as transient contention.
     ///
     /// This variant means "this host cannot do local chip access at all": no amount of waiting or
-    /// retrying will change it, and the caller should be using a remote signer instead (on Android
-    /// that is the OCBM `CH_MFI` relay). See gm_ccpa `12_OBSERVED_FLOW.md` Failure Point 6.
+    /// retrying will change it.
     LockUnavailable,
     /// The chip itself refused, NAKed, or timed out. Retrying is reasonable.
     Chip,
 }
 
-/// Map a remote failure onto the same variants a local one produces.
-///
-/// A box-side lock timeout must NOT come back as [`MfiError::Chip`]: `mfi_retry` retries `Chip`
-/// three times, so contention on the remote box would cost 3 x (connect + the box's own 10 s lock
-/// deadline) with the tunnel's SESSION mutex held — the stall this enum exists to prevent, moved
-/// one hop down the wire.
-fn remote_err(what: &str, e: mfi_wire::client::Error) -> MfiError {
-    eprintln!("[mfi-i2c-local] remote {what} failed: {e}");
-    match e {
-        mfi_wire::client::Error::Status(mfi_wire::Status::LockBusy) => MfiError::LockBusy,
-        _ => MfiError::Chip,
-    }
-}
-
 /// [`cert`] with the failure reason. `cert` is kept as the `Option` shim for existing callers.
 pub fn try_cert() -> Result<Vec<u8>, MfiError> {
-    // Remote coprocessor: no /dev/i2c-1 on this host, and the lock that matters lives on the box
-    // that holds the chip (mfid takes it there), so the local lock is skipped deliberately.
-    if let Some(addr) = mfi_wire::client::addr() {
-        return mfi_wire::client::cert(addr).map_err(|e| remote_err("cert", e));
-    }
     let _lock = MfiLock::acquire()?;
     cert_locked().ok_or(MfiError::Chip)
 }
 
 /// [`sign`] with the failure reason.
 pub fn try_sign(chal: &[u8]) -> Result<Vec<u8>, MfiError> {
-    if let Some(addr) = mfi_wire::client::addr() {
-        return mfi_wire::client::sign(addr, chal).map_err(|e| remote_err("sign", e));
-    }
     let _lock = MfiLock::acquire()?;
     sign_locked(chal).ok_or(MfiError::Chip)
 }
@@ -340,36 +316,4 @@ fn sign_locked(chal: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     Some(sig)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The whole point of the typed `mfi_wire::client::Error`: only a lock timeout may map to
-    /// `LockBusy`, and `LockBusy` must never be reported as `Chip` (which `mfi_retry` retries).
-    #[test]
-    fn remote_lock_busy_is_not_a_chip_error() {
-        use mfi_wire::client::Error;
-        assert_eq!(
-            remote_err("sign", Error::Status(mfi_wire::Status::LockBusy)),
-            MfiError::LockBusy
-        );
-        assert_eq!(
-            remote_err("sign", Error::Status(mfi_wire::Status::Chip)),
-            MfiError::Chip
-        );
-        assert_eq!(
-            remote_err("cert", Error::Status(mfi_wire::Status::BadRequest)),
-            MfiError::Chip
-        );
-        assert_eq!(remote_err("cert", Error::UnknownStatus(0x7f)), MfiError::Chip);
-        assert_eq!(
-            remote_err(
-                "sign",
-                Error::Io(std::io::Error::from(std::io::ErrorKind::TimedOut))
-            ),
-            MfiError::Chip
-        );
-    }
 }

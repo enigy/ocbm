@@ -22,12 +22,6 @@ run() {
 
 run "iap2-core"  cargo test -p carplay-iap2-core --quiet
 run "receiver"   cargo test --manifest-path crates/vendor/receiver/Cargo.toml --no-default-features --quiet
-# ...and again in the BOX configuration. `local-mfi` (direct /dev/i2c-1 chip access) became an
-# OPTIONAL feature on 2026-08-27 so the Android head-unit app can leave it off and install a remote
-# signer instead. That split means the two configurations compile DIFFERENT code, and the line above
-# only ever exercises the Android one -- a `local-mfi`-only break would ship to the box unseen.
-run "receiver (box: local-mfi)" cargo test --manifest-path crates/vendor/receiver/Cargo.toml \
-  --no-default-features --features local-mfi --quiet
 run "ocbm-proto" cargo test -p ocbm-proto --quiet
 run "ocbmd"      cargo test -p ocbmd --quiet
 run "iap2d"      cargo test -p iap2d --quiet
@@ -40,7 +34,6 @@ run "wireless"   cargo test -p btd --quiet
 # 29 tests used to run under the "wireless" line above; without this one they would silently
 # stop running, which is the failure mode an extraction is most likely to cause.
 run "bt-common"  cargo test -p bt-common --quiet
-run "aa-wireless" cargo test -p aa-wireless --quiet
 # box-common carries the shared flags and AP-address definitions all of the above depend on.
 run "box-common" cargo test -p box-common --quiet
 run "pairing"    cargo test --manifest-path crates/vendor/pairing/Cargo.toml --quiet

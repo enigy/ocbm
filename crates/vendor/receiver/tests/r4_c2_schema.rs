@@ -7,7 +7,7 @@
 //! Why these three and not more: every one of them is the same failure mode, and it is the worst one
 //! this module has. `carplayd::load_device_config` treats a parse error as "use the built-in
 //! defaults", so ANY of these turning into a hard serde error silently reverts the owner's
-//! resolution, HEVC, appDrivenSetup, audio set and metadata tier at once — a whole-config regression
+//! resolution, HEVC, audio set and metadata tier at once — a whole-config regression
 //! reported as a single mistyped enum value.
 
 use receiver::vehicle_config::VehicleConfig;
@@ -115,7 +115,7 @@ fn app_doc_without_c2_tail() -> String {
 /// (c) is the load-bearing half and is why the comparison is against the pre-C-2 document rather
 /// than against a hand-built `DeviceConfig`: the risk is not that `accessoryName` is parsed wrong,
 /// it is that appending two top-level keys after `metadata:` makes serde reject the whole document,
-/// at which point `carplayd::load_device_config` silently reverts resolution, HEVC, appDrivenSetup
+/// at which point `carplayd::load_device_config` silently reverts resolution, HEVC
 /// and the audio set to the compiled defaults.
 #[test]
 fn r4_c2_tail_parses_and_moves_nothing_the_box_already_emitted() {
@@ -142,12 +142,11 @@ fn r4_c2_tail_parses_and_moves_nothing_the_box_already_emitted() {
         "the C-2 tail must not move a single /info value"
     );
     assert_eq!(before.accessory_config.enables_hevc, after.accessory_config.enables_hevc);
-    assert_eq!(before.app_driven_setup(), after.app_driven_setup());
     assert_eq!(before.view_areas_enabled(), after.view_areas_enabled());
     assert_eq!(before.alt_screen(), after.alt_screen());
     // ...and the values are the ones the app actually asked for, so the assertion above is not
     // vacuously comparing two default configs.
-    assert!(after.accessory_config.enables_hevc && after.app_driven_setup());
+    assert!(after.accessory_config.enables_hevc);
     assert_eq!(after.apply(receiver::info::DeviceConfig::default()).display_height, 1080);
 
     // The hidConfig block the app really emits binds all four C-2 fields.
@@ -161,7 +160,7 @@ fn r4_c2_tail_parses_and_moves_nothing_the_box_already_emitted() {
 /// log at the point of USE instead of failing the WHOLE document here". Nothing pinned that. Turn
 /// the field into a serde enum (the obvious "tighten it up" refactor) and this is the test that
 /// stops it, because the cost is not a mis-parsed HID bit — it is the owner's resolution, HEVC,
-/// appDrivenSetup and audio set all reverting to compiled defaults on the next push.
+/// and audio set all reverting to compiled defaults on the next push.
 #[test]
 fn r4_unrecognised_touch_screen_mode_never_costs_the_rest_of_the_document() {
     for mode in ["Ludicrous Fidelty", "high fidelty", "High Fidelity", "", "Low Fidelty"] {
@@ -178,7 +177,6 @@ fn r4_unrecognised_touch_screen_mode_never_costs_the_rest_of_the_document() {
         );
         // The rest of the pushed config is intact — this is the property that matters.
         assert!(vc.accessory_config.enables_hevc, "HEVC survived {mode:?}");
-        assert!(vc.app_driven_setup(), "appDrivenSetup survived {mode:?}");
         let dev = vc.apply(receiver::info::DeviceConfig::default());
         assert_eq!((dev.display_width, dev.display_height), (800, 480), "resolution survived {mode:?}");
     }
@@ -249,8 +247,8 @@ accessoryConfig:
 /// `vehicle_config::tests::c2_hid_fields_are_parse_only_and_change_no_output` compares two
 /// `DeviceConfig` Debug renderings, which is sound for what `apply()` writes but blind to the four
 /// values that reach the wire WITHOUT going through `DeviceConfig` — `accessory_config.*` (read
-/// straight off `VehicleConfig` by carplayd) and the `app_driven_setup()` / `view_areas_enabled()` /
-/// `alt_screen()` accessors, each of which drives a SETUP `enabledFeatures` token. Wiring a C-2
+/// straight off `VehicleConfig` by carplayd) and the `view_areas_enabled()` / `alt_screen()`
+/// accessors, each of which drives a SETUP `enabledFeatures` token. Wiring a C-2
 /// field into any of those is a wire change that the Debug comparison passes clean.
 #[test]
 fn r4_c2_hid_fields_move_no_emitted_surface_including_the_non_device_config_ones() {
@@ -266,7 +264,6 @@ fn r4_c2_hid_fields_move_no_emitted_surface_including_the_non_device_config_ones
         "C-2 hid fields must not move any /info value"
     );
     // The surfaces DeviceConfig's Debug cannot see.
-    assert_eq!(off.app_driven_setup(), on.app_driven_setup(), "SETUP appDrivenSetup moved");
     assert_eq!(off.view_areas_enabled(), on.view_areas_enabled(), "enabledFeatures viewAreas moved");
     assert_eq!(off.alt_screen(), on.alt_screen(), "enabledFeatures altScreen moved");
     assert_eq!(off.alt_dimensions(), on.alt_dimensions(), "alt display geometry moved");
@@ -275,7 +272,6 @@ fn r4_c2_hid_fields_move_no_emitted_surface_including_the_non_device_config_ones
 
     // Same closure for accessoryName, which the author's test only checks against `DeviceConfig.name`.
     let named = VehicleConfig::from_yaml(b"name: X\naccessoryName: Roadster\n").unwrap();
-    assert_eq!(off.app_driven_setup(), named.app_driven_setup());
     assert_eq!(off.view_areas_enabled(), named.view_areas_enabled());
     assert_eq!(off.alt_screen(), named.alt_screen());
     assert_eq!(

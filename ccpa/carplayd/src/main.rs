@@ -1,14 +1,13 @@
 //! carplayd — box-side AirPlay/CarPlay pairing daemon (armv7/musl).
 //!
 //! Terminates the iPhone's AirPlay session on the box's real `ncm0`, runs pair-setup / pair-verify
-//! using the genuine **local** MFi 2.0C chip (`/dev/i2c-1 @0x11`) — NOT receiver_core's remote NCM
-//! signing service — derives the ChaCha20 session keys, and (later) forwards the encrypted A/V + hands the
+//! using the genuine **local** MFi 2.0C chip (`/dev/i2c-1 @0x11`), derives the ChaCha20 session keys, and (later) forwards the encrypted A/V + hands the
 //! ephemeral key to the host app over OCBM. Reuses receiver_core's `mfi` / `pairing` crypto crates.
 //!
 //! FIRST SLICE (this): the local `MfiSigner` — chip cert-copy + challenge-sign, the exact two chip
 //! operations `iap2d` already proved against a real iPhone this session (945-byte cert → 0xAA01,
 //! 128-byte sig → 0xAA03, iPhone → 0xAA05 AuthSuccess) — exercised through receiver_core's
-//! `MfiSigner` trait, proving the remote→local redirection and the crate reuse compile + work.
+//! `MfiSigner` trait.
 
 mod discovery;
 mod phone_gate;
@@ -90,8 +89,7 @@ struct I2cRdwr {
 }
 
 /// `MfiSigner` backed by the on-board genuine MFi 2.0C coprocessor over local I2C — the box-resident
-/// signing service. Drops in for receiver_core's `MfiAuthClient` (remote NCM TCP) with direct chip
-/// access, so the MFi private key never leaves the adapter.
+/// signing service, with direct chip access, so the MFi private key never leaves the adapter.
 pub struct LocalMfiSigner {
     fd: libc::c_int,
 }
@@ -109,13 +107,6 @@ impl Drop for LocalMfiSigner {
 
 impl LocalMfiSigner {
     pub fn open() -> io::Result<Self> {
-        // Remote coprocessor (Raspberry Pi port): there is no /dev/i2c-1 on this host, so opening it
-        // here would fail the whole control connection before a single trait method ran — which is
-        // exactly what "MFi open: No such file or directory" was. Hand back a signer with no fd; the
-        // trait impls below dispatch over the network and never touch `self.fd`.
-        if mfi_wire::client::addr().is_some() {
-            return Ok(Self { fd: -1 });
-        }
         // O_CLOEXEC: never let the chip handle leak into a child process.
         let fd = unsafe {
             libc::open(c"/dev/i2c-1".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC)
@@ -162,15 +153,7 @@ impl LocalMfiSigner {
     }
 
     /// DeviceVersion (reg 0x00) — a cheap warm-up/liveness read (=0x03 on this unit).
-    ///
-    /// `None` with no fd: on the remote-coprocessor path `open()` hands back `fd = -1` and there is
-    /// no local register to read, so a raw `rd` here just burns five EBADF retries and reports a
-    /// chip failure the host does not have. `mfid` exposes no DeviceVersion opcode, so the honest
-    /// answer is "unknown", not "failed".
     pub fn device_version(&self) -> Option<u8> {
-        if self.fd < 0 {
-            return None;
-        }
         let mut v = [0u8; 1];
         if self.rd(0x00, &mut v) {
             Some(v[0])
@@ -242,12 +225,6 @@ impl Drop for MfiLock {
 impl MfiSigner for LocalMfiSigner {
     /// CopyCertificate: reg 0x30 = length (2 BE), reg 0x31 = cert bytes (the genuine ~945-byte cert).
     fn copy_certificate(&mut self) -> io::Result<Vec<u8>> {
-        // Remote coprocessor (Raspberry Pi port): this host has no /dev/i2c-1, so the chip is
-        // reached over USB-NCM. Dispatching INSIDE the impl keeps `LocalMfiSigner`'s type identical,
-        // so `ControlServer<_, LocalMfiSigner>` and every other generic instantiation are unchanged.
-        if let Some(addr) = mfi_wire::client::addr() {
-            return mfi_wire::client::cert(addr).map_err(io::Error::from);
-        }
         let _lock = MfiLock::acquire()?; // held for the whole 0x30→0x31 transaction
         let mut lb = [0u8; 2];
         if !self.rd(0x30, &mut lb) {
@@ -267,18 +244,15 @@ impl MfiSigner for LocalMfiSigner {
     /// CreateSignature over a 20-byte SHA-1 digest: write challenge (0x20 len / 0x21 data), trigger
     /// (0x10=1), poll status (0x10 bit4), read sig (0x11 len / 0x12 data) — genuine 128-byte RSA-1024.
     fn create_signature(&mut self, digest: &[u8]) -> io::Result<Vec<u8>> {
-        if let Some(addr) = mfi_wire::client::addr() {
-            return mfi_wire::client::sign(addr, digest).map_err(io::Error::from);
-        }
-        // Same length guard the remote path applies, so a wrong-length digest is refused here
-        // instead of being written to reg 0x20/0x21 for the chip to NAK opaquely.
-        if digest.len() != mfi_wire::DIGEST_LEN {
+        // A wrong-length digest is refused here instead of being written to reg 0x20/0x21 for the
+        // chip to NAK opaquely.
+        if digest.len() != mfi::DIGEST_LEN {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
                     "digest is {} bytes, expected {}",
                     digest.len(),
-                    mfi_wire::DIGEST_LEN
+                    mfi::DIGEST_LEN
                 ),
             ));
         }
@@ -513,14 +487,8 @@ fn mfi_selftest() {
         eprintln!("[carplayd] open /dev/i2c-1: {e}");
         std::process::exit(1);
     });
-    let remote = mfi_wire::client::addr();
     match signer.device_version() {
         Some(v) => println!("[carplayd] MFi chip open (local i2c), DeviceVersion=0x{v:02x}"),
-        // The remote path has no local register to read; cert + sign below still exercise the real
-        // chip over the wire, so failing the whole self-test here would be a false negative.
-        None if remote.is_some() => {
-            println!("[carplayd] MFi via remote coprocessor — DeviceVersion not available, skipped")
-        }
         None => {
             eprintln!("[carplayd] MFi DeviceVersion read failed");
             std::process::exit(1);
@@ -637,13 +605,7 @@ const CARPLAY_CFG_FILE_DEFAULT: &str = "/tmp/carplay_cfg.yaml";
 
 /// Where to read the pushed config from, overridable by `CARPLAY_CFG_FILE`.
 ///
-/// The override exists for the Raspberry Pi / AAOS port, where the config producer is an ANDROID
-/// APP rather than ocbmd. An app process cannot write `/tmp` (`EACCES` — it is not in the app
-/// sandbox's writable set), so `com.carlink.projection` writes into its own data directory and
-/// points us at it. carplayd runs as root there, so reading an app-private path is fine.
-///
-/// Same opt-in shape as every other Pi-port override (`CARPLAY_MFI_ADDR`, `BOX_STATE_DIR`,
-/// `BOX_HOSTAPD_CONF`): unset, the CCPA behaves exactly as before. Resolved once and cached —
+/// A bench override: unset, the CCPA reads ocbmd's file. Resolved once and cached —
 /// `getenv`/`setenv` are not mutually thread-safe and this is read from the per-connection config
 /// load while other threads may still be arming levers.
 fn carplay_cfg_file() -> &'static str {
@@ -727,27 +689,13 @@ fn base_device_config() -> DeviceConfig {
     }
 }
 
-/// The `CARPLAY_APP_SETUP` harness override: `Some(true)`/`Some(false)` for "1"/"0", `None` when
-/// unset/other. It BEATS the YAML in both directions (a "0" can force the proven box-driven path even
-/// when a config asks for the relay), and it is deliberately re-read per connection rather than
-/// cached: carplayd re-reads the whole config per control connection anyway, so this stays consistent
-/// with how a config change lands (the reconnect-consumed class, docs/carplay/06_AV_PIPELINE.md) — unlike the receiver-side
-/// `CARPLAY_RELAY_*` knobs, which are process-cached.
-fn appsetup_override() -> Option<bool> {
-    match std::env::var("CARPLAY_APP_SETUP").ok().as_deref() {
-        Some("1") => Some(true),
-        Some("0") => Some(false),
-        _ => None,
-    }
-}
-
 /// Reset every per-connection lever to its no-config baseline: plain `false` for the schema-driven
-/// ones, the sanctioned bench env for the four that have one. Replaces the old `remove_var` block
+/// ones, the sanctioned bench env for the three that have one. Replaces the old `remove_var` block
 /// (see the setenv-UB note in [`load_device_config`]).
 ///
 /// THE RULE: a lever clears to its ENV form iff that env form is a sanctioned app-less bench
-/// override — cornerMasks (docs/carplay/06_AV_PIPELINE.md §4), its logTransfer twin (docs/carplay/04_CAPABILITIES_AND_CONFIG.md), mainBuffered (docs/carplay/04_CAPABILITIES_AND_CONFIG.md
-/// B4), and appDrivenSetup's `CARPLAY_APP_SETUP` harness switch. This function runs ONLY on the
+/// override — cornerMasks (docs/carplay/06_AV_PIPELINE.md §4), its logTransfer twin (docs/carplay/04_CAPABILITIES_AND_CONFIG.md) and mainBuffered (docs/carplay/04_CAPABILITIES_AND_CONFIG.md
+/// B4). This function runs ONLY on the
 /// no-config / parse-failure paths, i.e. exactly the app-less case. The rest clear to plain `false`
 /// because their env form is vestigial (`CARPLAY_HEVC`, docs/carplay/04_CAPABILITIES_AND_CONFIG.md) or the value is schema-derived
 /// from the YAML (dPad/knob/telephony from `hidConfig`, altScreen + dims from `altVideoStreams[]`,
@@ -774,8 +722,7 @@ fn clear_levers() {
     // Sanctioned bench overrides (see THE RULE above): `CARPLAY_CORNERMASKS` (docs/carplay/06_AV_PIPELINE.md §4) and its
     // logTransfer twin (docs/carplay/04_CAPABILITIES_AND_CONFIG.md). Clearing them to `false` here made both dead on the very first
     // connection — the app-less path is the only one they exist for. Presence-shaped, so the exact
-    // twin is `set_mainbuffered` above, NOT `set_appsetup` below (that one is a tri-state VALUE
-    // override where "0" can force OFF). Caveat worth keeping straight: on the CONFIG path these two
+    // twin is `set_mainbuffered` above. Caveat worth keeping straight: on the CONFIG path these two
     // are armed as `config || env`, so the env DOES override a pushed `false` there — deliberately,
     // unlike mainBuffered which is strictly YAML-wins. This line only stops the app-less paths from
     // wiping the seed.
@@ -790,24 +737,14 @@ fn clear_levers() {
     // owns it), so it clears to the constant 3000 that the box always sent before it was pushable.
     levers::set_view_area_anim_ms(levers::VIEW_AREA_ANIM_MS_DEFAULT);
     levers::set_logtransfer(std::env::var_os("CARPLAY_LOGTRANSFER").is_some());
-    // appDrivenSetup clears to the env override (not plain false): a harness run with
-    // CARPLAY_APP_SETUP=1 must still relay when no YAML landed (the no-config / parse-failure paths
-    // both come through here).
-    levers::set_appsetup(appsetup_override().unwrap_or(false));
 }
 
 /// Resolve the effective `DeviceConfig` for the connection about to be served. Reads the host-pushed
 /// `VehicleConfig` YAML if ocbmd has landed one; on absence OR any parse error, logs and falls back to
 /// the built-in default — a bad config can never take the box off the air. Read PER connection so a
 /// config pushed at SUBSCRIBE is honored on the next session (the reconnect-consumed class, docs/carplay/06_AV_PIPELINE.md).
-///
-/// Also returns the config's CRC-32 (of the YAML bytes actually loaded; 0 when the built-in default
-/// is in effect). The app-driven-SETUP relay echoes it in RS_OPEN so the host can verify THIS
-/// connection's `/info` was built from the config it pushed at SUBSCRIBE — a mismatch means the box
-/// is serving a stale/different config and the host should echo the local response verbatim.
-fn load_device_config() -> (DeviceConfig, u32) {
+fn load_device_config() -> DeviceConfig {
     let base = base_device_config();
-    let mut cfg_crc: u32 = 0;
     // Bound the host-pushed YAML before parsing (audit R6): serde_yaml is a recursive-descent parser, so
     // a pathologically large / deeply-nested config could drive it into a stack-overflow-abort. A real
     // VehicleConfig is a few KB; anything past this cap is treated as absent (fall back to base).
@@ -900,16 +837,6 @@ fn load_device_config() -> (DeviceConfig, u32) {
                         levers::VIEW_AREA_ANIM_MS_RANGE
                     );
                 }
-                // appDrivenSetup (plan P1): config-driven, with the CARPLAY_APP_SETUP=1/0 env
-                // override beating the YAML in BOTH directions (harness runs; a "0" force-reverts a
-                // relay-enabled config to the proven box-driven path without repushing).
-                levers::set_appsetup(
-                    appsetup_override().unwrap_or(vc.app_driven_setup()),
-                );
-                // The crc the relay's RS_OPEN reports: computed over the exact YAML bytes this
-                // connection's /info was built from (only on THIS success path — a rejected config
-                // configured nothing, so it reports 0 like the default).
-                cfg_crc = ocbm_proto::crc32(&bytes);
                 println!(
                     // mainBuffered is logged because it is the one arm here whose failure mode is
                     // SILENT MEDIA — an operator diagnosing dead audio must be able to see whether
@@ -932,7 +859,7 @@ fn load_device_config() -> (DeviceConfig, u32) {
                 // LOUD ON PURPOSE (docs/carplay/04_CAPABILITIES_AND_CONFIG.md #26). This is not a routine fallback — it is the OWNER'S
                 // SETTINGS BEING DISCARDED, and the blast radius is the whole document, not the one
                 // bad key. This exact path fired on 2026-08-11 when a glued newline in the app's
-                // emitter made the alt-ON document unparseable: resolution, HEVC, appDrivenSetup,
+                // emitter made the alt-ON document unparseable: resolution, HEVC,
                 // audio AND the metadata tier all reverted at once, and the single quiet line here
                 // read like normal operation. serde_yaml reports line and column — print them.
                 eprintln!("[carplayd] *** PUSHED CONFIG REJECTED — {e} ***");
@@ -981,10 +908,7 @@ fn load_device_config() -> (DeviceConfig, u32) {
         // left running, the phone reconnected to it, and every control connection from then on
         // landed here — `clear_levers()` + compiled defaults, silently. The app thought 2400×960/HEVC
         // was in force; the box served 1920×720/H.264 and scaled touch against the wrong panel for
-        // hours. The app-side guard that should have caught it ("BOX IS ON BUILT-IN DEFAULTS",
-        // keyed on `cfg_crc == 0` in RS_OPEN) never ran, because `clear_levers()` also cleared
-        // `appsetup`, so SETUP went box-driven and no RS_OPEN was ever relayed: the detector was
-        // disarmed by the very failure it targets.
+        // hours.
         //
         // So: quiet only when there is genuinely nobody to have pushed a config. With a host attached
         // to the accessory gadget, an absent config is a pushed config that is NOT IN FORCE, and it
@@ -1007,7 +931,7 @@ fn load_device_config() -> (DeviceConfig, u32) {
     // the :9110 HID seam only — `receiver::uplink`'s :9112 control socket never carried a live touch
     // sender and its dead copy of this geometry was removed.
     *plock(&DISPLAY_WH) = (dev.display_width as u16, dev.display_height as u16);
-    (dev, cfg_crc)
+    dev
 }
 
 /// HID-input ingest (task #20): a process-lifetime local listener that ocbmd relays CH_INPUT sub-frames
@@ -1020,8 +944,8 @@ fn load_device_config() -> (DeviceConfig, u32) {
 /// never share framing or contend for the port.
 const MIC_INGEST_ADDR: &str = "127.0.0.1:9112";
 
-/// Generation counter for accepted :9110 connections — the same one-producer discipline
-/// `receiver::relay`'s `SEAM_GEN` enforces on :9106. ocbmd is the only legitimate producer, but two
+/// Generation counter for accepted :9110 connections: one producer at a time. ocbmd is the only
+/// legitimate producer, but two
 /// can overlap across an ocbmd respawn, and the accept loop used to RETAIN every reader: both then
 /// injected HID for the same touch uid, interleaving DOWN/MOVE/UP for two different fingers into one
 /// report stream. A new accept supersedes the older reader, which exits at its next read or timeout.
@@ -1513,9 +1437,6 @@ const TRANSPORT_FLAG: &str = "/tmp/carplay_transport";
 
 /// Whether the control peer is on the wlan0 AP subnet (192.168.43.0/24, arriving as an IPv4-mapped
 /// `::ffff:192.168.43.x`) — a WIRELESS session; a wired NCM peer is an IPv6 link-local (`fe80::…`).
-/// Factored out of [`write_transport_flag`] because app-driven SETUP reports the transport to the
-/// host in RS_OPEN flags bit0 — one classifier, no drift. (It gated the delegate selection too until
-/// the 2026-08-10 wireless flip; the relay now runs on both transports.)
 fn peer_is_wireless(stream: &TcpStream) -> bool {
     // Range check on the parsed octets, not a string substring (audit B7): a substring match could be
     // fooled by an unforeseen address rendering. Unwrap the IPv4-mapped form (`::ffff:192.168.43.x`) or a
@@ -1699,8 +1620,7 @@ fn run_pairing_server() -> io::Result<()> {
         // Resolve the effective /info for THIS connection from the host's ephemeral YAML (or the
         // built-in default when idle). Per-connection so a SUBSCRIBE-pushed config lands on the next
         // session — the reconnect-consumed class the resolution lever lives in (docs/carplay/06_AV_PIPELINE.md / docs/carplay/04_CAPABILITIES_AND_CONFIG.md).
-        // cfg_crc identifies the loaded YAML for the SETUP relay's RS_OPEN (0 = built-in default).
-        let (dev, cfg_crc) = load_device_config();
+        let dev = load_device_config();
         let info = build_info(&dev);
         // 30 s read-timeout = quiet-but-live backstop (resilience #3). TCP keepalive 3/3/3 = fast
         // dead-transport detect (~12 s, resilience #2 / Apple 3/3/3) — arm both; they are independent.
@@ -1722,49 +1642,17 @@ fn run_pairing_server() -> io::Result<()> {
         if let Ok(addr) = stream.peer_addr() {
             av.set_peer_addr(addr);
         }
-        // Delegate selection (plan P1): app-driven SETUP wraps the unmodified AvSession in the relay
-        // delegate on BOTH transports (wireless flip, owner directive 2026-08-10 — it was wired-only
-        // through the previous milestone), whenever the host's config armed the lever AND ocbmd's
-        // relay seam is actually attached (no host ⇒ plain AvSession, zero new behavior).
-        // Wireless safety has TWO halves, and only the first is "by construction":
-        //  (a) STREAMS: the host authors the types it knows (110/111, 100-102) and echoes the box's
-        //      local answer for anything else — notably the type-130 RCS DataStream only wireless
-        //      carries (AirPlaySetupSession.swift / setup_driver.rs "out of host-authoring scope").
-        //  (b) FEATURES: phase-1 AUTHORS `enabledFeatures` rather than echoing it, and the box emits
-        //      two tokens on wireless the app has no config key for (`iAPChannel`,
-        //      `sessionManagement`). Both twins UNION those through; stripping `iAPChannel` makes
-        //      iOS 400 every `iAPSendMessage`, killing the iAP2 tunnel's DETECT+SYN. This was the
-        //      gate's round-1 rejection of the flip — do not "simplify" the union away.
-        // RS_OPEN reports the transport to the host in flags bit0, so the host can tell them apart.
-        // The peer addr is already set on `av`; RemoteSession reads it from inner for its RS_OPEN ctx.
-        let wireless = peer_is_wireless(&stream);
-        let session: Box<dyn receiver::session::SessionDelegate> =
-            if levers::appsetup() && receiver::relay::seam_up() {
-                eprintln!(
-                    "[carplayd] app-driven SETUP armed for this connection (relay seam up, {})",
-                    if wireless { "wireless" } else { "wired" }
-                );
-                Box::new(receiver::relay::RemoteSession::new(
-                    av,
-                    cfg_crc,
-                    wireless,
-                    dev.display_width as u32,
-                    dev.display_height as u32,
-                ))
-            } else {
-                Box::new(av)
-            };
         // Behind the phone gate when btd named a phone: a phase-1 SETUP from another phone is refused
         // before the session publishes who it is.
         let session: Box<dyn receiver::session::SessionDelegate> = match stream.peer_addr() {
             Ok(peer) if gate.armed() => Box::new(phone_gate::GatedSession::new(
-                session,
+                Box::new(av),
                 gate.clone(),
                 generation,
                 peer.ip(),
                 stream.try_clone().ok(),
             )),
-            _ => session,
+            _ => Box::new(av),
         };
         let mut session = session;
         session.set_resolution(dev.display_width, dev.display_height, dev.max_fps);
@@ -1860,10 +1748,6 @@ fn main() {
         // `uplink on <rate> <ch>` / `uplink off` back-channel. The RTP uplink itself is armed by the
         // type-100 `input=true` MainAudio SETUP inside receiver::session (feature `mic-uplink`).
         receiver::uplink::start_control_listener(MIC_INGEST_ADDR.to_string());
-        // App-driven-SETUP relay seam (plan P1) — process-lifetime like the two listeners above.
-        // ocbmd connects OUT to :9106 while a host is subscribed (its eager-connect tick); with no
-        // host the seam stays down and the per-connection selection falls back to plain AvSession.
-        receiver::relay::start_listener();
         if let Err(e) = run_pairing_server() {
             eprintln!("[carplayd] pairing server failed: {e}");
             std::process::exit(1);

@@ -28,12 +28,6 @@ const INPUT_INGEST_ADDR: &str = "127.0.0.1:9110";
 /// + non-blocking so it slots into the poll loop; a write error drops the socket to reconnect next chunk.
 const MIC_INGEST_ADDR: &str = "127.0.0.1:9112";
 
-/// carplayd's app-driven-SETUP relay seam (plan P1; `receiver::relay::start_listener` on the box).
-/// ocbmd is a DUMB BYTE PIPE for CH_RTSP: box→host it chunks whatever carplayd writes into ≤64 KiB
-/// OCBM frames; host→box it writes CH_RTSP payloads back verbatim. All message framing
-/// (`[u32 BE "RTSP"][u32 BE len][msg]`, RS_* ops) is endpoint-to-endpoint — carplayd ↔ host app.
-const RTSP_INGEST_ADDR: &str = "127.0.0.1:9106";
-
 /// What a pollfd slot represents, so the poll loop can dispatch after `poll()`.
 #[derive(Clone, Copy)]
 enum Kind {
@@ -41,7 +35,6 @@ enum Kind {
     AccOut, // the writer thread's pipe: room for output, or POLLERR once that thread has ended
     Pty,
     Mic,             // the mic-uplink seam to carplayd (readable: `uplink on/off` back-channel)
-    Rtsp,            // the SETUP-relay seam to carplayd (readable: box→host RS_OPEN/RS_REQ/RS_CLOSE bytes)
     AvListen(usize), // a local A/V seam listener (index into av_listeners)
     AvConn(usize),   // an accepted A/V seam connection (index into av_conns)
 }
@@ -189,7 +182,7 @@ struct Daemon {
     // byte-stream reassembly for that channel desyncs permanently. Connection lifecycle only — the seam
     // payload is still forwarded byte-for-byte untouched (box forwards, app processes).
     av_conns: Vec<(TcpStream, u16, bool)>,
-    out_hi: OutQueue, // priority output FIFO: CTRL/RTSP (reliable, latency-sensitive)
+    out_hi: OutQueue, // priority output FIFO: CTRL (reliable, latency-sensitive)
     out_console: OutQueue,                        // CH_CONSOLE — drained AFTER A/V so a console flood can't starve it (audit B3)
     // LIVE A/V — one queue PER stream so each video seam's read-gate keys on ITS OWN backlog, not a
     // shared one. A single shared FIFO coupled the two video streams + audio: the low-rate cluster
@@ -225,11 +218,9 @@ struct Daemon {
     hb_unsub_nudged_at: Option<std::time::Instant>,
     /// Who the host says it is: an optional UTF-8 label carried after the nonce in CT_HELLO.
     ///
-    /// The nonce distinguishes host PROCESSES; it says nothing about what KIND of host they are. The
-    /// box serves several — a GM head-unit app that owns Wi-Fi and uses the box as a BT+MFi bridge,
-    /// an Android Auto host driving `aa-bridge` over CH_IP, bench tooling — and its behaviour and its
-    /// logs both differ between them, yet until now "what is talking to me" was unanswerable. Purely
-    /// diagnostic: nothing gates on it, and an absent label reads exactly as it always did.
+    /// The nonce distinguishes host PROCESSES; it says nothing about what KIND of host they are
+    /// (Carlink, `ocbm-host`, other bench tooling). Purely diagnostic: nothing gates on it, and an
+    /// absent label reads exactly as it always did.
     host_name: Option<String>,
     /// Last host instance nonce seen in CT_HELLO (see `ocbm_proto::CT_HELLO`). None until a host that
     /// supplies one connects; 0 is never stored (older hosts opt out by sending it).
@@ -257,13 +248,9 @@ struct Daemon {
     /// seam drops in that window (peer closed after its `uplink off` raced our next PCM write, poll
     /// HUP, read error) the OFF is synthesized to the host: a seam owner that is gone cannot be
     /// consuming mic audio, and without this the app kept a hot mic for 45 min after a hangup
-    /// (measured 2026-09-04, first live HFP calls).
+    /// (measured 2026-09-04).
     mic_uplink_on: bool,
     mic_fwd: u64,    // count of mic PCM chunks relayed (observability)
-    // Bidirectional connection to carplayd's SETUP-relay seam (CH_RTSP ↔ :9106). EAGER while a host
-    // is subscribed (see ensure_rtsp_seam) — the relay's RS_OPEN fires at pair-verify, BEFORE any
-    // host→box bytes could lazily trigger a connect.
-    rtsp_sock: Option<TcpStream>,
     phone_state: Option<bool>, // last phone-on-bus state mirrored to the host (None = not yet read)
     // Wireless SSP Numeric-Comparison pairing code mirrored to the host (ssp_agent writes /tmp/pairing_code
     // during pairing; None = not yet read, Some("") = cleared/hidden, Some("418926") = show it).
@@ -358,7 +345,6 @@ const LOG_SOURCES: &[(u8, &str)] = &[
     (p::LOG_SRC_AIRPLAYD, "/tmp/carplayd.log"),
     (p::LOG_SRC_AIRPLAYD_WL, "/tmp/carplayd_wl.log"),
     (p::LOG_SRC_IAP2D, "/tmp/iap2d.log"),
-    (p::LOG_SRC_AA_BRIDGE, "/tmp/aa-bridge.log"),
     (p::LOG_SRC_BT, "/tmp/bt.log"),
     (p::LOG_SRC_RADIO_AP_DHCP, "/tmp/radio_ap_dhcp.log"),
     (p::LOG_SRC_RADIO_BT_ATTACH, "/tmp/radio_bt_attach.log"),
@@ -414,7 +400,7 @@ struct LogSource {
     /// Lines of THIS source lost to [`LOG_QUEUE_CAP`] since its last `LOG_F_DROPPED` report.
     dropped: u32,
     /// Latched so a failing source reports ONCE per failure run, not once per tick. Per source, not
-    /// global: several of these files legitimately never exist (aa-bridge on a CarPlay-only box), and
+    /// global: several of these files legitimately never exist (carplayd_wl.log with no wireless session), and
     /// a shared latch that any other source's successful read cleared would print on every tick — into
     /// `box.log`, which is itself being tailed, so the error would feed itself lines to fail on.
     err_logged: bool,
@@ -1665,10 +1651,7 @@ impl Daemon {
         let n = p::HDR_LEN + payload.len();
         let seq = self.seq;
         self.seq = self.seq.wrapping_add(1);
-        // CH_RTSP rides out_hi with the control plane: the SETUP relay is the timing-critical
-        // pair/SETUP/RECORD phase, and its whole failure model (3 s answer timeout → local fallback)
-        // assumes the transport never queues it behind bulk traffic. Small, reliable, latency-first.
-        if matches!(ch, p::CH_CTRL | p::CH_RTSP) {
+        if ch == p::CH_CTRL {
             // Reliable priority queue. Capped so a stalled host can't OOM the box; on
             // overflow we clear it (pathological — a control frame lost beats the whole daemon OOM-killed).
             // Worst-case resident: CAP + up-to-64 KiB reclaim prefix + one 16 B header — the same bound
@@ -1691,7 +1674,7 @@ impl Daemon {
             // independent of projection, so a high-volume console (a left-running `dmesg -w`, a chatty log,
             // a large `cat`) sitting in out_hi would be drained strictly ahead of A/V and freeze 4K video +
             // audio for its duration. Same cap/clear/wire_owner discipline as out_hi; latency-critical
-            // control frames (CTRL/RTSP) stay at top priority above A/V.
+            // control frames (CTRL) stay at top priority above A/V.
             if self.out_console.len() + n <= OUT_QUEUE_CAP {
                 self.out_console.push_frame(ch, flags, seq, payload);
             } else {
@@ -2005,7 +1988,7 @@ impl Daemon {
     }
 
     /// Full session teardown to idle: drop presence + subscription + ephemeral cfg and close the
-    /// host-side relays (mic/input/RTSP seams). THE host-gone routine —
+    /// host-side relays (mic/input seams). THE host-gone routine —
     /// every way a session can end (`CT_STOP`, heartbeat loss) funnels through it so their teardown
     /// can't drift, and the `/tmp/host_present` 1->0 edge it writes is what makes the supervisor run
     /// its complete wireless teardown back to IDLE. (The transport-death exit paths cannot call it —
@@ -2049,12 +2032,9 @@ impl Daemon {
         // App loss resets the CT_RADIO inhibit: the next session's pushed config governs radios
         // afresh (docs/carplay/04_CAPABILITIES_AND_CONFIG.md — no stale app commands survive the app).
         let _ = std::fs::remove_file(RADIO_OFF_FLAG);
-        // Drop the SETUP-relay seam: the departed host can no longer answer RS_REQs, and carplayd's
-        // reader turns our EOF into HostGone → sticky local fallback for any in-flight exchange.
-        self.rtsp_sock = None;
-        // Drop the mic + input seams too (audit B3): they connect to the departed session's carplayd, and
+        // Drop the mic + input seams (audit B3): they connect to the departed session's carplayd, and
         // `ensure_mic_seam` only reconnects when the socket is None — a stale seam would otherwise persist
-        // until the old carplayd EOFs, delaying the next session's uplink gate. Symmetric with rtsp_sock.
+        // until the old carplayd EOFs, delaying the next session's uplink gate.
         self.mic_sock = None;
         self.mic_rx.clear();
         self.mic_uplink_on = false; // the host that was gated ON is the one leaving
@@ -2350,7 +2330,8 @@ impl Daemon {
     /// BOUNDED and fire-and-forget, like every other loopback write on this thread: `connect_seam`
     /// caps the connect, a 250 ms `SO_SNDTIMEO` caps the write, and the response is never read. The
     /// poll loop also carries the host heartbeats, so a wedged or absent wireless daemon must cost a
-    /// bounded stall, not a torn-down session (the MFi-bridge lesson — see `forward_rtsp`). A failure
+    /// bounded stall, not a torn-down session: an unbounded box-side wait once stalled dispatch past
+    /// HEARTBEAT_GRACE and tore down a healthy session. A failure
     /// is logged and dropped: the SSP agent falls back to its own 55 s deadline and replies NO, which
     /// is the same outcome the user asked for on a Cancel and a safe one on a Pair.
     fn send_pair_answer(&mut self, accept: bool) {
@@ -2784,21 +2765,11 @@ impl Daemon {
         }
     }
 
-    /// Mirror the box's single-owner arbitration flag (`/tmp/projection_owner`, docs/androidauto/02_ARBITRATION.md) to the
-    /// host as `CT_PROJ_MODE` on each change.
+    /// Mirror the box's single-owner arbitration flag (`/tmp/projection_owner`) to the host as
+    /// `CT_PROJ_MODE` on each change: the box telling the app WHICH CarPlay transport it armed.
     ///
-    /// This is the box telling the app WHICH projection transport it armed — the app cannot see the
-    /// USB bus, the AOAP switch or `arm_aa`, so without it "the box is now doing Android Auto"
-    /// reached the app only via the hand-set `AA_OCBM` env stand-in. On `PM_WIRED_AA` — and, since
-    /// 2026-09-04, `PM_WIRELESS_AA` — the app runs its own AA head-unit engine over CH_IP to
-    /// `aa-bridge` instead of the CarPlay decode path. Nothing here distinguishes the two: this tick
-    /// is `owner().wire_code()` and `handle_ip` connects to whatever target the host names, so the
-    /// wireless transport needed no ocbmd change at all. Both AA transports are served by the same
-    /// `aa-bridge` process on the same `127.0.0.1:5277`.
-    ///
-    /// Reads through [`box_common::flags::owner`], so the legacy CarPlay-only `carplay_transport`
-    /// fallback and the token spellings stay defined in ONE place shared with aa-bridge and the
-    /// shell supervisor. Same discipline as [`Self::bt_phase_tick`]: changes only, throttled once
+    /// Reads through [`box_common::flags::owner`], so the legacy `carplay_transport` fallback and
+    /// the token spellings stay defined in ONE place shared with the shell supervisor. Same discipline as [`Self::bt_phase_tick`]: changes only, throttled once
     /// latched (the flag changes on arm/teardown, not during A/V).
     fn proj_mode_tick(&mut self, now_t: std::time::Instant) {
         if !self.subscribed {
@@ -3071,8 +3042,8 @@ impl Daemon {
     }
 
     /// Forget the mic seam socket (`ensure_mic_seam` reconnects on the next tick) and, if the host was
-    /// gated ON through this seam, gate it OFF now. The seam's owner (carplayd per session, or
-    /// btd's SCO module for an HFP call) sends `uplink off` and closes; if our next PCM
+    /// gated ON through this seam, gate it OFF now. The seam's owner (carplayd, per session)
+    /// sends `uplink off` and closes; if our next PCM
     /// write to the closing peer fails first, that line is never drained — so the drop itself is the
     /// OFF edge. The box does not interpret the audio; it only closes the gate it opened.
     fn drop_mic_seam(&mut self, why: &str) {
@@ -3125,19 +3096,14 @@ impl Daemon {
     /// is testable without a socket — the payload the host sees is the whole contract here.
     fn on_mic_backchannel_line(&mut self, line: &str) {
         if let Some(rest) = line.strip_prefix("uplink on") {
-            // `uplink on <rate> <ch> [codec]` — default 16 kHz mono if the fields are missing or
-            // garbled. The fourth token is OPTIONAL and additive (added 2026-09-04 for HFP
-            // wideband): carplayd never sends it and CVSD/HFP does not either, so its absence must
-            // keep meaning PCM rather than becoming a parse failure that gates the mic off.
+            // `uplink on <rate> <ch>` — default 16 kHz mono if the fields are missing or garbled.
+            // Anything after them is ignored: the box's uplink is always PCM, codec 0 (4, mSBC, was
+            // btd's HFP wideband, retired in OCBM 1.0.5), and the byte stays on the wire for the hosts
+            // that read it.
             let mut it = rest.split_whitespace();
             let rate: u32 = it.next().and_then(|s| s.parse().ok()).unwrap_or(16000);
             let ch: u8 = it.next().and_then(|s| s.parse().ok()).unwrap_or(1);
-            // An UNKNOWN fourth token is PCM, not a guess: a host told "codec 0" plays what it
-            // captures, while a host told some codec it does not have would stop capturing.
-            let codec: u8 = match it.next() {
-                Some("msbc") => p::SEAM_CODEC_MSBC,
-                _ => 0,
-            };
+            let codec: u8 = 0;
             let mut pl = Vec::with_capacity(8);
             pl.push(p::CT_UPLINK);
             pl.push(1); // on
@@ -3150,54 +3116,6 @@ impl Daemon {
         } else if line == "uplink off" {
             self.send_uplink_off();
             eprintln!("[ocbmd] mic: uplink OFF -> host");
-        }
-    }
-
-    /// Ensure the SETUP-relay seam to carplayd is connected (best-effort, idempotent — the
-    /// `ensure_mic_seam` clone). Established EAGERLY while a host is subscribed, not on first byte:
-    /// carplayd's `RemoteSession` emits RS_OPEN at pair-verify — BEFORE any host→box bytes exist that
-    /// could lazily trigger a connect — and its per-connection delegate selection gates on
-    /// `relay::seam_up()`, which is only true once we are attached. A data-triggered connect would
-    /// therefore permanently select the plain local session. A refused connect (carplayd restarting)
-    /// is cheap on localhost; the ≤500 ms subscribed poll cadence throttles the retry.
-    fn ensure_rtsp_seam(&mut self) {
-        if self.rtsp_sock.is_some() {
-            return;
-        }
-        if let Some(s) = connect_seam(RTSP_INGEST_ADDR, Duration::from_millis(500)) {
-            // connect_seam hands back a NON-blocking socket (its poll-loop contract). Flip it back to
-            // blocking with a 250 ms SO_SNDTIMEO instead: forward_rtsp must deliver a WHOLE RS_RESP —
-            // a partial nonblocking write would desync the byte stream mid-message — but the write
-            // must stay BOUNDED so a wedged carplayd can never starve the single-threaded poll loop
-            // (and with it the host heartbeats: the MFi-bridge lesson — an unbounded box-side wait
-            // once stalled dispatch past HEARTBEAT_GRACE and tore down a healthy session). The small
-            // SO_RCVTIMEO bounds the read side against a spurious level-triggered POLLIN wake.
-            let _ = s.set_nonblocking(false);
-            let _ = s.set_write_timeout(Some(Duration::from_millis(250)));
-            let _ = s.set_read_timeout(Some(Duration::from_millis(50)));
-            let _ = s.set_nodelay(true); // rpc frames are small and latency-critical
-            self.rtsp_sock = Some(s);
-            eprintln!("[ocbmd] rtsp: connected to carplayd {RTSP_INGEST_ADDR} (SETUP relay armed)");
-        }
-    }
-
-    /// Relay one CH_RTSP payload (host→box: RS_RESP / RS_ERR seam bytes) to carplayd's relay seam.
-    /// Any write failure — including the 250 ms SO_SNDTIMEO expiring — DROPS the socket: recovery is
-    /// by POLICY, not by retry. carplayd sees EOF on its reader, marks the seam down, fails every
-    /// pending exchange fast (HostGone → sticky local fallback), and the next `ensure_rtsp_seam`
-    /// tick reconnects fresh — so a wedged relay costs one bounded stall and one fallen-back
-    /// exchange, never a starved heartbeat or a desynced half-written message.
-    fn forward_rtsp(&mut self, pl: &[u8]) {
-        if pl.is_empty() {
-            return;
-        }
-        self.ensure_rtsp_seam();
-        let Some(s) = self.rtsp_sock.as_mut() else {
-            return; // carplayd not listening — the box side answers locally, nothing to do
-        };
-        if let Err(e) = s.write_all(pl) {
-            eprintln!("[ocbmd] rtsp: relay write failed ({e}) — dropping socket (carplayd falls back local)");
-            self.rtsp_sock = None;
         }
     }
 
@@ -3539,7 +3457,7 @@ impl Daemon {
         }
     }
 
-    fn handle(&mut self, ch: u16, flags: u8, pl: &[u8]) {
+    fn handle(&mut self, ch: u16, _flags: u8, pl: &[u8]) {
         self.note_host_frame(ch == p::CH_CTRL && pl.first() == Some(&p::CT_HELLO));
         match ch {
             p::CH_CTRL => {
@@ -3822,8 +3740,7 @@ impl Daemon {
                         // /tmp/carplay_cfg.yaml at startup, the app kept heartbeating into it with
                         // `subscribed=true` on its side, and the still-running carplayd_wl served the
                         // reconnecting phone compiled defaults (1920×720/H.264 against a pushed
-                        // 2400×960/HEVC) for hours. The app's own RS_OPEN `cfg_crc==0` guard never
-                        // ran because the no-config path also clears `appsetup` — no relay, no RS_OPEN.
+                        // 2400×960/HEVC) for hours.
                         //
                         // Answer with `SEV_HOST_GONE`: the app decodes it as "the box dropped my
                         // subscription", sets its `subscribed=false` and re-SUBSCRIBEs immediately
@@ -3927,7 +3844,6 @@ impl Daemon {
             p::CH_FILE => self.handle_file(pl),
             p::CH_INPUT => self.forward_input(pl), // HID input host -> carplayd -> iPhone (task #20)
             p::CH_MIC => self.forward_mic(pl), // mic PCM host -> carplayd -> iPhone (type-100 uplink)
-            p::CH_RTSP => self.forward_rtsp(pl), // SETUP-relay bytes host -> carplayd (RS_RESP/RS_ERR)
             p::CH_MGMT => self.handle_mgmt(pl), // box management (the app's "CCPA" tab)
             _ => {}
         }
@@ -4488,7 +4404,6 @@ fn main() {
         mic_rx: Vec::new(),
         mic_uplink_on: false,
         mic_fwd: 0,
-        rtsp_sock: None,
         phone_state: None,
         pairing_code: None,
         bt_phase: None,
@@ -4583,16 +4498,6 @@ fn main() {
             });
             kinds.push(Kind::Mic);
         }
-        if let Some(s) = d.rtsp_sock.as_ref() {
-            // SETUP-relay seam read side: box→host RS_OPEN/RS_REQ/RS_CLOSE bytes from carplayd. The
-            // write side (host→box RS_RESP) is bounded-blocking in forward_rtsp, never polled.
-            fds.push(libc::pollfd {
-                fd: s.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            });
-            kinds.push(Kind::Rtsp);
-        }
         for (idx, (l, _)) in d.av_listeners.iter().enumerate() {
             fds.push(libc::pollfd {
                 fd: l.as_raw_fd(),
@@ -4669,7 +4574,6 @@ fn main() {
                     match kinds[i] {
                         Kind::Pty => d.ptm = None, // console shell exited → drop the master pty
                         Kind::Mic => d.drop_mic_seam("poll HUP/ERR"), // ensure_mic_seam reconnects on the next tick
-                        Kind::Rtsp => d.rtsp_sock = None, // ensure_rtsp_seam reconnects on the next tick
                         Kind::AvConn(idx) => av_close.push(idx),
                         Kind::AvListen(_) => {} // a listen socket hangup shouldn't occur; nothing to drop
                         Kind::Acc | Kind::AccOut => {
@@ -4754,26 +4658,6 @@ fn main() {
                     // the mic seam's `uplink on/off` back-channel → CH_CTRL CT_UPLINK to the host
                     d.drain_mic_backchannel();
                 }
-                Kind::Rtsp => {
-                    // box→host: chunk carplayd's relay-seam bytes onto CH_RTSP (≤64 KiB per OCBM
-                    // frame; the endpoint framing has its own magic, so chunk boundaries are free).
-                    // `avbuf` (MAX_PAYLOAD) is reused — arms run sequentially within a pass.
-                    let res = d.rtsp_sock.as_mut().map(|s| s.read(&mut avbuf));
-                    match res {
-                        Some(Ok(0)) => d.rtsp_sock = None, // carplayd closed (restart) → reconnect on tick
-                        Some(Ok(n)) => d.send(p::CH_RTSP, p::F_SOM | p::F_EOM, &avbuf[..n]),
-                        // Spurious level-triggered wake bounded by the 50 ms SO_RCVTIMEO — not death.
-                        Some(Err(ref e))
-                            if matches!(
-                                e.kind(),
-                                std::io::ErrorKind::WouldBlock
-                                    | std::io::ErrorKind::TimedOut
-                                    | std::io::ErrorKind::Interrupted
-                            ) => {}
-                        Some(Err(_)) => d.rtsp_sock = None,
-                        None => {}
-                    }
-                }
                 Kind::AvListen(idx) => {
                     // accept a local A/V producer (the box session) → tag it with the target channel.
                     // DEFER the av_conns mutation to after the loop (av_new) so it can't shift the indices
@@ -4839,11 +4723,6 @@ fn main() {
         // throttles the retry. See ensure_mic_seam for the deadlock this avoids.
         if d.subscribed {
             d.ensure_mic_seam();
-            // SETUP-relay seam, same eager discipline — and doubly so: carplayd's per-connection
-            // delegate selection reads relay::seam_up() at the moment a phone connects, and its
-            // RS_OPEN fires at pair-verify. Both happen before any host→box relay byte exists, so a
-            // lazy (data-triggered) connect would permanently select the plain local session.
-            d.ensure_rtsp_seam();
         }
         d.drain(); // non-blocking flush (hi priority first)
 
@@ -5015,7 +4894,6 @@ mod tests {
             mic_rx: Vec::new(),
         mic_uplink_on: false,
             mic_fwd: 0,
-            rtsp_sock: None,
             phone_state: None,
             pairing_code: None,
             bt_phase: None,
@@ -5031,7 +4909,7 @@ mod tests {
         }
     }
 
-    /// Pop everything queued on the priority (CTRL/RTSP) queue as `(channel, flags, payload)`,
+    /// Pop everything queued on the priority (CTRL) queue as `(channel, flags, payload)`,
     /// parsed back through a real `Reassembler` so the header the host would actually see is the
     /// thing under test.
     fn sent(d: &mut Daemon) -> Vec<(u16, u8, Vec<u8>)> {
@@ -5251,8 +5129,8 @@ mod tests {
         out[0].2.clone()
     }
 
-    /// The CVSD/CarPlay form. Three tokens in, and the first seven payload bytes must be what they
-    /// have always been — every shipped host parses this by fixed offset.
+    /// Three tokens in, and the first seven payload bytes must be what they have always been —
+    /// every shipped host parses this by fixed offset.
     #[test]
     fn the_uplink_gate_carries_codec_zero_when_the_seam_names_no_codec() {
         let pl = uplink_payload("uplink on 8000 1");
@@ -5265,26 +5143,12 @@ mod tests {
         assert_eq!(uplink_payload("uplink on 16000 1")[7], 0);
     }
 
-    /// The wideband form: `uplink on 16000 1 msbc` — the app must be told to hand back mSBC packets
-    /// rather than PCM, and 16 kHz alone does not say that (CarPlay's own uplink is 16 kHz PCM).
+    /// A fourth token never names a codec any more: `msbc` (btd's HFP wideband) is retired, and
+    /// the host must keep being told PCM.
     #[test]
-    fn the_uplink_gate_relays_the_msbc_codec_byte() {
-        let pl = uplink_payload("uplink on 16000 1 msbc");
-        assert_eq!(pl.len(), 8);
-        assert_eq!(pl[1], 1);
-        assert_eq!(u32::from_le_bytes(pl[2..6].try_into().unwrap()), 16000);
-        assert_eq!(pl[6], 1);
-        assert_eq!(pl[7], p::SEAM_CODEC_MSBC);
-        assert_eq!(pl[7], 4);
-    }
-
-    /// An unknown fourth token must degrade to PCM, never gate the mic off: a host told "codec 0"
-    /// captures something, a host told a codec it has no encoder for captures nothing.
-    #[test]
-    fn an_unknown_uplink_codec_token_degrades_to_pcm() {
+    fn a_fourth_uplink_token_is_ignored_and_the_codec_stays_pcm() {
+        assert_eq!(uplink_payload("uplink on 16000 1 msbc")[7], 0);
         assert_eq!(uplink_payload("uplink on 16000 1 lc3")[7], 0);
-        assert_eq!(uplink_payload("uplink on 16000 1 MSBC")[7], 0, "the token is lowercase on the wire");
-        assert_eq!(uplink_payload("uplink on 16000 1 msbc extra")[7], p::SEAM_CODEC_MSBC);
     }
 
     /// OFF stays the seven-byte all-zero form byte-identically. It is the edge that STOPS a
@@ -5518,10 +5382,10 @@ mod tests {
         // The reaped-and-recreated case. Our open fd keeps the OLD inode alive, so without the
         // identity check the source reads EOF forever against a live new file — a daemon whose log
         // was rotated away would go permanently silent to the host with no error anywhere.
-        let (mut d, path) = td_log(p::LOG_SRC_AA_BRIDGE, "reap");
-        append(&path, "[aa] first\n");
+        let (mut d, path) = td_log(p::LOG_SRC_BT, "reap");
+        append(&path, "[bt] first\n");
         log_tick_now(&mut d);
-        assert_eq!(log_lines(&log_sent(&mut d)), ["[aa] first"]);
+        assert_eq!(log_lines(&log_sent(&mut d)), ["[bt] first"]);
 
         std::fs::remove_file(&path).unwrap();
         log_tick_now(&mut d);
@@ -5530,13 +5394,13 @@ mod tests {
         assert!(notes(&v).iter().any(|n| n.contains("replaced or reaped")));
         assert!(d.log.srcs[0].fd.is_none(), "the stale inode must be let go");
 
-        append(&path, "[aa] second\n"); // reappears as a NEW inode
+        append(&path, "[bt] second\n"); // reappears as a NEW inode
         log_tick_now(&mut d);
-        assert_eq!(log_lines(&log_sent(&mut d)), ["[aa] second"]);
+        assert_eq!(log_lines(&log_sent(&mut d)), ["[bt] second"]);
         // And it keeps following the new file, rather than one-shotting it.
-        append(&path, "[aa] third\n");
+        append(&path, "[bt] third\n");
         log_tick_now(&mut d);
-        assert_eq!(log_lines(&log_sent(&mut d)), ["[aa] third"]);
+        assert_eq!(log_lines(&log_sent(&mut d)), ["[bt] third"]);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -5879,7 +5743,7 @@ mod tests {
             assert!(!d.host_replaced, "a latched replacement must not outlive the session");
             assert!(d.rearm_deadline.is_none());
             assert!(!d.log.enabled, "the log stream must be disarmed");
-            assert!(d.rtsp_sock.is_none() && d.mic_sock.is_none() && d.input_sock.is_none());
+            assert!(d.mic_sock.is_none() && d.input_sock.is_none());
         }
         // ...and the flag the supervisor actually reads says GONE. Safe to assert on the shared path
         // because `presence_flag_lock` is held: `lost` wrote it last, and it wrote 0.
@@ -6461,7 +6325,7 @@ mod tests {
         assert!(proc_name_matches("carplayd", "carplayd", "carplayd"));
 
         // A multicall image invoked through /usr/sbin/<name>: comm is the symlink basename.
-        assert!(proc_name_matches("aa-bridge", "aa-bridge", "aa-bridge"));
+        assert!(proc_name_matches("iap2d", "iap2d", "iap2d"));
 
         // Negative cases: a different daemon, and the wrapper script that merely mentions the name.
         assert!(!proc_name_matches("ocbmd", "ocbmd", "carplayd"));

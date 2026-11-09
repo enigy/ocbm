@@ -74,7 +74,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
-use box_common::flags::{self, ProjectionOwner};
 
 use crate::ssp_agent;
 
@@ -656,13 +655,10 @@ impl Control {
     /// True once, when the switched-to phone's session is still live past the hold (and at least
     /// [`SWITCH_WIFI_FLOOR`] after it started) and carplayd has not taken a SETUP from it. That phone is
     /// then passed over for [`PASS_OVER`], and the caller ends the session, so the box goes back to its
-    /// call order. A wireless Android Auto session counts as projecting: it never writes the CarPlay
-    /// identity. A phone that reached CarPlay and has lost it again is not stranded: [`Control::carplay_lost`]
+    /// call order. A phone that reached CarPlay and has lost it again is not stranded: [`Control::carplay_lost`]
     /// starts its handoff again. Polled by `run_active_session`'s wait loop; reads files only at the deadline.
     pub fn switch_stranded(&self) -> bool {
-        self.switch_stranded_at(Instant::now(), |w| {
-            flags::owner() == ProjectionOwner::WirelessAa || self.switch_projected(w, read_ident())
-        })
+        self.switch_stranded_at(Instant::now(), |w| self.switch_projected(w, read_ident()))
     }
 
     /// Whether a switched-to phone reached CarPlay: carplayd names it `now`, or did earlier in its session.
@@ -1360,7 +1356,7 @@ mod tests {
         Some((SystemTime::UNIX_EPOCH + Duration::from_secs(written), Some(phone)))
     }
 
-    /// `switch_stranded` at `when`, with `now` in `/tmp/phone_identity` and no Android Auto session.
+    /// `switch_stranded` at `when`, with `now` in `/tmp/phone_identity`.
     fn stranded(c: &Control, when: Instant, now: Ident) -> bool {
         c.switch_stranded_at(when, |w| c.switch_projected(w, now))
     }
@@ -1446,7 +1442,7 @@ mod tests {
     }
 
     #[test]
-    fn a_switched_to_phone_projecting_android_auto_is_left_alone() {
+    fn a_switched_to_phone_that_is_projecting_is_left_alone() {
         let t0 = Instant::now();
         let c = switched(t0, t0 + Duration::from_secs(6), None);
         assert!(!c.switch_stranded_at(t0 + SWITCH_HOLD, |_| true));

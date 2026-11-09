@@ -67,24 +67,12 @@ const BASE_UUID: [u8; 16] = [
 /// discriminate between services:
 ///   * `0x1002` PublicBrowseGroup — from each record's `BrowseGroupList`
 ///   * `0x0100` L2CAP and `0x0003` RFCOMM — from each record's `ProtocolDescriptorList`
-///   * `0x1101` SerialPort — from the `BluetoothProfileDescriptorList` of the two `ServiceRecord`-
-///     shaped records (`sdp_record.rs`'s `UUID16_SERIAL_PORT`)
-///
-/// `0x1101` is the one approximation here since the HFP record joined the table (2026-09-04): that
-/// record's profile descriptor is Handsfree, not SerialPort, so a search for SerialPort ALONE now
-/// over-selects it. Over-answering a browse-shaped query is benign — the intent of this arm is
-/// "give me everything" — and the alternative is a per-service matchable-UUID list for one UUID no
-/// observed phone searches on its own. A search that NAMES a service still selects only that
-/// service, which is the property that matters.
+///   * `0x1101` SerialPort — from each record's `BluetoothProfileDescriptorList`
+///     (`sdp_record.rs`'s `UUID16_SERIAL_PORT`)
 ///
 /// A search pattern built ONLY from these is a "give me everything you have" query, and must return
-/// every service. BENCH-PROVEN NECESSARY: Android's discovery makes exactly two searches — DID
-/// `0x1200`, then L2CAP `0x0100` — and never uses PublicBrowseGroup. With only the browse group
-/// handled, the L2CAP search matched nothing, fell through to the single-service fallback, and the
-/// phone cached exactly one UUID for this box — `[BR/EDR UUIDs]` held only
-/// `00000000-deca-fade-deca-deafdecacaff`
-/// (`dumpsys bluetooth_manager`, 2026-09-01, with the Android Auto record registered but
-/// unreachable.) Gearhead then logs `doesn't contain AA UUID and won't request SDP` and gives up.
+/// every service. Bench-proven (2026-09-01): a phone's discovery may search L2CAP `0x0100` alone
+/// and never use PublicBrowseGroup.
 ///
 /// This also matches the ONLY known-good oracle. The stock CCPA does not implement SDP at all — it
 /// registers records with BlueZ (`sdp_record_register`, `sdp_set_access_protos`) and `sdpd` answers,
@@ -101,10 +89,6 @@ pub struct Service {
     pub record: Vec<u8>,
     /// Human name, for logs only.
     pub name: &'static str,
-    /// Mirrors `ServiceRecord::extra_class_uuid16` — the hedge lever's 16-bit UUID also appended
-    /// to the `ServiceClassIDList`, when set. `select_services` must be able to match on it, or
-    /// flipping the lever changes the record bytes without changing what the server matches on.
-    pub extra_class_uuid16: Option<u16>,
 }
 
 /// `@<unix_ms> ` write-time stamp (docs/carplay/01_OCBM_PROTOCOL.md CH_LOG): the box.log tailer
@@ -121,7 +105,7 @@ fn now_ms() -> u64 {
 }
 
 /// Is per-PDU SDP tracing on? Resolved once per process, matching the crate's env-lever
-/// convention (`hci::native_selected`, `rfcomm_uspace`'s backend select). Off by default: every
+/// convention. Off by default: every
 /// inbound PDU logging unconditionally is noise on a box serving other SDP-heavy traffic — opt in
 /// with `SDP_TRACE=1` for an actual troubleshooting session.
 fn trace_enabled() -> bool {
@@ -143,88 +127,9 @@ pub fn iap2_service(rfcomm_chan: u8) -> Service {
             uuid128: crate::sdp_record::uuid128_from_u128(0x00000000_deca_fade_deca_deafdecacaff),
             rfcomm_channel: rfcomm_chan,
             name: "Wireless iAPv2",
-            extra_class_uuid16: None,
         }
         .encode(),
         name: "Wireless iAPv2",
-        extra_class_uuid16: None,
-    }
-}
-
-/// The Android Auto wireless-projection service.
-///
-/// Name and channel both match what the stock CCPA's own `bluetoothDaemon` registers, recovered
-/// from its record builders (AAP = channel 4).
-pub fn android_auto_service(rfcomm_chan: u8) -> Service {
-    const AA: u128 = 0x4de17a00_52cb_11e6_bdf4_0800200c9a66;
-    Service {
-        handle: SVC_RECORD_HANDLE_BASE + 1,
-        uuid128: crate::sdp_record::uuid128_from_u128(AA),
-        record: crate::sdp_record::ServiceRecord {
-            handle: SVC_RECORD_HANDLE_BASE + 1,
-            uuid128: crate::sdp_record::uuid128_from_u128(AA),
-            rfcomm_channel: rfcomm_chan,
-            name: "Wireless Android Auto Protocol",
-            // Stock's shape. Flip to Some(0x1101) as the first hedge if a phone will not offer
-            // wireless AA — see ServiceRecord::extra_class_uuid16.
-            extra_class_uuid16: None,
-        }
-        .encode(),
-        name: "Wireless Android Auto Protocol",
-        extra_class_uuid16: None,
-    }
-}
-
-/// The HFP **Hands-Free** service, on its own RFCOMM channel.
-///
-/// Advertised so gearhead's wireless-setup gate can be satisfied: it requires
-/// `BluetoothProfile.HEADSET.getConnectedDevices()` to contain the head unit, i.e. an HFP SLC with
-/// the phone as audio gateway and us as hands-free (`docs/androidauto/03_WIRELESS.md` §6b). The
-/// record is what lets a phone whose `PhonePolicy` auto-connects HFP to a bonded HF device dial us;
-/// the wireless crate's `hfp_hf` module also dials the phone's own AG record, which is what the
-/// stock box does and the direction that is field-proven.
-///
-/// `uuid128` is the base-expanded `0x111E`, so a UUID16 search for Handsfree selects exactly this
-/// record; `extra_class_uuid16` makes the second class (`0x1203 GenericAudio`) equally searchable.
-pub fn hfp_hf_service(rfcomm_chan: u8) -> Service {
-    let record = crate::sdp_record::HandsFreeRecord {
-        handle: SVC_RECORD_HANDLE_BASE + 2,
-        rfcomm_channel: rfcomm_chan,
-        name: "Hands-Free",
-        profile_version: 0x0107,
-        supported_features: 0x003F,
-    }
-    .encode();
-    Service {
-        handle: SVC_RECORD_HANDLE_BASE + 2,
-        uuid128: expand_uuid(crate::sdp_record::UUID16_HANDSFREE as u32),
-        record,
-        name: "Hands-Free",
-        extra_class_uuid16: Some(crate::sdp_record::UUID16_GENERIC_AUDIO),
-    }
-}
-
-/// The HSP **Headset** service, on its own RFCOMM channel.
-///
-/// Advertised ALONGSIDE [`hfp_hf_service`], not instead of it, because the two reach gearhead's
-/// `BluetoothProfile.HEADSET` gate by different routes in AOSP and only the HFP one needs an AT
-/// dialogue (`bta_ag_act.cc:533-540`; see `sdp_record::HeadsetRecord`). A phone whose `PhonePolicy`
-/// auto-connects to a bonded headset-class device then finds a record either way.
-pub fn hsp_hs_service(rfcomm_chan: u8) -> Service {
-    let record = crate::sdp_record::HeadsetRecord {
-        handle: SVC_RECORD_HANDLE_BASE + 3,
-        rfcomm_channel: rfcomm_chan,
-        name: "Headset",
-        profile_version: 0x0102,
-        remote_audio_volume_control: false,
-    }
-    .encode();
-    Service {
-        handle: SVC_RECORD_HANDLE_BASE + 3,
-        uuid128: expand_uuid(crate::sdp_record::UUID16_HEADSET as u32),
-        record,
-        name: "Headset",
-        extra_class_uuid16: Some(crate::sdp_record::UUID16_GENERIC_AUDIO),
     }
 }
 
@@ -334,13 +239,12 @@ fn parse_search_pattern(p: &[u8]) -> Option<Vec<[u8; 16]>> {
 /// was a real defect, caught in the Pixel's own HCI snoop: after bonding, the phone asked for PnP
 /// Information (`0x1200`) and Phonebook Access Client (`0x112E`) and got the iAP2 record back both
 /// times. Answering a search with a record that does not contain the searched UUID is a protocol
-/// lie — the phone caches a service class for us that we do not implement, and with an HFP record
-/// now in the table the same bug would hand a phone the WRONG record for `0x111E`.
+/// lie — the phone caches a service class for us that we do not implement.
 ///
 /// The parse-failure and empty-pattern arms are kept as they were, deliberately: those are our own
 /// inability to read the request rather than a genuine miss, and before this server understood
 /// patterns at all it answered every request with iAP2. No request an iPhone has ever made may
-/// start getting a different answer because Android Auto was added.
+/// start getting a different answer.
 fn select_services<'a>(services: &'a [Service], pattern: &[u8]) -> Vec<&'a Service> {
     let Some(uuids) = parse_search_pattern(pattern) else {
         return services.first().into_iter().collect();
@@ -363,12 +267,7 @@ fn select_services<'a>(services: &'a [Service], pattern: &[u8]) -> Vec<&'a Servi
     // both of which are legal and are what a phone asking about a service we do not have expects.
     services
         .iter()
-        .filter(|svc| {
-            uuids.contains(&svc.uuid128)
-                || svc
-                    .extra_class_uuid16
-                    .is_some_and(|extra| uuids.contains(&expand_uuid(extra as u32)))
-        })
+        .filter(|svc| uuids.contains(&svc.uuid128))
         .collect()
 }
 
@@ -485,10 +384,8 @@ fn serve_attr_blob(
 
 /// `0x02 ServiceSearchRequest -> 0x03 ServiceSearchResponse`.
 ///
-/// Now actually matches the pattern. It used to return the one known handle unconditionally, which
-/// was fine with one record and wrong with two: an Android Auto search would resolve to iAP2's
-/// handle, the phone would then fetch iAP2's record and read RFCOMM channel 1 out of it, and dial
-/// the wrong service.
+/// Matches the pattern (`select_services`): a search names a service, and answering it with
+/// another service's handle sends the phone to that service's record and RFCOMM channel.
 fn handle_service_search(
     stream: &mut impl Write,
     tid: u16,
@@ -751,9 +648,8 @@ pub fn run(rfcomm_chan: u8, shutdown: &AtomicBool) -> std::io::Result<()> {
 ///
 /// There can only be one: L2CAP PSM 0x0001 is a well-known single-holder port and this binds it
 /// without `SO_REUSEADDR`, so a second process trying to advertise its own service gets
-/// `EADDRINUSE` and is silently never discoverable. That is why wireless Android Auto is served
-/// from inside this daemon rather than beside it, and it matches what the stock box does: one
-/// `bluetoothDaemon`, one Bluetooth identity, several records, told apart by RFCOMM channel.
+/// `EADDRINUSE` and is silently never discoverable. It matches what the stock box does: one
+/// `bluetoothDaemon`, one Bluetooth identity, its records told apart by RFCOMM channel.
 pub fn run_services(services: Vec<Service>, shutdown: &AtomicBool) -> std::io::Result<()> {
     let listener = open_l2cap_listener()?;
     for svc in &services {
@@ -826,21 +722,17 @@ pub fn run_services(services: Vec<Service>, shutdown: &AtomicBool) -> std::io::R
         } else {
             None
         };
-        let mut client = unsafe { std::fs::File::from_raw_fd(cfd) };
+        let client = unsafe { std::fs::File::from_raw_fd(cfd) };
         if let Some(e) = sockopt_err {
             // Serving without the timeout would block unboundedly on an idle peer — drop this
             // client (File closes cfd) and keep accepting rather than risk the wedge.
             log(&format!("SO_RCVTIMEO on accepted fd failed: {e} -- dropping client"));
             continue;
         }
-        // CONCURRENT, one thread per client. This server used to run `serve_client` to completion
-        // on the accept loop with a backlog of 1. That was safe only while iPhones were the only
-        // thing that ever browsed us: `serve_client`'s own contract is that a phone LEGITIMATELY
-        // idles on an open SDP channel, so once an Android Auto record is advertised, an idling
-        // Android phone would hold the single slot while an arriving iPhone's connect sat unserved
-        // — and an iPhone that browses SDP and finds no iAP2 service disconnects. That is the exact
-        // CarPlay failure this module was written to prevent, and adding AA would have introduced
-        // it, so the fix ships in the same change.
+        // CONCURRENT, one thread per client. `serve_client`'s own contract is that a phone
+        // LEGITIMATELY idles on an open SDP channel, so with one slot an idling phone would hold it
+        // while an arriving iPhone's connect sat unserved — and an iPhone that browses SDP and
+        // finds no iAP2 service disconnects.
         //
         // Scoped threads so `shutdown` and the service table can be borrowed rather than cloned
         // into 'static; bounded so a hostile or broken peer cannot spawn threads without limit.
@@ -886,7 +778,7 @@ mod tests {
     #[test]
     fn services_carry_their_own_rfcomm_channels() {
         assert_eq!(iap2_service(7).record[crate::sdp_record::RFCOMM_CHANNEL_OFFSET], 7);
-        assert_eq!(android_auto_service(4).record[crate::sdp_record::RFCOMM_CHANNEL_OFFSET], 4);
+        assert_eq!(other_service(4).record[crate::sdp_record::RFCOMM_CHANNEL_OFFSET], 4);
     }
 
     #[test]
@@ -961,28 +853,10 @@ mod tests {
     #[test]
     fn select_services_serial_port_uuid_is_universal() {
         // SerialPort (0x1101) is in every record's BluetoothProfileDescriptorList, so a pattern
-        // asking for it alone must be treated as "everything", not fall through to the fallback
-        // (M2: the lever's UUID must actually be reachable by search, not just present in bytes).
-        let services = [iap2_service(1), android_auto_service(4)];
+        // asking for it alone must be treated as "everything", not fall through to the fallback.
+        let services = both();
         let hits = select_services(&services, &uuid16_search_pattern(0x1101));
         assert_eq!(hits.len(), 2, "0x1101 alone must match every service, not just the fallback");
-    }
-
-    #[test]
-    fn select_services_matches_the_extra_class_uuid_lever() {
-        // With the hedge lever flipped, a search for that extra UUID (not the 128-bit class UUID,
-        // and not one of the universal UUIDs) must hit the service carrying it.
-        let mut aa = android_auto_service(4);
-        aa.extra_class_uuid16 = Some(0x1234);
-        let services = [iap2_service(1), aa];
-        let hits = select_services(&services, &uuid16_search_pattern(0x1234));
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].name, "Wireless Android Auto Protocol");
-
-        // Without the lever set, the same search matches nothing — and now RETURNS nothing rather
-        // than the iAP2 record. See `select_services`' 2026-09-04 correction.
-        let services = [iap2_service(1), android_auto_service(4)];
-        assert!(select_services(&services, &uuid16_search_pattern(0x1234)).is_empty());
     }
 
     /// THE DEFECT, from the Pixel's own HCI snoop (2026-09-04): after bonding, the phone asked for
@@ -991,8 +865,8 @@ mod tests {
     /// the searched UUID.
     #[test]
     fn a_search_for_a_service_we_do_not_have_returns_nothing() {
-        let services = all_four();
-        for uuid in [0x1200u16, 0x112e, 0x110a, 0x1132, 0x111f, 0x1112] {
+        let services = both();
+        for uuid in [0x1200u16, 0x112e, 0x110a, 0x1132, 0x111e, 0x111f, 0x1108, 0x1112] {
             let hits = select_services(&services, &uuid16_search_pattern(uuid));
             assert!(hits.is_empty(), "0x{uuid:04x} must select no service, got {}", hits.len());
         }
@@ -1015,33 +889,15 @@ mod tests {
         assert_eq!(&p[2..4], &[0x35, 0x00]);
     }
 
-    /// Each audio-profile record must be selected by BOTH of its class UUIDs, and by neither the
-    /// other record's nor the audio-gateway UUIDs the PHONE advertises.
-    #[test]
-    fn the_audio_profile_records_are_selected_by_their_own_class_uuids() {
-        let services = all_four();
-        let hits = select_services(&services, &uuid16_search_pattern(0x111e));
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].handle, SVC_RECORD_HANDLE_BASE + 2);
-        let hits = select_services(&services, &uuid16_search_pattern(0x1108));
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].handle, SVC_RECORD_HANDLE_BASE + 3);
-        // GenericAudio is in both class lists, so it selects both and only those two.
-        let hits = select_services(&services, &uuid16_search_pattern(0x1203));
-        assert_eq!(hits.len(), 2);
-        assert_eq!(hits[0].handle, SVC_RECORD_HANDLE_BASE + 2);
-        assert_eq!(hits[1].handle, SVC_RECORD_HANDLE_BASE + 3);
-    }
-
     /// Every registered handle must be servable — a phone that just learned one from a search and
     /// then gets INVALID_HANDLE will not connect.
     #[test]
-    fn all_four_handles_are_distinct_and_servable() {
-        let services = all_four();
+    fn every_handle_is_distinct_and_servable() {
+        let services = both();
         let mut handles: Vec<u32> = services.iter().map(|s| s.handle).collect();
         handles.sort_unstable();
         handles.dedup();
-        assert_eq!(handles.len(), 4);
+        assert_eq!(handles.len(), 2);
         for svc in &services {
             let mut out = Vec::new();
             let mut params = svc.handle.to_be_bytes().to_vec();
@@ -1052,17 +908,17 @@ mod tests {
         }
     }
 
-    /// A browse must reach all four records, or a service the phone never caches is a service it
-    /// never dials — the bench-proven failure this arm was added for.
+    /// A browse must reach every record, or a service the phone never caches is a service it never
+    /// dials — the bench-proven failure this arm was added for.
     #[test]
-    fn a_browse_returns_all_four_records() {
+    fn a_browse_returns_every_record() {
         for pattern in [
             vec![0x35u8, 0x03, 0x19, 0x10, 0x02], // PublicBrowseGroup
             vec![0x35, 0x03, 0x19, 0x01, 0x00],   // L2CAP
         ] {
             let mut out = Vec::new();
-            handle_service_search(&mut out, 1, &search_params(&pattern), &all_four()).unwrap();
-            assert_eq!(handles_from_search_response(&out).len(), 4, "pattern {pattern:?}");
+            handle_service_search(&mut out, 1, &search_params(&pattern), &both()).unwrap();
+            assert_eq!(handles_from_search_response(&out).len(), 2, "pattern {pattern:?}");
         }
     }
 
@@ -1075,8 +931,7 @@ mod tests {
         ];
         // Kept as a REGRESSION test, byte-for-byte as it was before this server understood search
         // patterns: an unmatched pattern must still get exactly the iAP2 handle it always got.
-        let services = vec![iap2_service(1), android_auto_service(4)];
-        handle_service_search(&mut out, 0x0007, &params, &services).unwrap();
+        handle_service_search(&mut out, 0x0007, &params, &both()).unwrap();
         assert_eq!(out[0], SDP_SVC_SEARCH_RSP);
         let plen = u16::from_be_bytes([out[3], out[4]]) as usize;
         let p = &out[5..5 + plen];
@@ -1085,18 +940,27 @@ mod tests {
         assert_eq!(&p[4..8], &SVC_RECORD_HANDLE_BASE.to_be_bytes());
     }
 
-    fn both() -> Vec<Service> {
-        vec![iap2_service(1), android_auto_service(4)]
+    /// UUID of the test-only second service. btd serves iAP2 alone; a second record keeps the
+    /// multi-record paths (search selection, browse, handle lookup, the 16-bit outer length) tested.
+    const OTHER_UUID: u128 = 0x11112222_3333_4444_5555_666677778888;
+
+    fn other_service(rfcomm_chan: u8) -> Service {
+        Service {
+            handle: SVC_RECORD_HANDLE_BASE + 1,
+            uuid128: crate::sdp_record::uuid128_from_u128(OTHER_UUID),
+            record: crate::sdp_record::ServiceRecord {
+                handle: SVC_RECORD_HANDLE_BASE + 1,
+                uuid128: crate::sdp_record::uuid128_from_u128(OTHER_UUID),
+                rfcomm_channel: rfcomm_chan,
+                name: "Other",
+            }
+            .encode(),
+            name: "Other",
+        }
     }
 
-    /// Everything `main.rs` actually registers.
-    fn all_four() -> Vec<Service> {
-        vec![
-            iap2_service(crate::sdp_record::IAP2_RFCOMM_CHANNEL),
-            android_auto_service(crate::sdp_record::AAP_RFCOMM_CHANNEL),
-            hfp_hf_service(crate::sdp_record::HFP_HF_RFCOMM_CHANNEL),
-            hsp_hs_service(crate::sdp_record::HSP_HS_RFCOMM_CHANNEL),
-        ]
+    fn both() -> Vec<Service> {
+        vec![iap2_service(1), other_service(4)]
     }
 
     /// A UUID128 search pattern for one service.
@@ -1120,12 +984,11 @@ mod tests {
         (0..n).map(|i| u32::from_be_bytes(p[4 + i * 4..8 + i * 4].try_into().unwrap())).collect()
     }
 
-    /// The whole point of the change: an Android Auto search must resolve to the AA handle, not
-    /// iAP2's. Getting iAP2's back means the phone reads RFCOMM channel 1 and dials CarPlay.
+    /// A search naming the second service must resolve to its handle, not iAP2's.
     #[test]
-    fn an_android_auto_search_returns_the_android_auto_handle() {
+    fn a_search_for_the_other_service_returns_its_handle() {
         let mut out = Vec::new();
-        let params = search_params(&pattern_uuid128(0x4de17a00_52cb_11e6_bdf4_0800200c9a66));
+        let params = search_params(&pattern_uuid128(OTHER_UUID));
         handle_service_search(&mut out, 1, &params, &both()).unwrap();
         assert_eq!(handles_from_search_response(&out), vec![SVC_RECORD_HANDLE_BASE + 1]);
     }
@@ -1151,9 +1014,7 @@ mod tests {
         );
     }
 
-    /// THE BENCH-PROVEN CASE. Android's discovery searches L2CAP 0x0100 and nothing else useful;
-    /// before this it matched no service and fell back to iAP2 alone, so the phone cached exactly
-    /// one UUID and gearhead refused to request SDP.
+    /// THE BENCH-PROVEN CASE: a discovery that searches L2CAP 0x0100 alone must see every record.
     #[test]
     fn an_l2cap_search_returns_every_service() {
         let mut out = Vec::new();
@@ -1190,10 +1051,10 @@ mod tests {
     #[test]
     fn a_universal_uuid_mixed_with_a_specific_one_is_not_everything() {
         let mut pattern = vec![0x35, 20, 0x19, 0x01, 0x00, 0x1c];
-        pattern.extend_from_slice(&0x4de17a00_52cb_11e6_bdf4_0800200c9a66u128.to_be_bytes());
+        pattern.extend_from_slice(&OTHER_UUID.to_be_bytes());
         let services = both();
         let hits = select_services(&services, &pattern);
-        assert_eq!(hits.len(), 1, "L2CAP + AA UUID must select only Android Auto");
+        assert_eq!(hits.len(), 1, "L2CAP + the other UUID must select only that service");
         assert_eq!(hits[0].handle, SVC_RECORD_HANDLE_BASE + 1);
     }
 
@@ -1213,7 +1074,7 @@ mod tests {
     }
 
     /// An unparseable pattern must fall back to iAP2, never error — no request an iPhone has ever
-    /// made may start failing because Android Auto was added.
+    /// made may start failing.
     #[test]
     fn a_malformed_pattern_falls_back_to_iap2() {
         let services = both();

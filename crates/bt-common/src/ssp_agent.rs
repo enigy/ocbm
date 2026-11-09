@@ -584,8 +584,7 @@ fn pairing_allowed(window_open: bool, bonds: usize) -> bool {
 /// The scan mode is ALSO written directly. On the CCPA's 3.14 kernel `SET_DISCOVERABLE` is a no-op when
 /// the mgmt flag already holds the asked-for value, and `bt_bringup` turns inquiry scan on with a raw
 /// Write_Scan_Enable that never sets that flag, so "SET_DISCOVERABLE=0" alone could leave the box
-/// visible. The native (modern-kernel) backend uses the ioctl instead, which keeps the mgmt flags in
-/// step (`hci::set_scan`).
+/// visible.
 fn apply_pairing_state(sock: &mut File, index: u16, open: bool, why: &str) {
     if open {
         apply_setting(sock, OP_SET_BONDABLE, index, &[1], "SET_BONDABLE=1");
@@ -595,12 +594,7 @@ fn apply_pairing_state(sock: &mut File, index: u16, open: bool, why: &str) {
         apply_setting(sock, OP_SET_BONDABLE, index, &[0], "SET_BONDABLE=0");
     }
     let scan = if open { crate::hci::SCAN_PAGE_AND_INQUIRY } else { crate::hci::SCAN_PAGE };
-    let wrote = if crate::hci::native_selected() {
-        crate::hci::set_scan(index, scan)
-    } else {
-        crate::hci::write_scan_enable(index, scan)
-    };
-    if let Err(e) = wrote {
+    if let Err(e) = crate::hci::write_scan_enable(index, scan) {
         log(&format!("pairing window: scan mode write failed (non-fatal): {e}"));
     }
     if open {
@@ -674,7 +668,7 @@ impl PairAnswer {
 
 /// How long the box waits for the head unit's answer before giving up and replying NO.
 ///
-/// 55 s, inside `rfcomm_uspace::PAIRING_HOLD_SECS` (60): the connect hold must still be running when
+/// 55 s, inside `rfcomm::PAIRING_HOLD_SECS` (60): the connect hold must still be running when
 /// the negative reply lands, so `pairing_aware_connect` sees `/tmp/pair_rejected` and aborts rather
 /// than timing out on its own with the SSP exchange still half-open.
 pub const PAIR_CONFIRM_WAIT_SECS: u64 = 55;
@@ -772,11 +766,11 @@ fn send_confirm_reply(sock: &mut File, p: &PendingConfirm, accept: bool) {
 }
 
 /// The side effects that go with answering NO: the code on screen is dead, and the connect attempt
-/// must stop retrying. `rfcomm_uspace::pairing_aware_connect` aborts on `PAIR_REJECTED_FLAG` and the
+/// must stop retrying. `rfcomm::connect_to` aborts on `PAIR_REJECTED_FLAG` and the
 /// reconnect driver backs off and removes it — the same flag the rejection-streak path raises.
 fn refuse_pairing(bdaddr: &[u8; 6]) {
     clear_pairing_code();
-    let _ = std::fs::write(crate::rfcomm_uspace::PAIR_REJECTED_FLAG, fmt_bdaddr_tail(bdaddr));
+    let _ = std::fs::write(crate::rfcomm::PAIR_REJECTED_FLAG, fmt_bdaddr_tail(bdaddr));
 }
 
 /// Bring `controller_index` (typically 0 for `hci0`) up with SSP enabled and IO capability set to
@@ -1061,7 +1055,7 @@ pub fn run(
                     log(&format!("NEW_LINK_KEY (short event, len={param_len})"));
                 }
                 clear_pairing_code(); // bond formed → pairing complete → app hides the code
-                let _ = std::fs::remove_file(crate::rfcomm_uspace::PAIR_REJECTED_FLAG);
+                let _ = std::fs::remove_file(crate::rfcomm::PAIR_REJECTED_FLAG);
             }
             EV_USER_CONFIRM_REQUEST => {
                 // Numeric Comparison: the 6-digit value is `[value u32 LE]` at param offset 8 (after
@@ -1096,13 +1090,13 @@ pub fn run(
                         log(&format!(
                             "numeric-comparison code = {code} — waiting up to {PAIR_CONFIRM_WAIT_SECS}s for \
                              the head unit's yes/no (the connect is held {}s)",
-                            crate::rfcomm_uspace::PAIRING_HOLD_SECS
+                            crate::rfcomm::PAIRING_HOLD_SECS
                         ));
                     } else {
                         log(&format!(
                             "numeric-comparison code = {code} — confirm it matches the iPhone (auto-accepting; \
                              the connect is held up to {}s for the phone-side tap)",
-                            crate::rfcomm_uspace::PAIRING_HOLD_SECS
+                            crate::rfcomm::PAIRING_HOLD_SECS
                         ));
                     }
                 } else {
@@ -1119,11 +1113,11 @@ pub fn run(
                             fmt_bdaddr_tail(&bdaddr)
                         ));
                         // The code on screen is dead now, and the connect wait must stop retrying:
-                        // clear the code, raise the rejected flag (rfcomm_uspace::connect_to aborts
+                        // clear the code, raise the rejected flag (rfcomm::connect_to aborts
                         // on it; the reconnect driver backs off and removes it).
                         clear_pairing_code();
                         let _ = std::fs::write(
-                            crate::rfcomm_uspace::PAIR_REJECTED_FLAG,
+                            crate::rfcomm::PAIR_REJECTED_FLAG,
                             fmt_bdaddr_tail(&bdaddr),
                         );
                         if let Some(hook) = on_pair_rejected {
@@ -1392,7 +1386,7 @@ mod tests {
     fn the_wait_is_inside_the_connect_hold() {
         // A deadline at or past PAIRING_HOLD_SECS would let the hold expire with the SSP exchange
         // still open, which is exactly the stall this replaced.
-        assert!(PAIR_CONFIRM_WAIT_SECS < crate::rfcomm_uspace::PAIRING_HOLD_SECS);
+        assert!(PAIR_CONFIRM_WAIT_SECS < crate::rfcomm::PAIRING_HOLD_SECS);
     }
 
     #[test]

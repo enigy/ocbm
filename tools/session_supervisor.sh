@@ -120,42 +120,6 @@ wired_iphone_on_usb() {
   grep -q 05ac /sys/bus/usb/devices/*/idVendor 2>/dev/null
 }
 
-# Is a non-Apple phone (an Android Auto candidate) on the host-facing bus? Any USB idVendor that is
-# neither Apple (05ac) nor a Linux-Foundation root hub/controller (1d6b) — this covers a normal-mode
-# Android phone AND its post-AOAP accessory re-enumeration (0x18d1:0x2d0x), so it stays true across the
-# switch. Mirrors box_common::phone::classify; the DEFINITIVE Android-Auto test is aa-bridge's AOAP
-# getProtocol probe, so this only has to be a cheap selection hint (docs/androidauto/02_ARBITRATION.md).
-android_phone_on_bus() {
-  for _v in /sys/bus/usb/devices/*/idVendor; do
-    [ -f "$_v" ] || continue
-    case "$(cat "$_v" 2>/dev/null)" in
-      05ac | 1d6b | "") continue ;;
-    esac
-    # A HUB is not a phone. bDeviceClass 0x09 is mandatory in every hub's device descriptor
-    # (USB 2.0 §11.23.1) and is never used by a phone — Apple, Android normal mode and AOAP
-    # accessories are all per-interface (0x00). Without this an external hub (or a dashcam, or a card
-    # reader) reads as an Android Auto candidate, which launches a bridge that AOAP-probes it forever
-    # and suppresses wireless CarPlay for anyone using one. Mirrors box_common::phone::classify_dev.
-    case "$(cat "${_v%/idVendor}/bDeviceClass" 2>/dev/null)" in
-      09 | 9) continue ;;
-    esac
-    # A USB STICK is not a phone either. The one-file install leaves its stick in the adapter for the
-    # first trial start, and on 29 Oct that stick read as an Android Auto candidate: aa-bridge started
-    # and wireless CarPlay, Bluetooth included, was suppressed, so no iPhone could pair. A device whose
-    # interfaces are ALL mass storage (bInterfaceClass 08) is skipped; a phone always has others (MTP,
-    # ADB, AOAP). Mirrors box_common::phone::classify_dev.
-    _n=0; _ms=0
-    for _c in "${_v%/idVendor}"/*:*/bInterfaceClass; do
-      [ -f "$_c" ] || continue
-      _n=$((_n + 1))
-      [ "$(cat "$_c" 2>/dev/null)" = 08 ] && _ms=$((_ms + 1))
-    done
-    [ "$_n" -gt 0 ] && [ "$_ms" = "$_n" ] && continue
-    return 0
-  done
-  return 1
-}
-
 # Is an iPhone attached to the phone-facing port? TWO modes (the role switch flips them):
 #   normal mode  — the iPhone is a 05ac USB DEVICE on the box's host controller (sysfs idVendor);
 #   projected    — after the 0x51 role switch the iPhone is the USB HOST and the box is a gadget,
@@ -239,21 +203,13 @@ wired_carplayd_live() {
   [ "$armed" = 1 ] || [ "$(cat /tmp/carplay_transport 2>/dev/null)" = "wired" ]
 }
 
-# The single projection OWNER across all transports (box_common::flags model, /tmp/projection_owner).
-# Prefers the unified flag and falls back to the legacy wireless-only /tmp/carplay_transport, so it is
-# byte-compatible with the existing wireless arbitration above. A 'wired-aa' owner is LIVENESS-checked:
-# if the flag claims AA owns the box but aa-bridge is gone (unclean exit), the flag is stale — clear it
-# and fall through, so a crashed Android Auto session can never wedge the CarPlay path. (docs/androidauto/02_ARBITRATION.md.)
-# Claim/release the unified owner flag for a WIRED CARPLAY session.
-#
-# Until now nothing ever wrote `wired-cp`, so `projection_owner()` could not tell "idle" from "CarPlay
-# is streaming" — and aa-bridge, which reads the same flag, could re-claim the box out from under a
-# live CarPlay session. Its own stand-downs do not cover that: `carplay_session_live` gates only the
-# LAUNCH of a bridge (a resident one re-claims without passing it again), and the bridge's
-# `apple_on_bus` check goes blind the moment the iPhone role-switches out of 05ac. Writing the flag
-# gives the bridge a signal that stays true for the whole session.
+# The single projection OWNER (box_common::flags model, /tmp/projection_owner). Prefers the unified flag
+# and falls back to the legacy wireless-only /tmp/carplay_transport, so it is byte-compatible with the
+# existing wireless arbitration above.
+# Claim/release the unified owner flag for a WIRED CARPLAY session, so `projection_owner()` (and
+# ocbmd's CT_PROJ_MODE) can tell "idle" from "CarPlay is streaming".
 claim_carplay_owner() { echo wired-cp > /tmp/projection_owner 2>/dev/null; }
-# Only ever clears OUR token, so it can't stomp a wireless or AA claim.
+# Only ever clears OUR token, so it can't stomp a wireless claim.
 release_carplay_owner() {
   [ "$(cat /tmp/projection_owner 2>/dev/null)" = "wired-cp" ] && rm -f /tmp/projection_owner 2>/dev/null
   return 0
@@ -263,9 +219,8 @@ projection_owner() {
   o=$(cat /tmp/projection_owner 2>/dev/null)
   case "$o" in
     wired-cp)
-      # Same liveness self-heal the wired-aa arm gets: if the flag claims CarPlay owns the box but its
-      # daemons are gone (crash, missed release), the claim is stale — clear it and fall through, so a
-      # dead CarPlay session can never lock Android Auto out permanently.
+      # Liveness self-heal: if the flag claims CarPlay owns the box but its daemons are gone (crash,
+      # missed release), the claim is stale — clear it and fall through.
       #
       # `iap2d` ALONE, not `carplayd || iap2d` (F2, device-proven 2026-08-27). WIRED CarPlay IS the
       # Identified iAP2 link, and that link is iap2d; carplayd is NOT evidence of one. This very
@@ -274,31 +229,9 @@ projection_owner() {
       # wireless arm — so an `||` here means a surviving carplayd keeps a dead session's `wired-cp`
       # claim alive FOREVER. Measured: unplug the iPhone mid-session -> iap2d exits, carplayd stays,
       # flag stays `wired-cp` with an EMPTY bus; the box then reported "wired CarPlay" to the app with
-      # nothing plugged in, and plugging an Android phone in did nothing at all because arm_aa stands
-      # down against the flag. That is exactly the iPhone->Android swap failure.
+      # nothing plugged in.
       if pgrep iap2d >/dev/null 2>&1; then echo wired-cp; return; fi
       rm -f /tmp/projection_owner 2>/dev/null
-      ;;
-    wired-aa)
-      # NAME-based match (comm), not `pgrep -f` — a full-cmdline match false-positives on any process
-      # whose args merely mention aa-bridge (the supervisor, a run_aa_bridge.sh wrapper, a debug shell).
-      if pgrep aa-bridge >/dev/null 2>&1; then echo wired-aa; return; fi
-      rm -f /tmp/projection_owner 2>/dev/null   # stale (aa-bridge gone) — self-heal
-      ;;
-    wireless-aa)
-      # Wireless Android Auto, served BY btd (one Bluetooth identity advertises both
-      # protocols; the RFCOMM channel the phone opens decides which — docs/androidauto/03_WIRELESS.md
-      # §6b). So the liveness check is the SAME process the `wireless` arm depends on.
-      #
-      # This arm is load-bearing, not cosmetic. Without it the case fell through to the
-      # `carplay_transport` fallback, which is only written by the CarPlay AV arm and is absent
-      # during an AA session — so projection_owner() returned "" and the supervisor believed the box
-      # was IDLE while a wireless AA session was live. The next wired plug or host-present edge then
-      # ran preempt_wireless_for_wired / wireless_down, which `pkill`s btd and takes the
-      # AA session down mid-projection. The Rust reader (box_common::flags) decoded this value
-      # correctly the whole time; the shell did not, and the shell holds the kill switch.
-      if pgrep btd >/dev/null 2>&1; then echo wireless-aa; return; fi
-      rm -f /tmp/projection_owner 2>/dev/null   # stale (daemon gone, e.g. pkill -9) — self-heal
       ;;
     wireless) echo "$o"; return ;;
   esac
@@ -306,26 +239,7 @@ projection_owner() {
   echo ""
 }
 
-# True while a live wired Android Auto session (aa-bridge) owns the phone-facing controller ci_hdrc.0.
-# The wired-CarPlay supervisor must NOT run projection_up / kill_session / escalate (which includes
-# phone_reset.sh's real USB port reset) against it — the same doctrine as wireless_owns_session,
-# extended to Android Auto. Without this guard, a spurious SUBSCRIBE during an AA session could burn
-# the PROJ_AT ladder and reset ci_hdrc.0 out from under a live AOAP link (docs/androidauto/02_ARBITRATION.md).
-aa_owns_session() {
-  # BOTH Android Auto transports. The box is first-come-first-served (docs/androidauto/02_ARBITRATION.md
-  # §0): whichever session arrived first owns the box regardless of protocol, so a live WIRELESS AA
-  # session must inhibit the same wired-CarPlay machinery a wired one does.
-  case "$(projection_owner)" in
-    wired-aa|wireless-aa) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
 kill_session() {
-  if aa_owns_session; then
-    echo "[sup] kill_session suppressed — a live Android Auto session owns the phone port"
-    return 0
-  fi
   if wireless_owns_session; then
     echo "[sup] kill_session suppressed — a live wireless session owns carplayd"
     return 0
@@ -363,92 +277,7 @@ preempt_wireless_for_wired() {
   rm -f /tmp/carplay_transport
 }
 
-# Gated launch of the Android Auto USB bridge (the AA analogue of arm()). aa-bridge is long-lived: it
-# listens for the macOS host app, runs the AOAP switch on the Android phone, pumps the raw AA stream,
-# and claims /tmp/projection_owner=wired-aa on an active session (step 1). Idempotent — a bridge is
-# already running is a no-op; the supervisor loop calls this to (re)launch after a crash while the
-# Android phone is still present. Not an inittab respawn: launched ONLY here, gated on AA selection.
-AA_BRIDGE=${AA_BRIDGE_BIN:-/usr/sbin/aa-bridge}
-arm_aa() {
-  # NAME-based guard, and since 2026-09-04 it also covers the WIRELESS launch below: one aa-bridge
-  # process serves both transports, and a resident `aa-bridge --wireless` runs the wired AOAP arm
-  # itself when a phone appears (its `wait_for_wired_work`, which is this function's gate in-process).
-  # So "already running" is a genuine no-op here, not a missed wired arm.
-  if pgrep aa-bridge >/dev/null 2>&1; then
-    return 0
-  fi
-  if [ ! -x "$AA_BRIDGE" ]; then
-    echo "[sup] arm_aa: $AA_BRIDGE not installed — Android Auto unavailable"
-    return 1
-  fi
-  echo "[sup] Android phone on bus + AA enabled -> launching aa-bridge (Android Auto)"
-  setsid "$AA_BRIDGE" >> /tmp/aa-bridge.log 2>&1 &
-}
-
-# The WIRELESS half of the same bridge (docs/androidauto/03_WIRELESS.md §1, "OCBM CH_IP pump").
-#
-# Launched from wireless_up(), not from the Android-phone-on-bus path: the Bluetooth bootstrap can
-# run at ANY time the box is discoverable, so the TCP endpoint it advertises
-# (box_common::net::AP_IP : aa_wireless::DEFAULT_PORT) has to be listening whenever the wireless
-# stack is up — there is no USB event to key off. `--wireless` also makes the process resident, which
-# is why the `pgrep` guard below is a no-op and not a second launch: arm_aa above defers to it.
-#
-# Gated on wifi_ap_enabled because in the `wifi_ap: false` bridge role the box raises no SoftAP at
-# all, so that address never exists and the pump could only spin on a bind that cannot succeed.
-# $1 non-empty => this is a bring-up, so SAY why we are skipping. Empty (the per-tick self-heal
-# call) => stay silent about the standing conditions; one line per second is not a diagnostic.
-# `_`-prefixed local, per this script's convention: bare names clobber the main loop's variables.
-arm_aa_wireless() {
-  _aaw_v="${1:-}"
-  if ! wifi_ap_enabled; then
-    [ -n "$_aaw_v" ] && echo "[sup] wifi_ap:false -> wireless Android Auto pump NOT started (the box has no SoftAP to listen on)"
-    return 0
-  fi
-  if [ ! -x "$AA_BRIDGE" ]; then
-    [ -n "$_aaw_v" ] && echo "[sup] arm_aa_wireless: $AA_BRIDGE not installed — wireless Android Auto unavailable"
-    return 0
-  fi
-  # Either a wired arm_aa launch (no --wireless, so no wireless listener — but wireless_up is itself
-  # suppressed while a wired AA phone is on the bus, so that state is transient), or our own resident
-  # process from an earlier bring-up. Never two. SILENT, because the main loop calls this every tick
-  # as a liveness self-heal and a line per tick would drown the log.
-  if pgrep aa-bridge >/dev/null 2>&1; then
-    return 0
-  fi
-  echo "[sup] wireless stack up + AP enabled -> launching aa-bridge --wireless (wireless Android Auto pump)"
-  setsid "$AA_BRIDGE" --wireless >> /tmp/aa-bridge.log 2>&1 &
-}
-
-# Teardown counterpart, called from wireless_down().
-#
-# Two guards, both load-bearing. (1) The pattern includes `--wireless`, so a bridge that arm_aa
-# launched for a WIRED session is never in scope — wireless teardown has no business touching the
-# cable path. (2) Even the resident one is spared while it owns the box as `wired-aa`, because the
-# same process serves both arms and a wireless radio teardown must not drop a live wired AA session
-# mid-drive (first-come-wins, docs/androidauto/02_ARBITRATION.md §0). It is then reaped by the next
-# teardown once that session ends.
-aa_bridge_wireless_down() {
-  # `[a]a-bridge` for the same self-match reason the btd patterns are bracketed: this
-  # text ends up in the detached subshell's own argv.
-  pgrep -f "[a]a-bridge --wireless" >/dev/null 2>&1 || return 0
-  if [ "$(cat /tmp/projection_owner 2>/dev/null)" = "wired-aa" ]; then
-    echo "[sup] wireless teardown: leaving aa-bridge up — it is serving a live WIRED Android Auto session"
-    return 0
-  fi
-  echo "[sup] wireless teardown -> stopping the wireless Android Auto pump (aa-bridge --wireless)"
-  setsid sh -c '
-    pkill -f "[a]a-bridge --wireless" 2>/dev/null
-    sleep 1
-    pkill -9 -f "[a]a-bridge --wireless" 2>/dev/null
-  ' </dev/null >/dev/null 2>&1 &
-  return 0
-}
-
 arm() {
-  if aa_owns_session; then
-    echo "[sup] ARM suppressed — a live Android Auto session owns the phone port (dual-mode, first-come-wins)"
-    return 1
-  fi
   if wireless_owns_session; then
     echo "[sup] ARM suppressed — a live wireless session owns carplayd (dual-transport, first-come-wins)"
     return 1
@@ -503,7 +332,7 @@ arm() {
   # merely moved — rx-connect used to advertise before the RTSP port was listening.
   env OCBM_FWD_ENC=1 $CM $LT $MB setsid carplayd >>"$AL" 2>&1 &   # /usr/sbin/carplayd
   armed=1
-  claim_carplay_owner   # tell the box (and aa-bridge) that wired CarPlay owns the port
+  claim_carplay_owner   # tell the box that wired CarPlay owns the port
   # fresh establishment window for this session
   saw_paired=0; saw_record=0; healthy=0; established_since=0
   estab_deadline=$(( $(now) + ESTAB_CONNECT_GRACE ))
@@ -534,14 +363,6 @@ escalate() {   # $1 = reason
   # destroys the state being measured. tmpfs, so it clears itself on the next boot.
   if [ -f /tmp/no_escalate ]; then
     echo "[sup] escalate INHIBITED ($1) — /tmp/no_escalate present (testing)"
-    armed=0
-    return
-  fi
-  # NEVER escalate (least of all REBOOT / phone_reset.sh USB port reset) while a live Android Auto
-  # session owns ci_hdrc.0 — the wired-CarPlay watchdog must not reset the controller under a live
-  # AOAP link it doesn't manage (docs/androidauto/02_ARBITRATION.md).
-  if aa_owns_session; then
-    echo "[sup] escalate suppressed ($1) — a live Android Auto session owns the phone port"
     armed=0
     return
   fi
@@ -715,11 +536,7 @@ prune_edges() {
 bound_logs() {
   # docs/wireless/00_WIRELESS_CARPLAY.md #1.5: the wireless-side logs (av.rs's spawn_detached targets + btd's own log)
   # were omitted here — unbounded append on the 123 MB no-swap tmpfs across long-lived wireless sessions.
-  # /tmp/aa-bridge.log joined the list 2026-08-25: arm_aa appends every (re)launch to it, and the
-  # bridge now retries the AOAP switch on a backoff rather than staying inert, so a phone that never
-  # completes the switch (MDM-blocked, charge-only) appends indefinitely.
   for f in /tmp/ocbmd.log /tmp/iap2d.log /tmp/supervisor.log "$AL" \
-           /tmp/aa-bridge.log \
            /tmp/carplayd_wl.log /tmp/wl.log; do
     [ -f "$f" ] || continue
     sz=$(wc -c < "$f" 2>/dev/null || echo 0)
@@ -751,45 +568,6 @@ WIRELESS_CFG=${CARPLAY_CFG_FILE:-/tmp/carplay_cfg.yaml}
 # file / missing key / `wireless: true` all mean enabled. Kept a raw grep so ocbmd + this shell need no
 # YAML parser (carplayd's receiver ignores the key; the supervisor is its sole consumer).
 wireless_enabled() { ! grep -qiE '^[[:space:]]*wireless:[[:space:]]*false' "$WIRELESS_CFG" 2>/dev/null; }
-# Android Auto enable lever (app-driven, docs/carplay/04_CAPABILITIES_AND_CONFIG.md). Default ON so a plugged Android phone projects out
-# of the box; the app opts out with `android_auto: false` in the pushed carplay_cfg.yaml (docs/androidauto/02_ARBITRATION.md).
-# This grep gates the LAUNCH only. An already-running aa-bridge reads the same key itself
-# (box_common::cfg::aa_enabled — the Rust-side definition this must stay in step with) and stands
-# down on it at every claim point AND mid-session, so turning the toggle off ends a live AA session
-# rather than waiting for the phone to be unplugged (docs/androidauto/02_ARBITRATION.md F3).
-aa_enabled() { ! grep -qiE '^[[:space:]]*android_auto:[[:space:]]*false' "$WIRELESS_CFG" 2>/dev/null; }
-
-# Is a wired CarPlay session LIVE right now? Blocks arm_aa, because Android Auto must never be armed
-# on top of a running CarPlay session — aa-bridge would claim /tmp/projection_owner out from under it,
-# after which this supervisor treats the still-running CarPlay stack as "handed off" (no kill_session,
-# no escalate) and the app is told to switch its window to AA. The session would be orphaned invisibly.
-#
-# `wired_iphone_on_usb` alone CANNOT carry this gate: it is the raw 05ac probe, and a phone that has
-# already role-switched into projection no longer enumerates as 05ac (see its own comment above), so it
-# reads FALSE for exactly the live session we must protect. `phone_on_bus` is no good either — its
-# android0 CONFIGURED arm describes the HEAD-UNIT-facing gadget, so in OCBM mode it is true merely
-# because the host app is attached. So test the session directly: this supervisor's own armed state,
-# plus the wired CarPlay daemons it spawns.
-carplay_session_live() {
-  [ "${armed:-0}" = 1 ] && return 0
-  # iap2d ONLY — a bare `carplayd` is NOT a live wired CarPlay session (F2, device-proven
-  # 2026-08-27, the same mistake as the `wired-cp` self-heal in projection_owner()).
-  #
-  # A wired CarPlay session IS the Identified iAP2 link, and that link is iap2d: it exits the moment
-  # the iPhone leaves the bus. carplayd does not — this script deliberately leaves it running when
-  # the host goes away ("carplayd are wired-owned, left running") and the wireless arm
-  # shares it — so testing carplayd here means ONE wired CarPlay session poisons the box for every
-  # Android phone that follows it, until something kills carplayd.
-  #
-  # Measured before this change: iPhone streams, unplug it, plug in a Pixel -> the supervisor logs
-  # "no iPhone (05ac) on the bus" and latches to WAITING, and `arm_aa` is never reached at all
-  # because this returned true on the surviving carplayd. Android Auto simply never started.
-  #
-  # The AA-hijack protection this guard exists for is unaffected: a live wired CarPlay session always
-  # has iap2d holding the link, so the case it must refuse still reads true.
-  pgrep iap2d >/dev/null 2>&1 && return 0
-  return 1
-}
 # App-commanded radio inhibit (ocbmd CT_RADIO, docs/carplay/04_CAPABILITIES_AND_CONFIG.md radio gating): flag present = radios must be
 # OFF now. ocbmd owns the flag lifecycle (set/cleared by host CT_RADIO; cleared on fresh SUBSCRIBE,
 # app loss, and ocbmd startup) — this is an app-commanded surface, NOT an on-box lever.
@@ -838,62 +616,13 @@ pairing_mode() {
     echo just_works
   fi
 }
-# Should the BOX raise its own SoftAP? Default TRUE (stock behavior); only an explicit `wifi_ap: false`
-# in the host YAML suppresses it. This is the gm_ccpa bridge role: the head-unit app is the AirPlay
-# endpoint on the VEHICLE's hotspot, so the box must be the Bluetooth radio and the MFi coprocessor
-# and nothing else. bt_on.sh is independent of Wi-Fi (IW416 BT is a UART/hci_uart path, not the moal
-# SDIO driver), so dropping wlan_on.sh leaves Bluetooth fully working.
-wifi_ap_enabled() { ! grep -qiE '^[[:space:]]*wifi_ap:[[:space:]]*false' "$WIRELESS_CFG" 2>/dev/null; }
-
-# Pull one scalar out of the host YAML, stripping any surrounding quotes. Values may contain spaces
-# (an SSID like `myChevrolet 32D4`), so everything after the colon is taken verbatim.
-cfg_value() {
-  # Case-SENSITIVE on purpose: a case-insensitive grep paired with a case-sensitive sed strip would
-  # match `WIFI_SSID:` and then strip nothing, leaking the whole line in as the value. Trailing
-  # whitespace/CR is removed before the quote strip so a deliberately-quoted trailing space survives.
-  grep -E "^[[:space:]]*$1:" "$WIRELESS_CFG" 2>/dev/null | head -1 |
-    sed -e "s/^[[:space:]]*$1:[[:space:]]*//" -e 's/[[:space:]]*$//' -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'$/\1/"
-}
-
-# gm_ccpa bridge role: the 0x5702->0x5703 handoff must hand the iPhone the VEHICLE's hotspot, not the
-# box's own AP. `wifi_handoff::read_hostapd_ap_config()` reads /etc/hostapd.conf unconditionally, so
-# the cheapest correct intervention is to write the app-supplied credentials into that file before
-# btd starts. This is safe precisely BECAUSE wifi_ap:false means no hostapd ever runs
-# from it. /etc/hostapd.conf.stock is the pristine base, so repeated runs never drift.
-apply_host_wifi_creds() {
-  # NOTE the underscore prefixes. The bare names s/p/c would CLOBBER the main loop's presence
-  # variables ($p is the current /tmp/host_present value): wireless_up runs from inside the edge
-  # handler BEFORE last_p is updated, so overwriting $p manufactures a fresh 0->1 edge on every
-  # subsequent tick. That drives concurrent radio bring-ups and then the flap detector, escalating
-  # to ocbmd restarts and real reboots. Observed live before this was caught.
-  _s=$(cfg_value wifi_ssid)
-  [ -n "$_s" ] || return 0
-  _p=$(cfg_value wifi_pass)
-  _c=$(cfg_value wifi_channel)
-  if [ ! -f /etc/hostapd.conf.stock ]; then
-    cp /etc/hostapd.conf /etc/hostapd.conf.stock || {
-      echo "[sup] WARN: could not snapshot /etc/hostapd.conf — not rewriting credentials"; return 0; }
-  fi
-  _tmp=/etc/hostapd.conf.new   # same filesystem, so the mv below is atomic (jffs2)
-  # Rebuild rather than sed-substitute: an SSID or passphrase can contain regex/delimiter characters.
-  # Only strip the keys we are actually going to replace, so an unsupplied channel keeps the stock one
-  # (hostapd of this vintage has no ACS and refuses to start with no channel).
-  _strip='^ssid='
-  [ -n "$_p" ] && _strip="$_strip|^wpa_passphrase="
-  [ -n "$_c" ] && _strip="$_strip|^channel="
-  grep -vE "$_strip" /etc/hostapd.conf.stock > "$_tmp" 2>/dev/null || {
-    echo "[sup] WARN: could not read the stock hostapd.conf — not rewriting credentials"; return 0; }
-  echo "ssid=$_s" >> "$_tmp"
-  if [ -n "$_p" ]; then
-    echo "wpa_passphrase=$_p" >> "$_tmp"
-    # read_hostapd_ap_config() reports Wpa2OrWpa3Personal only when a wpa=/wpa_key_mgmt= line is
-    # ALSO present; without one it drops the passphrase and advertises the vehicle's WPA hotspot as
-    # OPEN in the 0x5703. The phone then fails to join with no error on our side.
-    grep -qE '^(wpa|wpa_key_mgmt)=' "$_tmp" || { echo 'wpa=2' >> "$_tmp"; echo 'wpa_key_mgmt=WPA-PSK' >> "$_tmp"; }
-  fi
-  [ -n "$_c" ] && echo "channel=$_c" >> "$_tmp"
-  mv "$_tmp" /etc/hostapd.conf && sync
-  echo "[sup] 0x5703 credentials <- host app: ssid='$_s' channel='${_c:-stock}' pass=$([ -n "$_p" ] && echo set || echo none)"
+# The GM bridge role (`wifi_ap: false`, OCBM 1.0.4 and earlier) wrote the vehicle hotspot into
+# /etc/hostapd.conf and kept the adapter's own as /etc/hostapd.conf.stock. The role is gone, so the box's
+# AP must be its own again: put the original back, once.
+restore_stock_hostapd() {
+  [ -f /etc/hostapd.conf.stock ] || return 0
+  mv -f /etc/hostapd.conf.stock /etc/hostapd.conf && sync \
+    && echo "[sup] put back the adapter's own /etc/hostapd.conf (the bridge role's copy is retired)"
 }
 
 wireless_up() {
@@ -920,16 +649,6 @@ wireless_up() {
     echo "[sup] wireless_up SUPPRESSED — a WIRED session owns the box (Hot-Handover off)"
     return
   fi
-  # Same choke point for Android Auto. TWO conditions, because there is a race: wireless_up() fires on
-  # the host-present 0->1 edge (at SUBSCRIBE), but AA only claims the owner flag a few seconds later
-  # (after the app opens CH_IP and aa-bridge finishes the AOAP switch). So suppressing on
-  # aa_owns_session ALONE let wireless CP start BT pairing in that window even with an Android phone
-  # plugged. Also suppress when an Android phone is simply ON THE BUS and AA is enabled — that phone is
-  # the wired AA path, exactly as a wired iPhone (phone_on_bus above) suppresses wireless. (docs/androidauto/02_ARBITRATION.md.)
-  if aa_owns_session || { android_phone_on_bus && aa_enabled; }; then
-    echo "[sup] wireless_up SUPPRESSED — a wired Android Auto phone owns/claims the box"
-    return
-  fi
   wireless_running && return   # idempotent guard (checked HERE, before the wrapper exists)
   # Clean slate before a fresh bring-up: reap any orphaned A/V children left by a prior session so the
   # new stack can NEVER latch onto / collide with a stale carplayd (the observed
@@ -952,35 +671,15 @@ wireless_up() {
     echo "[sup] wireless_up: carplayd is wired-owned — leaving it running, skipping the pre-bringup reap"
   fi
   mode=$(pairing_mode)
-  if wifi_ap_enabled; then ap=1; else ap=0; fi
-  apply_host_wifi_creds
-  # In the bridge role the HEAD-UNIT APP is the AirPlay endpoint, so the box must not spawn one.
-  # av.rs resolves both daemons through these env vars (av.rs:145-146, 238-239), so pointing them at
-  # a no-op suppresses the A/V layer with no Rust change. Note this also means av.rs's rollback path
-  # runs and /tmp/carplay_transport is released — which is the behaviour we want for a no-A/V box.
-  # DO NOT point these at /bin/true. av.rs's wait_visible polls for the spawned path to become
-  # visible to pgrep, and pid_alive requires argv[0] to EQUAL the full path — so a binary that exits
-  # immediately (or any shell script, whose argv[0] is the interpreter) can never satisfy it. The
-  # result was ~12s stalled under AV_LOCK on EVERY iOS 0x5702 retry, blocking the bt-driver loop;
-  # measured on hardware, four retries wedged the control session long enough for the phone to drop
-  # Bluetooth — which is the session anchor, so the whole CarPlay attempt died with it.
-  #
-  # Letting the box's own carplayd start is harmless in the bridge role: with wifi_ap:false
-  # there is no wlan0 and the box has no route to the vehicle subnet, so nothing can reach them. They
-  # latch AV_LAYER_UP instantly, the stall disappears, and the head-unit app remains the only
-  # reachable AirPlay endpoint. Suppressing them properly needs an explicit AV_DISABLED gate in
-  # av.rs, which is a Rust change.
-  AV_SUPPRESS=''
-  echo "[sup] host PRESENT + wireless enabled -> CLEAN bring-up of wireless stack (detached, pairing=$mode, wifi_ap=$ap, av_suppress=no)"
+  restore_stock_hostapd
+  echo "[sup] host PRESENT + wireless enabled -> CLEAN bring-up of wireless stack (detached, pairing=$mode)"
   # Detached session; sequential WiFi AP -> BT radio -> CarLink advertiser, each redirected (not piped).
   # NO inner pgrep guard: the wrapper `sh -c` argv itself contains "/usr/sbin/btd", so an
   # inner `pgrep -f /usr/sbin/btd` self-matches the wrapper and SKIPS the launch (the bug
   # that left btd never started). The outer `wireless_running && return` above is the guard.
-  # BT_PAIRING_MODE is inherited through setsid -> sh -c -> the exec'd btd.
-  # BOX_WIFI_AP is read by the inner shell at runtime (the body is single-quoted on purpose, so the
-  # decision travels as an env var rather than by interpolating into the wrapper's argv).
-  # shellcheck disable=SC2086  # AV_SUPPRESS is a deliberate word-split of VAR=VAL assignments
-  env $AV_SUPPRESS BT_PAIRING_MODE="$mode" BT_SSP_INTERACTIVE="$(pairing_interactive)" BOX_WIFI_AP="$ap" OCBM_WL_REAPED="$_wl_reaped" setsid sh -c '
+  # BT_PAIRING_MODE is inherited through setsid -> sh -c -> the exec'd btd. The body is single-quoted on
+  # purpose, so values travel as env vars rather than by interpolating into the wrapper's argv.
+  env BT_PAIRING_MODE="$mode" BT_SSP_INTERACTIVE="$(pairing_interactive)" OCBM_WL_REAPED="$_wl_reaped" setsid sh -c '
     # Radio bring-up goes through the chipset-neutral seam. It resolves this unit'"'"'s own
     # bring-up mapping at runtime, so the supervisor never names a chip, a module or an attach
     # helper. Exit codes: 0 converged / 1 failed / 2 already up / 3 unsupported on this variant.
@@ -988,11 +687,7 @@ wireless_up() {
     # scripts, which simply do not exist on a Realtek or Broadcom unit, so wireless bring-up
     # failed SILENTLY here (the calls sit in this detached wrapper, redirected, exit status
     # unread) while wired projection kept working and nothing looked wrong.
-    if [ "$BOX_WIFI_AP" = "0" ]; then
-      echo "[sup] wifi_ap:false -> box SoftAP SUPPRESSED (BT-only bridge role; the head-unit app owns Wi-Fi)" >/tmp/wlan.log
-    else
-      sh /script/radio_hal.sh wifi_ap_on >/tmp/wlan.log 2>&1
-    fi
+    sh /script/radio_hal.sh wifi_ap_on >/tmp/wlan.log 2>&1
     # bt.log stays the small truncated per-attempt status file that docs/wireless/01_BT_AND_RADIO.md
     # tells an operator to cat directly. This call is foreground (no trailing ampersand), so teeing
     # its combined stdout/stderr into the universal log costs nothing and changes no lifecycle.
@@ -1041,19 +736,12 @@ wireless_up() {
     # nothing every tick.
     exec /usr/sbin/btd </dev/null >>/tmp/wl.log 2>&1
   ' </dev/null >/dev/null 2>&1 &
-  # The wireless Android Auto byte pump, alongside the advertiser that will bootstrap phones to it.
-  # Started here rather than inside the wrapper above so its exit status and log line are visible;
-  # it binds the AP address with its own retry, so racing the AP bring-up in that wrapper is fine.
-  arm_aa_wireless bringup
 }
 
 wireless_down() {
   # $1 = why, for the log only. Default keeps the historical host-presence wording; the wired-takeover
   # caller passes its own so the log never claims the app went away when it did not.
   _wd_why="${1:-host GONE (or wireless disabled)}"
-  # BEFORE the already-fully-down early return below: that return only inspects the CarPlay-side
-  # stack (advertiser, A/V children, hostapd, hci0), and the AA pump can outlive all four.
-  aa_bridge_wireless_down
   # COMPLETE wireless-stack teardown, tied to app presence: the advertiser (btd) AND its
   # setsid-detached A/V children (carplayd). pkill-ing ONLY the parent orphans the children,
   # and the next app-connect bring-up then collides with those orphans ("Address in use" on the
@@ -1338,23 +1026,7 @@ while :; do
         fi
         _a2_state="$_a2_want"
       fi
-      # Liveness self-heal for the wireless AA pump, the analogue of arm_aa's per-tick relaunch.
-      # wireless_up() reaches arm_aa_wireless only on a genuine bring-up (its own `wireless_running`
-      # idempotence guard returns first otherwise), so without this a crashed pump would stay dead
-      # until the next app reconnect. Internally silent + pgrep-guarded, so a tick costs one pgrep.
-      wireless_running && arm_aa_wireless
-      if aa_owns_session; then
-        # Android Auto owns ci_hdrc.0 right now (aa-bridge holds a live AOAP link + the wired-aa owner
-        # flag). Hands off entirely: no projection_up, no arm(), no escalation — aa-bridge self-manages
-        # its session and the step-1 guards already suppress kill_session/escalate. (docs/androidauto/02_ARBITRATION.md.)
-        :
-      elif android_phone_on_bus && ! wired_iphone_on_usb && ! carplay_session_live \
-           && aa_enabled && ! wireless_owns_session; then
-        # An Android phone (not an iPhone) is on the bus and AA is enabled -> SELECT Android Auto:
-        # launch/relaunch the bridge. Runs before the CarPlay arm path so an Android phone never burns
-        # a projection_up(05ac) attempt (audit scenario 2), and defers to a live wireless session.
-        arm_aa
-      elif wireless_owns_session; then
+      if wireless_owns_session; then
         # docs/wireless/00_WIRELESS_CARPLAY.md #1.3: a live wireless session owns carplayd right now. `armed` stays 0 for the whole
         # duration (arm()/kill_session()/escalate() all suppress themselves against wireless), so
         # WITHOUT this branch the wired logic below would keep calling arm() — which returns 1 here —

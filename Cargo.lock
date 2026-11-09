@@ -3,22 +3,6 @@
 version = 4
 
 [[package]]
-name = "aa-bridge"
-version = "0.1.0"
-dependencies = [
- "aa-wireless",
- "box-common",
- "libc",
-]
-
-[[package]]
-name = "aa-wireless"
-version = "0.1.0"
-dependencies = [
- "box-common",
-]
-
-[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -43,13 +27,6 @@ dependencies = [
  "cfg-if",
  "cipher",
  "cpufeatures",
-]
-
-[[package]]
-name = "apdhcpd"
-version = "0.0.0"
-dependencies = [
- "libc",
 ]
 
 [[package]]
@@ -89,7 +66,6 @@ dependencies = [
 name = "box-common"
 version = "0.1.0"
 dependencies = [
- "libc",
  "ocbm-proto",
 ]
 
@@ -104,22 +80,13 @@ dependencies = [
 name = "btd"
 version = "0.1.0"
 dependencies = [
- "aa-wireless",
  "box-common",
  "bt-common",
  "carplay-iap2-core",
  "libc",
- "mfi-wire",
  "ocbm-proto",
  "sha2",
  "signal-hook",
-]
-
-[[package]]
-name = "c2air-btattach"
-version = "0.0.0"
-dependencies = [
- "libc",
 ]
 
 [[package]]
@@ -149,7 +116,6 @@ dependencies = [
  "libc",
  "mdns-sd",
  "mfi",
- "mfi-wire",
  "ocbm-proto",
  "pairing",
  "portable-atomic",
@@ -546,27 +512,6 @@ name = "mfi-i2c-local"
 version = "0.0.0"
 dependencies = [
  "libc",
- "mfi-wire",
-]
-
-[[package]]
-name = "mfi-probe"
-version = "0.0.0"
-dependencies = [
- "mfi-wire",
-]
-
-[[package]]
-name = "mfi-wire"
-version = "0.0.0"
-
-[[package]]
-name = "mfid"
-version = "0.0.0"
-dependencies = [
- "mfi-i2c-local",
- "mfi-wire",
- "portable-atomic",
 ]
 
 [[package]]
@@ -619,10 +564,7 @@ dependencies = [
  "chacha20poly1305",
  "libc",
  "ocbm-proto",
- "plist",
  "rusb",
- "serde",
- "serde_yaml",
 ]
 
 [[package]]

@@ -41,9 +41,7 @@ use iap2_core::{
     state::{self, Action, State},
 };
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
-// Only the local chip path retries with a backoff; without `local-mfi` nothing here sleeps.
-#[cfg(feature = "local-mfi")]
+use std::sync::Mutex;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -568,131 +566,14 @@ enum ExecOutcome {
 /// immediate retry succeeds. Contention is higher for this module specifically (per
 /// `mfi-i2c-local`'s own doc comment, up to three processes can now want the chip around the same
 /// time), so this retry matters at least as much here as it did for the BT-time handshake.
-/// A remote MFi signer, installed by the embedder when this process cannot reach a chip locally.
-///
-/// # Why this exists
-///
-/// The AirPlay-tunnel iAP2 handshake needs two chip operations (`copy_certificate`,
-/// `create_signature`). It used to call [`mfi_i2c_local`] unconditionally — direct I2C on
-/// `/dev/i2c-1` behind a `flock` on `/tmp/carplay_mfi.lock`. That is correct ON THE BOX, where this
-/// crate runs inside `carplayd` alongside four other chip users.
-///
-/// It is wrong wherever the chip is NOT on the machine running this crate — and which machine that
-/// is varies by deployment, which is the whole reason this is a runtime choice rather than an
-/// assumption:
-///
-/// | Deployment | Runs this crate | Where the MFi chip is | Correct path |
-/// |---|---|---|---|
-/// | CCPA box, wired/wireless CarPlay (`carplayd`) | the box | same board, `/dev/i2c-1` | local — `local-mfi` |
-/// | gm_ccpa: GM `gminfo37` head unit owns the SoftAP and the CarPlay session; the CCPA is **only** a BT radio + MFi coprocessor | the head-unit Android app | on the **box**, across USB | remote — OCBM `CH_MFI` |
-/// | Pi / NCM bring-up | the host | on the box, across USB-NCM | remote — `mfi-wire` to `mfid` |
-///
-/// Other OCBM hosts exist with their own arrangements; the rule is the invariant, not the table.
-///
-/// In the gm_ccpa case two independent facts make the local path impossible, either alone fatal:
-///
-///  1. `/tmp` does not exist on Android, so the lock file cannot even be opened — which presented
-///     for months as "another chip user holds the lock" (see `MfiError::LockUnavailable`);
-///  2. a head unit's own coprocessor, where fitted, is reachable only by system apps, and that app is
-///     deliberately an ordinary Play-attributed app UID — and it is not the chip the session
-///     authenticates with anyway.
-///
-/// `/auth-setup` in the very same session already proves the correct route: it goes over `CH_MFI` to
-/// the box and returns the 945-byte certificate and 128-byte RSA-1024 signature. The tunnel simply
-/// never used it.
-///
-/// A process-wide registry rather than a threaded parameter because [`execute`] is a free function
-/// reached through `on_message`, and `SESSION` above establishes that module-level state is how this
-/// module already carries per-process context.
-static REMOTE_SIGNER: Mutex<Option<Arc<Mutex<dyn mfi::auth_client::MfiSigner + Send>>>> =
-    Mutex::new(None);
-
-/// Install the signer the tunnel should use instead of local chip access. Call once, before a
-/// session starts. Installing a signer takes precedence over [`mfi_i2c_local`] unconditionally.
-///
-/// # The signer you install MUST be bounded, and bounded tightly
-///
-/// [`handle_inbound`] holds the module-wide `SESSION` mutex across its whole dispatch, which
-/// includes [`execute`] and therefore these two chip calls. Whatever budget your signer has is a
-/// budget the RCS reader, the event handler, `POST /command` and teardown all wait on — none of
-/// which have a deadline of their own. This is not new (the local path has the same shape, and the
-/// note on [`mfi_retry`] below says so), but a REMOTE signer makes it a network property rather
-/// than a bus property, so the ceiling is whatever the embedder chose rather than a chip timeout.
-///
-/// Embedders today, for calibration:
-///  - gm_ccpa's OCBM `CH_MFI` relay uses its short-budget methods, 4 s TOTAL per op (lock
-///    acquisition and reply wait come out of one clock). Cert measures ~1.1 s, sign ~1.7 s.
-///  - `mfi-wire` (Pi / NCM bring-up) uses a 5 s connect + 30 s I/O timeout, i.e. up to ~35 s. That
-///    is far too long to hold `SESSION` and is only survivable because that host is a bench tool,
-///    not a live projection session. Do not copy those numbers into a vehicle path.
-///
-/// If you need a budget larger than a few seconds, restructure so the call happens outside the
-/// `SESSION` guard rather than raising it here.
-pub fn set_remote_signer(signer: Arc<Mutex<dyn mfi::auth_client::MfiSigner + Send>>) {
-    if let Ok(mut slot) = REMOTE_SIGNER.lock() {
-        *slot = Some(signer);
-        log("remote MFi signer installed — tunnel chip ops go through the embedder, not /dev/i2c-1");
-    }
-}
-
-fn remote_signer() -> Option<Arc<Mutex<dyn mfi::auth_client::MfiSigner + Send>>> {
-    REMOTE_SIGNER.lock().ok().and_then(|s| s.clone())
-}
-
-/// `copy_certificate`, from whichever chip path this build/process actually has.
+/// `copy_certificate` from the box's own chip (`/dev/i2c-1`, behind `/tmp/carplay_mfi.lock`).
 fn mfi_cert() -> Option<Vec<u8>> {
-    if let Some(sig) = remote_signer() {
-        return match sig.lock() {
-            Ok(mut s) => match s.copy_certificate() {
-                Ok(c) => Some(c),
-                Err(e) => {
-                    log(&format!("MFi cert via remote signer FAILED: {e}"));
-                    None
-                }
-            },
-            Err(_) => {
-                log("MFi cert: remote signer mutex poisoned");
-                None
-            }
-        };
-    }
-    #[cfg(feature = "local-mfi")]
-    {
-        mfi_retry("cert", mfi_i2c_local::try_cert)
-    }
-    #[cfg(not(feature = "local-mfi"))]
-    {
-        log("MFi cert: no remote signer installed and local chip access is not compiled in");
-        None
-    }
+    mfi_retry("cert", mfi_i2c_local::try_cert)
 }
 
-/// `create_signature` over a 20-byte SHA-1 digest, same dispatch as [`mfi_cert`].
+/// `create_signature` over a 20-byte SHA-1 digest, from the same chip as [`mfi_cert`].
 fn mfi_sign(chal: &[u8]) -> Option<Vec<u8>> {
-    if let Some(sig) = remote_signer() {
-        return match sig.lock() {
-            Ok(mut s) => match s.create_signature(chal) {
-                Ok(v) => Some(v),
-                Err(e) => {
-                    log(&format!("MFi sign via remote signer FAILED: {e}"));
-                    None
-                }
-            },
-            Err(_) => {
-                log("MFi sign: remote signer mutex poisoned");
-                None
-            }
-        };
-    }
-    #[cfg(feature = "local-mfi")]
-    {
-        mfi_retry("sign", || mfi_i2c_local::try_sign(chal))
-    }
-    #[cfg(not(feature = "local-mfi"))]
-    {
-        log("MFi sign: no remote signer installed and local chip access is not compiled in");
-        None
-    }
+    mfi_retry("sign", || mfi_i2c_local::try_sign(chal))
 }
 
 /// Retry a chip operation — but NOT a lock timeout.
@@ -706,7 +587,6 @@ fn mfi_sign(chal: &[u8]) -> Option<Vec<u8>> {
 ///
 /// It also produces a truthful diagnostic: a wedged holder and a dead chip used to log the same
 /// "all 3 attempts failed".
-#[cfg(feature = "local-mfi")]
 fn mfi_retry<T>(
     what: &str,
     mut op: impl FnMut() -> Result<T, mfi_i2c_local::MfiError>,
@@ -721,19 +601,12 @@ fn mfi_retry<T>(
                 ));
                 return None;
             }
-            // NOT contention — this host cannot reach the chip locally at all, and no retry, no
-            // waiting and no later session will change that. Saying so plainly matters: while this
-            // shared a variant with LockBusy, an unconditional structural failure on Android was
-            // logged as a transient race and read that way for months (gm_ccpa
-            // 12_OBSERVED_FLOW.md Failure Point 6). The fix is to route these two call sites through
-            // the MfiSigner the ControlServer already holds — on Android that is the OCBM CH_MFI
-            // relay, which /auth-setup uses successfully in the very same session (gm_ccpa
-            // 11_HARDENING_PLAN.md T5.3).
+            // NOT contention — this host cannot open the lock path at all, and no retry, no
+            // waiting and no later session will change that, so say so plainly.
             Err(mfi_i2c_local::MfiError::LockUnavailable) => {
                 log(&format!(
                     "MFi {what}: NO LOCAL CHIP ACCESS on this host (lock path unopenable) — this is \
-                     NOT lock contention and will never succeed here; the tunnel needs a remote \
-                     signer (OCBM CH_MFI). See T5.3."
+                     NOT lock contention and will never succeed here"
                 ));
                 return None;
             }
@@ -871,87 +744,5 @@ mod bt_mac_tests {
         assert_eq!(parse_bd_addr("11:22:33:44:55:66:77"), None);
         assert_eq!(parse_bd_addr(""), None);
         assert_eq!(PLACEHOLDER_BT_MAC[0] & 0x02, 0x02, "not locally administered");
-    }
-}
-
-#[cfg(test)]
-mod remote_signer_tests {
-    use super::*;
-    use std::sync::atomic::AtomicUsize;
-
-    /// Records what it was asked for, so the test can prove the tunnel took the REMOTE path rather
-    /// than falling through to `/dev/i2c-1`.
-    struct Fake {
-        certs: Arc<AtomicUsize>,
-        signs: Arc<AtomicUsize>,
-        fail: bool,
-        last_digest: Arc<Mutex<Vec<u8>>>,
-    }
-
-    impl mfi::auth_client::MfiSigner for Fake {
-        fn copy_certificate(&mut self) -> std::io::Result<Vec<u8>> {
-            self.certs.fetch_add(1, Ordering::Relaxed);
-            if self.fail {
-                return Err(std::io::Error::other("relay down"));
-            }
-            Ok(vec![0xC0; 945]) // the 945-byte cert the OCBM CH_MFI relay returns on hardware
-        }
-        fn create_signature(&mut self, digest: &[u8]) -> std::io::Result<Vec<u8>> {
-            self.signs.fetch_add(1, Ordering::Relaxed);
-            *self.last_digest.lock().unwrap() = digest.to_vec();
-            if self.fail {
-                return Err(std::io::Error::other("relay down"));
-            }
-            Ok(vec![0x51; 128]) // 128-byte RSA-1024 signature
-        }
-    }
-
-    /// One test, not several: `REMOTE_SIGNER` is process-wide state and cargo runs tests in
-    /// parallel threads, so the ordering has to be explicit.
-    #[test]
-    fn remote_signer_takes_over_the_tunnels_two_chip_call_sites() {
-        // 1. Nothing installed. Without `local-mfi` there is no chip to fall back to, so both
-        //    dispatchers must report failure rather than reach for /dev/i2c-1.
-        #[cfg(not(feature = "local-mfi"))]
-        {
-            assert!(mfi_cert().is_none(), "no signer + no local chip must not silently succeed");
-            assert!(mfi_sign(&[0u8; 20]).is_none());
-        }
-
-        // 2. Install one. THIS is the T5.3 fix: on Android the tunnel used to call mfi-i2c-local
-        //    unconditionally and fail every attempt (no /tmp -> the lock could not even be opened),
-        //    which cost the metadata/controls channel entirely.
-        let certs = Arc::new(AtomicUsize::new(0));
-        let signs = Arc::new(AtomicUsize::new(0));
-        let last = Arc::new(Mutex::new(Vec::new()));
-        set_remote_signer(Arc::new(Mutex::new(Fake {
-            certs: certs.clone(),
-            signs: signs.clone(),
-            fail: false,
-            last_digest: last.clone(),
-        })));
-
-        let cert = mfi_cert().expect("cert must come back from the remote signer");
-        assert_eq!(cert.len(), 945);
-        assert_eq!(certs.load(Ordering::Relaxed), 1, "the REMOTE path must have been taken");
-
-        let digest = [0xAB; 20];
-        let sig = mfi_sign(&digest).expect("signature must come back from the remote signer");
-        assert_eq!(sig.len(), 128);
-        assert_eq!(signs.load(Ordering::Relaxed), 1);
-        assert_eq!(&*last.lock().unwrap(), &digest, "the digest must be passed through verbatim");
-
-        // 3. A failing relay is a failed handshake attempt, not a panic and not a fallback to the
-        //    local chip: the tunnel is Zero-Ack and its own 120 s budget retries.
-        set_remote_signer(Arc::new(Mutex::new(Fake {
-            certs: certs.clone(),
-            signs: signs.clone(),
-            fail: true,
-            last_digest: last.clone(),
-        })));
-        assert!(mfi_cert().is_none());
-        assert!(mfi_sign(&digest).is_none());
-        assert_eq!(certs.load(Ordering::Relaxed), 2, "still remote -- no local fallback on error");
-        assert_eq!(signs.load(Ordering::Relaxed), 2);
     }
 }

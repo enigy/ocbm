@@ -6,6 +6,3 @@ publish = false
 
 [dependencies]
 libc = "0.2"
-# MFI1 client for a REMOTE coprocessor (`CARPLAY_MFI_ADDR`) — the Raspberry Pi port has no local
-# chip. Dormant when the env var is unset, i.e. on the CCPA.
-mfi-wire = { path = "../../mfi-wire" }

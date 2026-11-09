@@ -1,6 +1,6 @@
 //! Process-local cells for the per-connection capability levers (`hevc`, `dpad`, `knob`,
 //! `telephony`, `altscreen` + alt dims, `viewareas`, `cornermasks`, `logtransfer`, `mainbuffered`,
-//! `appsetup`, `view_area_anim_ms`).
+//! `view_area_anim_ms`).
 //!
 //! Each cell is SEEDED from the like-named `CARPLAY_*` env var once per process, then WRITTEN per
 //! control connection by `load_device_config` on all three of its paths (success / parse failure /
@@ -15,8 +15,7 @@
 //!     `false`, and honoured on the no-config paths.
 //!  3. **No-config fallback only** (`CARPLAY_MAINBUFFERED`): the config path takes the YAML value
 //!     ALONE, because a stale bench flag overriding a pushed `false` there could silence media
-//!     (docs/carplay/04_CAPABILITIES_AND_CONFIG.md B4). `CARPLAY_APP_SETUP` is the tri-state variant — a value, not a presence, so
-//!     `0` can force OFF.
+//!     (docs/carplay/04_CAPABILITIES_AND_CONFIG.md B4).
 //!
 //! carplayd's `load_device_config` used to publish these via `std::env::set_var`/`remove_var` on the
 //! serve thread on EVERY control connection, while other live threads concurrently `getenv` the same
@@ -73,7 +72,6 @@ static VIEWAREAS: AtomicBool = AtomicBool::new(false);
 static CORNERMASKS: AtomicBool = AtomicBool::new(false);
 static LOGTRANSFER: AtomicBool = AtomicBool::new(false);
 static MAINBUFFERED: AtomicBool = AtomicBool::new(false);
-static APPSETUP: AtomicBool = AtomicBool::new(false);
 
 /// Seed every lever from the environment exactly once, before the first read or write. Presence =
 /// on (matching the old `env::var(..).is_ok()` gates), and a present-but-unparseable dimension is
@@ -98,12 +96,6 @@ fn seed() {
         };
         ALT_W.store(dim("CARPLAY_ALT_W"), Ordering::Relaxed);
         ALT_H.store(dim("CARPLAY_ALT_H"), Ordering::Relaxed);
-        // appsetup seeds from the VALUE (=="1"), not presence: CARPLAY_APP_SETUP is a 1/0 override
-        // (harness use — "0" must force OFF over a YAML "true", so its presence alone can't mean on).
-        APPSETUP.store(
-            std::env::var("CARPLAY_APP_SETUP").is_ok_and(|v| v == "1"),
-            Ordering::Relaxed,
-        );
     });
 }
 
@@ -227,10 +219,6 @@ pub fn set_viewareas(on: bool) {
 /// that view — the two are mutually exclusive per iOS's validator). Phase 1 of the corner-mask
 /// experiment: advertise the feature so the phone starts streaming its `topLeftCornerMask` buffer, which
 /// `CARPLAY_CORNERMASK_CAPTURE` (server.rs) dumps so we can learn the (undocumented) wire format.
-///
-/// Unlike [`logtransfer`], this lever has no one-sided-emission hazard under the app-driven SETUP
-/// relay: the `viewAreas` structure it rides on is emitted unconditionally, so an env force-arm the
-/// host's echo cannot see produces structure-without-echo, which iOS ignores.
 pub fn cornermasks() -> bool {
     seed();
     CORNERMASKS.load(Ordering::Relaxed)
@@ -288,16 +276,6 @@ pub fn set_focus_transfer(on: bool) {
 /// The archive transfer itself (RCS LogTransfer channel routing + the chunked file-message codec)
 /// is NOT implemented; an inbound LogTransfer RCS SETUP is accepted as a stream and its frames are
 /// logged-and-dropped, which is the correct passive-responder posture until the wire shapes are known.
-///
-/// APP-LESS BENCH CORNER, wider here than for cornerMasks — arm the YAML, not the env, whenever the
-/// app-driven SETUP relay is up. The host authors the `enabledFeatures` echo from the pushed YAML and
-/// cannot see this lever's env force-arm, so an env-armed `logTransferInfo` in `/info` can pair with
-/// an echo that omits the token — the iOS-27 `carEndpoint_validateInfoResponseKeyPresentForFeature`
-/// "found but not negotiated" abort. Reachable both on the config path (`/tmp/logtransfer_test`
-/// armed while the app pushes `enablesLogTransfer: false`) and, since the app-less paths stopped
-/// wiping the seed, with `CARPLAY_APP_SETUP=1` and no/unparseable config. `cornerMasks` is exempt:
-/// its backing `viewAreas` structure is emitted unconditionally, so only the harmless direction
-/// (structure without echo) can occur there.
 pub fn logtransfer() -> bool {
     seed();
     LOGTRANSFER.load(Ordering::Relaxed)
@@ -315,10 +293,6 @@ pub fn set_logtransfer(on: bool) {
 /// app that said `false` could silence media if iOS moves to a buffered stream we don't serve.
 /// Both the `/info` `mainBufferedInfo` emission and the SETUP `"mainBuffered"` echo read THIS
 /// lever, preserving the both-sides-or-neither coupling iOS validates.
-///
-/// App-less bench corner: with no/unparseable config AND `CARPLAY_APP_SETUP=1`, the env-armed
-/// `/info` key pairs with a host-authored echo that omits the token, which iOS-27 rejects as
-/// "found but not negotiated" — arm the YAML, not the env, when running the relay harness.
 pub fn mainbuffered() -> bool {
     seed();
     MAINBUFFERED.load(Ordering::Relaxed)
@@ -327,22 +301,6 @@ pub fn mainbuffered() -> bool {
 pub fn set_mainbuffered(on: bool) {
     seed();
     MAINBUFFERED.store(on, Ordering::Relaxed);
-}
-
-/// App-driven-SETUP lever (`accessoryConfig.appDrivenSetup`, env override `CARPLAY_APP_SETUP=1/0`):
-/// selects `relay::RemoteSession` over the plain `AvSession` on BOTH transports when the host relay
-/// seam is up (carplayd's per-connection delegate selection — plan P1; wireless joined at the
-/// 2026-08-10 flip). The YAML arrives from the host at SUBSCRIBE, so this lever doubles as the
-/// host-capability flag: a host that can't answer RS_REQs simply never pushes it. The app defaults
-/// it ON; the box's local response stays the sticky fallback on any relay failure.
-pub fn appsetup() -> bool {
-    seed();
-    APPSETUP.load(Ordering::Relaxed)
-}
-
-pub fn set_appsetup(on: bool) {
-    seed();
-    APPSETUP.store(on, Ordering::Relaxed);
 }
 
 /// View-area resize animation duration (ms) — the `animationDurationMillis` the box puts in its

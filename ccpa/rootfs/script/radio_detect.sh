@@ -225,13 +225,10 @@ BT_ATTACH_CMD=""
 BT_AFTER_WLAN=0
 grep -qE 'while \[ ! -e /sys/class/net/' /script/attach_bluetooth.sh 2>/dev/null && BT_AFTER_WLAN=1
 
-# ---- 4c. THE SCO / HFP VOICE SETUP THIS UNIT'S OWN DISPATCHER APPLIES ------------------------
-# The bring-up in btd forces a DOWN->UP cycle on the controller, and this controller
-# is hciattach'd over UART, so it carries HCI_QUIRK_RESET_ON_CLOSE: the `down` makes the kernel
-# issue a real HCI_Reset, which DISCARDS everything attach_bluetooth.sh set after its own attach --
-# including the SCO setup HFP call audio needs (docs/wireless/01_BT_AND_RADIO.md "Accepted side
-# effect"). Those lines are the vendor's OBSERVATIONS, per-chip and not re-derivable by us, so they
-# are extracted here exactly like the insmod/attach mapping and re-applied by `radio_hal.sh sco_on`.
+# ---- 4c. THE SCO SETUP THIS UNIT'S OWN DISPATCHER APPLIES ------------------------------------
+# attach_bluetooth.sh sets SCO up after its own attach. Those lines are the vendor's OBSERVATIONS,
+# per-chip and not re-derivable by us, so they are extracted here exactly like the insmod/attach
+# mapping and applied by `radio_hal.sh bt_on`, as the stock attach does.
 #
 # SCOPE THE EXTRACTION TO THIS UNIT'S OWN BRANCH. Unlike the insmod and attach lines -- which are
 # discriminated by the module tarball and by attach-helper presence -- the SCO lines appear in

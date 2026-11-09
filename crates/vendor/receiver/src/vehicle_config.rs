@@ -311,7 +311,6 @@ impl Default for AccessoryConfig {
             enables_corner_masks: false,
             enables_log_transfer: false,
             enables_main_buffered_audio: false,
-            app_driven_setup: false,
             enables_ui_appearance: true,
             enables_map_appearance: true,
             enables_focus_transfer: false,
@@ -415,14 +414,6 @@ pub struct AccessoryConfig {
     /// it; docs/carplay/04_CAPABILITIES_AND_CONFIG.md). Wired is device-tested benign (iOS negotiates it disabled over USB).
     #[serde(default, rename = "enablesMainBufferedAudio")]
     pub enables_main_buffered_audio: bool,
-    /// App-driven SETUP (plan P1, our extension — not a stock Apple `AccessoryConfig` key): the host
-    /// app authors the AirPlay SETUP/RECORD responses over the OCBM CH_RTSP relay; the box pre-runs
-    /// its own unmodified session as the oracle + fallback (`receiver::relay`). Because this YAML
-    /// only ever arrives from the host at SUBSCRIBE, setting it is simultaneously the host's
-    /// capability declaration ("I will answer RS_REQs"). Absent/false = box-driven SETUP; the app
-    /// ships it ON and it applies to BOTH transports since the 2026-08-10 wireless flip.
-    #[serde(default, rename = "appDrivenSetup")]
-    pub app_driven_setup: bool,
     /// `uiAppearanceMode`/`uiAppearanceSetting` and `mapAppearanceMode`/`mapAppearanceSetting` in
     /// `/info`. These were emitted UNCONDITIONALLY while the app shipped owner-facing toggles for
     /// them — the box deciding a value the app owns, i.e. a docs/carplay/04_CAPABILITIES_AND_CONFIG.md directive-2 violation rather than
@@ -592,7 +583,7 @@ pub struct ViewAreaEntry {
     /// `SettingsWindow.swift:355`, which emits it at the same indent as `safeArea:`.
     #[serde(default, rename = "drawUIOutsideSafeArea")]
     pub draw_ui_outside_safe_area: bool,
-    /// OUR extension key (not in Apple's `ViewAreaConfig.CodingKeys`, like `appDrivenSetup`):
+    /// OUR extension key (not in Apple's `ViewAreaConfig.CodingKeys`):
     /// `initial: true` on `viewAreas[1]` makes the session START in that area (display-level
     /// `initialViewArea: 1`, the lever's `:initial`). Apple keeps that choice at the display level,
     /// so no Apple template carries it; serde-default `false` means every existing document parses
@@ -723,7 +714,7 @@ pub struct HidConfig {
     /// literally; the app already emits it in that exact form. Parsed as a free `String` rather than a
     /// serde enum so an unrecognised value degrades to "no touch bits" with a log at the point of USE
     /// (C-7) instead of failing the WHOLE document here — a parse failure would drop the pushed
-    /// resolution, HEVC, appDrivenSetup and metadata tier along with it.
+    /// resolution, HEVC, and metadata tier along with it.
     #[serde(default, rename = "touchScreenMode")]
     pub touch_screen_mode: String,
 }
@@ -773,7 +764,7 @@ pub struct DisplayPanelConfig {
     /// `additionalContent`, `showsInstruments` — and only the last appears in any stock template.
     /// Parsed as free strings so an unrecognised value degrades to "ignored" at the point of USE
     /// rather than failing the WHOLE pushed document (a parse failure would drop the resolution,
-    /// HEVC, appDrivenSetup and metadata tier along with it).
+    /// HEVC and metadata tier along with it).
     #[serde(default, rename = "displayProperties")]
     pub display_properties: Vec<String>,
 }
@@ -1074,14 +1065,6 @@ impl VehicleConfig {
         self.accessory_config.enables_log_transfer
     }
 
-    /// Whether the host asks for app-driven SETUP (`accessoryConfig.appDrivenSetup`, plan P1).
-    /// Drives the `appsetup` lever the same way the other accessoryConfig toggles drive theirs: the
-    /// CALLER (carplayd `load_device_config`) arms `levers::set_appsetup` per connection — apply()
-    /// never touches levers in this crate, so the config→lever seam stays in one place.
-    pub fn app_driven_setup(&self) -> bool {
-        self.accessory_config.app_driven_setup
-    }
-
     /// Whether the host YAML asks for the D-Pad HID device (Apple `hidConfig.dPadSupport`). Drives
     /// the `CARPLAY_DPAD` lever, which gates the uid-3 D-Pad HID device ONLY — it contributes
     /// nothing to the display features word. 0x10 there is Touchpad and 0x20 is DirectionButtons;
@@ -1232,22 +1215,6 @@ accessoryConfig:
                 .unwrap()
                 .accessory_config
                 .enables_main_buffered_audio
-        );
-    }
-
-    #[test]
-    fn app_driven_setup_parses_true_and_defaults_false() {
-        let y = "accessoryConfig:\n  appDrivenSetup: true\n";
-        assert!(
-            VehicleConfig::from_yaml(y.as_bytes())
-                .unwrap()
-                .app_driven_setup()
-        );
-        // Absent = false: box-driven SETUP stays the default (a host that can't relay never pushes it).
-        assert!(
-            !VehicleConfig::from_yaml(b"name: Minimum\n")
-                .unwrap()
-                .app_driven_setup()
         );
     }
 
@@ -1446,7 +1413,7 @@ videoStreamsConfig:
     /// It compares `DeviceConfig` and NOTHING ELSE. That is total within `DeviceConfig` (a Debug
     /// comparison catches every field, including ones added later), but several emitted surfaces
     /// never travel through it — `accessory_config.*`, which carplayd reads straight off
-    /// `VehicleConfig`; `app_driven_setup()` / `view_areas_enabled()` / `alt_screen()`, which are
+    /// `VehicleConfig`; `view_areas_enabled()` / `alt_screen()`, which are
     /// armed as `levers::` and each drive a SETUP `enabledFeatures` token; and — the one that
     /// matters here — the HID surface C-2 exists to feed, since `displays[].features` and
     /// `hidDevices[]` are emitted from `levers::dpad()/knob()/telephony()` in `info.rs`, not from
@@ -1524,7 +1491,7 @@ displayPanelsConfig:
     }
 
     /// The app ships `altDisplayPanels: []` today, and an unrecognised `displayProperties` value must
-    /// not fail the WHOLE document — that would silently drop resolution, HEVC, appDrivenSetup and
+    /// not fail the WHOLE document — that would silently drop resolution, HEVC, and
     /// the metadata tier with it.
     #[test]
     fn alt_display_panels_absent_empty_and_unknown_properties_are_all_harmless() {
@@ -1685,7 +1652,7 @@ metadata:
     ///   3. THE FATAL ONE, which only a fixture containing `videoStreamsConfig:` can catch: `va()`'s
     ///      literal has NO trailing newline, so an appended `initialURL` line GLUES onto
     ///      `drawUIOutsideSafeArea: false` and serde rejects the ENTIRE document — silently
-    ///      reverting resolution, HEVC, appDrivenSetup, audio and the metadata tier together.
+    ///      reverting resolution, HEVC, audio and the metadata tier together.
     #[test]
     fn the_apps_real_emitted_document_parses() {
         let y = APP_EMITTED_DOCUMENT;
@@ -1717,7 +1684,6 @@ metadata:
             "Apple's own VehicleConfigs ship this typo; the app emits it deliberately [sic]"
         );
         assert!(cfg.accessory_config.enables_hevc, "the accessoryConfig tail");
-        assert!(cfg.accessory_config.app_driven_setup);
 
         // THE ESCAPING SEAM. `oemIconLabel` is the only free text in the pushed document that runs
         // through `YamlEmit.quotedBody`, and the generator now extracts the REAL escaper out of
@@ -1742,7 +1708,6 @@ metadata:
         // would fail to parse and the box would silently revert to compiled defaults.
         let ac = &cfg.accessory_config;
         assert!(ac.enables_hevc, "a KNOWN key still parses alongside ten unknown ones");
-        assert!(ac.app_driven_setup);
         assert!(!ac.enables_corner_masks);
         // The two gated in docs/carplay/04_CAPABILITIES_AND_CONFIG.md #25 ride in the same block and must survive the unknown keys.
         assert!(ac.enables_ui_appearance);
@@ -1963,7 +1928,7 @@ metadata:
     }
 
     /// A bad leaf must never fail the whole document — the policy this file states for resolution,
-    /// HEVC, `appDrivenSetup` and the metadata tier. A `formats[]` entry missing `type` used to be a
+    /// HEVC and the metadata tier. A `formats[]` entry missing `type` used to be a
     /// serde "missing field" error, i.e. a whole-document failure that reverted EVERY key.
     #[test]
     fn a_formats_entry_missing_type_loses_only_that_entry() {
@@ -2003,6 +1968,9 @@ metadata:
         /// supervisor. Verified by grep on 2026-08-11. Each is a live owner-facing control in the
         /// app's UI that currently reaches nothing, EXCEPT where noted.
         const EMITTED_BUT_UNREAD: &[&str] = &[
+            // Read by nothing since OCBM 1.0.5 retired the Android Auto bridge and the SETUP relay.
+            "android_auto",
+            "appDrivenSetup",
             // The six `accessoryConfig` capabilities that are simply unimplemented (docs/carplay/04_CAPABILITIES_AND_CONFIG.md #25
             // closed the three that WERE doctrine violations — those are parsed now).
             "enablesDCX",
@@ -2035,7 +2003,6 @@ metadata:
 
         /// Emitted for a consumer OUTSIDE this crate. Not a gap.
         const READ_ELSEWHERE: &[&str] = &[
-            "android_auto", // tools/session_supervisor.sh — aa_enabled(): gates arming the AA bridge
             "hot_handover", // tools/session_supervisor.sh — gates the wired/wireless preempt
             "pairing",      // tools/session_supervisor.sh — SSP association model
         ];

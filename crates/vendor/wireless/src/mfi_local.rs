@@ -1,11 +1,8 @@
 //! mfi_local.rs — MFi 2.0C authentication over the box's LOCAL I2C chip (`/dev/i2c-1 @0x11`).
 //!
-//! The ported `bt_driver` originally called `carplay_iap2_core::mfi`, which is an auth-service TCP client
-//! (`192.168.50.2:5290`) — the PoC's way of borrowing a *remote* CCPA's MFi chip because the Pi had
-//! none. THIS box IS the CCPA: the genuine MFi 2.0C coprocessor sits on `/dev/i2c-1 @0x11` and is
-//! driven directly, exactly as the wired `iap2d` daemon does (`ccpa/iap2d/src/main.rs`). This module
-//! is that same proven direct-I2C cert-copy + challenge-sign, exposing `cert()`/`sign()` with the
-//! same signatures the auth-service module had, so `bt_driver` swaps backends with a two-line change.
+//! The genuine MFi 2.0C coprocessor sits on `/dev/i2c-1 @0x11` and is driven directly, exactly as the
+//! wired `iap2d` daemon does (`ccpa/iap2d/src/main.rs`): the same proven direct-I2C cert-copy +
+//! challenge-sign, as `cert()`/`sign()`.
 //!
 //! One MFi chip, shared with `iap2d` — but the session arbiter guarantees only one transport is
 //! active at a time, so wired and wireless never drive the chip concurrently.
@@ -180,112 +177,9 @@ fn i2c_wr(reg: u8, data: &[u8]) -> bool {
     false
 }
 
-/// Env var selecting a REMOTE MFi service instead of this box's local i2c coprocessor.
-///
-/// Set it to `host:port` (e.g. `192.168.50.2:7789`) and `cert`/`sign` speak the `MFI1` protocol to
-/// `mfid` instead of touching `/dev/i2c-1`. This exists for the **Raspberry Pi port**, where the Pi
-/// runs the Bluetooth/iAP2 stack but has no coprocessor of its own and reaches the CCPA's over
-/// USB-NCM.
-///
-/// UNSET is the CCPA's own case and leaves the local i2c path below byte-for-byte unchanged —
-/// including `MfiLock`, which is meaningless on the remote path (the lock that matters lives on the
-/// box holding the chip, and `mfid` takes it there).
-const REMOTE_ADDR_ENV: &str = "CARPLAY_MFI_ADDR";
-
-/// Resolved ONCE per process, matching the project's env-lever convention — editing the variable
-/// mid-run does nothing until the daemon restarts.
-fn remote_addr() -> Option<&'static str> {
-    static ADDR: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    ADDR.get_or_init(|| match std::env::var(REMOTE_ADDR_ENV) {
-        Ok(v) if !v.trim().is_empty() => {
-            let v = v.trim().to_string();
-            eprintln!("[mfi] REMOTE backend {v} — local /dev/i2c-1 will NOT be used");
-            Some(v)
-        }
-        _ => None,
-    })
-    .as_deref()
-}
-
-/// MFI1 client for the remote coprocessor. Deliberately blocking and synchronous: `sign` is called
-/// inside the iAP2 handshake against the phone's timeout, so no async boundary may appear here.
-mod remote {
-    use mfi_wire::{read_frame, write_frame, Op, Status, DIGEST_LEN};
-    use std::io::Write;
-    use std::net::{TcpStream, ToSocketAddrs};
-    use std::time::Duration;
-
-    const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-    /// Generous on purpose: a contended chip lock is bounded at 10 s inside the daemon and the sign
-    /// path itself measures ~1.5 s over NCM. A tighter client timeout would report false failures.
-    const IO_TIMEOUT: Duration = Duration::from_secs(30);
-
-    fn exchange(addr: &str, op: Op, payload: &[u8]) -> Option<Vec<u8>> {
-        let sa = match addr.to_socket_addrs().ok().and_then(|mut a| a.next()) {
-            Some(sa) => sa,
-            None => {
-                eprintln!("[mfi] remote: cannot resolve {addr}");
-                return None;
-            }
-        };
-        let mut s = match TcpStream::connect_timeout(&sa, CONNECT_TIMEOUT) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("[mfi] remote: connect {addr} failed: {e}");
-                return None;
-            }
-        };
-        let _ = s.set_read_timeout(Some(IO_TIMEOUT));
-        let _ = s.set_write_timeout(Some(IO_TIMEOUT));
-        let _ = s.set_nodelay(true);
-
-        if let Err(e) = write_frame(&mut s, op as u8, payload).and_then(|()| s.flush()) {
-            eprintln!("[mfi] remote: send failed: {e}");
-            return None;
-        }
-        match read_frame(&mut s) {
-            Ok((code, body)) => match Status::from_u8(code) {
-                Some(Status::Ok) => Some(body),
-                Some(st) => {
-                    eprintln!("[mfi] remote: daemon returned {}", st.as_str());
-                    None
-                }
-                None => {
-                    eprintln!("[mfi] remote: unknown status 0x{code:02x}");
-                    None
-                }
-            },
-            Err(e) => {
-                eprintln!("[mfi] remote: receive failed: {e}");
-                None
-            }
-        }
-    }
-
-    pub fn cert(addr: &str) -> Option<Vec<u8>> {
-        exchange(addr, Op::Cert, &[])
-    }
-
-    pub fn sign(addr: &str, chal: &[u8]) -> Option<Vec<u8>> {
-        // Reject locally rather than let the daemon answer BadRequest — the chip would otherwise be
-        // handed a short buffer and fail with an opaque NAK.
-        if chal.len() != DIGEST_LEN {
-            eprintln!(
-                "[mfi] remote: digest is {} bytes, expected {DIGEST_LEN}",
-                chal.len()
-            );
-            return None;
-        }
-        exchange(addr, Op::Sign, chal)
-    }
-}
-
 /// Fetch the accessory certificate. CopyCertificate: reg `0x30` len (2 BE), reg `0x31` cert. Same
 /// return shape as `carplay_iap2_core::mfi::cert()` (the auth op `0x01`), fed to iAP2 0xAA01.
 pub fn cert() -> Option<Vec<u8>> {
-    if let Some(addr) = remote_addr() {
-        return remote::cert(addr);
-    }
     let _lock = MfiLock::acquire()?; // serialize vs iap2d for the whole cert read (#109)
     let mut lb = [0u8; 2];
     if !i2c_rd(0x30, &mut lb) {
@@ -306,9 +200,6 @@ pub fn cert() -> Option<Vec<u8>> {
 /// (`0x10`=1), poll status bit4, read `0x11` len / `0x12` sig. Same as the auth op `0x02`, fed to
 /// iAP2 0xAA03.
 pub fn sign(chal: &[u8]) -> Option<Vec<u8>> {
-    if let Some(addr) = remote_addr() {
-        return remote::sign(addr, chal);
-    }
     let _lock = MfiLock::acquire()?; // hold the lock across the ENTIRE stateful sequence (#109)
     let clen = chal.len();
     if !i2c_wr(0x20, &[(clen >> 8) as u8, clen as u8]) {

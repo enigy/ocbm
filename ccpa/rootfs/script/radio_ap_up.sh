@@ -80,15 +80,8 @@ trap 'rm -rf "$LOCK"; trap - EXIT; exit 143' INT TERM HUP
 # identity on both radios. Falls back to the serial when the MAC is unreadable. Read from sysfs,
 # not from `set_wifi_mac`, so this works on a unit where that vendor helper was stripped.
 #
-# THIS OVERWRITES ssid= IN /etc/hostapd.conf, AND THAT IS ONLY SAFE BECAUSE OF WHO CALLS US.
-# In the BT-only bridge role (wifi_ap:false — the GM head-unit deployment, where the adapter is
-# just the Bluetooth radio and the MFi coprocessor) that same file holds the VEHICLE's ssid,
-# written by the supervisor's apply_host_wifi_creds(), and it is what the box hands the phone in
-# the iAP2 0x5703 handoff. Clobbering it there would point the phone at an AP that is never
-# raised — a documented, session-killing failure that also poisons the next attempt.
-# We are safe only because session_supervisor skips wifi_ap_on entirely when BOX_WIFI_AP=0.
-# So: do NOT make radio_hal call this verb unconditionally, and do NOT "fix" the supervisor's
-# wifi_ap:false branch to fall through to here.
+# This overwrites ssid= in /etc/hostapd.conf, which is also what the box hands the phone in the
+# iAP2 0x5703 handoff, so the two always name the same AP.
 # The seam resolves the identity once and passes it in, so the SSID and the Bluetooth name come
 # from ONE decision. The local derivation below is only for a direct/bench invocation; it reads
 # the same persisted /etc/carplay_ident first, so the two paths cannot diverge.

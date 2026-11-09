@@ -19,20 +19,11 @@ carplay-iap2-core = { path = "../iap2-core" }
 # Wire constants only (CT_BT_PHASE / BTP_*), so the phase values the driver publishes and the ones
 # ocbmd forwards are literally the same symbols. Zero transitive deps.
 ocbm-proto = { path = "../../ocbm-proto" }
-# MFI1 framing for the REMOTE MFi backend (mfi_local.rs, `CARPLAY_MFI_ADDR`). Needed by the
-# Raspberry Pi port, which has no coprocessor of its own and reaches the CCPA's over USB-NCM.
-# Zero transitive deps; unused when the env var is unset, i.e. on the CCPA itself.
-mfi-wire = { path = "../../mfi-wire" }
-# HCI, userspace RFCOMM, the SDP server and the pairing agent — extracted from this crate on
-# 2026-09-01 and now shared with aa-wireless. Same code, same behaviour; see that crate's manifest.
+# Scan enable, RFCOMM, the SDP server and the pairing agent — extracted from this crate on
+# 2026-09-01; see that crate's manifest.
 bt-common = { path = "../../bt-common" }
 
-# The single definition of the SoftAP gateway address (`net::AP_IP`). Already in this binary's
-# dependency tree through aa-wireless; named directly so `av.rs` can reference the constant rather
-# than repeat the literal, which is what the wireless-AA handoff depends on being identical.
+# The single definition of the SoftAP gateway address (`net::AP_IP`), so `av.rs` references the
+# constant rather than repeating the literal.
 box-common = { path = "../../box-common" }
 
-# The wireless Android Auto bootstrap. A library, not a daemon: this binary owns the single
-# Bluetooth identity that advertises BOTH projection protocols, so the AA half has to live inside it
-# (docs/androidauto/03_WIRELESS.md §6b). Protocol only — no sockets, no radio, no lifecycle.
-aa-wireless = { path = "../../../ccpa/aa-wireless" }

@@ -1,11 +1,10 @@
-//! Session-arbitration flags — the `/tmp` substrate the CarPlay and Android Auto sets share so a
-//! live session is never interrupted by another connecting phone. See docs/androidauto/02_ARBITRATION.md.
+//! Session-arbitration flags — the `/tmp` substrate the box's daemons share so a live session is
+//! never interrupted by another connecting phone.
 //!
-//! Today `session_supervisor.sh` arbitrates wired↔wireless CarPlay via `/tmp/carplay_transport`
-//! (= "wireless" when the wireless arm owns the box). This module generalizes that to a single
-//! projection OWNER covering all transports, so Android Auto folds into the same first-come-wins
-//! model instead of a parallel path. `ProjectionOwner::as_str()` is byte-compatible with the shell:
-//! "wireless" == WirelessCp, so an existing `carplay_transport` file still reads correctly.
+//! `session_supervisor.sh` arbitrates wired↔wireless CarPlay via `/tmp/carplay_transport`
+//! (= "wireless" when the wireless arm owns the box) and `/tmp/projection_owner` (= "wired-cp" for
+//! wired). `ProjectionOwner::as_str()` is byte-compatible with the shell: "wireless" == WirelessCp, so
+//! an existing `carplay_transport` file still reads correctly.
 //!
 //! Portable (plain file writes); the shell reads the same paths.
 
@@ -26,16 +25,12 @@ pub const CARPLAY_TRANSPORT: &str = "/tmp/carplay_transport";
 /// Who owns the single phone-facing controller / projection session right now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProjectionOwner {
-    /// Idle — no session; a new phone of either kind may claim the box.
+    /// Idle — no session; a new phone may claim the box.
     None,
     /// Wired CarPlay (iap2d + carplayd over NCM).
     WiredCp,
     /// Wireless CarPlay (btd: BT + WiFi AP). Byte-compatible with the legacy "wireless".
     WirelessCp,
-    /// Wired Android Auto (aa-bridge AOAP pump).
-    WiredAa,
-    /// Wireless Android Auto (aa-wireless: BT bootstrap + WiFi AP + TCP accept).
-    WirelessAa,
 }
 
 impl ProjectionOwner {
@@ -45,8 +40,6 @@ impl ProjectionOwner {
             ProjectionOwner::None => "",
             ProjectionOwner::WiredCp => "wired-cp",
             ProjectionOwner::WirelessCp => "wireless",
-            ProjectionOwner::WiredAa => "wired-aa",
-            ProjectionOwner::WirelessAa => "wireless-aa",
         }
     }
 
@@ -54,31 +47,17 @@ impl ProjectionOwner {
         match s.trim() {
             "wired-cp" => ProjectionOwner::WiredCp,
             "wireless" | "wireless-cp" => ProjectionOwner::WirelessCp,
-            "wired-aa" => ProjectionOwner::WiredAa,
-            "wireless-aa" => ProjectionOwner::WirelessAa,
             _ => ProjectionOwner::None,
         }
     }
 
-    /// Is this a CarPlay transport (wired or wireless)? The AA arm refuses to arm while true.
-    pub fn is_carplay(self) -> bool {
-        matches!(self, ProjectionOwner::WiredCp | ProjectionOwner::WirelessCp)
-    }
-
-    /// Is this an Android Auto transport? The CarPlay arms refuse to arm while true.
-    pub fn is_android_auto(self) -> bool {
-        matches!(self, ProjectionOwner::WiredAa | ProjectionOwner::WirelessAa)
-    }
-
     /// The `PM_*` byte ocbmd puts on the wire in `CT_PROJ_MODE`, so the host app learns WHICH
-    /// transport owns the box (docs/androidauto/02_ARBITRATION.md). One mapping, shared by every box-side writer.
+    /// transport owns the box. One mapping, shared by every box-side writer.
     pub fn wire_code(self) -> u8 {
         match self {
             ProjectionOwner::None => ocbm_proto::PM_NONE,
             ProjectionOwner::WiredCp => ocbm_proto::PM_WIRED_CP,
             ProjectionOwner::WirelessCp => ocbm_proto::PM_WIRELESS_CP,
-            ProjectionOwner::WiredAa => ocbm_proto::PM_WIRED_AA,
-            ProjectionOwner::WirelessAa => ocbm_proto::PM_WIRELESS_AA,
         }
     }
 }
@@ -111,8 +90,8 @@ pub fn set_owner(who: ProjectionOwner) -> std::io::Result<()> {
 /// polling them: one landing in that window reads "", which `ProjectionOwner::from_str` maps to
 /// `None` — "the box is free to claim" — so a re-write of an owner could hand the session away
 /// mid-claim. Rename is atomic: a reader sees the whole old value or the whole new one. The pid
-/// suffix keeps the temp private to this writer, since ocbmd, aa-bridge and aa-wireless all write
-/// `PROJECTION_OWNER` and a shared temp name would just move the torn window into the temp file.
+/// suffix keeps the temp private to this writer, so a second writer's temp name can never become
+/// this one's torn window.
 fn write_atomic(path: &str, content: &str) -> std::io::Result<()> {
     let tmp = format!("{path}.tmp.{}", std::process::id());
     fs::write(&tmp, content)?;
@@ -148,10 +127,10 @@ mod tests {
     fn owner_roundtrip_and_legacy_compat() {
         assert_eq!(ProjectionOwner::from_str("wireless"), ProjectionOwner::WirelessCp);
         assert_eq!(ProjectionOwner::WirelessCp.as_str(), "wireless");
-        assert_eq!(ProjectionOwner::from_str("wired-aa"), ProjectionOwner::WiredAa);
-        assert!(ProjectionOwner::WiredCp.is_carplay());
-        assert!(ProjectionOwner::WiredAa.is_android_auto());
-        assert!(!ProjectionOwner::WiredAa.is_carplay());
+        assert_eq!(ProjectionOwner::from_str("wired-cp"), ProjectionOwner::WiredCp);
+        // An owner token from an earlier OCBM that this one no longer has reads as idle.
+        assert_eq!(ProjectionOwner::from_str("wired-aa"), ProjectionOwner::None);
+        assert_eq!(ProjectionOwner::from_str("wireless-aa"), ProjectionOwner::None);
     }
 
     /// The torn-read window itself is not observable from a single-threaded test; what IS checkable
@@ -166,8 +145,8 @@ mod tests {
         let path = dir.join("projection_owner");
         let p = path.to_str().unwrap();
 
-        write_atomic(p, ProjectionOwner::WirelessAa.as_str()).unwrap();
-        assert_eq!(fs::read_to_string(&path).unwrap(), ProjectionOwner::WirelessAa.as_str());
+        write_atomic(p, ProjectionOwner::WiredCp.as_str()).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), ProjectionOwner::WiredCp.as_str());
         // Overwrite with a SHORTER value: no tail of the longer previous owner may survive.
         write_atomic(p, ProjectionOwner::WirelessCp.as_str()).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), ProjectionOwner::WirelessCp.as_str());

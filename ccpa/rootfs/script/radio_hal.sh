@@ -4,7 +4,7 @@
 # the Rust daemons) asks for "wifi up" / "bt up" and never names a chip, a module, a firmware
 # path or an attach helper.
 #
-# VERBS   probe | status | wifi_ap_on | wifi_ap_off | bt_on | bt_off | sco_on
+# VERBS   probe | status | wifi_ap_on | wifi_ap_off | bt_on | bt_off | preload
 # EXIT    0 converged now   1 ran and failed   2 already converged   3 unsupported on this unit
 #
 # ---------------------------------------------------------------------------------------------
@@ -158,8 +158,7 @@ caps() {
 # not theoretical: wlan_iface() once used `_n`, the BT wait loop used `_n` as its counter, and
 # calling the helper replaced the counter with a sysfs path — `_n=$((_n+1))` then failed with an
 # arithmetic syntax error. It only ever reached that line when NO interface existed (otherwise
-# the caller's `&& break` fired first), i.e. exclusively in the BT-only bridge role. Keep these
-# names distinctive.
+# the caller's `&& break` fired first). Keep these names distinctive.
 wlan_iface() {
   for _wif_d in /sys/class/net/*/; do
     [ -e "$_wif_d/wireless" ] || [ -e "$_wif_d/phy80211" ] || continue
@@ -226,9 +225,8 @@ ap_running() { pgrep -x hostapd >/dev/null 2>&1 || ps | grep -v grep | grep -qw 
 # disagree: on the validated unit the WLAN MAC and the BT controller address share no octets at
 # all (Realtek sets no bd_addr, so BT uses its own chip efuse), giving suffixes like ccpa-AABB
 # from Wi-Fi and ccpa-CCDD from Bluetooth. So which name a radio gets would depend on which radio
-# happened to be up when it was asked — and in the BT-only bridge role (wifi_ap:false) the WLAN
-# driver is never loaded at all, so BT would silently take the other name. Worse, the answer
-# could change between boots, and the phone stores the name in its bonded record.
+# happened to be up when it was asked. Worse, the answer could change between boots, and the phone
+# stores the name in its bonded record.
 #
 # So: first successful derivation wins and is written to /etc/carplay_ident; everything after
 # reads that file. One small flash write, once per box.
@@ -284,8 +282,8 @@ bt_set_name() {  # $1 = hci dev
 
 # Load THIS unit's WLAN driver and nothing else - no AP, no addressing. Factored out of
 # wifi_ap_on because bt_on needs it too: on the parts whose vendor script makes BT attach wait
-# for the WLAN interface, the BT-only bridge role (wifi_ap:false) never calls wifi_ap_on, so
-# waiting for an interface is waiting for something nobody will ever create. See do_bt_on.
+# for the WLAN interface, a bt_on with no wifi_ap_on before it (preload, a direct call) would wait
+# for something nobody creates. See do_bt_on.
 # Returns 0 if the driver is loaded (or was already), 1 if there is nothing to load.
 wlan_driver_up() {
   [ -n "$RADIO_WLAN_INSMOD" ] || { log "no WLAN insmod mapping for this unit"; return 1; }
@@ -315,16 +313,9 @@ wlan_driver_up() {
 }
 
 # ---------------------------------------------------------------------------------------------
-# SCO (HFP call audio). Re-apply THIS UNIT'S OWN post-attach SCO setup.
-#
-# WHY A SEPARATE VERB. `btd`'s `bt_bringup::bring_up` forces a DOWN->UP cycle on the
-# controller (it is the only way the kernel re-sends its Set_Event_Mask, without which SSP pairing
-# silently never reaches the host). This controller is hciattach'd over UART, so it carries
-# HCI_QUIRK_RESET_ON_CLOSE and that `down` issues a real HCI_Reset -- discarding everything
-# attach_bluetooth.sh set after ITS attach, the SCO setup included. For as long as nothing carried
-# audio over SCO that was a documented, harmless side effect. Wireless Android Auto carries call
-# and Assistant audio over HFP/SCO, so it is now a real fault, and the daemon calls this verb after
-# every bring-up.
+# SCO. Apply THIS UNIT'S OWN post-attach SCO setup at bt_on, as the vendor's attach script does.
+# Nothing on the box carries audio over SCO (CarPlay's calls ride the AirPlay session), so this only
+# keeps bt_on doing what the stock attach does; btd's DOWN->UP cycle later discards it, harmlessly.
 #
 # The commands are the VENDOR'S, extracted per-branch by radio_detect.sh -- never composed here.
 # On this unit's Realtek branch the vendor sets ONLY the SCO MTU and no routing command at all
@@ -354,22 +345,6 @@ apply_sco() {  # $1 = hci dev; echoes what it did. 0 = applied, 3 = nothing to a
     _did=1
   done
   [ "$_did" = 1 ] || return 3
-  return 0
-}
-
-do_sco_on() {
-  caps || { log "no descriptor - cannot restore SCO setup"; return 3; }
-  _d=$(hci_dev 2>/dev/null) || {
-    log "no HCI device - nothing to apply SCO setup to"; return 3; }
-  if ! apply_sco "$_d"; then
-    log "no SCO mapping could be extracted for chipset ${RADIO_SDIO_DEVICE:-unknown} - HFP call audio will not be restored after a controller reset"
-    return 3
-  fi
-  # Read the controller back. `hciconfig <dev>` prints `SCO MTU: 240:32` and `Voice: 0x0060`; those
-  # are the two facts an HFP call depends on, and a readback is the only thing that distinguishes
-  # "applied" from "the command exited 0 and the controller ignored it".
-  _rb=$(timeout 5 hciconfig "$_d" 2>/dev/null | tr -s ' ' | grep -o 'SCO MTU: [0-9]*:[0-9]*')
-  log "SCO setup applied to $_d (${_rb:-SCO MTU unreadable})"
   return 0
 }
 
@@ -596,13 +571,12 @@ do_bt_on() {
       # vendor there GUARDS the attach on the interface existing rather than proceeding.
       #
       # The previous version only polled for an interface and then attached anyway, quoting the
-      # vendor's own timeout behaviour. That excuse does not survive the bridge role: with
-      # wifi_ap:false the supervisor never calls wifi_ap_on, so nothing ever loads the driver and
-      # the poll is guaranteed to time out - we would attach, every time, into the exact ordering
-      # the constraint exists to forbid, on the deployment where BT is the entire product.
+      # vendor's own timeout behaviour. That excuse does not survive a bt_on with no wifi_ap_on
+      # before it: nothing loads the driver and the poll is guaranteed to time out - we would
+      # attach into the exact ordering the constraint exists to forbid.
       #
-      # Loading the driver is not an AP: no addressing, no hostapd, nothing the bridge role
-      # objects to. If it cannot be loaded we fail honestly rather than wedge the chip.
+      # Loading the driver is not an AP: no addressing, no hostapd. If it cannot be loaded we fail
+      # honestly rather than wedge the chip.
       if [ "${RADIO_BT_AFTER_WLAN:-0}" = 1 ] && ! wlan_iface >/dev/null 2>&1; then
         log "chipset requires the WLAN driver before BT attach - loading it (driver only, no AP)"
         if wlan_driver_up; then
@@ -741,8 +715,8 @@ do_bt_on() {
         # Vendor SCO tuning where the mapping carried it; non-fatal. Was a HARDCODED
         # `scomtu 240:32` despite this comment -- which is the Realtek/NXP value and nobody
         # else's, and which skipped the routing command the NXP and BCM4358 branches need.
-        # Now the extracted per-branch mapping, same as `sco_on`.
-        apply_sco "$_d" >/dev/null 2>&1 || log "no SCO mapping for this chipset (HFP call audio unavailable)"
+        # Now the extracted per-branch mapping.
+        apply_sco "$_d" >/dev/null 2>&1 || log "no SCO mapping for this chipset"
         bt_set_name "$_d"
         publish "$BT_STATE" "result=ok" "backend=mapped" "chipset=$RADIO_SDIO_DEVICE" "hci_dev=$_d" \
                 "bt_mac=$(cat /sys/class/bluetooth/$_d/address 2>/dev/null)"
@@ -813,9 +787,5 @@ case "$VERB" in
   # the WLAN driver, which an app-driven wifi_ap_on arriving mid-preload must not race.
   preload)     lock_take wlan || exit 1; lock_take bt || { lock_drop wlan; exit 1; }
                do_preload; _r=$?; lock_drop bt; rm -rf /tmp/.radio_lock_wlan 2>/dev/null; exit $_r ;;
-  # Best-effort and idempotent: the daemon calls it after every bring-up DOWN->UP, and a unit
-  # whose branch carries no SCO mapping must report that (3) rather than fail the caller.
-  sco_on)      log "sco_on: taking the bt lock"; lock_take bt || exit 1; log "sco_on: bt lock taken"
-               do_sco_on;      _r=$?; lock_drop bt;   exit $_r ;;
-  *) echo "$LOGP usage: radio_hal.sh probe|status|wifi_ap_on|wifi_ap_off|bt_on|bt_off|sco_on|preload" >&2; exit 64 ;;
+  *) echo "$LOGP usage: radio_hal.sh probe|status|wifi_ap_on|wifi_ap_off|bt_on|bt_off|preload" >&2; exit 64 ;;
 esac
