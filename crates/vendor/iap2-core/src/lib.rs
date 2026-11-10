@@ -18,6 +18,9 @@ pub mod features;
 /// today; vehicle identity next). See docs/carplay/04_CAPABILITIES_AND_CONFIG.md.
 pub mod config;
 pub mod link;
+/// The car's position for the iPhone (0xFFFA/0xFFFB/0xFFFC + Identify param 22), declared on the
+/// AirPlayTunnel arm only when the app pushes `location:`. LIVI research item 4, off by default.
+pub mod location;
 pub mod message;
 /// iAP2 metadata plane: NowPlaying / route-guidance / maneuver / call-state / communications / list
 /// subscribe-builders + inbound parsers, plus the `127.0.0.1:9004 → CH_METADATA` seam forwarder and

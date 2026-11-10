@@ -297,6 +297,7 @@ pub fn build_ident_info_excluding(
         crate::features::Policy::active(),
         &crate::features::ambient_skip(),
         &crate::config::VehicleIdentity::baseline(),
+        &crate::location::capabilities(),
     )
 }
 
@@ -337,12 +338,16 @@ pub fn build_ident_info_excluding_with(
         crate::features::Policy::active(),
         &crate::features::ambient_skip(),
         identity,
+        &crate::location::capabilities(),
     )
 }
 
 /// Injection form of [`build_ident_info_excluding`]: builds with an EXPLICIT metadata `policy` + `skip`
 /// rather than the process-cached ambient ones, so a test pins the proven baseline regardless of a dev
 /// box's `/tmp/carplay_metadata` (audit Fix #25). Production callers use `build_ident_info_excluding`.
+///
+/// `location` is the param-22 capability list (`location::capabilities`); empty declares no location, and
+/// only the AirPlayTunnel arm ever declares one.
 pub(crate) fn build_ident_info_excluding_with_policy(
     name: &str,
     transport: TransportComponent,
@@ -351,8 +356,28 @@ pub(crate) fn build_ident_info_excluding_with_policy(
     policy: crate::features::Policy,
     skip: &[&str],
     identity: &crate::config::VehicleIdentity,
+    location: &[u16],
 ) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::new();
+
+    // The location declaration (`location.rs`) is the AirPlayTunnel arm's alone, and it touches params 6,
+    // 7 and 22. A reject naming any of the three retries WITHOUT it: 6/7 can't be stripped, so keeping
+    // the location ids there would make the retry byte-identical and abort the tunnel session, while
+    // dropping them makes the retry the declaration this arm has always had accepted. Read from the
+    // caller's own `exclude`, before the required-param filter below takes 6/7 out of it.
+    let location: &[u16] = if !matches!(transport, TransportComponent::AirPlayTunnel { .. })
+        || exclude.iter().any(|p| {
+            [
+                spec::ident::MESSAGES_SENT_BY_ACCESSORY,
+                spec::ident::MESSAGES_RECEIVED_FROM_DEVICE,
+                spec::ident::LOCATION_INFORMATION_COMPONENT,
+            ]
+            .contains(p)
+        }) {
+        &[]
+    } else {
+        location
+    };
 
     // A 0x1D03 IdentificationRejected retry must NEVER strip a REQUIRED IdentificationInformation param
     // (#407): dropping e.g. Name / the MessagesSent-or-Received lists / PowerProvidingCapability makes
@@ -526,10 +551,16 @@ pub(crate) fn build_ident_info_excluding_with_policy(
         let p = policy;
         let np = crate::metadata::start_now_playing;
         let rg = crate::metadata::start_route_guidance;
-        (
-            be16_list(&crate::features::sent_ids(&crate::features::active_with_skip(p.sent, np, rg, skip))),
-            be16_list(&crate::features::received_ids(&crate::features::active_with_skip(p.recv, np, rg, skip))),
-        )
+        let mut s = be16_list(&crate::features::sent_ids(&crate::features::active_with_skip(p.sent, np, rg, skip)));
+        let mut r = be16_list(&crate::features::received_ids(&crate::features::active_with_skip(p.recv, np, rg, skip)));
+        // The car's position (`location.rs`, docs/carplay/05_METADATA_AND_CONTROLS.md §2.1), only when the app pushed
+        // `location:`: the payload is ours (param 6), its Start AND Stop are the phone's (param 7).
+        if !location.is_empty() {
+            s.extend_from_slice(&spec::MSG_LOCATION_INFORMATION.to_be_bytes()); // 0xFFFB
+            r.extend_from_slice(&spec::MSG_START_LOCATION_INFORMATION.to_be_bytes()); // 0xFFFA
+            r.extend_from_slice(&spec::MSG_STOP_LOCATION_INFORMATION.to_be_bytes()); // 0xFFFC
+        }
+        (s, r)
     } else {
         // The wired-proven floor, unioned with the feature table (docs/carplay/05_METADATA_AND_CONTROLS.md). The floor is kept
         // verbatim so `CARPLAY_METADATA=proven` reproduces the declaration this transport has been
@@ -703,6 +734,17 @@ pub(crate) fn build_ident_info_excluding_with_policy(
                 t.bytes(spec::ident::VEHICLE_STATUS_COMPONENT, &g21)
             }); // param 21
         }
+    }
+
+    // Param 22 — LocationInformationComponent: the sentences the app said it can build, as presence
+    // flags. AirPlayTunnel only and only when pushed (`location` is empty otherwise, see the top of this
+    // function). Between 21 and 24, keeping the ascending order the captures show; identifier 4 keeps it
+    // apart from params 20/21's 1-3.
+    if !location.is_empty() {
+        let g22 = build_location_information_component(4, name, location);
+        push(exclude, spec::ident::LOCATION_INFORMATION_COMPONENT, &|t| {
+            t.0.extend_from_slice(&g22)
+        }); // param 22
     }
 
     // Param 24 — WirelessCarPlayTransportComponent (Apple's authoritative name; byte-confirmed
@@ -1082,6 +1124,7 @@ mod tests {
             // Baseline identity: this helper pins the PRE-C6 bytes, so it must never carry pushed
             // vehicle config. The identity-aware assertions build their own bodies explicitly.
             &crate::config::VehicleIdentity::baseline(),
+            &[],
         )
     }
 
@@ -2060,6 +2103,94 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// [`proven_ident_body`] with a location declaration and an exclude list.
+    fn located_body(transport: TransportComponent, location: &[u16], exclude: &[u16]) -> Vec<u8> {
+        build_ident_info_excluding_with_policy(
+            "CarLink",
+            transport,
+            false,
+            exclude,
+            crate::features::Policy {
+                sent: crate::features::Tier::Proven,
+                recv: crate::features::Tier::Proven,
+                subscribe: crate::features::Tier::Proven,
+            },
+            &[],
+            &crate::config::VehicleIdentity::baseline(),
+            location,
+        )
+    }
+
+    fn be16_ids(list: &[u8]) -> Vec<u16> {
+        list.chunks(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect()
+    }
+
+    #[test]
+    fn location_is_declared_on_the_tunnel_arm_with_its_ids_in_the_right_params() {
+        let tunnel = TransportComponent::AirPlayTunnel { bt_mac: [0, 1, 2, 3, 4, 5] };
+        let gga_rmc = [
+            location_info::GLOBAL_POSITIONING_SYSTEM_FIX_DATA,
+            location_info::RECOMMENDED_MINIMUM_SPECIFIC_GPS_TRANSIT_DATA,
+        ];
+        let plain = proven_ident_body("CarLink", tunnel);
+        let body = located_body(tunnel, &gga_rmc, &[]);
+
+        let sent = be16_ids(&top_level_param_value(&body, spec::ident::MESSAGES_SENT_BY_ACCESSORY).unwrap());
+        let rcv = be16_ids(&top_level_param_value(&body, spec::ident::MESSAGES_RECEIVED_FROM_DEVICE).unwrap());
+        let mut want_sent = be16_ids(&top_level_param_value(&plain, spec::ident::MESSAGES_SENT_BY_ACCESSORY).unwrap());
+        let mut want_rcv = be16_ids(&top_level_param_value(&plain, spec::ident::MESSAGES_RECEIVED_FROM_DEVICE).unwrap());
+        want_sent.push(spec::MSG_LOCATION_INFORMATION);
+        want_rcv.extend([spec::MSG_START_LOCATION_INFORMATION, spec::MSG_STOP_LOCATION_INFORMATION]);
+        assert_eq!(sent, want_sent, "0xFFFB appended to param 6, nothing else moved");
+        assert_eq!(rcv, want_rcv, "0xFFFA and its Stop 0xFFFC appended to param 7");
+        for &id in &sent {
+            assert_eq!(spec::source_of(id), Some(spec::Source::Accessory), "param-6 id {id:#06x}");
+        }
+        for &id in &rcv {
+            assert_eq!(spec::source_of(id), Some(spec::Source::Device), "param-7 id {id:#06x}");
+        }
+
+        let g22 = build_location_information_component(4, "CarLink", &gga_rmc);
+        assert_eq!(top_level_param_value(&body, spec::ident::LOCATION_INFORMATION_COMPONENT).unwrap(), g22[4..]);
+        let ids = top_level_param_ids(&body);
+        let at = |p| ids.iter().position(|&i| i == p).unwrap();
+        assert!(at(spec::ident::VEHICLE_INFORMATION_COMPONENT) < at(spec::ident::LOCATION_INFORMATION_COMPONENT));
+        assert!(at(spec::ident::LOCATION_INFORMATION_COMPONENT) < at(spec::ident::WIRELESS_CAR_PLAY_TRANSPORT_COMPONENT));
+        let mut rest = top_level_param_ids(&plain);
+        rest.insert(rest.iter().position(|&i| i == spec::ident::WIRELESS_CAR_PLAY_TRANSPORT_COMPONENT).unwrap(), spec::ident::LOCATION_INFORMATION_COMPONENT);
+        assert_eq!(ids, rest, "param 22 is the only new top-level param");
+    }
+
+    #[test]
+    fn no_location_and_the_other_arms_stay_byte_identical() {
+        let gga = [location_info::GLOBAL_POSITIONING_SYSTEM_FIX_DATA];
+        for transport in [
+            TransportComponent::AirPlayTunnel { bt_mac: [0, 1, 2, 3, 4, 5] },
+            TransportComponent::Usb { cp_iface: 1 },
+            TransportComponent::Wireless { bt_mac: [0, 1, 2, 3, 4, 5] },
+        ] {
+            assert_eq!(located_body(transport, &[], &[]), proven_ident_body("CarLink", transport), "{transport:?}: nothing pushed");
+        }
+        for transport in [TransportComponent::Usb { cp_iface: 1 }, TransportComponent::Wireless { bt_mac: [0, 1, 2, 3, 4, 5] }] {
+            assert_eq!(located_body(transport, &gga, &[]), proven_ident_body("CarLink", transport), "{transport:?} never declares location");
+        }
+    }
+
+    #[test]
+    fn a_reject_naming_params_6_7_or_22_retries_without_location() {
+        let tunnel = TransportComponent::AirPlayTunnel { bt_mac: [0, 1, 2, 3, 4, 5] };
+        let gga = [location_info::GLOBAL_POSITIONING_SYSTEM_FIX_DATA];
+        let plain = proven_ident_body("CarLink", tunnel);
+        for rejected in [spec::ident::MESSAGES_SENT_BY_ACCESSORY, spec::ident::MESSAGES_RECEIVED_FROM_DEVICE, spec::ident::LOCATION_INFORMATION_COMPONENT] {
+            assert_eq!(located_body(tunnel, &gga, &[rejected]), plain, "reject of param {rejected}: the accepted declaration");
+        }
+        // A reject of something else keeps location and strips only what was named.
+        let without_20 = located_body(tunnel, &gga, &[spec::ident::VEHICLE_INFORMATION_COMPONENT]);
+        let ids = top_level_param_ids(&without_20);
+        assert!(ids.contains(&spec::ident::LOCATION_INFORMATION_COMPONENT));
+        assert!(!ids.contains(&spec::ident::VEHICLE_INFORMATION_COMPONENT));
     }
 
     #[test]

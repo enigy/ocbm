@@ -776,7 +776,11 @@ fn load_device_config() -> DeviceConfig {
                 // two parsers can fail independently). `arm_pushed_policy` is first-arm-wins, and
                 // `iap_tunnel::start` (which builds the tunnel Identify) runs at session start —
                 // strictly after this — so the declaration and the subscribes share one snapshot.
-                iap2_core::config::Iap2Config::from_slice(&bytes).arm_metadata_policy();
+                let iap2_cfg = iap2_core::config::Iap2Config::from_slice(&bytes);
+                iap2_cfg.arm_metadata_policy();
+                // The car's GPS for the phone (LIVI item 4): the same first-arm-wins snapshot, armed before
+                // `iap_tunnel::start` builds the tunnel Identify. Nothing pushed = nothing declared.
+                iap2_cfg.arm_location();
                 levers::set_hevc(vc.accessory_config.enables_hevc);
                 // mainBuffered from the pushed config alone (docs/carplay/04_CAPABILITIES_AND_CONFIG.md B4) — deliberately NO env OR:
                 // a stale bench flag must never override an app that said `false` (media-silence
@@ -1009,12 +1013,17 @@ fn read_input_exact(stream: &mut TcpStream, buf: &mut [u8], gen: u32) -> Result<
 /// The largest input sub-frame: an `INPUT_DATASTREAM` (type, stream id, the JSON message at its cap).
 const MAX_INPUT_SUB_FRAME: usize = 1 + 4 + ocbm_proto::MAX_INPUT_DATASTREAM;
 
-/// Every input sub-frame is at most 64 B, as before, except route A's: an `INPUT_DATASTREAM` (the answers) and
-/// an `INPUT_TUNNEL` (the proxy tunnel's bytes), up to [`MAX_INPUT_SUB_FRAME`]. A longer one of another type
-/// means the framing is lost.
+/// Every input sub-frame is at most 64 B, as before, except route A's, an `INPUT_DATASTREAM` (the answers) and an
+/// `INPUT_TUNNEL` (the proxy tunnel's bytes), up to [`MAX_INPUT_SUB_FRAME`], and an `INPUT_LOCATION` (one NMEA
+/// sentence), up to [`MAX_INPUT_FRAME`]. A longer one of another type means the framing is lost.
 fn input_sub_frame_fits(pl: &[u8]) -> bool {
-    let route_a = matches!(pl.first(), Some(&ocbm_proto::INPUT_DATASTREAM | &ocbm_proto::INPUT_TUNNEL));
-    !pl.is_empty() && (pl.len() <= 64 || (route_a && pl.len() <= MAX_INPUT_SUB_FRAME))
+    let cap = match pl.first() {
+        None => return false,
+        Some(&ocbm_proto::INPUT_DATASTREAM | &ocbm_proto::INPUT_TUNNEL) => MAX_INPUT_SUB_FRAME,
+        Some(&ocbm_proto::INPUT_LOCATION) => MAX_INPUT_FRAME,
+        Some(_) => 64,
+    };
+    pl.len() <= cap.max(64)
 }
 
 /// `setVideoPlaybackAllowed`'s `playbackStatus` for a `VIDEO_STATUS_*` byte (LIVI's words): nothing queued, a
@@ -1049,9 +1058,10 @@ fn read_input(mut stream: TcpStream, gen: u32) {
             eprintln!("[input] ingest connection closed mid-payload ({len} B expected: {e})");
             break;
         }
-        // Only route A's sub-frames (INPUT_DATASTREAM, INPUT_TUNNEL) run past 64 B; any other that does is a desync.
+        // Only route A's sub-frames (INPUT_DATASTREAM, INPUT_TUNNEL) and INPUT_LOCATION run past 64 B; any other that does
+        // is a desync.
         if !input_sub_frame_fits(&pl) {
-            eprintln!("[input] a {len} B sub-frame of type 0x{:02x}: only INPUT_DATASTREAM and INPUT_TUNNEL run past 64 B — desync, dropping the ingest connection", pl[0]);
+            eprintln!("[input] a {len} B sub-frame of type 0x{:02x}: only INPUT_DATASTREAM, INPUT_TUNNEL and INPUT_LOCATION run past 64 B — desync, dropping the ingest connection", pl[0]);
             break;
         }
         // Re-checked HERE, not just before the reads: this is the last instant before the frame
@@ -1063,6 +1073,10 @@ fn read_input(mut stream: TcpStream, gen: u32) {
         handle_input_frame(&pl);
     }
 }
+
+/// The longest CH_INPUT sub-frame: an `INPUT_LOCATION`, its type byte and one NMEA sentence
+/// (`iap2_core::location::MAX_SENTENCE`). Every HID frame is far shorter; past this is desync.
+const MAX_INPUT_FRAME: usize = 1 + iap2_core::location::MAX_SENTENCE;
 
 /// Turn one CH_INPUT sub-frame into a HID report to the iPhone. Single-touch MVP (uid 1): DOWN/MOVE =
 /// tip down, UP = tip up; normalized 0..=65535 coords scaled to the advertised resolution (`DISPLAY_WH`).
@@ -1102,6 +1116,17 @@ fn handle_input_frame(pl: &[u8]) {
                 events::CLUSTER_STREAM_ID,
                 events::screen_focused()
             );
+        }
+        return;
+    }
+    // The car's own GPS (LIVI item 4): one NMEA sentence from the app, forwarded on the iAP2 tunnel only
+    // when the phone asked for that type (`iap_tunnel::send_location`). Not a HID report.
+    if pl.first() == Some(&ocbm_proto::INPUT_LOCATION) {
+        match std::str::from_utf8(&pl[1..]) {
+            Ok(sentence) => {
+                receiver::iap_tunnel::send_location(sentence);
+            }
+            Err(_) => eprintln!("[input] location sentence isn't UTF-8 ({} B) — dropped", pl.len() - 1),
         }
         return;
     }

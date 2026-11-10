@@ -425,9 +425,15 @@ pub const INPUT_NAV: u8 = 0x05; // [INPUT_NAV][nav u8] -> box taps the D-Pad HID
 pub const INPUT_TELEPHONY: u8 = 0x08; // [INPUT_TELEPHONY][buttonIndex u8] -> box sends the 1-byte HID
                                       // Telephony report (index) then a release (0). 1=Answer(HookSwitch)
                                       // 2=Flash 3=End(Drop) 4=Mute 5..14=DTMF 0..9 15=* 16=# 17=Delete.
+pub const INPUT_LOCATION: u8 = 0x09; // [INPUT_LOCATION][one NMEA-0183 sentence, ASCII, `$` to the checksum, no CR LF]
+                                     // -> the car's own GPS for the phone (LIVI research item 4). carplayd forwards it as
+                                     // iAP2 LocationInformation (0xFFFB) on the wireless tunnel only after the phone's
+                                     // StartLocationInformation selected that type, no faster than its minimum interval;
+                                     // otherwise it is dropped. Declared only when the app pushed `location: [...]`, and
+                                     // the box tells the app when to start and stop with META_JSON {"kind":"location"}.
 pub const INPUT_DATASTREAM: u8 = 0x0A; // [INPUT_DATASTREAM][stream u32 LE][JSON message] -> box sends the
                                        // message on that shared DataStream (route A: the phone's video Playback
-                                       // channel; receiver::playback). 0x09 is INPUT_LOCATION on livi-research.
+                                       // channel; receiver::playback).
 /// The JSON message's cap in an `INPUT_DATASTREAM` sub-frame. The other sub-frames stay at carplayd's 64 B.
 pub const MAX_INPUT_DATASTREAM: usize = 16_384; // 16 KiB
 pub const INPUT_TUNNEL: u8 = 0x0B; // [INPUT_TUNNEL][op][id u8][data] -> carplayd opens, writes to or closes route A's

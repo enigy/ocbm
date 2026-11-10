@@ -41,6 +41,13 @@ pub struct Iap2Config {
     /// records `iapConfig.enablementConfig.appDiscovery`, so this is Apple's key, not ours).
     #[serde(rename = "iapConfig", default)]
     pub iap_config: IapConfigSection,
+    /// `location:` — OUR extension (LIVI research item 4): the NMEA sentences the app can build from the
+    /// car's own GPS, `location: [GPGGA, GPRMC]`. Arms the AirPlayTunnel Identify's location
+    /// declaration (`location.rs`); absent or empty declares nothing. Held as a raw value, so a
+    /// mistyped `location:` is read as nothing rather than failing this whole slice (and the metadata
+    /// tier with it): see [`Iap2Config::location_names`].
+    #[serde(default)]
+    pub location: Option<serde_yaml::Value>,
 }
 
 /// `iapConfig:` — vehicle identity for Identify params 20/21 (docs/carplay/04_CAPABILITIES_AND_CONFIG.md C6).
@@ -485,6 +492,28 @@ impl Iap2Config {
             _ => false,
         }
     }
+
+    /// The `location:` names: a list of strings, or one string of names split by spaces or commas.
+    /// Anything else reads as none, logged.
+    pub fn location_names(&self) -> Vec<String> {
+        use serde_yaml::Value;
+        match &self.location {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::String(s)) => s.split([' ', ',']).filter(|n| !n.is_empty()).map(str::to_string).collect(),
+            Some(Value::Sequence(items)) => items.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
+            Some(other) => {
+                eprintln!("[iap2-config] location: {other:?} isn't a list of sentence names — nothing declared");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Arm the tunnel's location declaration from `location:` (`location::arm`, first arm wins per
+    /// process). False when nothing usable was pushed or another list is already armed.
+    pub fn arm_location(&self) -> bool {
+        let names = self.location_names();
+        !names.is_empty() && crate::location::arm(&names)
+    }
 }
 
 #[cfg(test)]
@@ -511,6 +540,19 @@ mod tests {
             serde_yaml::from_slice(b"metadata:\n  tier: all\n  skip: [call_history, power]\n").unwrap();
         assert_eq!(c.metadata.tier.as_deref(), Some("all"));
         assert_eq!(c.metadata.skip, vec!["call_history".to_string(), "power".to_string()]);
+    }
+
+    #[test]
+    fn location_names_read_a_list_or_a_string_and_a_mistype_costs_nothing_else() {
+        let names = |y: &str| serde_yaml::from_slice::<Iap2Config>(y.as_bytes()).unwrap().location_names();
+        assert_eq!(names("location: [GPGGA, GPRMC]\n"), ["GPGGA", "GPRMC"]);
+        assert_eq!(names("location: \"GPGGA GPRMC\"\n"), ["GPGGA", "GPRMC"]);
+        assert_eq!(names("location: GPGGA,GPRMC\n"), ["GPGGA", "GPRMC"]);
+        assert!(names("name: X\n").is_empty());
+        assert!(names("location:\n").is_empty());
+        let odd = serde_yaml::from_slice::<Iap2Config>(b"metadata:\n  tier: extended\nlocation: 5\n").unwrap();
+        assert!(odd.location_names().is_empty());
+        assert_eq!(odd.metadata.tier.as_deref(), Some("extended"), "the tier still parses");
     }
 
     #[test]
