@@ -244,7 +244,8 @@ construction.
   `load_device_config`). It declares location on the AirPlayTunnel Identify ONLY: `0xFFFB` in param 6,
   `0xFFFA`/`0xFFFC` in param 7, param 22 with those sentences; a reject naming 6, 7 or 22 retries without it.
   Sentences ride CH_INPUT `INPUT_LOCATION`; docs/carplay/05_METADATA_AND_CONTROLS.md §2.1 has the flow. Absent =
-  nothing declared, byte-identical. Not proven on a device.
+  nothing declared, byte-identical. Device-proven 2026-11-10 on the dev adapter (iOS 15 and 27.2): the tunnel Identify
+  with location (330 B) accepted every time, no 0x1D03, and the BT-time Identify unchanged (301 B).
 - **Guard:** dimensions are applied only when both are > 0; a partial/garbled config falls through to the
   box default (never zeros the resolution out from under a session). The guard stays; the box default
   it falls to is an interim safety floor — target state per docs/carplay/04_CAPABILITIES_AND_CONFIG.md is hold-IDLE-until-config, with
