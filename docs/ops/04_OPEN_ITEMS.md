@@ -254,12 +254,21 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
      host returning "before teardown completes" is only the (a) shape — which still kept the phone.
      If `PHONE_ABSENT` recurs, look at the supervisor's L1 `phone_reset` rung
      (`tools/session_supervisor.sh`, `escalate`) and the gadget un-CONFIGURED edge, not at host timing.
-  4. **Is the A/V session key re-issued to a same-nonce re-SUBSCRIBE?** Still open. Today's resets
-     rotate the nonce, so they cannot answer it; the same-nonce paths are the heartbeat
-     re-SUBSCRIBE after `SEV_HOST_GONE` (`OcbmClient.startHeartbeat`) and a USB-blip reattach.
-     Test: with carplayd alive, starve the heartbeat past `HEARTBEAT_GRACE` (10 s), let the client
-     re-SUBSCRIBE, and check whether a fresh seam key arrives (`onSessionKeyed`, the lanes'
-     `keys=` counter) before any A/V frame.
+  4. **Is the A/V session key re-issued to a same-nonce re-SUBSCRIBE?** Answered for the reattach,
+     2026-11-10: **no, until the fix below.** On the bridge self-update bench (AAOS emulator, dev
+     adapter on 1.0.5) the head unit's bridge app restarted for its update, Carlink's link came back
+     in about a second with the same nonce inside `HEARTBEAT_GRACE`, and the box confirmed presence
+     over the live session. carplayd's seams to ocbmd outlived the link, so no `SEAM_KEY` was sent
+     again: audio played, video stayed undecryptable, and Carlink showed no phone, on both updates,
+     until a Carlink restart (new nonce, so a replacement and a re-arm). **Fix (main, not yet
+     benched):** a HELLO while a session is live that is not a replacement latches
+     `host_reattached`; its SUBSCRIBE closes the keyed A/V producers after the dispatch pass
+     (`rekey_av_seams`: main and cluster video, media and voice audio; metadata stays), and carplayd
+     reconnects each with a fresh `SEAM_KEY` (audio also `SEAM_FORMAT`) and a ForceKeyFrame for the
+     video ones. A config re-push (SUBSCRIBE with no HELLO) keeps its keys. Bench: a bridge update,
+     or any USB blip, under a live session should get video back within a second or two. The other
+     same-nonce path, the heartbeat re-SUBSCRIBE after `SEV_HOST_GONE` (`OcbmClient.startHeartbeat`),
+     follows a presence drop and so a re-arm; it is still unbenched.
 
 - **No inbound `stopSession` handler.** The box declares a five-value `stopSessionReasons`
   vocabulary and then ignores the command; `disconnectReason` plumbing to the supervisor follows

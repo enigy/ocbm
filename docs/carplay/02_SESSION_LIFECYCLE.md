@@ -915,12 +915,18 @@ receives the derived session key) — exactly like RiddleBox.
 All four are implemented and hardware-validated. Stated here as current behaviour; the dated
 build-and-validate narrative was cut 2026-08-31.
 
-**1. Host-link reattach and resync.** A `CT_HELLO` resets the session box-side — clears
-`out_hi`/`out_video`/`out_alt_video`/`out_audio`/`out_lo` and zeroes `seq` before replying HELLO_ACK
-(`out_console` is deliberately not cleared) — so a new host is never served a prior session's frames.
+**1. Host-link reattach and resync.** A `CT_HELLO` resets the session box-side — clears every
+outbound queue (`out_hi`, `out_console`, the A/V queues, `out_log`, `out_lo`) and zeroes `seq` before
+replying HELLO_ACK — so a new host is never served a prior session's frames.
 Host-side, `do_hello` drains frames until the ACK and re-sends HELLO once mid-wait, because
 kernel-FIFO-buffered stale frames cannot be retracted by the box. host→box self-resyncs on magic in
-the reassembler. This is also the resync path RECOVERING uses.
+the reassembler. This is also the resync path RECOVERING uses. A HELLO under a live session that is
+not a replacement (the same nonce: a USB blip, or the head unit's bridge app restarting for its own
+update) is a **reattach**: the session goes on, but the host's per-stream keys went with its old link
+and carplayd's seams to ocbmd outlived it. So the SUBSCRIBE after it closes the keyed A/V seams
+(`rekey_av_seams`), and carplayd reconnects each with a fresh `SEAM_KEY` and, for video, a
+ForceKeyFrame. Before that (benched 2026-11-10) such a reattach came back with audio but no decryptable
+video until the app restarted; see docs/ops/04_OPEN_ITEMS.md, item 4.
 
 **2. Disk-backed PeerStore.** `MemPeers` → `DiskPeers`: an in-memory map persisted as
 `[u8 id_len][id][32-byte LTPK]` records, atomic `.tmp`+rename, path from `PEERSTORE_PATH` (default
