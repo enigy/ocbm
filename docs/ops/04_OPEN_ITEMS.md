@@ -429,7 +429,7 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
   Source: `docs/carplay/04_CAPABILITIES_AND_CONFIG.md` §4 Mechanism A, `docs/host/00_MACOS_HOST_APP.md` Tier 4. Verified open 2026-08-16:
   `grep -rn "vehicleStateProtocol" crates ccpa --include="*.rs"` → no hits in box code.
 
-- **`videoPlayback` (video while parked) is unbuilt; its first step is a bench of one log line.**
+- **`videoPlayback` (video while parked) is unbuilt, and the phone side is on.**
   No lever, no `/info` advertisement, no `lunaConfig`/`videoPresetSizes`, no echo. Corrected
   2026-11-10 from the Mac's lookups (handoff doc, "Mac findings, 10 Nov", section 5): it is NOT
   blocked on an entitlement for the box. `com.apple.developer.carplay-video` is what an iPhone app
@@ -440,10 +440,14 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
   (macOS's AirPlayReceiver has the last two), `setVideoPlaybackAllowed`, a `changeModes` borrow with
   `borrowID` `VideoPlayback` (the Simulator's string too), and the phone's play-queue verbs on the
   Playback DataStream, client type `A6B27562-B43A-4F2D-B75F-82391E250194` (iOS:
-  `kFigEndpointRemoteControlSessionClientTypeUUIDKey_MatchPoint`) [E for the UUID and borrow ID; I
-  for the CarPlay keys]. **Next:** carplayd now logs `SETUP phase1: the phone proposes features=…`;
-  if an iPhone proposes `"videoPlayback"` to the dev adapter, the phone side is on and the rest is
-  receiver and Carlink work. Source: `docs/carplay/04_CAPABILITIES_AND_CONFIG.md` §7.
+  `kFigEndpointRemoteControlSessionClientTypeUUIDKey_MatchPoint`) [E for the UUID's name and the
+  borrow ID; I for the CarPlay keys and for the stream on CarPlay, seen on macOS's receiver].
+  **Benched 2026-11-10** (the Mac, dev adapter on `b84a58b`): at SETUP phase 1 Scott's iPhone on iOS
+  27.2 proposes 14 words, CarKit's list in its order, with `"videoPlayback"` among them (no
+  `fileTransfer` or `uiSync`: no gauge cluster), and the box echoes `hevc`, `viewAreas`, `iAPChannel`
+  and `sessionManagement`. So the phone side is on. What iOS then wants from the head unit is still
+  [I]; LIVI's `/info` keys, the `videoPlayback` echo and the Playback stream, behind a lever that is
+  off by default, are the next things to try. Source: `docs/carplay/04_CAPABILITIES_AND_CONFIG.md` §7.
 
 - **`fileTransfer` is blocked-untestable — even the advertise step is byte-unsafe.** The
   `fileTransferInfo` dict's keys are unknown, as is which transport carries the chunk dict.
