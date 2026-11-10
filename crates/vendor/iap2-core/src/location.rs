@@ -42,8 +42,11 @@ pub const SENTENCES: [Sentence; 7] = [
     Sentence { name: "GPHDT", capability: cap::VEHICLE_HEADING_DATA },
 ];
 
-/// NMEA-0183's longest sentence, `$` to the checksum, without the CR LF.
-pub const MAX_SENTENCE: usize = 80;
+/// The longest sentence taken, `$` to the checksum, without the CR LF. NMEA-0183 stops at 80, but Apple's
+/// `$PASCD` carries a run of speed samples past that: the truck's head unit writes six samples twice a
+/// second, 93 characters (`$PASCD,68536.594,C,D,0,6,0.10,7.839,…*47`, 10 Nov), and iAP2's NMEASentence has
+/// no limit of its own. 255 still bounds a CH_INPUT frame.
+pub const MAX_SENTENCE: usize = 255;
 
 /// The pushed `location:` list as sentences, in Apple's order, each once. Unknown names are left out
 /// and logged: a typo declares less, never something we can't produce.
@@ -276,7 +279,17 @@ mod tests {
         assert_eq!(sentence_name(&GGA.replace("*65", "*6")), None, "short checksum");
         assert_eq!(sentence_name(&GGA[1..]), None, "no $");
         assert_eq!(sentence_name(&sentence("GPGGA").replace('1', "\u{7f}")), None, "not printable");
-        assert_eq!(sentence_name(&sentence(&"GPGGA,0".repeat(12))), None, "longer than NMEA allows");
+        assert_eq!(sentence_name(&sentence(&"GPGGA,0".repeat(40))), None, "longer than MAX_SENTENCE");
+    }
+
+    #[test]
+    fn the_trucks_own_pascd_passes_though_nmea_stops_at_80() {
+        // The 10 Nov truck drive: the head unit's GNSS writes six speed samples twice a second.
+        let moving = "$PASCD,68536.594,C,D,0,6,0.10,7.839,0.20,7.956,0.30,8.034,0.40,8.129,0.50,8.294,0.60,8.381*47";
+        let parked = "$PASCD,68235.594,C,P,0,6,0.02,0.000,0.14,0.000,0.23,0.000,0.34,0.000,0.43,0.000,0.54,0.000*57";
+        assert_eq!(moving.len(), 93);
+        assert_eq!(sentence_name(moving), Some("PASCD"));
+        assert_eq!(sentence_name(parked), Some("PASCD"));
     }
 
     #[test]
