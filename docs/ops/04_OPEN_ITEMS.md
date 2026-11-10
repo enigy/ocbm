@@ -628,8 +628,11 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
   item 4).** With the app's `location:` pushed, the AirPlayTunnel Identify declares it and
   `iap_tunnel::send_location` sends `LocationInformation` (0xFFFB) from the app's CH_INPUT `INPUT_LOCATION`
   sentences after the phone's Start (`crates/vendor/iap2-core/src/location.rs`). iOS 15 and 27.2 accepted the
-  tunnel Identify and selected GGA and RMC; Maps followed a plausible fix. Open: the truck (a garage or a
-  tunnel); PASCD/GPGSV/GPHDT; the wired arm. Until 2026-11-10 it was parse-only:
+  tunnel Identify and selected GGA and RMC; Maps followed a plausible fix. The truck's head unit hands apps
+  its own GGA, RMC and Apple-format PASCD (truck probe, 2026-11-10), so the app can forward those as they
+  come; the box takes sentences up to 255 characters (`location::MAX_SENTENCE`), as the truck's PASCD runs
+  to 93. Open: the truck (a garage or a tunnel); GPGSV/GPHDT; the wired arm. Until 2026-11-10 it was
+  parse-only:
   Source: `docs/host/00_MACOS_HOST_APP.md` Tier 4. Verified open 2026-08-16:
   `grep -rn "0xFFFB\|MSG_LOCATION_INFORMATION" --include="*.rs" crates ccpa` → the spec table and
   `crates/vendor/metadata/src/location.rs` (a parser); no emitter.
