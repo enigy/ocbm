@@ -244,6 +244,18 @@ pub fn now_ms() -> u64 {
 /// a new failure mode for no gain.
 pub const PHONE_IDENT_FILE: &str = "/tmp/phone_identity";
 
+/// The phone's phase-1 SETUP `features`, for the log: the words it proposes, which `enabledFeatures`
+/// answers (that echo is logged at `SETUP negotiated`). They say which features this phone would run
+/// with this car, e.g. `videoPlayback` for video while parked (iOS turns CarPlay feature bit 6 into
+/// that word: the Mac's 10 Nov lookups, LIVI item 5). Something other than a list is shown as it came.
+fn proposed_features(req: &Dictionary) -> String {
+    match req.get("features") {
+        None => "(none)".into(),
+        Some(Value::Array(words)) => format!("{:?}", words.iter().map(|w| w.as_string().unwrap_or("?")).collect::<Vec<_>>()),
+        Some(other) => format!("{other:?}"),
+    }
+}
+
 /// Publish who the phone is, from its phase-1 SETUP plist.
 ///
 /// Every field is Apple's own key, lifted verbatim (`AirPlayReceiverServer.c:3213` reads `name`
@@ -1895,6 +1907,7 @@ impl SessionDelegate for AvSession {
         if !has_streams {
             if let Some(d) = dict.as_ref() {
                 publish_phone_identity(d);
+                eprintln!("[session] SETUP phase1: the phone proposes features={}", proposed_features(d));
             }
         }
         let keep_alive = dict
@@ -3154,6 +3167,19 @@ fn ntp_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_phones_proposed_features_are_logged_as_words() {
+        let mut d = Dictionary::new();
+        assert_eq!(proposed_features(&d), "(none)");
+        d.insert(
+            "features".into(),
+            Value::Array(vec![Value::String("viewAreas".into()), Value::String("videoPlayback".into()), Value::Integer(7.into())]),
+        );
+        assert_eq!(proposed_features(&d), r#"["viewAreas", "videoPlayback", "?"]"#);
+        d.insert("features".into(), Value::Integer(64.into()));
+        assert!(proposed_features(&d).contains("64"), "a non-list shows as it came");
+    }
 
     /// The audio seam's control messages must be MAGIC-tagged and exactly the lengths the host's
     /// resync treats as structural (45 / 21). Both ends hardcode those numbers; this is the only

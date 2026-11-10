@@ -424,12 +424,21 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
   Source: `docs/carplay/04_CAPABILITIES_AND_CONFIG.md` §4 Mechanism A, `docs/host/00_MACOS_HOST_APP.md` Tier 4. Verified open 2026-08-16:
   `grep -rn "vehicleStateProtocol" crates ccpa --include="*.rs"` → no hits in box code.
 
-- **`videoPlayback` is inert and blocked on an Apple-approval-only entitlement.** No lever, no
-  `/info` advertisement, no `lunaConfig`/`videoPresetSizes`, no echo. The non-code action is
-  requesting `com.apple.developer.carplay-video`; the `/info` wire shape is also uncaptured.
-  Source: `docs/carplay/04_CAPABILITIES_AND_CONFIG.md` §7. Verified open 2026-08-16:
-  `grep -rn "videoPlayback\|lunaConfig\|videoPresetSizes" --include="*.rs" crates ccpa` → only
-  `vehicle_config.rs` test fixtures.
+- **`videoPlayback` (video while parked) is unbuilt; its first step is a bench of one log line.**
+  No lever, no `/info` advertisement, no `lunaConfig`/`videoPresetSizes`, no echo. Corrected
+  2026-11-10 from the Mac's lookups (handoff doc, "Mac findings, 10 Nov", section 5): it is NOT
+  blocked on an entitlement for the box. `com.apple.developer.carplay-video` is what an iPhone app
+  needs to offer video in CarPlay (`CRCarPlayAppDeclaration.supportsVideo`) [E, iOS CarKit]. iOS turns
+  CarPlay feature bit 6 into the SETUP word `"videoPlayback"` [E, iOS CarKit], and CarPlaySDK 509.11
+  doesn't check that word [E]. The wire shape comes from LIVI, an independent receiver that plays it:
+  `/info` `videoPlaybackInfo` {`videoPlaybackAllowed`, `featuresEx`} and `playbackCapabilities`
+  (macOS's AirPlayReceiver has the last two), `setVideoPlaybackAllowed`, a `changeModes` borrow with
+  `borrowID` `VideoPlayback` (the Simulator's string too), and the phone's play-queue verbs on the
+  Playback DataStream, client type `A6B27562-B43A-4F2D-B75F-82391E250194` (iOS:
+  `kFigEndpointRemoteControlSessionClientTypeUUIDKey_MatchPoint`) [E for the UUID and borrow ID; I
+  for the CarPlay keys]. **Next:** carplayd now logs `SETUP phase1: the phone proposes features=…`;
+  if an iPhone proposes `"videoPlayback"` to the dev adapter, the phone side is on and the rest is
+  receiver and Carlink work. Source: `docs/carplay/04_CAPABILITIES_AND_CONFIG.md` §7.
 
 - **`fileTransfer` is blocked-untestable — even the advertise step is byte-unsafe.** The
   `fileTransferInfo` dict's keys are unknown, as is which transport carries the chunk dict.
