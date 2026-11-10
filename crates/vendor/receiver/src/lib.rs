@@ -17,6 +17,7 @@ pub mod iap_tunnel;
 pub mod info;
 pub mod levers;
 pub mod net;
+pub mod probe;
 pub mod server;
 pub mod session;
 pub mod stream;

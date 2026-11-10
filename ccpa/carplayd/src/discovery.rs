@@ -185,6 +185,31 @@ pub fn start(device_id: String, pairing_identity: String, gate: std::sync::Arc<c
     });
 }
 
+/// The AirPlay video probe's route C: "Carlink Video", an ordinary `_airplay._tcp` service at the AP
+/// address, with its own host name, device id and port, pointed at a listener that only logs
+/// (`receiver::probe`). Wireless only, since the phone has to reach it on the adapter's Wi-Fi. Every
+/// failure is a `[probe]` line, never an error: the CarPlay service must not depend on it.
+fn advertise_video_receiver(mdns: &ServiceDaemon, dev_id: &str, adv_addr: &str) {
+    use receiver::probe;
+    let name = probe::RECEIVER_NAME;
+    if adv_addr.is_empty() {
+        probe::line(format_args!("receiver: no AP address (RX_ADDR unset: not wireless); \"{name}\" is not advertised"));
+        return;
+    }
+    let Some(port) = probe::spawn_receiver_listener() else {
+        return;
+    };
+    let txt = probe::receiver_txt(dev_id, &probe::switches().txt);
+    let props: HashMap<String, String> = txt.iter().cloned().collect();
+    let registered = ServiceInfo::new("_airplay._tcp.local.", name, probe::RECEIVER_HOST, adv_addr, port, props)
+        .map_err(|e| e.to_string())
+        .and_then(|svc| mdns.register(svc).map_err(|e| e.to_string()));
+    match registered {
+        Ok(()) => probe::line(format_args!("receiver: advertised _airplay._tcp \"{name}\" at {adv_addr}:{port}, TXT {txt:?}")),
+        Err(e) => probe::line(format_args!("receiver: \"{name}\" not advertised: {e}")),
+    }
+}
+
 fn run(
     dev_id: &str,
     pi: &str,
@@ -238,6 +263,12 @@ fn run(
     };
     mdns.register(svc)?;
     println!("[rx] advertised _airplay._tcp 'CarPlay' :{PORT}");
+    // The AirPlay video probe's route C (receiver::probe, off unless /etc/ocbm/airplay_probe says
+    // `receiver`): a second, ordinary AirPlay receiver beside the CarPlay service, which stays exactly
+    // as registered above. Nothing here can fail discovery.
+    if receiver::probe::switches().receiver {
+        advertise_video_receiver(&mdns, dev_id, &adv_addr);
+    }
 
     let browse = mdns.browse("_carplay-ctrl._tcp.local.")?;
     let mut dialed: HashSet<String> = HashSet::new();

@@ -100,7 +100,8 @@ fn probe_datastream_keys(
 /// failed `declared == pt.len()` and was dropped. Observed consequence: album artwork Setup and the
 /// final small fragment parsed, the two 65525-byte data fragments did not, and the transfer was
 /// acknowledged as complete while holding a truncated JPEG.
-fn drain_rcs(buf: &mut Vec<u8>, is_iap: bool) {
+/// `probe`: the channel's name when the AirPlay video probe logs it (route A on, a non-iAP channel).
+fn drain_rcs(buf: &mut Vec<u8>, is_iap: bool, probe: Option<&str>) {
     /// Refuse to buffer more than this. `totalLength` is a u32 from the peer; without a ceiling a
     /// corrupt length would let a remote party drive allocation on a 123 MB box.
     const MAX_RCS: usize = 256 * 1024;
@@ -122,7 +123,7 @@ fn drain_rcs(buf: &mut Vec<u8>, is_iap: bool) {
         }
         // Handle the message in place, then drain — no per-message copy (the old
         // `buf.drain(..).collect()` copied every RCS message just to hand it to a `&[u8]` sink).
-        log_datastream_frame(&buf[..declared], is_iap);
+        log_datastream_frame(&buf[..declared], is_iap, probe);
         buf.drain(..declared);
     }
 }
@@ -136,7 +137,11 @@ fn drain_rcs(buf: &mut Vec<u8>, is_iap: bool) {
 /// types (LogTransfer, VehicleDataProtocol×2, UrlFling, OverlayUI, SenderSettingsData) are logged and
 /// dropped. The gate is an allowlist of one, so the three types this project did not know about until
 /// 2026-07-30 were always correctly excluded — see docs/carplay/05_METADATA_AND_CONTROLS.md §1.2 for the full table.
-fn log_datastream_frame(pt: &[u8], is_iap: bool) {
+///
+/// `probe` names the channel when the AirPlay video probe logs it (route A on, a non-iAP channel): its
+/// messages then get one `[probe]` line each, shape only, in place of the bare "logged only" note and
+/// the ASCII dump — a play request's URL must not reach the log past its host.
+fn log_datastream_frame(pt: &[u8], is_iap: bool, probe: Option<&str>) {
     // Strip the 32-byte RCS envelope and hand the iAP2 link frame to the existing state machine, which
     // already implements DETECT/SYN/ACK, the MFi cert+challenge exchange, Identify, and the metadata
     // subscribes for the wired and BT links.
@@ -204,7 +209,15 @@ fn log_datastream_frame(pt: &[u8], is_iap: bool) {
                 );
             }
             if !is_iap {
-                eprintln!("[datastream] non-iAP channel payload — logged only, not routed to iap_tunnel");
+                match probe {
+                    Some(name) => crate::probe::line(format_args!(
+                        "DataStream {name}: '{}' '{}' message, {}",
+                        f.kind_str(),
+                        f.msg_type_str(),
+                        crate::probe::body_shape(None, f.payload)
+                    )),
+                    None => eprintln!("[datastream] non-iAP channel payload — logged only, not routed to iap_tunnel"),
+                }
                 return;
             }
             if !crate::iap_tunnel::handle_inbound(f.payload) {
@@ -213,6 +226,11 @@ fn log_datastream_frame(pt: &[u8], is_iap: bool) {
                 crate::events::dispatch_iap_tunnel_message(f.payload);
             }
         }
+        None if !is_iap && probe.is_some() => crate::probe::line(format_args!(
+            "DataStream {}: a message whose envelope doesn't parse, {}",
+            probe.unwrap_or_default(),
+            crate::probe::body_shape(None, pt)
+        )),
         None => {
             let ascii: String = pt
                 .iter()
@@ -583,7 +601,9 @@ impl AvSession {
         self.peer_addr = Some(addr);
     }
 
-    fn setup_phase1(&mut self, keep_alive: bool) -> Result<Vec<u8>, SetupError> {
+    /// `echo_video`: the AirPlay video probe's route A is on and the phone proposed `videoPlayback`
+    /// ([`crate::probe::echoes_video`]); false on every other path, which leaves the echo as it was.
+    fn setup_phase1(&mut self, keep_alive: bool, echo_video: bool) -> Result<Vec<u8>, SetupError> {
         // Idempotent, per Apple's reference (see `control_setup`). A repeat phase-1 SETUP with no
         // intervening TEARDOWN returns the SAME ports rather than re-binding: the phone is already
         // using them, and re-binding both breaks that and strands the previous threads.
@@ -762,6 +782,14 @@ impl AvSession {
         // env var (docs/wireless/00_WIRELESS_CARPLAY.md #2.1), not shared with CARPLAY_WIRELESS_METADATA — see info.rs's comment.
         if std::env::var("CARPLAY_SESSION_MGMT").is_ok() {
             feats.push(Value::String("sessionManagement".into()));
+        }
+        // videoPlayback: the AirPlay video probe's route A (probe.rs). The SETUP-response half of
+        // offering video in the CarPlay session; the /info half is `videoPlaybackInfo` +
+        // `playbackCapabilities` (info.rs), on the same switch. Echoed only when the phone proposed it
+        // (Scott's iPhone does, iOS 27.2, 10 Nov), so a plain session's echo is unchanged.
+        if echo_video {
+            feats.push(Value::String("videoPlayback".into()));
+            crate::probe::line(format_args!("SETUP phase1: echoing videoPlayback, which the phone proposed"));
         }
         self.negotiated_features = feats
             .iter()
@@ -1193,6 +1221,19 @@ impl AvSession {
                              → streamID={stream_id}{}",
                             if is_iap { "  [iAP channel]" } else { "  [NON-iAP channel]" }
                         );
+                        // The AirPlay video probe's route A (probe.rs): name the channel — the brief
+                        // expects UrlFling, SenderSettingsData and OverlayUI once video is offered — and
+                        // log the shape of what it carries (`drain_rcs`). Taken like any other: the
+                        // session never ends over one.
+                        let probe_channel = (crate::probe::switches().video && !is_iap)
+                            .then(|| crate::probe::channel_name(&client_type));
+                        if let Some(name) = probe_channel {
+                            crate::probe::line(format_args!(
+                                "DataStream SETUP: {name}, clientTypeUUID {client_type}, streamID {stream_id}; \
+                                 the request was {}",
+                                crate::probe::dict_shape(sd)
+                            ));
+                        }
                         let mut r = Dictionary::new();
                         r.insert("type".into(), Value::Integer(ty.into()));
                         r.insert(
@@ -1478,7 +1519,7 @@ impl AvSession {
                                                                         Ok(Some((pt, used))) => {
                                                                             acc.drain(..used);
                                                                             rcs.extend_from_slice(&pt);
-                                                                            drain_rcs(&mut rcs, is_iap);
+                                                                            drain_rcs(&mut rcs, is_iap, probe_channel);
                                                                         }
                                                                         Ok(None) => break, // need more
                                                                         Err(e) => {
@@ -1625,6 +1666,12 @@ impl AvSession {
                         // MainBuffered. They are not requested in any capture on record (mainBuffered
                         // and enhancedSiri both negotiate to disabled), so this is currently unreachable.
                         eprintln!("[session] SETUP phase2 stream type {ty} NOT IMPLEMENTED — omitted from the response");
+                        if crate::probe::switches().video {
+                            crate::probe::line(format_args!(
+                                "SETUP phase2: stream type {ty} omitted; the request was {}",
+                                crate::probe::dict_shape(sd)
+                            ));
+                        }
                     }
                 }
             }
@@ -1683,6 +1730,14 @@ impl SessionDelegate for AvSession {
                 ""
             }
         );
+        // The AirPlay video probe's route A (probe.rs): the shape of every command this session
+        // doesn't act on. The iAP2 tunnel frames, modesChanged and requestViewArea are handled below.
+        if crate::probe::switches().video && !is_iap && ty != "modesChanged" && ty != "requestViewArea" {
+            let shape = parsed
+                .as_ref()
+                .map_or_else(|| crate::probe::body_shape(None, request_plist), crate::probe::dict_shape);
+            crate::probe::line(format_args!("POST /command: {shape}"));
+        }
         // Wireless-metadata investigation (2026-07-17): unconditionally capture EVERY inbound
         // /command plist to a fixed box file, so the exact iAP2-over-AirPlay tunnel frames (type
         // "iAPSendMessage" — the wireless-only metadata carrier) can be pulled over OCBM and decoded
@@ -1926,7 +1981,8 @@ impl SessionDelegate for AvSession {
             }
             Ok(self.setup_phase2(dict.as_ref().unwrap()))
         } else {
-            self.setup_phase1(keep_alive)
+            let echo_video = crate::probe::echoes_video(crate::probe::switches(), dict.as_ref());
+            self.setup_phase1(keep_alive, echo_video)
         }
     }
 
@@ -2039,6 +2095,14 @@ impl SessionDelegate for AvSession {
         }
         if control_started {
             crate::events::mark_session_started(true);
+            // The AirPlay video probe's route A (probe.rs): tell the phone video may play (the bench is
+            // parked), once, as LIVI does at RECORD. Only in a session that negotiated videoPlayback;
+            // `noallow` in the switch file leaves it out.
+            let negotiated = self.negotiated_features.iter().any(|f| f == "videoPlayback");
+            if negotiated && crate::probe::switches().allow {
+                let sent = crate::events::send_command(&crate::probe::allowed_command(true));
+                crate::probe::line(format_args!("RECORD: setVideoPlaybackAllowed(true, idle) sent={sent}"));
+            }
         }
         eprintln!("[session] RECORD done");
         Vec::new()
@@ -3313,6 +3377,27 @@ mod tests {
             .unwrap();
         assert!(d.get("timingPort").unwrap().as_unsigned_integer().unwrap() > 0);
         assert!(d.get("eventPort").unwrap().as_unsigned_integer().unwrap() > 0);
+    }
+
+    /// The AirPlay video probe's route A: `videoPlayback` is echoed only when the switch is on AND the
+    /// phone proposed it (`probe::echoes_video`); a phone proposing it to a box without the switch file
+    /// gets today's echo.
+    #[test]
+    fn video_playback_is_echoed_only_when_the_probe_offers_it() {
+        let echoed = |resp: &[u8]| -> bool {
+            let d = Value::from_reader(Cursor::new(resp)).unwrap().into_dictionary().unwrap();
+            d["enabledFeatures"].as_array().unwrap().iter().any(|f| f.as_string() == Some("videoPlayback"))
+        };
+        let mut req = Dictionary::new();
+        req.insert("features".into(), Value::Array(vec![Value::String("videoPlayback".into())]));
+        let mut body = Vec::new();
+        Value::Dictionary(req).to_writer_binary(&mut body).unwrap();
+        let mut s = AvSession::new();
+        assert!(!echoed(&s.setup(&body).unwrap()), "no switch file on a test host: not echoed");
+        assert!(!s.negotiated_features.iter().any(|f| f == "videoPlayback"));
+        assert!(echoed(&s.setup_phase1(false, true).unwrap()));
+        assert!(s.negotiated_features.iter().any(|f| f == "videoPlayback"), "RECORD reads this");
+        assert!(!echoed(&s.setup_phase1(false, false).unwrap()));
     }
 
     #[test]

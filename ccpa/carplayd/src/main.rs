@@ -1741,6 +1741,9 @@ fn main() {
                 "ON-BOX DECODE — OCBM_FWD_ENC explicitly disabled (dev/legacy fallback)"
             }
         );
+        // The AirPlay video probe's switches (receiver::probe): /etc/ocbm/airplay_probe, read once, here,
+        // before anything serves. No file, nothing on and nothing logged.
+        let _ = receiver::probe::switches();
         start_input_listener(); // HID input ingest (task #20) — process-lifetime, before the accept loop
         start_host_present_watcher(); // wireless: keyframe-on-host-subscribe (fn doc)
         // Mic-uplink ingest seam — a DEDICATED port, separate from the :9110 HID seam so the working HID

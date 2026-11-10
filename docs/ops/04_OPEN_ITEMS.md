@@ -462,6 +462,16 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
   and `sessionManagement`. So the phone side is on. What iOS then wants from the head unit is still
   [I]; LIVI's `/info` keys, the `videoPlayback` echo and the Playback stream, behind a lever that is
   off by default, are the next things to try. Source: `docs/carplay/04_CAPABILITIES_AND_CONFIG.md` §7.
+  **The probe for that** is on branch `airplay-video-probe` (not on `main`; the Mac's 10 Nov brief),
+  `crates/vendor/receiver/src/probe.rs`. Its two switches are off unless `/etc/ocbm/airplay_probe`
+  names them, read when carplayd starts. `video` (route A) echoes `videoPlayback` when the phone
+  proposes it, adds LIVI's two `/info` keys (`featuresEx` = `features` as bytes, low byte first,
+  trailing zeros dropped, Base64: `gAtERGE=`; `bits` ORs in bits 0 and 49), sends
+  `setVideoPlaybackAllowed` (true, `idle`) once at RECORD (`noallow` leaves it out), and logs the
+  shape of every non-iAP DataStream message and of each request nothing handles. `receiver` (route C)
+  advertises "Carlink Video", an ordinary `_airplay._tcp` service with the Apple TV TXT record from
+  nto's and openairplay's public specifications, on port 7000; its listener logs each connection's
+  first requests and answers 501. Each line is tagged `[probe]` and gives keys, types and sizes only.
 
 - **`fileTransfer` is blocked-untestable — even the advertise step is byte-unsafe.** The
   `fileTransferInfo` dict's keys are unknown, as is which transport carries the chunk dict.

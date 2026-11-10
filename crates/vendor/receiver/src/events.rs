@@ -228,6 +228,9 @@ fn handle_inbound_event(pt: &[u8]) {
         // `disableBluetooth` entry in its type histogram) that this command DOES arrive — not a
         // guess.
         eprintln!("[events] disableBluetooth received (BT link may now be released; no action taken)");
+    } else if crate::probe::switches().video {
+        // The AirPlay video probe's route A (probe.rs): the shape of anything else the phone sends here.
+        crate::probe::line(format_args!("event channel: the phone sent {}", crate::probe::dict_shape(&d)));
     } else if events_log() {
         eprintln!("[events] ← iPhone event: type='{ty}' ({} B)", pt.len());
     }
