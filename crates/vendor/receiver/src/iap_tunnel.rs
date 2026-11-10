@@ -326,21 +326,24 @@ static LOCATION_HELD: AtomicU32 = AtomicU32::new(0);
 /// One NMEA sentence from the app (CH_INPUT `INPUT_LOCATION`) to the phone as `LocationInformation`
 /// (0xFFFB), when the phone's Start asked for it and its minimum interval has passed
 /// (`iap2_core::location::admit`). Anything else is held back and counted. Logged on the first and
-/// every 60th of each, so a 1 Hz feed doesn't flood the log. LIVI research item 4, off by default.
+/// every 60th of each, so a 1 Hz feed doesn't flood the log, and by the sentence's type and length only: the
+/// box log reaches the host and its exports, and a sentence is the car's position. LIVI research item 4, off by
+/// default.
 pub fn send_location(sentence: &str) -> bool {
-    use iap2_core::location::{admit, information_body, Admit};
+    use iap2_core::location::{admit, information_body, sentence_name, Admit};
     let verdict = admit(sentence, now_ms());
+    let what = sentence_name(sentence).unwrap_or("malformed");
     if verdict != Admit::Send {
         let n = LOCATION_HELD.fetch_add(1, Ordering::Relaxed) + 1;
         if n == 1 || n.is_multiple_of(60) {
-            log(&format!("location: held back {n} sentence(s), this one {verdict:?}: {}", sentence.trim_end()));
+            log(&format!("location: held back {n} sentence(s), this one {verdict:?}: {what}, {} B", sentence.len()));
         }
         return false;
     }
     let (ok, len) = send_message(spec::MSG_LOCATION_INFORMATION, &information_body(sentence));
     let n = LOCATION_SENT.fetch_add(1, Ordering::Relaxed) + 1;
     if !ok || n == 1 || n.is_multiple_of(60) {
-        log(&format!("TX 0xFFFB LocationInformation #{n} ({len} B, sent={ok}): {}", sentence.trim_end()));
+        log(&format!("TX 0xFFFB LocationInformation #{n} ({len} B, sent={ok}): {what}"));
     }
     ok
 }
