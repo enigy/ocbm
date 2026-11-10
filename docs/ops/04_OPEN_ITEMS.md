@@ -256,17 +256,22 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
      (`tools/session_supervisor.sh`, `escalate`) and the gadget un-CONFIGURED edge, not at host timing.
   4. **Is the A/V session key re-issued to a same-nonce re-SUBSCRIBE?** Answered for the reattach,
      2026-11-10: **no, until the fix below.** On the bridge self-update bench (AAOS emulator, dev
-     adapter on 1.0.5) the head unit's bridge app restarted for its update, Carlink's link came back
+     adapter on `5ffd015`) the head unit's bridge app restarted for its update, Carlink's link came back
      in about a second with the same nonce inside `HEARTBEAT_GRACE`, and the box confirmed presence
      over the live session. carplayd's seams to ocbmd outlived the link, so no `SEAM_KEY` was sent
      again: audio played, video stayed undecryptable, and Carlink showed no phone, on both updates,
-     until a Carlink restart (new nonce, so a replacement and a re-arm). **Fix (main, not yet
-     benched):** a HELLO while a session is live that is not a replacement latches
+     until a Carlink restart (new nonce, so a replacement and a re-arm). **Fix (`76d0c71`),
+     device-proven 2026-11-10:** a HELLO while a session is live that is not a replacement latches
      `host_reattached`; its SUBSCRIBE closes the keyed A/V producers after the dispatch pass
      (`rekey_av_seams`: main and cluster video, media and voice audio; metadata stays), and carplayd
      reconnects each with a fresh `SEAM_KEY` (audio also `SEAM_FORMAT`) and a ForceKeyFrame for the
-     video ones. A config re-push (SUBSCRIBE with no HELLO) keeps its keys. Bench: a bridge update,
-     or any USB blip, under a live session should get video back within a second or two. The other
+     video ones. A config re-push (SUBSCRIBE with no HELLO) keeps its keys. Bench (the Mac: dev
+     adapter on `76d0c71`, AAOS emulator, iPhone on iOS 27.2): the bench bridges reinstalled under a
+     live session, 1.0.11 → 1.0.10 → 1.0.11. Both times the audio key and first audio frame came
+     about 2.7 s after the bridge died, the video key about 5 s and the first frame about 5.5 s
+     (Carlink holds the first key up to 3 s until the box's state at SUBSCRIBE proves live), and
+     Settings showed the phone. ocbmd logged `reattached=true` at HELLO and SUBSCRIBE, then
+     `closed 3` and `closed 2 keyed A/V seam(s)`. The other
      same-nonce path, the heartbeat re-SUBSCRIBE after `SEV_HOST_GONE` (`OcbmClient.startHeartbeat`),
      follows a presence drop and so a re-arm; it is still unbenched.
 

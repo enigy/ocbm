@@ -3055,11 +3055,6 @@ impl Daemon {
         self.mic_uplink_on = false;
     }
 
-    /// Forget the mic seam socket (`ensure_mic_seam` reconnects on the next tick) and, if the host was
-    /// gated ON through this seam, gate it OFF now. The seam's owner (carplayd, per session)
-    /// sends `uplink off` and closes; if our next PCM
-    /// write to the closing peer fails first, that line is never drained — so the drop itself is the
-    /// OFF edge. The box does not interpret the audio; it only closes the gate it opened.
     /// Close the keyed A/V producers (main and cluster video, media and voice audio) so carplayd
     /// reconnects each one. A reconnecting seam writer re-sends its `SEAM_KEY` (audio its `SEAM_FORMAT`
     /// too), and a video one asks the phone for a keyframe (receiver `session.rs`); the first frame of
@@ -3077,6 +3072,11 @@ impl Daemon {
         closed
     }
 
+    /// Forget the mic seam socket (`ensure_mic_seam` reconnects on the next tick) and, if the host was
+    /// gated ON through this seam, gate it OFF now. The seam's owner (carplayd, per session)
+    /// sends `uplink off` and closes; if our next PCM
+    /// write to the closing peer fails first, that line is never drained — so the drop itself is the
+    /// OFF edge. The box does not interpret the audio; it only closes the gate it opened.
     fn drop_mic_seam(&mut self, why: &str) {
         self.mic_sock = None;
         self.mic_rx.clear();

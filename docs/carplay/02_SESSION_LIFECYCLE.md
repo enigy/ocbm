@@ -925,8 +925,9 @@ not a replacement (the same nonce: a USB blip, or the head unit's bridge app res
 update) is a **reattach**: the session goes on, but the host's per-stream keys went with its old link
 and carplayd's seams to ocbmd outlived it. So the SUBSCRIBE after it closes the keyed A/V seams
 (`rekey_av_seams`), and carplayd reconnects each with a fresh `SEAM_KEY` and, for video, a
-ForceKeyFrame. Before that (benched 2026-11-10) such a reattach came back with audio but no decryptable
-video until the app restarted; see docs/ops/04_OPEN_ITEMS.md, item 4.
+ForceKeyFrame (device-proven 2026-11-10: video back about 5.5 s after the bridge app died). Before that,
+such a reattach came back with audio but no decryptable video until the app restarted; see
+docs/ops/04_OPEN_ITEMS.md, item 4.
 
 **2. Disk-backed PeerStore.** `MemPeers` → `DiskPeers`: an in-memory map persisted as
 `[u8 id_len][id][32-byte LTPK]` records, atomic `.tmp`+rename, path from `PEERSTORE_PATH` (default
