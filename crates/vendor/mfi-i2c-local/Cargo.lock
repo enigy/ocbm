@@ -13,9 +13,4 @@ name = "mfi-i2c-local"
 version = "0.0.0"
 dependencies = [
  "libc",
- "mfi-wire",
 ]
-
-[[package]]
-name = "mfi-wire"
-version = "0.0.0"
