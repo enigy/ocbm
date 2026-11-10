@@ -287,12 +287,15 @@ if [ "$dispatcher" = 1 ] && [ -e "$MODE" ]; then
   # OCBM_RESTORE on the same stick goes first (the truck adapter, 2 Nov). The stick handler runs this
   # image the moment the stick goes into a running trial, before the dispatcher's restore_watch sees
   # OCBM_RESTORE; refusing the installed OCBM then parked the image as .refused, and it had to be
-  # renamed back by hand for the install after the restore. Stand aside, image left in place.
+  # renamed back by hand for the install after the restore. Stand aside, image left in place. After the
+  # restore, the stock start ran the waiting image by itself 5 s after power-on (the dev adapter, 10 Nov),
+  # so a replug is only the fallback.
   if [ "$ROUTE" = stick ] && [ -e "$STICK/OCBM_RESTORE" ]; then
     say "OCBM_RESTORE is on the stick: the adapter goes back to stock first; this image waits"
     result "WAITING FOR THE RESTORE" \
       "OCBM_RESTORE is on this stick, so the adapter goes back to stock first. Nothing was installed." "" \
-      "When the adapter has restarted, unplug it and plug it back in with this stick in: the install runs then."
+      "When the adapter has restarted on stock, the install usually starts by itself within seconds." \
+      "If it hasn't started within a minute, unplug the adapter and plug it back in with this stick in."
     exit 1
   fi
   # An update package on the same stick: OCBM takes it itself at its start (ocbm_dispatch.sh, stick_update),

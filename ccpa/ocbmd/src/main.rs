@@ -229,6 +229,16 @@ struct Daemon {
     /// present — i.e. the previous host died without CT_STOP and this is its replacement. Consumed by
     /// the next CT_SUBSCRIBE, which owes the presence re-arm that host's CT_STOP never sent.
     host_replaced: bool,
+    /// Set when a HELLO arrives while a session is live and it is NOT a replacement: the same host's
+    /// link was rebuilt (a USB blip; on a head unit, the bridge app restarting for its own update), and
+    /// the host's A/V reassembly and per-stream keys went with the old link. carplayd's seams to this
+    /// daemon outlive that, so nothing would hand the keys again. Consumed by the next CT_SUBSCRIBE,
+    /// which re-keys the A/V seams when presence never dropped (`rekey_av`). Device-proven need
+    /// (10 Nov, bridge-update bench): audio came back, video stayed undecryptable until a Carlink restart.
+    host_reattached: bool,
+    /// Close the keyed A/V producers after this dispatch pass ([`Daemon::rekey_av_seams`]). Deferred
+    /// because `handle` runs inside the pass, whose `Kind::AvConn(idx)` entries index `av_conns`.
+    rekey_av: bool,
     /// When to restore `/tmp/host_present` to 1 after a silent re-arm. See [`REARM_HOLD`].
     rearm_deadline: Option<std::time::Instant>,
     /// When `/tmp/host_present` was last written 0 because presence actually DROPPED (`CT_STOP` or
@@ -2020,6 +2030,10 @@ impl Daemon {
         // reattach that deliberately withholds the radio-wake edge), so a stale `true` could survive
         // to force an unwanted re-arm on a much later, unrelated SUBSCRIBE.
         self.host_replaced = false;
+        // Likewise the reattach latch, and a re-key not yet applied: the next session's carplayd hands
+        // its own keys when its seams first connect.
+        self.host_reattached = false;
+        self.rekey_av = false;
         // Same reasoning, one deadline over: a pending re-ARM dip must not outlive the session that
         // started it. `presence_tick` restores HOST_PRESENT_FLAG when this elapses, so leaving it set
         // through a teardown would reassert presence for a host we have just declared GONE -- and the
@@ -3041,6 +3055,23 @@ impl Daemon {
         self.mic_uplink_on = false;
     }
 
+    /// Close the keyed A/V producers (main and cluster video, media and voice audio) so carplayd
+    /// reconnects each one. A reconnecting seam writer re-sends its `SEAM_KEY` (audio its `SEAM_FORMAT`
+    /// too), and a video one asks the phone for a keyframe (receiver `session.rs`); the first frame of
+    /// each new connection carries `F_NEW_SOURCE`. The metadata seam carries no key and stays. Returns
+    /// how many were closed. Run between dispatch passes only (see `rekey_av`).
+    fn rekey_av_seams(&mut self) -> usize {
+        const KEYED: [u16; 4] = [p::CH_VIDEO, p::CH_ALT_VIDEO, p::CH_MEDIA_AUDIO, p::CH_ALT_AUDIO];
+        let before = self.av_conns.len();
+        self.av_conns.retain(|(_, ch, _)| !KEYED.contains(ch));
+        let closed = before - self.av_conns.len();
+        eprintln!(
+            "[ocbmd] session: the same host re-attached over a live session — closed {closed} keyed A/V seam(s); \
+             carplayd reconnects them with fresh keys and a keyframe"
+        );
+        closed
+    }
+
     /// Forget the mic seam socket (`ensure_mic_seam` reconnects on the next tick) and, if the host was
     /// gated ON through this seam, gate it OFF now. The seam's owner (carplayd, per session)
     /// sends `uplink off` and closes; if our next PCM
@@ -3493,6 +3524,9 @@ impl Daemon {
                             self.host_instance = Some(inst);
                         }
                     }
+                    // Not a replacement, but a HELLO all the same while a session is live: the same host
+                    // rebuilt its link and lost its A/V keys with it. The SUBSCRIBE that follows re-keys.
+                    self.host_reattached = self.present && self.subscribed && !self.host_replaced;
                     // Optional host label after the nonce. Additive and length-tolerant in both
                     // directions: an older host sends nothing and is unchanged, and an older box
                     // ignores the extra bytes exactly as this one used to.
@@ -3549,8 +3583,8 @@ impl Daemon {
                     // the same nonce and label — the ordinary case, and the one a "why is there no
                     // HELLO in the log" investigation starts from — left no trace at all.
                     eprintln!(
-                        "[ocbmd] HELLO nonce={inst:#010x} caps={caps:#x} label={label:?} replaced={}",
-                        self.host_replaced
+                        "[ocbmd] HELLO nonce={inst:#010x} caps={caps:#x} label={label:?} replaced={} reattached={}",
+                        self.host_replaced, self.host_reattached
                     );
                     let mut a = [0u8; 7];
                     a[0] = p::CT_HELLO_ACK;
@@ -3625,6 +3659,7 @@ impl Daemon {
                     // one. A host that closed cleanly needs nothing here: CT_STOP already went idle,
                     // so `set_present(true)` below IS the edge.
                     let replaced = std::mem::take(&mut self.host_replaced);
+                    let reattached = std::mem::take(&mut self.host_reattached);
                     // Diagnostic only (there is no warm-reuse path left to gate on it): says whether
                     // this SUBSCRIBE re-pushed the same YAML the previous one did.
                     let cfg_changed = self.cfg.as_slice() != &pl[1..];
@@ -3697,7 +3732,7 @@ impl Daemon {
                     // which does not depend on the box remembering anything across a session boundary.
                     let _ = std::fs::remove_file(RADIO_OFF_FLAG);
                     eprintln!(
-                        "[ocbmd] session: SUBSCRIBE ({} B config, cfg_changed={cfg_changed} replaced={replaced})",
+                        "[ocbmd] session: SUBSCRIBE ({} B config, cfg_changed={cfg_changed} replaced={replaced} reattached={reattached})",
                         self.cfg.len()
                     );
                     if replaced {
@@ -3715,6 +3750,11 @@ impl Daemon {
                         // Presence never dropped — a re-SUBSCRIBE by the SAME host (config re-push, or a
                         // reconnect inside the heartbeat grace). Confirm presence explicitly: set_present's
                         // edge guard would otherwise swallow the event.
+                        //
+                        // After a HELLO it is the reconnect, and the session goes on under a host whose
+                        // keys are gone: hand them again (`rekey_av`). A config re-push has no HELLO and
+                        // keeps its keys, so it is left alone.
+                        self.rekey_av |= reattached;
                         self.send(
                             p::CH_CTRL,
                             p::F_SOM | p::F_EOM,
@@ -4396,6 +4436,8 @@ fn main() {
         last_phone_ident_check: None,
         last_forget_check: None,
         host_replaced: false,
+        host_reattached: false,
+        rekey_av: false,
         cfg: Vec::new(),
         input_sock: None,
         input_fwd: 0,
@@ -4706,6 +4748,11 @@ fn main() {
                 d.av_conns.remove(idx);
             }
         }
+        // A same-host reattach asked for fresh keys (`rekey_av`): close the live producers now that the
+        // pass's indices are spent, and before this wake's accepts, which are fresh producers already.
+        if std::mem::take(&mut d.rekey_av) {
+            d.rekey_av_seams();
+        }
         // Now apply the deferred accepts (indices are no longer needed). One producer per channel: drop
         // any stale prior connection on the same channel (a re-SETUP reconnects) so av_conns can't grow
         // with orphaned local sockets.
@@ -4886,6 +4933,8 @@ mod tests {
             last_phone_ident_check: None,
             last_forget_check: None,
             host_replaced: false,
+            host_reattached: false,
+            rekey_av: false,
             cfg: Vec::new(),
             input_sock: None,
             input_fwd: 0,
@@ -5817,6 +5866,58 @@ mod tests {
     }
 
     #[test]
+    fn a_same_nonce_hello_on_a_live_session_rekeys_at_its_subscribe() {
+        let _flag = presence_flag_lock(); // CT_SUBSCRIBE writes the presence flag
+        // The 10 Nov bridge-update bench: the bridge app restarted, Carlink's link came back about a
+        // second later with the same nonce, and the session went on with no video key for that link.
+        let mut d = td();
+        d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &hello(0xAAAA_AAAA, b""));
+        d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &[p::CT_SUBSCRIBE, b'x']);
+        assert!(d.present && d.subscribed);
+        assert!(!d.rekey_av, "a first attach has nothing to re-key");
+
+        d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &[p::CT_SUBSCRIBE, b'x']);
+        assert!(!d.rekey_av, "a config re-push without a HELLO keeps its keys");
+
+        d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &hello(0xAAAA_AAAA, b""));
+        assert!(d.host_reattached && !d.host_replaced);
+        d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &[p::CT_SUBSCRIBE, b'x']);
+        assert!(d.rekey_av, "the reattached host's SUBSCRIBE must ask for fresh keys");
+        assert!(!d.host_reattached, "the latch is spent");
+    }
+
+    #[test]
+    fn a_replacement_rearms_instead_of_rekeying() {
+        let _flag = presence_flag_lock(); // CT_SUBSCRIBE writes the presence flag
+        let mut d = td();
+        d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &hello(0xAAAA_AAAA, b""));
+        d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &[p::CT_SUBSCRIBE, b'x']);
+        d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &hello(0xBBBB_BBBB, b""));
+        assert!(d.host_replaced && !d.host_reattached, "a new nonce is a replacement, not a reattach");
+        d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &[p::CT_SUBSCRIBE, b'x']);
+        assert!(!d.rekey_av, "the re-arm brings a new carplayd, which keys its own seams");
+    }
+
+    #[test]
+    fn rekey_closes_the_keyed_av_producers_and_keeps_metadata() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("test seam port");
+        let mut d = td();
+        let mut producers = Vec::new();
+        for ch in [p::CH_VIDEO, p::CH_ALT_VIDEO, p::CH_MEDIA_AUDIO, p::CH_ALT_AUDIO, p::CH_METADATA] {
+            producers.push((std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap(), ch));
+            d.av_conns.push((l.accept().unwrap().0, ch, false));
+        }
+        assert_eq!(d.rekey_av_seams(), 4);
+        assert_eq!(d.av_conns.iter().map(|(_, ch, _)| *ch).collect::<Vec<_>>(), [p::CH_METADATA]);
+        // Each closed producer sees its seam end, which is what makes carplayd reconnect and re-key.
+        for (mut s, ch) in producers {
+            s.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+            let closed = matches!(std::io::Read::read(&mut s, &mut [0u8; 1]), Ok(0));
+            assert_eq!(closed, ch != p::CH_METADATA, "channel {ch:#06x}");
+        }
+    }
+
+    #[test]
     fn hello_clears_the_console_queue_too_so_the_ack_is_not_spliced_mid_frame() {
         let _flag = presence_flag_lock(); // shares HOST_PRESENT_FLAG with every other presence test
         // out_console is the one queue that can be resting MID-FRAME (a `dmesg -w` flood against a
@@ -5906,6 +6007,18 @@ mod tests {
             d.host_instance = Some(1);
             d.go_idle(notify);
             assert!(!d.host_replaced, "notify={notify}");
+        }
+    }
+
+    #[test]
+    fn go_idle_clears_the_reattach_latch_and_a_pending_rekey() {
+        let _flag = presence_flag_lock(); // shares HOST_PRESENT_FLAG with every other presence test
+        for notify in [true, false] {
+            let mut d = td();
+            d.host_reattached = true;
+            d.rekey_av = true;
+            d.go_idle(notify);
+            assert!(!d.host_reattached && !d.rekey_av, "notify={notify}");
         }
     }
 

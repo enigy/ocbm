@@ -174,8 +174,10 @@ sees `OCBM_RESTORE`, and the installer refused the installed OCBM and parked the
 The revert then went ahead, but its restart shared the stick (`1d6b:a4a5`) instead of running the
 image, so the install needed the image renamed back and a cold start. Installers built since the
 commit after `9b2331d` stand aside while `OCBM_RESTORE` is on the stick ("WAITING FOR THE RESTORE")
-and leave the image in place: plug the stick in, let the adapter go back to stock and restart, then
-unplug the adapter and plug it back in with the stick in. With an older image (going back to
+and leave the image in place: plug the stick in and let the adapter go back to stock and restart. The
+stock start then usually runs the waiting image by itself (5 s after power-on on the dev adapter,
+2026-11-10, installed in trial 26 s later); if it hasn't within a minute, unplug the adapter and plug
+it back in with the stick in. With an older image (going back to
 `052fd04`, say), put `OCBM_RESTORE` on the stick alone first; after the revert, copy the image on and
 cold-start the adapter.
 

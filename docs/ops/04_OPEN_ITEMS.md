@@ -254,12 +254,26 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
      host returning "before teardown completes" is only the (a) shape — which still kept the phone.
      If `PHONE_ABSENT` recurs, look at the supervisor's L1 `phone_reset` rung
      (`tools/session_supervisor.sh`, `escalate`) and the gadget un-CONFIGURED edge, not at host timing.
-  4. **Is the A/V session key re-issued to a same-nonce re-SUBSCRIBE?** Still open. Today's resets
-     rotate the nonce, so they cannot answer it; the same-nonce paths are the heartbeat
-     re-SUBSCRIBE after `SEV_HOST_GONE` (`OcbmClient.startHeartbeat`) and a USB-blip reattach.
-     Test: with carplayd alive, starve the heartbeat past `HEARTBEAT_GRACE` (10 s), let the client
-     re-SUBSCRIBE, and check whether a fresh seam key arrives (`onSessionKeyed`, the lanes'
-     `keys=` counter) before any A/V frame.
+  4. **Is the A/V session key re-issued to a same-nonce re-SUBSCRIBE?** Answered for the reattach,
+     2026-11-10: **no, until the fix below.** On the bridge self-update bench (AAOS emulator, dev
+     adapter on `5ffd015`) the head unit's bridge app restarted for its update, Carlink's link came back
+     in about a second with the same nonce inside `HEARTBEAT_GRACE`, and the box confirmed presence
+     over the live session. carplayd's seams to ocbmd outlived the link, so no `SEAM_KEY` was sent
+     again: audio played, video stayed undecryptable, and Carlink showed no phone, on both updates,
+     until a Carlink restart (new nonce, so a replacement and a re-arm). **Fix (`76d0c71`),
+     device-proven 2026-11-10:** a HELLO while a session is live that is not a replacement latches
+     `host_reattached`; its SUBSCRIBE closes the keyed A/V producers after the dispatch pass
+     (`rekey_av_seams`: main and cluster video, media and voice audio; metadata stays), and carplayd
+     reconnects each with a fresh `SEAM_KEY` (audio also `SEAM_FORMAT`) and a ForceKeyFrame for the
+     video ones. A config re-push (SUBSCRIBE with no HELLO) keeps its keys. Bench (the Mac: dev
+     adapter on `76d0c71`, AAOS emulator, iPhone on iOS 27.2): the bench bridges reinstalled under a
+     live session, 1.0.11 → 1.0.10 → 1.0.11. Both times the audio key and first audio frame came
+     about 2.7 s after the bridge died, the video key about 5 s and the first frame about 5.5 s
+     (Carlink holds the first key up to 3 s until the box's state at SUBSCRIBE proves live), and
+     Settings showed the phone. ocbmd logged `reattached=true` at HELLO and SUBSCRIBE, then
+     `closed 3` and `closed 2 keyed A/V seam(s)`. The other
+     same-nonce path, the heartbeat re-SUBSCRIBE after `SEV_HOST_GONE` (`OcbmClient.startHeartbeat`),
+     follows a presence drop and so a re-arm; it is still unbenched.
 
 - **No inbound `stopSession` handler.** The box declares a five-value `stopSessionReasons`
   vocabulary and then ignores the command; `disconnectReason` plumbing to the supervisor follows
@@ -415,12 +429,25 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
   Source: `docs/carplay/04_CAPABILITIES_AND_CONFIG.md` §4 Mechanism A, `docs/host/00_MACOS_HOST_APP.md` Tier 4. Verified open 2026-08-16:
   `grep -rn "vehicleStateProtocol" crates ccpa --include="*.rs"` → no hits in box code.
 
-- **`videoPlayback` is inert and blocked on an Apple-approval-only entitlement.** No lever, no
-  `/info` advertisement, no `lunaConfig`/`videoPresetSizes`, no echo. The non-code action is
-  requesting `com.apple.developer.carplay-video`; the `/info` wire shape is also uncaptured.
-  Source: `docs/carplay/04_CAPABILITIES_AND_CONFIG.md` §7. Verified open 2026-08-16:
-  `grep -rn "videoPlayback\|lunaConfig\|videoPresetSizes" --include="*.rs" crates ccpa` → only
-  `vehicle_config.rs` test fixtures.
+- **`videoPlayback` (video while parked) is unbuilt, and the phone side is on.**
+  No lever, no `/info` advertisement, no `lunaConfig`/`videoPresetSizes`, no echo. Corrected
+  2026-11-10 from the Mac's lookups (handoff doc, "Mac findings, 10 Nov", section 5): it is NOT
+  blocked on an entitlement for the box. `com.apple.developer.carplay-video` is what an iPhone app
+  needs to offer video in CarPlay (`CRCarPlayAppDeclaration.supportsVideo`) [E, iOS CarKit]. iOS turns
+  CarPlay feature bit 6 into the SETUP word `"videoPlayback"` [E, iOS CarKit], and CarPlaySDK 509.11
+  doesn't check that word [E]. The wire shape comes from LIVI, an independent receiver that plays it:
+  `/info` `videoPlaybackInfo` {`videoPlaybackAllowed`, `featuresEx`} and `playbackCapabilities`
+  (macOS's AirPlayReceiver has the last two), `setVideoPlaybackAllowed`, a `changeModes` borrow with
+  `borrowID` `VideoPlayback` (the Simulator's string too), and the phone's play-queue verbs on the
+  Playback DataStream, client type `A6B27562-B43A-4F2D-B75F-82391E250194` (iOS:
+  `kFigEndpointRemoteControlSessionClientTypeUUIDKey_MatchPoint`) [E for the UUID's name and the
+  borrow ID; I for the CarPlay keys and for the stream on CarPlay, seen on macOS's receiver].
+  **Benched 2026-11-10** (the Mac, dev adapter on `b84a58b`): at SETUP phase 1 Scott's iPhone on iOS
+  27.2 proposes 14 words, CarKit's list in its order, with `"videoPlayback"` among them (no
+  `fileTransfer` or `uiSync`: no gauge cluster), and the box echoes `hevc`, `viewAreas`, `iAPChannel`
+  and `sessionManagement`. So the phone side is on. What iOS then wants from the head unit is still
+  [I]; LIVI's `/info` keys, the `videoPlayback` echo and the Playback stream, behind a lever that is
+  off by default, are the next things to try. Source: `docs/carplay/04_CAPABILITIES_AND_CONFIG.md` §7.
 
 - **`fileTransfer` is blocked-untestable — even the advertise step is byte-unsafe.** The
   `fileTransferInfo` dict's keys are unknown, as is which transport carries the chunk dict.
