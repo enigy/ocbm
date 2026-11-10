@@ -532,8 +532,11 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
   Source: `docs/carplay/01_OCBM_PROTOCOL.md` §"What is genuinely not supported (open item)". Verified open 2026-08-16:
   `grep -n "CH_VIDEO\|CH_ALT_VIDEO" crates/ocbm-proto/src/lib.rs` → exactly two video channels.
 
-- **Accessory-side NMEA/GPS is parse-only.** The box decodes the phone's `StartLocationInformation`
-  selection but nothing ever sends `LocationInformation` (0xFFFB).
+- **Accessory-side NMEA/GPS: built, off by default, unproven (2026-11-10, LIVI item 4).** With the app's
+  `location:` pushed, the AirPlayTunnel Identify declares it and `iap_tunnel::send_location` sends
+  `LocationInformation` (0xFFFB) from the app's CH_INPUT `INPUT_LOCATION` sentences after the phone's Start
+  (`crates/vendor/iap2-core/src/location.rs`). Open: whether iOS takes it on the tunnel Identify; PASCD/GPGSV/GPHDT;
+  the wired arm. Until 2026-11-10 it was parse-only:
   Source: `docs/host/00_MACOS_HOST_APP.md` Tier 4. Verified open 2026-08-16:
   `grep -rn "0xFFFB\|MSG_LOCATION_INFORMATION" --include="*.rs" crates ccpa` → the spec table and
   `crates/vendor/metadata/src/location.rs` (a parser); no emitter.

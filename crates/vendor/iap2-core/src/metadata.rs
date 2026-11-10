@@ -918,6 +918,10 @@ pub fn dispatch(msg_id: u16, body: &[u8]) -> bool {
         MSG_MEDIA_LIBRARY_INFORMATION | MSG_MEDIA_LIBRARY_UPDATE => {
             emit_json(&media_library(msg_id, body))
         }
+        // The phone asking for the car's position, and done with it (`location.rs`): declared only on
+        // the AirPlayTunnel arm, and only when the app pushed `location:`.
+        MSG_START_LOCATION_INFORMATION => one(crate::location::on_start(body)),
+        MSG_STOP_LOCATION_INFORMATION => one(crate::location::on_stop()),
         _ => return false,
     }
     true

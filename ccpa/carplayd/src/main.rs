@@ -776,7 +776,11 @@ fn load_device_config() -> DeviceConfig {
                 // two parsers can fail independently). `arm_pushed_policy` is first-arm-wins, and
                 // `iap_tunnel::start` (which builds the tunnel Identify) runs at session start —
                 // strictly after this — so the declaration and the subscribes share one snapshot.
-                iap2_core::config::Iap2Config::from_slice(&bytes).arm_metadata_policy();
+                let iap2_cfg = iap2_core::config::Iap2Config::from_slice(&bytes);
+                iap2_cfg.arm_metadata_policy();
+                // The car's GPS for the phone (LIVI item 4): the same first-arm-wins snapshot, armed before
+                // `iap_tunnel::start` builds the tunnel Identify. Nothing pushed = nothing declared.
+                iap2_cfg.arm_location();
                 levers::set_hevc(vc.accessory_config.enables_hevc);
                 // mainBuffered from the pushed config alone (docs/carplay/04_CAPABILITIES_AND_CONFIG.md B4) — deliberately NO env OR:
                 // a stale bench flag must never override an app that said `false` (media-silence
@@ -1017,7 +1021,7 @@ fn read_input(mut stream: TcpStream, gen: u32) {
             break;
         }
         let len = u16::from_le_bytes(hdr) as usize;
-        if len == 0 || len > 64 {
+        if len == 0 || len > MAX_INPUT_FRAME {
             // implausible sub-frame length → treat as desync and drop the connection
             eprintln!("[input] implausible sub-frame length {len} — desync, dropping the ingest connection");
             break;
@@ -1036,6 +1040,10 @@ fn read_input(mut stream: TcpStream, gen: u32) {
         handle_input_frame(&pl);
     }
 }
+
+/// The longest CH_INPUT sub-frame: an `INPUT_LOCATION`, its type byte and one NMEA sentence
+/// (`iap2_core::location::MAX_SENTENCE`). Every HID frame is far shorter; past this is desync.
+const MAX_INPUT_FRAME: usize = 1 + iap2_core::location::MAX_SENTENCE;
 
 /// Turn one CH_INPUT sub-frame into a HID report to the iPhone. Single-touch MVP (uid 1): DOWN/MOVE =
 /// tip down, UP = tip up; normalized 0..=65535 coords scaled to the advertised resolution (`DISPLAY_WH`).
@@ -1065,6 +1073,17 @@ fn handle_input_frame(pl: &[u8]) {
                 events::CLUSTER_STREAM_ID,
                 events::screen_focused()
             );
+        }
+        return;
+    }
+    // The car's own GPS (LIVI item 4): one NMEA sentence from the app, forwarded on the iAP2 tunnel only
+    // when the phone asked for that type (`iap_tunnel::send_location`). Not a HID report.
+    if pl.first() == Some(&ocbm_proto::INPUT_LOCATION) {
+        match std::str::from_utf8(&pl[1..]) {
+            Ok(sentence) => {
+                receiver::iap_tunnel::send_location(sentence);
+            }
+            Err(_) => eprintln!("[input] location sentence isn't UTF-8 ({} B) — dropped", pl.len() - 1),
         }
         return;
     }

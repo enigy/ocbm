@@ -221,6 +221,7 @@ pub fn start() {
     log(&format!(
         "TX detect+SYN over AirPlay tunnel (detect_sent={sent_detect} syn_sent={sent_syn}) — starting fresh iAP2 session"
     ));
+    iap2_core::location::reset(); // a fresh iAP2 session: the phone must ask for location again
     *guard = Some(Session {
         link,
         state: State::Init,
@@ -289,6 +290,7 @@ pub fn tick() {
 /// Reset on session teardown so a future reconnect starts fresh (called from `events::clear()`).
 pub fn reset() {
     *crate::plock(&SESSION) = None;
+    iap2_core::location::reset();
     HANDSHAKE_REBUILDS.store(0, Ordering::Relaxed); // re-arm the budget retry cap for the next session
 }
 
@@ -303,6 +305,12 @@ pub fn reset() {
 /// `events::send_wireless_metadata_subscriptions`, so the lock is held only briefly and never across
 /// the inter-subscribe sleep.
 pub(crate) fn send_subscribe(id: u16, body: &[u8]) -> (bool, usize) {
+    send_message(id, body)
+}
+
+/// Build and send one control-session message on the tunnel link, just in time like
+/// [`send_subscribe`]. `(false, 0)` when no tunnel session is up.
+fn send_message(id: u16, body: &[u8]) -> (bool, usize) {
     let mut guard = crate::plock(&SESSION);
     let Some(sess) = guard.as_mut() else {
         return (false, 0); // session torn down between IdentifyAccept and this send
@@ -310,6 +318,31 @@ pub(crate) fn send_subscribe(id: u16, body: &[u8]) -> (bool, usize) {
     let frame = sess.link.build_msg(1, id, body);
     let n = frame.len();
     (crate::events::send_iap_message(&frame), n)
+}
+
+static LOCATION_SENT: AtomicU32 = AtomicU32::new(0);
+static LOCATION_HELD: AtomicU32 = AtomicU32::new(0);
+
+/// One NMEA sentence from the app (CH_INPUT `INPUT_LOCATION`) to the phone as `LocationInformation`
+/// (0xFFFB), when the phone's Start asked for it and its minimum interval has passed
+/// (`iap2_core::location::admit`). Anything else is held back and counted. Logged on the first and
+/// every 60th of each, so a 1 Hz feed doesn't flood the log. LIVI research item 4, off by default.
+pub fn send_location(sentence: &str) -> bool {
+    use iap2_core::location::{admit, information_body, Admit};
+    let verdict = admit(sentence, now_ms());
+    if verdict != Admit::Send {
+        let n = LOCATION_HELD.fetch_add(1, Ordering::Relaxed) + 1;
+        if n == 1 || n.is_multiple_of(60) {
+            log(&format!("location: held back {n} sentence(s), this one {verdict:?}: {}", sentence.trim_end()));
+        }
+        return false;
+    }
+    let (ok, len) = send_message(spec::MSG_LOCATION_INFORMATION, &information_body(sentence));
+    let n = LOCATION_SENT.fetch_add(1, Ordering::Relaxed) + 1;
+    if !ok || n == 1 || n.is_multiple_of(60) {
+        log(&format!("TX 0xFFFB LocationInformation #{n} ({len} B, sent={ok}): {}", sentence.trim_end()));
+    }
+    ok
 }
 
 /// Feed one inbound tunnel read through the link/state machine, draining EVERY link packet coalesced

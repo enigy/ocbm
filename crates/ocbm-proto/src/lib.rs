@@ -417,6 +417,12 @@ pub const INPUT_NAV: u8 = 0x05; // [INPUT_NAV][nav u8] -> box taps the D-Pad HID
 pub const INPUT_TELEPHONY: u8 = 0x08; // [INPUT_TELEPHONY][buttonIndex u8] -> box sends the 1-byte HID
                                       // Telephony report (index) then a release (0). 1=Answer(HookSwitch)
                                       // 2=Flash 3=End(Drop) 4=Mute 5..14=DTMF 0..9 15=* 16=# 17=Delete.
+pub const INPUT_LOCATION: u8 = 0x09; // [INPUT_LOCATION][one NMEA-0183 sentence, ASCII, `$` to the checksum, no CR LF]
+                                     // -> the car's own GPS for the phone (LIVI research item 4). carplayd forwards it as
+                                     // iAP2 LocationInformation (0xFFFB) on the wireless tunnel only after the phone's
+                                     // StartLocationInformation selected that type, no faster than its minimum interval;
+                                     // otherwise it is dropped. Declared only when the app pushed `location: [...]`, and
+                                     // the box tells the app when to start and stop with META_JSON {"kind":"location"}.
 pub const INPUT_KNOB: u8 = 0x07; // [INPUT_KNOB][flags u8][nudge_x i8][nudge_y i8][rotation i8] -> box sends
                                  // one report on the Knob HID (uid 4): flags bit0 Select/bit1 Home/bit2 Back,
                                  // signed X/Y nudge (±127 = a 4-way arrow), signed relative rotation (±1/detent).

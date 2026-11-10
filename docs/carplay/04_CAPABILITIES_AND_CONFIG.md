@@ -237,6 +237,14 @@ construction.
   `displayPlugins` (car maker themes). Both default off, so the OFF `/info` is byte-identical. Neither is
   proven on a device here; the comparison points are `CarPlaySDK` 509.11 (§03) and LIVI (f-io/LIVI, an
   independent receiver advertising 950.7.1 with this panel shape). Bench them on the dev adapter only.
+- **Applied, BENCH lever (2026-11-10, LIVI item 4):** top-level `location:`, the NMEA sentences the app builds
+  from the car's GPS (`location: [GPGGA, GPRMC]`, or one string of names). Read on the iAP2 side
+  (`iap2_core::config::Iap2Config::location_names`, so a mistyped value reads as none instead of failing that
+  slice) and armed first-arm-wins per process beside the metadata tier (`location::arm`, carplayd
+  `load_device_config`). It declares location on the AirPlayTunnel Identify ONLY: `0xFFFB` in param 6,
+  `0xFFFA`/`0xFFFC` in param 7, param 22 with those sentences; a reject naming 6, 7 or 22 retries without it.
+  Sentences ride CH_INPUT `INPUT_LOCATION`; docs/carplay/05_METADATA_AND_CONTROLS.md §2.1 has the flow. Absent =
+  nothing declared, byte-identical. Not proven on a device.
 - **Guard:** dimensions are applied only when both are > 0; a partial/garbled config falls through to the
   box default (never zeros the resolution out from under a session). The guard stays; the box default
   it falls to is an interim safety floor — target state per docs/carplay/04_CAPABILITIES_AND_CONFIG.md is hold-IDLE-until-config, with
