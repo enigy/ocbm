@@ -539,6 +539,10 @@ pub const REQUEST_UI_URL_MAX: usize = 255;
 // idle), at play start and as parking changes. Before RECORD the word is kept for RECORD's; until the host has said,
 // nothing goes out (receiver `playback::host_allows`). A missing status byte is idle.
 pub const CMD_VIDEO_ALLOWED: u8 = 0x13;
+// Route A: borrow the main screen for the phone's video while Carlink shows it, or give it back, as LIVI does
+// (borrowID "VideoPlayback"). `[INPUT_COMMAND][CMD_VIDEO_SCREEN][borrow 0|1]` -> a `changeModes` Borrow or Unborrow
+// of resourceID 1 (receiver `events::send_video_borrow`), with the probe's `video` switch on.
+pub const CMD_VIDEO_SCREEN: u8 = 0x14;
 // playbackStatus (LIVI's words): nothing queued, a queued video allowed to show, one queued that may not show.
 pub const VIDEO_STATUS_IDLE: u8 = 0; // "idle"
 pub const VIDEO_STATUS_VIDEO: u8 = 1; // "video"
@@ -1121,7 +1125,7 @@ mod tests {
             CMD_REQUEST_UI, CMD_REQUEST_SIRI, CMD_SIRI_DOWN, CMD_SIRI_UP, CMD_NAV_START, CMD_NAV_STOP,
             CMD_NAV_CARD, CMD_LIMITED_UI_ON, CMD_LIMITED_UI_OFF, CMD_NAV_APP, CMD_NAV_APPEARANCE,
             CMD_NAV_ZOOM_IN, CMD_NAV_ZOOM_OUT, CMD_UI_APPEARANCE, CMD_MAP_APPEARANCE, CMD_NIGHT_MODE,
-            CMD_VIEW_AREA, CMD_REQUEST_UI_URL, CMD_VIDEO_ALLOWED,
+            CMD_VIEW_AREA, CMD_REQUEST_UI_URL, CMD_VIDEO_ALLOWED, CMD_VIDEO_SCREEN,
         ];
         let mut sorted = ids.to_vec();
         sorted.sort_unstable();
@@ -1130,6 +1134,7 @@ mod tests {
         assert_eq!(CMD_VIEW_AREA, 0x11);
         assert_eq!(CMD_REQUEST_UI_URL, 0x12);
         assert_eq!(CMD_VIDEO_ALLOWED, 0x13);
+        assert_eq!(CMD_VIDEO_SCREEN, 0x14);
     }
 
     #[test]

@@ -1394,6 +1394,22 @@ fn handle_input_frame(pl: &[u8]) {
             // Route A: whether video may play (the car known to be parked) and the play queue's status,
             // `[cmd][allowed][status]`. Sent now in a session past RECORD that negotiated videoPlayback, else
             // kept for RECORD (receiver::playback).
+            // Route A: borrow the main screen while Carlink shows the phone's video, or give it back, `[cmd][borrow]`.
+            ocbm_proto::CMD_VIDEO_SCREEN => {
+                if pl.len() < 3 {
+                    eprintln!("[input] videoScreen frame too short ({} bytes) — dropped", pl.len());
+                    return;
+                }
+                if !receiver::probe::switches().video {
+                    eprintln!("[input] videoScreen with route A off — dropped");
+                    return;
+                }
+                let borrow = pl[2] != 0;
+                (
+                    if borrow { "changeModes(borrow VideoPlayback)" } else { "changeModes(unborrow VideoPlayback)" },
+                    events::send_video_borrow(borrow),
+                )
+            }
             ocbm_proto::CMD_VIDEO_ALLOWED => {
                 if pl.len() < 3 {
                     eprintln!("[input] videoAllowed frame too short ({} bytes) — dropped", pl.len());
