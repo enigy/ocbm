@@ -24,8 +24,9 @@
 //!
 //! Every line written here starts `[probe]`, in carplayd's log (`/tmp/carplayd_wl.log` for a wireless
 //! session). Keys, value types and sizes only: no URL past its host, no titles, names or other values a
-//! phone might put in a play request. The exceptions are protocol identifiers: a message's own `type`,
-//! a DataStream's client type, and the header values in [`SHOWN_HEADERS`].
+//! phone might put in a play request. The exceptions are protocol identifiers: the string values under
+//! [`NAME_KEYS`] (a message's `type`, `kind`, `property` and the like), a DataStream's client type, and the
+//! header values in [`SHOWN_HEADERS`]. A line repeated word for word is counted, not logged each time.
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
@@ -139,15 +140,52 @@ pub fn switches() -> &'static Switches {
     })
 }
 
-/// One `[probe]` line. The first 400 go out whole, then one in 100 with its number, so a chatty
-/// channel can't fill the tmpfs log.
+/// One `[probe]` line. A line that repeats one of the last [`REMEMBERED`] word for word (the phone's
+/// `playbackInfo` poll, once a second) is counted, and logged again only every [`REPEAT_EVERY`]th time with
+/// its count. Of what is left, the first 400 go out whole, then one in 100 with its number, so a chatty
+/// channel can't fill the tmpfs log. On the Mac's 10 Nov bench the polls alone used 329 of the 400, and the
+/// TEARDOWN after them went unlogged.
 pub fn line(msg: std::fmt::Arguments) {
+    let text = msg.to_string();
+    let seen = repeats(&text);
+    if seen > 1 && seen % REPEAT_EVERY != 0 {
+        return;
+    }
     static N: AtomicU32 = AtomicU32::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+    let again = if seen > 1 { format!("  (the same line {seen} times so far)") } else { String::new() };
     if n <= 400 {
-        eprintln!("[probe] {msg}");
+        eprintln!("[probe] {text}{again}");
     } else if n % 100 == 0 {
-        eprintln!("[probe] {msg}  (probe line {n}: past 400, one in 100 is logged)");
+        eprintln!("[probe] {text}{again}  (probe line {n}: past 400, one in 100 is logged)");
+    }
+}
+
+/// How many recent distinct lines [`line`] remembers, and how often a repeat of one is logged again.
+const REMEMBERED: usize = 32;
+const REPEAT_EVERY: u32 = 50;
+
+/// How many times [`line`] has now been asked for `text`, counting this one ([`Recent`]).
+fn repeats(text: &str) -> u32 {
+    static RECENT: std::sync::Mutex<Recent> = std::sync::Mutex::new(Recent(Vec::new()));
+    crate::plock(&RECENT).count(text)
+}
+
+/// The last [`REMEMBERED`] distinct lines, each with how many times it was asked for.
+struct Recent(Vec<(String, u32)>);
+
+impl Recent {
+    /// Count `text` once more and return its count; a new line forgets the oldest when full.
+    fn count(&mut self, text: &str) -> u32 {
+        if let Some((_, n)) = self.0.iter_mut().find(|(t, _)| t == text) {
+            *n = n.saturating_add(1);
+            return *n;
+        }
+        if self.0.len() == REMEMBERED {
+            self.0.remove(0);
+        }
+        self.0.push((text.to_string(), 1));
+        1
     }
 }
 
@@ -321,6 +359,11 @@ fn key_text(k: &str) -> String {
     }
 }
 
+/// Keys whose string values are protocol names, shown as they are (when they read as one): a message's
+/// `type` and `kind`, `setProperty`'s `property`, an item's `mediaType` and `audioMode`, and `messageType`.
+/// Titles, names and addresses are never under these.
+const NAME_KEYS: [&str; 6] = ["type", "kind", "property", "mediaType", "audioMode", "messageType"];
+
 /// A command or message name: short, and made of identifier characters.
 fn is_identifier(s: &str) -> bool {
     !s.is_empty() && s.len() <= 64 && s.chars().all(|c| c.is_ascii_alphanumeric() || "_-.:".contains(c))
@@ -328,7 +371,7 @@ fn is_identifier(s: &str) -> bool {
 
 /// A string as the log shows it: its size; a URL's scheme and host; the value itself only under `type`.
 fn string_shape(key: Option<&str>, s: &str) -> String {
-    if key == Some("type") && is_identifier(s) {
+    if key.is_some_and(|k| NAME_KEYS.contains(&k)) && is_identifier(s) {
         return format!("{s:?}");
     }
     match url_host(s) {
@@ -933,6 +976,36 @@ mod tests {
         let mut d = Dictionary::new();
         d.insert("type".into(), Value::String("Scott's iPhone".into()));
         assert_eq!(shape(&Value::Dictionary(d)), "{type: string(14)}");
+    }
+
+    #[test]
+    fn a_repeated_line_is_counted_not_logged_each_time() {
+        let mut r = Recent(Vec::new());
+        assert_eq!(r.count("playbackInfo poll"), 1);
+        assert_eq!(r.count("playbackInfo poll"), 2);
+        for _ in 0..47 {
+            r.count("playbackInfo poll");
+        }
+        assert_eq!(r.count("playbackInfo poll"), REPEAT_EVERY, "logged again at the 50th");
+        for i in 0..REMEMBERED {
+            r.count(&format!("other {i}"));
+        }
+        assert_eq!(r.count("playbackInfo poll"), 1, "forgotten once 32 other lines came after it");
+    }
+
+    #[test]
+    fn protocol_names_show_and_titles_do_not() {
+        let mut meta = Dictionary::new();
+        meta.insert("Title".into(), Value::String("A Match".into()));
+        let mut d = Dictionary::new();
+        d.insert("type".into(), Value::String("setProperty".into()));
+        d.insert("kind".into(), Value::String("request".into()));
+        d.insert("property".into(), Value::String("metadata".into()));
+        d.insert("value".into(), Value::Dictionary(meta));
+        assert_eq!(
+            shape(&Value::Dictionary(d)),
+            r#"{type: "setProperty", kind: "request", property: "metadata", value: {Title: string(7)}}"#
+        );
     }
 
     #[test]
