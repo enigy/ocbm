@@ -9,6 +9,7 @@
 //! Fire-and-forget: HID reports pass a NULL completion in the C, so we send and don't await the
 //! response (a background reader drains inbound frames so the socket can't back up).
 
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,6 +21,12 @@ use rtsp::control::{derive_event_keys, ControlChannel};
 
 /// The active event channel (one per session). `None` until RECORD wires it / after teardown.
 static EVENT: Mutex<Option<EventSender>> = Mutex::new(None);
+
+/// Our commands still waiting for the phone's reply, by CSeq, with what each one was ([`command_label`]), so a reply
+/// names the command it answers: the Mac's 11 Nov bench saw nine `400 Bad Request`s and nothing to pair them with.
+/// Bounded by [`PENDING_MAX`]; a command the phone never answers is forgotten.
+static PENDING: Mutex<VecDeque<(u32, String)>> = Mutex::new(VecDeque::new());
+const PENDING_MAX: usize = 64;
 
 /// Does the receiver currently hold MainScreen focus (#47)? Set true when we take the screen at RECORD;
 /// updated from inbound `modesChanged` on either channel. Lets a consumer (host status / watchdog)
@@ -103,10 +110,14 @@ fn handle_inbound_event(pt: &[u8]) {
         // Response to one of our commands. Log non-2xx always (a real problem); 2xx only when asked.
         let code = rest.split_whitespace().next().unwrap_or("");
         let ok = code.starts_with('2');
+        let what = answered(inbound_cseq(&text).and_then(|c| c.parse().ok()));
         if !ok {
-            eprintln!("[events] command response NOT OK: '{first}'");
+            eprintln!("[events] command response NOT OK: '{first}' to {what}");
         } else if events_log() {
-            eprintln!("[events] command response: '{first}'");
+            eprintln!("[events] command response: '{first}' to {what}");
+        }
+        if let Some(status) = reply_status(pt) {
+            eprintln!("[events] reply to {what}: {status}");
         }
         // A 2xx response CAN carry a body (Content-Length + plist): Apple's own
         // `_AirPlayReceiverSessionSendCommandCompletion` parses one when present (`{status, params?}` —
@@ -241,6 +252,57 @@ fn handle_inbound_event(pt: &[u8]) {
 /// from the lossy conversion in [`handle_inbound_event`]). Used by the docs/wireless/00_WIRELESS_CARPLAY.md #2.5 conditional reply.
 fn inbound_cseq(text: &str) -> Option<&str> {
     text.lines().find_map(|l| l.strip_prefix("CSeq:").map(|v| v.trim()))
+}
+
+/// Remember an outbound command until its reply comes ([`PENDING`]).
+fn note_sent(cseq: u32, label: String) {
+    let mut pending = crate::plock(&PENDING);
+    if pending.len() >= PENDING_MAX {
+        pending.pop_front();
+    }
+    pending.push_back((cseq, label));
+}
+
+/// The command a reply with this CSeq answers, for its log line, forgotten once named: `changeModes (CSeq 12)`.
+fn answered(cseq: Option<u32>) -> String {
+    let Some(cseq) = cseq else {
+        return "a command (the reply has no CSeq)".into();
+    };
+    let mut pending = crate::plock(&PENDING);
+    match pending.iter().position(|(c, _)| *c == cseq) {
+        Some(i) => format!("{} (CSeq {cseq})", pending.remove(i).map(|(_, l)| l).unwrap_or_default()),
+        None => format!("CSeq {cseq} (not one of ours, or too old to name)"),
+    }
+}
+
+/// What a `POST /command` was: the body's `type`, or the DataStream a stream message rode.
+fn command_label(body_plist: &[u8], extra_headers: &str) -> String {
+    if let Some(stream) = extra_headers.strip_prefix("X-Apple-StreamID: ") {
+        return format!("stream {} message", stream.trim_end());
+    }
+    match Value::from_reader(std::io::Cursor::new(body_plist)) {
+        Ok(Value::Dictionary(d)) => d.get("type").and_then(Value::as_string).unwrap_or("untyped command").to_string(),
+        _ => "unreadable command".to_string(),
+    }
+}
+
+/// A reply's `{status, params?}` body, Apple's `_AirPlayReceiverSessionSendCommandCompletion` shape: `status N`, and
+/// with the video probe on the shape of `params`. None for a bodyless reply, the usual one.
+fn reply_status(pt: &[u8]) -> Option<String> {
+    let at = pt.windows(4).position(|w| w == b"\r\n\r\n")?;
+    let body = &pt[at + 4..];
+    if body.is_empty() {
+        return None;
+    }
+    let Ok(Value::Dictionary(d)) = Value::from_reader(std::io::Cursor::new(body)) else {
+        return None;
+    };
+    let status = d.get("status").and_then(Value::as_signed_integer)?;
+    let shape = match d.get("params").and_then(Value::as_dictionary) {
+        Some(p) if crate::probe::switches().video => format!(", params {}", crate::probe::dict_shape(p)),
+        _ => String::new(),
+    };
+    Some(format!("status {status}{shape}"))
 }
 
 /// Handle one inbound `modesChanged`, from EITHER channel.
@@ -477,6 +539,7 @@ fn send_command_with(body_plist: &[u8], extra_headers: &str) -> bool {
         return false;
     };
     ev.cseq += 1;
+    note_sent(ev.cseq, command_label(body_plist, extra_headers));
     let msg = command_request(ev.cseq, extra_headers, body_plist);
     let frame = ev.chan.encrypt_frame(&msg);
     if write_frame_or_fail(&mut ev.stream, &frame) {
@@ -1279,6 +1342,40 @@ mod tests {
             assert_eq!(r.get("borrowID").and_then(Value::as_string), Some("VideoPlayback"));
             assert_eq!(r.contains_key("transferPriority"), borrow, "a priority on the borrow only");
         }
+    }
+
+    /// A reply names the command it answers, once: by the body's `type`, or the stream a message rode.
+    #[test]
+    fn a_reply_names_its_command_by_cseq() {
+        assert_eq!(command_label(&video_borrow_body(true), ""), "changeModes");
+        assert_eq!(command_label(b"bp", "X-Apple-StreamID: 3\r\n"), "stream 3 message");
+        assert_eq!(command_label(b"not a plist", ""), "unreadable command");
+        note_sent(900_001, "changeModes".into());
+        assert_eq!(answered(Some(900_001)), "changeModes (CSeq 900001)");
+        assert!(answered(Some(900_001)).contains("not one of ours"), "named once");
+        assert!(answered(None).contains("no CSeq"));
+        for c in 0..=PENDING_MAX as u32 {
+            note_sent(910_000 + c, format!("command {c}"));
+        }
+        assert!(answered(Some(910_000)).contains("too old"), "the oldest is forgotten");
+        assert_eq!(answered(Some(910_000 + PENDING_MAX as u32)), format!("command {PENDING_MAX} (CSeq {})", 910_000 + PENDING_MAX));
+    }
+
+    /// The status in a reply's body is logged; the usual bodyless reply has none.
+    #[test]
+    fn a_reply_body_gives_its_status() {
+        let mut params = Dictionary::new();
+        params.insert("resources".into(), Value::Array(vec![]));
+        let mut d = Dictionary::new();
+        d.insert("status".into(), Value::Integer((-6705).into()));
+        d.insert("params".into(), Value::Dictionary(params));
+        let mut body = Vec::new();
+        Value::Dictionary(d).to_writer_binary(&mut body).unwrap();
+        let mut reply = b"RTSP/1.0 200 OK\r\nCSeq: 7\r\nContent-Length: 0\r\n\r\n".to_vec();
+        reply.extend_from_slice(&body);
+        assert_eq!(reply_status(&reply).as_deref(), Some("status -6705"));
+        assert_eq!(reply_status(b"RTSP/1.0 200 OK\r\nCSeq: 7\r\n\r\n"), None);
+        assert_eq!(reply_status(b"RTSP/1.0 400 Bad Request\r\nCSeq: 7\r\n\r\nnot a plist"), None);
     }
 
     /// A plain command's request is unchanged; a shared DataStream's carries its stream in a header line.

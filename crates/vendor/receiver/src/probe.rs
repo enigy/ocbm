@@ -17,6 +17,9 @@
 //! bits       with video: `featuresEx` also carries bits 0 and 49, the bits macOS's AirPlay sender
 //!            tests for video [I]
 //! noallow    with video: leave setVideoPlaybackAllowed out
+//! borrow     with video: pass Carlink's screen borrow and give-back on to the phone (changeModes, borrowID
+//!            `VideoPlayback`). Off by default: iOS answered the borrow `400 Bad Request` nine times of nine
+//!            (Mac bench, 11 Nov), and video plays without it
 //! receiver   route C: a second, ordinary `_airplay._tcp` service, "Carlink Video", whose listener
 //!            logs the first requests of each connection and closes it
 //! txt:K=V    with receiver: that service's TXT key K becomes V (`txt:K=` drops K)
@@ -52,6 +55,8 @@ pub struct Switches {
     pub bits: bool,
     /// With `video`: setVideoPlaybackAllowed(true) at RECORD. On with `video` unless `noallow`.
     pub allow: bool,
+    /// With `video`: Carlink's screen borrow goes to the phone ([`crate::events::send_video_borrow`]).
+    pub borrow: bool,
     /// Route C: an ordinary AirPlay receiver beside CarPlay.
     pub receiver: bool,
     /// With `receiver`: TXT keys set (`Some`) or dropped (`None`) over [`receiver_txt`]'s defaults.
@@ -65,12 +70,14 @@ impl Switches {
     pub fn parse(text: &str) -> Switches {
         let mut s = Switches::default();
         let mut noallow = false;
+        let mut borrow = false;
         let words = text.lines().flat_map(|l| l.split('#').next().unwrap_or("").split_whitespace());
         for w in words {
             match w {
                 "video" => s.video = true,
                 "bits" => s.bits = true,
                 "noallow" => noallow = true,
+                "borrow" => borrow = true,
                 "receiver" => s.receiver = true,
                 _ => match w.strip_prefix("txt:").and_then(|kv| kv.split_once('=')) {
                     Some((k, v)) if txt_key_ok(k) && txt_value_ok(v) => {
@@ -82,6 +89,7 @@ impl Switches {
             }
         }
         s.allow = s.video && !noallow;
+        s.borrow = s.video && borrow;
         s
     }
 
@@ -90,9 +98,10 @@ impl Switches {
         let mut on = Vec::new();
         if self.video {
             on.push(format!(
-                "video (featuresEx {}, setVideoPlaybackAllowed {})",
+                "video (featuresEx {}, setVideoPlaybackAllowed {}, screen borrow {})",
                 if self.bits { "with bits 0 and 49" } else { "as /info features" },
-                if self.allow { "at RECORD" } else { "left out" }
+                if self.allow { "at RECORD" } else { "left out" },
+                if self.borrow { "sent" } else { "left out" }
             ));
         }
         if self.receiver {
@@ -875,6 +884,11 @@ mod tests {
     fn the_file_names_the_switches_in_any_order() {
         let s = Switches::parse("receiver\nvideo bits  # both routes\n");
         assert!(s.video && s.bits && s.allow && s.receiver);
+        assert!(!s.borrow, "the screen borrow stays out unless named");
+        let s = Switches::parse("borrow video");
+        assert!(s.borrow, "named with video, the borrow goes to the phone");
+        assert!(s.describe().contains("screen borrow sent"), "{}", s.describe());
+        assert!(!Switches::parse("borrow").borrow, "the borrow needs route A");
         let s = Switches::parse("video noallow");
         assert!(s.video && !s.allow, "noallow leaves setVideoPlaybackAllowed out");
         let s = Switches::parse("bits receiver");

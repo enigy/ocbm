@@ -1400,8 +1400,10 @@ fn handle_input_frame(pl: &[u8]) {
                     eprintln!("[input] videoScreen frame too short ({} bytes) — dropped", pl.len());
                     return;
                 }
-                if !receiver::probe::switches().video {
-                    eprintln!("[input] videoScreen with route A off — dropped");
+                // Its own probe word, not route A's: iOS answered the borrow `400 Bad Request` nine times of nine (Mac bench,
+                // 11 Nov), the wire form is still [I], and video plays without it.
+                if !receiver::probe::switches().borrow {
+                    eprintln!("[input] videoScreen dropped — the screen borrow is off (probe word `borrow`)");
                     return;
                 }
                 let borrow = pl[2] != 0;

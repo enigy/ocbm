@@ -502,6 +502,13 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
   the phone's pre-shared key, then CONNECT. The box carries the bytes on `CH_TUNNEL` (`receiver::tunnel`,
   docs/carplay/01_OCBM_PROTOCOL.md), connecting only to the phone. FairPlay still can't play on any
   route; the proxy is for a unit without internet of its own, and for streams only the phone can reach.
+  **The screen borrow** (2026-11-11): Carlink borrows the main screen while the phone's video shows
+  (`CMD_VIDEO_SCREEN`; `changeModes` `{resourceID 1, transferType 3, transferPriority 500, borrowID
+  "VideoPlayback"}`) and gives it back after (`transferType` 4). **Benched 2026-11-11** (the Mac): iOS
+  answers the borrow `400 Bad Request` nine times of nine and accepts the give-back, and video plays the
+  same without the borrow. The wire form is [I], so carplayd passes both on only with the probe word
+  `borrow` and otherwise drops them with a log line. Each command reply now names its command by CSeq,
+  and a reply body's `status` is logged.
 
 - **`fileTransfer` is blocked-untestable — even the advertise step is byte-unsafe.** The
   `fileTransferInfo` dict's keys are unknown, as is which transport carries the chunk dict.
