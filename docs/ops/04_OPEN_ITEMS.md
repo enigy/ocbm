@@ -480,6 +480,14 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
   C's "Carlink Video" was never listed. Probe 2 logs one level into those `data` bytes and a TEARDOWN's
   stream ids; the TEARDOWN that also stopped the iAP2 channel is fixed (a partial TEARDOWN now stops only
   the RCS channel it names).
+  **Route A's relay** (branch `airplay-video`, on top of the probe; behind the same `video` switch):
+  carplayd carries the phone's shared DataStreams to the host and back (`receiver/src/playback.rs`). A
+  `POST /command` whose `X-Apple-StreamID` header names a stream goes up as a
+  `{"kind":"dataStream","stream","client","message"}` record, its `params.data` plist as JSON. The host's
+  answers come down as `INPUT_DATASTREAM` (`0x0A`) sub-frames, `[stream u32 LE][JSON]` (the one input
+  sub-frame allowed past 64 B, up to 16 KiB), and go to the phone as a binary plist in `{params: {data}}`
+  on the event channel, with the same header. Carlink keeps the play queue and answers each request
+  (`playbackInfo` says not ready); nothing plays until its player is built.
 
 - **`fileTransfer` is blocked-untestable — even the advertise step is byte-unsafe.** The
   `fileTransferInfo` dict's keys are unknown, as is which transport carries the chunk dict.

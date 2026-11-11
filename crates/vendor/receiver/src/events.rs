@@ -441,19 +441,43 @@ pub fn clear() {
 /// Send a binary-plist `{type, …}` command to the iPhone as an encrypted `POST /command` (fire-and-
 /// forget). Returns false if no event channel is active or the write fails.
 pub fn send_command(body_plist: &[u8]) -> bool {
+    send_command_with(body_plist, "")
+}
+
+/// A message on a shared DataStream, the way the phone sends its own on it (route A, `playback.rs`): a
+/// `POST /command` whose `X-Apple-StreamID` header names the stream and whose body is `{params: {data}}`.
+pub fn send_stream_message(stream_id: i64, data: &[u8]) -> bool {
+    let mut params = Dictionary::new();
+    params.insert("data".into(), Value::Data(data.to_vec()));
+    let mut d = Dictionary::new();
+    d.insert("params".into(), Value::Dictionary(params));
+    let mut body = Vec::new();
+    if Value::Dictionary(d).to_writer_binary(&mut body).is_err() {
+        return false;
+    }
+    send_command_with(&body, &format!("X-Apple-StreamID: {stream_id}\r\n"))
+}
+
+/// One `POST /command` on the event channel, before encryption. `extra_headers` is whole lines, each ending
+/// `\r\n`; with none the request is byte for byte what [`send_command`] always sent.
+fn command_request(cseq: u32, extra_headers: &str, body_plist: &[u8]) -> Vec<u8> {
+    let header = format!(
+        "POST /command RTSP/1.0\r\nCSeq: {cseq}\r\n{extra_headers}Content-Type: application/x-apple-binary-plist\r\nContent-Length: {}\r\n\r\n",
+        body_plist.len()
+    );
+    let mut msg = header.into_bytes();
+    msg.extend_from_slice(body_plist);
+    msg
+}
+
+fn send_command_with(body_plist: &[u8], extra_headers: &str) -> bool {
     // Poison-tolerant: see `crate::plock` (this mutex is held across a bounded socket write).
     let mut guard = crate::plock(&EVENT);
     let Some(ev) = guard.as_mut() else {
         return false;
     };
     ev.cseq += 1;
-    let header = format!(
-        "POST /command RTSP/1.0\r\nCSeq: {}\r\nContent-Type: application/x-apple-binary-plist\r\nContent-Length: {}\r\n\r\n",
-        ev.cseq,
-        body_plist.len()
-    );
-    let mut msg = header.into_bytes();
-    msg.extend_from_slice(body_plist);
+    let msg = command_request(ev.cseq, extra_headers, body_plist);
     let frame = ev.chan.encrypt_frame(&msg);
     if write_frame_or_fail(&mut ev.stream, &frame) {
         return true;
@@ -1209,6 +1233,20 @@ pub fn send_hid_report(uid: u32, report: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A plain command's request is unchanged; a shared DataStream's carries its stream in a header line.
+    #[test]
+    fn a_stream_message_names_its_stream_and_a_command_is_unchanged() {
+        let plain = command_request(4, "", b"bp");
+        assert_eq!(
+            plain,
+            b"POST /command RTSP/1.0\r\nCSeq: 4\r\nContent-Type: application/x-apple-binary-plist\r\nContent-Length: 2\r\n\r\nbp"
+        );
+        let stream = String::from_utf8(command_request(5, "X-Apple-StreamID: 3\r\n", b"bp")).unwrap();
+        assert!(stream.starts_with("POST /command RTSP/1.0\r\nCSeq: 5\r\nX-Apple-StreamID: 3\r\nContent-Type:"), "{stream}");
+        let req = rtsp::message::Request::parse(stream.as_bytes()).unwrap().unwrap().0;
+        assert_eq!(crate::playback::stream_of(&req), Some(3), "the phone's own parser would find the stream");
+    }
 
     /// Build one `resources[]` entry in the shape every `modesChanged` in
     /// `docs/ops/captures/2026-07-24_carplay_cmd_capture.bin` uses: `{resourceID, entity,

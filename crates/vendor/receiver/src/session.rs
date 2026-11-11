@@ -361,6 +361,12 @@ pub trait SessionDelegate: Send {
     fn command(&mut self, _request_plist: &[u8]) -> Vec<u8> {
         Vec::new()
     }
+    /// A POST /command that is a shared DataStream's message (its `X-Apple-StreamID` header named `stream`):
+    /// the response body when this delegate relays it (route A, `playback.rs`), else `None` and it is handled
+    /// as an ordinary command. A delegate that wraps another must pass this on.
+    fn stream_message(&mut self, _stream: i64, _body: &[u8]) -> Option<Vec<u8>> {
+        None
+    }
     /// Tear the session down. The request plist may carry a `streams` array (partial teardown of only
     /// those streams — the session stays alive) or none (full teardown of the whole session).
     fn teardown(&mut self, _request_plist: &[u8]) {}
@@ -452,12 +458,14 @@ pub struct AvSession {
     rcs_channels: HashMap<String, RcsChannel>,
 }
 
-/// One RCS (type-130) channel as its SETUP made it: the transport token returned for it (`streamID`), and
-/// whether it is the iAP channel, which carries the session's metadata, calls and location.
-#[derive(Debug, Clone, Copy)]
+/// One RCS (type-130) channel as its SETUP made it: the transport token returned for it (`streamID`),
+/// whether it is the iAP channel, which carries the session's metadata, calls and location, and its
+/// `clientTypeUUID` (which a shared channel's relayed messages are labelled with, playback.rs).
+#[derive(Debug, Clone)]
 struct RcsChannel {
     stream_id: i64,
     iap: bool,
+    client_type: String,
 }
 
 /// The RCS channels one partial-TEARDOWN entry names, and how it named them: by its `channelID`, else by its
@@ -1258,7 +1266,7 @@ impl AvSession {
                         );
                         // What a partial TEARDOWN of this channel is matched against.
                         self.rcs_channels
-                            .insert(channel_id.clone(), RcsChannel { stream_id, iap: is_iap });
+                            .insert(channel_id.clone(), RcsChannel { stream_id, iap: is_iap, client_type: client_type.clone() });
                         // The AirPlay video probe's route A (probe.rs): name the channel — the brief
                         // expects UrlFling, SenderSettingsData and OverlayUI once video is offered — and
                         // log the shape of what it carries (`drain_rcs`). Taken like any other: the
@@ -1742,6 +1750,16 @@ impl SessionDelegate for AvSession {
 
     fn set_resolution(&mut self, w: i64, h: i64, fps: i64) {
         self.resolution = (w, h, fps);
+    }
+
+    /// Route A (`playback.rs`, behind the probe's `video` switch): a shared DataStream's message goes to the
+    /// host, labelled with its channel's client type. With the switch off it is an ordinary command, as before.
+    fn stream_message(&mut self, stream: i64, body: &[u8]) -> Option<Vec<u8>> {
+        if !crate::probe::switches().video {
+            return None;
+        }
+        let client = self.rcs_channels.values().find(|c| c.stream_id == stream).map(|c| c.client_type.clone());
+        Some(crate::playback::on_phone_message(stream, client.as_deref(), body))
     }
 
     /// Capture: log + dump every POST /command (duckAudio/unduckAudio/flushAudio/setVolume/… — the
@@ -3351,7 +3369,7 @@ mod tests {
         let settings = s.stream_flag_keyed(130, "RCS-2".into());
         let playback = s.stream_flag_keyed(130, "RCS-3".into());
         for (ch, stream_id, iap) in [("RCS-1", 1, true), ("RCS-2", 2, false), ("RCS-3", 3, false)] {
-            s.rcs_channels.insert(ch.into(), RcsChannel { stream_id, iap });
+            s.rcs_channels.insert(ch.into(), RcsChannel { stream_id, iap, client_type: String::new() });
         }
         let req = |id: Option<(&str, Value)>| {
             let mut e = Dictionary::new();
@@ -3372,7 +3390,7 @@ mod tests {
         assert!(!settings.load(Ordering::Acquire), "named by its channelID");
         assert!(iap.load(Ordering::Acquire), "the iAP channel stays");
         let other = s.stream_flag_keyed(130, "RCS-4".into());
-        s.rcs_channels.insert("RCS-4".into(), RcsChannel { stream_id: 4, iap: false });
+        s.rcs_channels.insert("RCS-4".into(), RcsChannel { stream_id: 4, iap: false, client_type: String::new() });
         s.teardown(&req(None));
         assert!(!other.load(Ordering::Acquire), "no id: every channel but the iAP one");
         assert!(iap.load(Ordering::Acquire), "never the iAP channel on a guess");

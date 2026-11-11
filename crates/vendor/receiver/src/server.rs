@@ -412,6 +412,12 @@ impl<'a, P: Pairings, S: MfiSigner> ControlServer<'a, P, S> {
                         let _ = f.write_all(&req.body);
                     }
                 }
+                // A shared DataStream's message (route A, playback.rs): its header names the stream.
+                if let Some(stream) = crate::playback::stream_of(req) {
+                    if let Some(resp) = self.session.stream_message(stream, &req.body) {
+                        return Ok(Response::ok(req, Some(BPLIST), resp));
+                    }
+                }
                 Ok(Response::ok(req, Some(BPLIST), self.session.command(&req.body)))
             }
             Route::GetParameter => {

@@ -1006,6 +1006,15 @@ fn read_input_exact(stream: &mut TcpStream, buf: &mut [u8], gen: u32) -> Result<
     Ok(())
 }
 
+/// The largest input sub-frame: an `INPUT_DATASTREAM` (type, stream id, the JSON message at its cap).
+const MAX_INPUT_SUB_FRAME: usize = 1 + 4 + ocbm_proto::MAX_INPUT_DATASTREAM;
+
+/// Every input sub-frame is at most 64 B, as before, except an `INPUT_DATASTREAM` (route A's answers, up to
+/// [`MAX_INPUT_SUB_FRAME`]); a longer one of another type means the framing is lost.
+fn input_sub_frame_fits(pl: &[u8]) -> bool {
+    !pl.is_empty() && (pl.len() <= 64 || (pl[0] == ocbm_proto::INPUT_DATASTREAM && pl.len() <= MAX_INPUT_SUB_FRAME))
+}
+
 /// Read length-prefixed input sub-frames off one ocbmd connection until it closes/errors/is evicted.
 fn read_input(mut stream: TcpStream, gen: u32) {
     let mut hdr = [0u8; 2];
@@ -1017,7 +1026,7 @@ fn read_input(mut stream: TcpStream, gen: u32) {
             break;
         }
         let len = u16::from_le_bytes(hdr) as usize;
-        if len == 0 || len > 64 {
+        if len == 0 || len > MAX_INPUT_SUB_FRAME {
             // implausible sub-frame length → treat as desync and drop the connection
             eprintln!("[input] implausible sub-frame length {len} — desync, dropping the ingest connection");
             break;
@@ -1025,6 +1034,11 @@ fn read_input(mut stream: TcpStream, gen: u32) {
         let mut pl = vec![0u8; len];
         if let Err(e) = read_input_exact(&mut stream, &mut pl, gen) {
             eprintln!("[input] ingest connection closed mid-payload ({len} B expected: {e})");
+            break;
+        }
+        // Only an INPUT_DATASTREAM sub-frame (route A's answers) runs past 64 B; any other that does is a desync.
+        if !input_sub_frame_fits(&pl) {
+            eprintln!("[input] a {len} B sub-frame of type 0x{:02x}: only INPUT_DATASTREAM runs past 64 B — desync, dropping the ingest connection", pl[0]);
             break;
         }
         // Re-checked HERE, not just before the reads: this is the last instant before the frame
@@ -1043,6 +1057,11 @@ fn handle_input_frame(pl: &[u8]) {
     use std::sync::atomic::{Ordering};
     use portable_atomic::{AtomicU64};
     static N: AtomicU64 = AtomicU64::new(0);
+    // Route A (receiver::playback): the host's answer on a shared DataStream, on its way to the phone.
+    if pl.first() == Some(&ocbm_proto::INPUT_DATASTREAM) {
+        receiver::playback::send_reply(&pl[1..]);
+        return;
+    }
     // Host-detected video-loss keyframe request (task #33): relay ForceKeyFrame to iOS over the event
     // channel — the box owns that channel, so only it can issue the command. No-op between sessions.
     if pl.first() == Some(&ocbm_proto::INPUT_KEYFRAME) {
@@ -1761,6 +1780,18 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Route A's answers are the one input sub-frame allowed past 64 B; any other that long is a desync.
+    #[test]
+    fn only_a_datastream_answer_runs_past_64_bytes() {
+        assert!(input_sub_frame_fits(&[ocbm_proto::INPUT_TOUCH; 6]));
+        assert!(!input_sub_frame_fits(&[]));
+        let mut big = vec![ocbm_proto::INPUT_TOUCH; 65];
+        assert!(!input_sub_frame_fits(&big), "a 65 B touch frame is a desync");
+        big[0] = ocbm_proto::INPUT_DATASTREAM;
+        assert!(input_sub_frame_fits(&big));
+        assert!(!input_sub_frame_fits(&vec![ocbm_proto::INPUT_DATASTREAM; MAX_INPUT_SUB_FRAME + 1]));
+    }
 
     const ID: &[u8] = b"0D4C5E7A-1111-2222-3333-444455556666";
 

@@ -241,6 +241,10 @@ impl SessionDelegate for GatedSession {
         self.inner.command(request_plist)
     }
 
+    fn stream_message(&mut self, stream: i64, body: &[u8]) -> Option<Vec<u8>> {
+        self.inner.stream_message(stream, body)
+    }
+
     fn teardown(&mut self, request_plist: &[u8]) {
         self.inner.teardown(request_plist)
     }
