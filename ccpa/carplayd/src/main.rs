@@ -1009,10 +1009,12 @@ fn read_input_exact(stream: &mut TcpStream, buf: &mut [u8], gen: u32) -> Result<
 /// The largest input sub-frame: an `INPUT_DATASTREAM` (type, stream id, the JSON message at its cap).
 const MAX_INPUT_SUB_FRAME: usize = 1 + 4 + ocbm_proto::MAX_INPUT_DATASTREAM;
 
-/// Every input sub-frame is at most 64 B, as before, except an `INPUT_DATASTREAM` (route A's answers, up to
-/// [`MAX_INPUT_SUB_FRAME`]); a longer one of another type means the framing is lost.
+/// Every input sub-frame is at most 64 B, as before, except route A's: an `INPUT_DATASTREAM` (the answers) and
+/// an `INPUT_TUNNEL` (the proxy tunnel's bytes), up to [`MAX_INPUT_SUB_FRAME`]. A longer one of another type
+/// means the framing is lost.
 fn input_sub_frame_fits(pl: &[u8]) -> bool {
-    !pl.is_empty() && (pl.len() <= 64 || (pl[0] == ocbm_proto::INPUT_DATASTREAM && pl.len() <= MAX_INPUT_SUB_FRAME))
+    let route_a = matches!(pl.first(), Some(&ocbm_proto::INPUT_DATASTREAM | &ocbm_proto::INPUT_TUNNEL));
+    !pl.is_empty() && (pl.len() <= 64 || (route_a && pl.len() <= MAX_INPUT_SUB_FRAME))
 }
 
 /// `setVideoPlaybackAllowed`'s `playbackStatus` for a `VIDEO_STATUS_*` byte (LIVI's words): nothing queued, a
@@ -1047,9 +1049,9 @@ fn read_input(mut stream: TcpStream, gen: u32) {
             eprintln!("[input] ingest connection closed mid-payload ({len} B expected: {e})");
             break;
         }
-        // Only an INPUT_DATASTREAM sub-frame (route A's answers) runs past 64 B; any other that does is a desync.
+        // Only route A's sub-frames (INPUT_DATASTREAM, INPUT_TUNNEL) run past 64 B; any other that does is a desync.
         if !input_sub_frame_fits(&pl) {
-            eprintln!("[input] a {len} B sub-frame of type 0x{:02x}: only INPUT_DATASTREAM runs past 64 B — desync, dropping the ingest connection", pl[0]);
+            eprintln!("[input] a {len} B sub-frame of type 0x{:02x}: only INPUT_DATASTREAM and INPUT_TUNNEL run past 64 B — desync, dropping the ingest connection", pl[0]);
             break;
         }
         // Re-checked HERE, not just before the reads: this is the last instant before the frame
@@ -1071,6 +1073,11 @@ fn handle_input_frame(pl: &[u8]) {
     // Route A (receiver::playback): the host's answer on a shared DataStream, on its way to the phone.
     if pl.first() == Some(&ocbm_proto::INPUT_DATASTREAM) {
         receiver::playback::send_reply(&pl[1..]);
+        return;
+    }
+    // Route A's tunnel to the phone's proxy: open, write to or close one (receiver::tunnel).
+    if pl.first() == Some(&ocbm_proto::INPUT_TUNNEL) {
+        receiver::tunnel::on_input(&pl[1..]);
         return;
     }
     // Host-detected video-loss keyframe request (task #33): relay ForceKeyFrame to iOS over the event
@@ -1821,6 +1828,10 @@ mod tests {
         big[0] = ocbm_proto::INPUT_DATASTREAM;
         assert!(input_sub_frame_fits(&big));
         assert!(!input_sub_frame_fits(&vec![ocbm_proto::INPUT_DATASTREAM; MAX_INPUT_SUB_FRAME + 1]));
+        // The proxy tunnel's bytes too, at their cap: type, op, id, then the data.
+        let mut tunnel = vec![0u8; 3 + ocbm_proto::MAX_INPUT_TUNNEL];
+        tunnel[0] = ocbm_proto::INPUT_TUNNEL;
+        assert!(input_sub_frame_fits(&tunnel));
     }
 
     /// Route A's playbackStatus words are LIVI's three; a byte past them is refused, never guessed.

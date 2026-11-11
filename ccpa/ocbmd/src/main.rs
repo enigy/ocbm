@@ -191,6 +191,7 @@ struct Daemon {
     // never gated and drains first so it never waits behind a video frame.
     out_video: OutQueue,                          // CH_VIDEO (main screen)
     out_alt_video: OutQueue,                      // CH_ALT_VIDEO (cluster / type-111)
+    out_tunnel: OutQueue,                         // CH_TUNNEL (route A's proxy tunnel: read-gated, never dropped)
     out_audio: OutQueue,                          // CH_MEDIA_AUDIO + CH_ALT_AUDIO (never gated)
     out_log: OutQueue, // CH_LOG — below CONSOLE, above bulk: diagnostics must never delay the
     // control plane, A/V, or an interactive rescue console, but they should still beat a file pull.
@@ -1649,6 +1650,7 @@ enum Wire {
     Audio,
     Video,
     AltVideo,
+    Tunnel,
     Console,
     Log,
     Lo,
@@ -1707,6 +1709,16 @@ impl Daemon {
                     self.log_drop(src, lost);
                 }
             }
+        } else if ch == p::CH_TUNNEL {
+            // Route A's proxy tunnel: a TLS byte stream, so a frame is never dropped mid-stream. Its seam
+            // is read-gated on this queue in the poll loop, as video is, so at most one chunk waits here
+            // and a slow host backs the phone off over TCP; the cap is only the OOM backstop.
+            if self.out_tunnel.len() + n <= OUT_QUEUE_CAP {
+                self.out_tunnel.push_frame(ch, flags, seq, payload);
+            } else {
+                eprintln!("[ocbmd] out_tunnel cap hit ({OUT_QUEUE_CAP} B) — a tunnel frame dropped (read-gate skipped?)");
+            }
+            self.drain();
         } else if matches!(
             ch,
             p::CH_VIDEO | p::CH_ALT_VIDEO | p::CH_MEDIA_AUDIO | p::CH_ALT_AUDIO
@@ -1854,6 +1866,7 @@ impl Daemon {
                 Wire::Audio => self.out_audio.drain_to(&mut self.acc).done(),
                 Wire::Video => self.out_video.drain_to(&mut self.acc).done(),
                 Wire::AltVideo => self.out_alt_video.drain_to(&mut self.acc).done(),
+                Wire::Tunnel => self.out_tunnel.drain_to(&mut self.acc).done(),
                 Wire::Console => self.out_console.drain_to(&mut self.acc).done(),
                 Wire::Log => self.out_log.drain_to(&mut self.acc).done(),
                 Wire::Lo => self.out_lo.drain_to(&mut self.acc).done(),
@@ -1886,6 +1899,9 @@ impl Daemon {
         // starvation, so the box keeps main-first priority. Audio still drains ahead of both.
         step!(self.out_video.drain_to(&mut self.acc), Wire::Video);
         step!(self.out_alt_video.drain_to(&mut self.acc), Wire::AltVideo);
+        // Route A's proxy tunnel after both video lanes: the phone's video it carries plays over CarPlay's,
+        // but CarPlay's own screen must never wait behind a stream segment.
+        step!(self.out_tunnel.drain_to(&mut self.acc), Wire::Tunnel);
         // CH_CONSOLE below A/V (audit B3) but above the bulk out_lo — interactive enough to beat ECHO/IP/
         // FILE/ETH, never at the expense of live video/audio.
         step!(self.out_console.drain_to(&mut self.acc), Wire::Console);
@@ -3550,6 +3566,7 @@ impl Daemon {
                     self.out_hi.clear();
                     self.out_video.clear();
                     self.out_alt_video.clear();
+                    self.out_tunnel.clear();
                     self.out_audio.clear();
                     self.out_lo.clear();
                     // out_console too: it is the one queue that can be resting MID-FRAME under a
@@ -3674,6 +3691,7 @@ impl Daemon {
                     // first bytes. Normally a no-op: each A/V stream is gated to one in-flight frame.
                     self.out_video.clear();
                     self.out_alt_video.clear();
+                    self.out_tunnel.clear();
                     self.out_audio.clear();
                     // If one of those was resting MID-FRAME it owns the wire, and leaving the owner set
                     // would make the next drain() try to finish a frame its queue no longer holds (the
@@ -3681,7 +3699,7 @@ impl Daemon {
                     // so the cost is the single truncated frame we just chose to abandon.
                     if matches!(
                         self.wire_owner,
-                        Some(Wire::Video) | Some(Wire::AltVideo) | Some(Wire::Audio)
+                        Some(Wire::Video) | Some(Wire::AltVideo) | Some(Wire::Tunnel) | Some(Wire::Audio)
                     ) {
                         self.wire_owner = None;
                     }
@@ -4381,6 +4399,7 @@ fn main() {
         (9003u16, p::CH_ALT_AUDIO, false),
         (9004u16, p::CH_METADATA, false),
         (9005u16, p::CH_ALT_VIDEO, false),
+        (9006u16, p::CH_TUNNEL, false),
     ] {
         match TcpListener::bind(("127.0.0.1", port)) {
             Ok(l) => {
@@ -4409,6 +4428,7 @@ fn main() {
         out_console: OutQueue::default(),
         out_video: OutQueue::default(),
         out_alt_video: OutQueue::default(),
+        out_tunnel: OutQueue::default(),
         out_audio: OutQueue::default(),
         out_log: OutQueue::default(),
         out_lo: OutQueue::default(),
@@ -4499,6 +4519,7 @@ fn main() {
         let want_out = !d.out_hi.is_empty()
             || !d.out_video.is_empty()
             || !d.out_alt_video.is_empty()
+            || !d.out_tunnel.is_empty()
             || !d.out_audio.is_empty()
             || !d.out_console.is_empty()   // audit B3: without this, console-only backlog never arms POLLOUT → the tail freezes when unsubscribed (poll blocks -1)
             || !d.out_log.is_empty()       // same for the log tail, now that the poll can really sleep
@@ -4552,10 +4573,13 @@ fn main() {
             // Backpressure each VIDEO seam on ITS OWN queue only (audit H1): pull the next chunk once THAT
             // stream has drained, so a slow pipe throttles that iPhone encoder instead of us dropping
             // P-frames (task #33) — and the cluster (:9005) can never gate the main 4K seam (:9001). Audio
-            // (low-rate) is never gated so it never starves behind video.
+            // (low-rate) is never gated so it never starves behind video. Route A's proxy tunnel is gated
+            // the same way: its bytes are a TLS stream that must never be dropped, so a slow host has to
+            // back the phone off over TCP instead.
             let gated = match *ch {
                 p::CH_VIDEO => !d.out_video.is_empty(),
                 p::CH_ALT_VIDEO => !d.out_alt_video.is_empty(),
+                p::CH_TUNNEL => !d.out_tunnel.is_empty(),
                 _ => false,
             };
             if gated {
@@ -4899,6 +4923,7 @@ mod tests {
             out_console: OutQueue::default(),
             out_video: OutQueue::default(),
             out_alt_video: OutQueue::default(),
+            out_tunnel: OutQueue::default(),
             out_audio: OutQueue::default(),
             out_log: OutQueue::default(),
             out_lo: OutQueue::default(),

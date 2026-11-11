@@ -636,6 +636,7 @@ impl AvSession {
         crate::uplink::clear();
         crate::events::clear();
         crate::playback::session_ended();
+        crate::tunnel::close_all();
         clear_sinks();
     }
 
@@ -643,6 +644,8 @@ impl AvSession {
     /// uplink can target it on the correct interface. Pass the full `peer_addr()`, not `.ip()`.
     pub fn set_peer_addr(&mut self, addr: std::net::SocketAddr) {
         self.peer_addr = Some(addr);
+        // Route A's tunnel may reach only this phone (tunnel.rs).
+        crate::tunnel::set_phone(addr);
     }
 
     /// `echo_video`: the AirPlay video probe's route A is on and the phone proposed `videoPlayback`
