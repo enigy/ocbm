@@ -1678,12 +1678,18 @@ impl AvSession {
                                     );
                                 }
                             }
+                        } else if crate::probe::switches().video {
+                            // A shared channel: once route A offers video, the phone's video Playback
+                            // channel asks for no socket, and its messages ride POST /command with this
+                            // streamID in X-Apple-StreamID. The relay (playback.rs) carries them to the
+                            // host and back (benched 10 Nov).
+                            eprintln!(
+                                "[session] DataStream(130) streamID {stream_id} shares the control connection: \
+                                 its messages ride POST /command, relayed to the host (playback.rs)"
+                            );
                         } else {
-                            // Every capture on record requests a dedicated socket
-                            // (wantsDedicatedSocket=true), so this arm has never been exercised on
-                            // hardware — and the shared-connection transport it implies (RCS frames
-                            // multiplexed onto the control connection, addressed by the transport
-                            // token) is NOT implemented. Be loud about it rather than silently
+                            // A shared channel with nothing to carry it: the relay (playback.rs) runs only
+                            // under the probe's `video` switch. Be loud about it rather than silently
                             // returning a streamID the phone will talk into a void.
                             eprintln!(
                                 "[session] *** DataStream(130) wantsDedicatedSocket=false — the \

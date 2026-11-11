@@ -68,11 +68,8 @@ pub fn send_reply(pl: &[u8]) -> bool {
         return false;
     }
     let sent = crate::events::send_stream_message(i64::from(stream), &data);
-    crate::probe::line(format_args!(
-        "DataStream stream {stream}, from the host: {} ({} B) sent={sent}",
-        crate::probe::shape(&message),
-        data.len()
-    ));
+    // Shape only, no byte count, so a poll's answers repeat word for word and are counted, not logged each time.
+    crate::probe::line(format_args!("DataStream stream {stream}, from the host: {} sent={sent}", crate::probe::shape(&message)));
     sent
 }
 

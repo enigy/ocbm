@@ -486,8 +486,12 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
   `{"kind":"dataStream","stream","client","message"}` record, its `params.data` plist as JSON. The host's
   answers come down as `INPUT_DATASTREAM` (`0x0A`) sub-frames, `[stream u32 LE][JSON]` (the one input
   sub-frame allowed past 64 B, up to 16 KiB), and go to the phone as a binary plist in `{params: {data}}`
-  on the event channel, with the same header. Carlink keeps the play queue and answers each request
-  (`playbackInfo` says not ready); nothing plays until its player is built.
+  on the event channel, with the same header. Carlink keeps the play queue, answers each request, and
+  plays the item, parked only. **Benched 2026-11-10** (the answers only, no player yet): the relay works
+  both ways. Safari hands off Apple's unencrypted H.264 example stream, whose `Start-Position` is a
+  CMTime. YouTube lists CarPlay but doesn't hand off: it sends `removePlayQueueItem` and tears the stream
+  down. While the relay is on, the shared channel's SETUP logs one plain line instead of the NOT
+  IMPLEMENTED warning.
 
 - **`fileTransfer` is blocked-untestable — even the advertise step is byte-unsafe.** The
   `fileTransferInfo` dict's keys are unknown, as is which transport carries the chunk dict.
