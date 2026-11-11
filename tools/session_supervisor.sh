@@ -233,6 +233,7 @@ projection_owner() {
       if pgrep iap2d >/dev/null 2>&1; then echo wired-cp; return; fi
       rm -f /tmp/projection_owner 2>/dev/null
       ;;
+    mirror) echo mirror; return ;;   # Twofish: local AirPlay mirror
     wireless) echo "$o"; return ;;
   esac
   [ "$(cat /tmp/carplay_transport 2>/dev/null)" = "wireless" ] && { echo wireless; return; }
@@ -847,6 +848,108 @@ if [ "$(cat "$FLAG" 2>/dev/null)" != 1 ]; then
   fi
 fi
 
+# Mirror mode is another owner in this supervisor, never a second radio manager.
+# These variables survive ticks; only our receiver PID is stopped, never an unrelated process.
+MIRROR_BIN=/usr/sbin/mirror-receiver
+MIRROR_REQUEST=/tmp/mirror_requested
+MIRROR_PID_FILE=/tmp/mirror_receiver.pid
+mirror_active=0
+mirror_running_mode=0
+mirror_paused=0
+mirror_failures=0
+mirror_retry_at=0
+mirror_stop_ticks=0
+mirror_pid=$(cat "$MIRROR_PID_FILE" 2>/dev/null || true)
+mirror_pid_alive() {
+  case "$mirror_pid" in ''|*[!0-9]*) return 1 ;; esac
+  case "$(tr '\000' '\n' < "/proc/$mirror_pid/cmdline" 2>/dev/null | head -n 1)" in
+    "$MIRROR_BIN") kill -0 "$mirror_pid" 2>/dev/null ;;
+    *) return 1 ;;
+  esac
+}
+mirror_control() { printf '%s\n' "$1" | nc -w 2 127.0.0.1 9115 2>/dev/null; }
+# OCBM's one-file installer places only usr/ and script/ files, so a full install carries no
+# /etc/ocbm marker. Write it when an executable receiver is installed, and only when it is missing.
+MIRROR_MARKER=/etc/ocbm/mirror-enabled
+mirror_marker_sync() {
+  [ -s "$MIRROR_BIN" ] || return 0
+  [ "$(dd if="$MIRROR_BIN" bs=1 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n')" = 7f ] || return 0
+  [ -f "$MIRROR_MARKER" ] && return 0
+  mkdir -p "${MIRROR_MARKER%/*}" && printf 'mirror-mode\n' > "$MIRROR_MARKER.new" &&
+    mv -f "$MIRROR_MARKER.new" "$MIRROR_MARKER" &&
+    echo "[sup] mirror marker set for the installed receiver"
+}
+mirror_marker_sync
+mirror_tick() {
+  _mirror_want=0
+  if [ "$p" = 1 ] && [ -f "$MIRROR_REQUEST" ] && [ -f /etc/ocbm/mirror-enabled ] && [ -x "$MIRROR_BIN" ] && ! radio_off && wireless_enabled; then
+    case "$(projection_owner)" in ''|wireless|mirror) _mirror_want=1 ;; esac
+  fi
+  if [ "$_mirror_want" = 1 ]; then
+    _mirror_mode=$(cat "$MIRROR_REQUEST" 2>/dev/null)
+    if [ "$mirror_active" = 0 ]; then
+      mirror_active=1; mirror_paused=0; mirror_failures=0; mirror_retry_at=0
+      echo "[sup] reserving mirror presentation; AP remains active"
+    fi
+    echo mirror > /tmp/projection_owner.mirror-tmp && mv /tmp/projection_owner.mirror-tmp /tmp/projection_owner
+    if [ "$mirror_paused" = 0 ]; then
+      # This btd verb holds AV_LOCK until any in-flight CarPlay spawn has finished and stopped.
+      _mirror_reply=$(mirror_control '{"cmd":"pause_carplay_for_mirror"}')
+      case "$_mirror_reply" in *'"ok":true'*) mirror_paused=1 ;; *) return 0 ;; esac
+    fi
+    carplayd_alive && return 0
+    if mirror_pid_alive && [ "$mirror_running_mode" != "$_mirror_mode" ]; then
+      kill "$mirror_pid" 2>/dev/null || true
+      mirror_stop_ticks=$((mirror_stop_ticks + 1))
+      [ "$mirror_stop_ticks" -gt 3 ] && kill -9 "$mirror_pid" 2>/dev/null
+      return 0
+    fi
+    mirror_stop_ticks=0
+    if ! mirror_pid_alive && [ "$(now)" -ge "$mirror_retry_at" ]; then
+      [ -n "$mirror_pid" ] && wait "$mirror_pid" 2>/dev/null || true
+      mirror_failures=$((mirror_failures + 1))
+      if [ "$mirror_failures" -gt 3 ]; then
+        echo "[sup] mirror receiver retry budget exhausted"
+        rm -f "$MIRROR_REQUEST"
+        return 0
+      fi
+      mkdir -p /etc/ocbm/mirror && chmod 700 /etc/ocbm/mirror || return 0
+      _mirror_mac=$(cat /sys/class/net/wlan0/address 2>/dev/null)
+      [ -n "$_mirror_mac" ] || return 0
+      mirror_running_mode=$_mirror_mode
+      set --
+      [ "$mirror_running_mode" = 2 ] && set -- --app-airplay
+      # --registry-file keeps PIN-paired iPhones across sessions; without it every new receiver forgot
+      # the phone while its identity key stayed the same, and the phone's saved pairing failed.
+      "$MIRROR_BIN" --device-id "$_mirror_mac" --key-file /etc/ocbm/mirror/identity.pem --registry-file /etc/ocbm/mirror/clients --name 'Truck Screen' --output-port 9006 "$@" >> /tmp/mirror-receiver.log 2>&1 &
+      mirror_pid=$!
+      echo "$mirror_pid" > "$MIRROR_PID_FILE"
+      mirror_retry_at=$(( $(now) + 5 ))
+    fi
+    # Skip wired projection arming, bus resets and watchdog escalation while mirror owns the pane.
+    return 0
+  fi
+  if [ "$mirror_active" = 1 ] || [ "$(cat /tmp/projection_owner 2>/dev/null)" = mirror ] || mirror_pid_alive; then
+    if mirror_pid_alive; then
+      kill "$mirror_pid" 2>/dev/null || true
+      mirror_stop_ticks=$((mirror_stop_ticks + 1))
+      [ "$mirror_stop_ticks" -gt 3 ] && kill -9 "$mirror_pid" 2>/dev/null
+      return 0
+    fi
+    [ -n "$mirror_pid" ] && wait "$mirror_pid" 2>/dev/null || true
+    mirror_pid=""; mirror_stop_ticks=0; mirror_active=0; mirror_paused=0
+    rm -f "$MIRROR_PID_FILE"
+    [ "$(cat /tmp/projection_owner 2>/dev/null)" = mirror ] && rm -f /tmp/projection_owner
+    rm -f /tmp/carplay_transport
+    armed=0
+    if [ "$p" = 1 ] && ! radio_off && wireless_enabled; then
+      mirror_control '{"cmd":"resume_carplay"}' >/dev/null
+    fi
+    echo "[sup] mirror presentation released"
+  fi
+  return 1
+}
+
 while :; do
   # Read presence, acting only on a DEFINITE 0/1 — an empty/partial read (or missing file) keeps the
   # last state rather than flapping. (ocbmd writes the flag atomically, so this is defensive.)
@@ -934,6 +1037,11 @@ while :; do
       last_p="$p"
       ;;
   esac
+
+  if mirror_tick; then
+    sleep 1
+    continue
+  fi
 
   case "$p" in
     1)

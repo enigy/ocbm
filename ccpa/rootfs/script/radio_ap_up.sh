@@ -193,6 +193,9 @@ grep -q '^interface' /etc/udhcpd.conf 2>/dev/null && sed -i "s/^interface.*/inte
 echo 1 > "/proc/sys/net/ipv6/conf/$IF/disable_ipv6" 2>/dev/null
 ifconfig "$IF" "$WLANIP" netmask 255.255.255.0 mtu 1500 up || {
   echo "$L could not configure $IF"; exit 1; }
+# The offline AP has no default route. Give Bonjour's IPv4 multicast group a local route
+# so the receiver can select the AP address and join the group on this interface.
+ip route replace 224.0.0.251/32 dev "$IF" || echo "$L could not route Bonjour multicast on $IF"
 
 # ---- bring up ---------------------------------------------------------------------------------
 test -e /tmp/bin/hostapd || cp /usr/sbin/hostapd /tmp/bin/hostapd 2>/dev/null

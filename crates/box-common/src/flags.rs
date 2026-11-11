@@ -31,6 +31,8 @@ pub enum ProjectionOwner {
     WiredCp,
     /// Wireless CarPlay (btd: BT + WiFi AP). Byte-compatible with the legacy "wireless".
     WirelessCp,
+    /// Local AirPlay mirror presentation over the existing AP (Twofish).
+    Mirror,
 }
 
 impl ProjectionOwner {
@@ -40,6 +42,7 @@ impl ProjectionOwner {
             ProjectionOwner::None => "",
             ProjectionOwner::WiredCp => "wired-cp",
             ProjectionOwner::WirelessCp => "wireless",
+            ProjectionOwner::Mirror => "mirror",
         }
     }
 
@@ -47,6 +50,7 @@ impl ProjectionOwner {
         match s.trim() {
             "wired-cp" => ProjectionOwner::WiredCp,
             "wireless" | "wireless-cp" => ProjectionOwner::WirelessCp,
+            "mirror" => ProjectionOwner::Mirror,
             _ => ProjectionOwner::None,
         }
     }
@@ -58,6 +62,7 @@ impl ProjectionOwner {
             ProjectionOwner::None => ocbm_proto::PM_NONE,
             ProjectionOwner::WiredCp => ocbm_proto::PM_WIRED_CP,
             ProjectionOwner::WirelessCp => ocbm_proto::PM_WIRELESS_CP,
+            ProjectionOwner::Mirror => ocbm_proto::PM_MIRROR,
         }
     }
 }
@@ -131,6 +136,9 @@ mod tests {
         // An owner token from an earlier OCBM that this one no longer has reads as idle.
         assert_eq!(ProjectionOwner::from_str("wired-aa"), ProjectionOwner::None);
         assert_eq!(ProjectionOwner::from_str("wireless-aa"), ProjectionOwner::None);
+        assert_eq!(ProjectionOwner::from_str("mirror"), ProjectionOwner::Mirror);
+        assert_eq!(ProjectionOwner::Mirror.as_str(), "mirror");
+        assert_eq!(ProjectionOwner::Mirror.wire_code(), ocbm_proto::PM_MIRROR);
     }
 
     /// The torn-read window itself is not observable from a single-threaded test; what IS checkable

@@ -3,6 +3,8 @@
 
 pub mod flags;
 pub mod net;
+/// USB idVendor -> PhoneType. Twofish: kept for ocbmd's AirPlay mirror admission after upstream retired it (5fec709).
+pub mod phone;
 
 /// The agnostic OCBM framing/channel layer. For now a re-export of `ocbm-proto` so every box crate
 /// references ONE definition of the channel ids and frame codec; ocbmd's mux-core (OutQueue/poll

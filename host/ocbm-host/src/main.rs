@@ -8,6 +8,7 @@
 //!                                                `rm /script/ncm_only; reboot` over ssh.
 //!   ocbm-host push  [vid pid] <local> <remote> [mode-octal]   verified file deploy (default mode 755)
 //!   ocbm-host pull  [vid pid] <remote> <local> [mode-octal]   verified file retrieval (box -> host)
+//!   ocbm-host airplay-probe [vid pid] <1|2>    verify one receiver mode and its HTTP seam without a phone (Twofish)
 //! Every connection also auto-pushes the host clock right after the HELLO_ACK. Without one, nothing
 //! else is sent and ocbm-host exits 1.
 
@@ -545,6 +546,78 @@ fn mode_session(link: &mut Link, secs: u64, cfg_path: Option<&str>) {
     println!("[session] STOP sent — clean exit");
 }
 
+/// Verify the actual supervisor starts the selected receiver and that its listener is reachable over CH_IP.
+fn mode_airplay_probe(link: &mut Link, mode: u8) -> bool {
+    let flags = p::F_SOM | p::F_EOM;
+    if !matches!(mode, 1 | 2) || !link.send(p::CH_CTRL, flags, &[p::CT_SUBSCRIBE]) {
+        return false;
+    }
+    let mut out = vec![0u8; p::MAX_PAYLOAD];
+    let deadline = Instant::now() + Duration::from_secs(24);
+    let mut next_hb = Instant::now();
+    let request_at = Instant::now() + Duration::from_secs(5);
+    let mut requested = false;
+    let mut ack = false;
+    let mut hello = Vec::new();
+    let mut queried = false;
+    let mut reply = Vec::new();
+    let mut success = false;
+    while Instant::now() < deadline {
+        // The truck enters AirPlay from an already running CarPlay AP. Give the bench AP the same warm-up.
+        if !requested && Instant::now() >= request_at {
+            if !link.send(p::CH_CTRL, flags, &[p::CT_MIRROR_READY, mode]) { break; }
+            requested = true;
+        }
+        if Instant::now() >= next_hb {
+            link.send(p::CH_CTRL, flags, &[p::CT_HEARTBEAT]);
+            next_hb = Instant::now() + Duration::from_secs(1);
+        }
+        let Some((channel, _, size)) = link.recv(&mut out, Instant::now() + Duration::from_millis(200)) else { continue };
+        let bytes = &out[..size];
+        if channel == p::CH_CTRL && bytes.first() == Some(&p::CT_MIRROR_READY) {
+            if bytes != [p::CT_MIRROR_READY, mode] { break; }
+            ack = true;
+        } else if channel == p::CH_MIRROR && !queried {
+            // HELLO describes the USB socket. The first heartbeat is emitted after the HTTP listener starts.
+            hello.extend_from_slice(&bytes[..bytes.len().min(72 - hello.len())]);
+        } else if channel == p::CH_IP && bytes.starts_with(&[p::IP_DATA, 17, 0]) {
+            reply.extend_from_slice(&bytes[3..]);
+            if let Some(end) = reply.windows(2).position(|pair| pair == b"\r\n") {
+                let expected = if mode == 1 { b"RTSP/1.0 200".as_slice() } else { b"HTTP/1.1 404".as_slice() };
+                success = reply[..end].starts_with(expected);
+                break;
+            }
+            if reply.len() > 1024 { break; }
+        } else if queried && channel == p::CH_IP && bytes == [p::IP_CLOSE, 17, 0] {
+            break;
+        }
+        if ack && hello.len() == 72 && !queried {
+            if !hello.starts_with(b"MIR1\x01\x01") || !hello[40..].starts_with(b"MIR1\x01\x0A") { break; }
+            let mut open = vec![p::IP_OPEN, 17, 0];
+            open.extend_from_slice(b"127.0.0.1:7000");
+            let mut request = vec![p::IP_DATA, 17, 0];
+            request.extend_from_slice(if mode == 1 {
+                b"GET /info RTSP/1.0\r\nCSeq: 1\r\n\r\n".as_slice()
+            } else {
+                // An idle HLS listener deliberately returns 404 because the phone supplied no playlist.
+                b"GET /master.m3u8 HTTP/1.1\r\nHost: localhost:7000\r\n\r\n".as_slice()
+            });
+            queried = link.send(p::CH_IP, flags, &open) && link.send(p::CH_IP, flags, &request);
+            if !queried { break; }
+        }
+    }
+    link.send(p::CH_IP, flags, &[p::IP_CLOSE, 17, 0]);
+    link.send(p::CH_CTRL, flags, &[p::CT_MIRROR_READY, 0]);
+    link.send(p::CH_CTRL, flags, &[p::CT_STOP]);
+    if success {
+        println!("AirPlay mode {mode}: readiness, receiver HELLO and HTTP listener via USB passed");
+    } else {
+        eprintln!("AirPlay mode {mode} probe failed (ack={ack}, hello={}, queried={queried}, HTTP={})",
+            hello.len(), String::from_utf8_lossy(reply.split(|byte| *byte == b'\r').next().unwrap_or(&[])));
+    }
+    success
+}
+
 /// `av` — receive the box's A/V over OCBM (CH_VIDEO / CH_MEDIA_AUDIO), count it, and save the video
 /// stream to a file. Validates the box-session -> ocbmd -> OCBM -> host A/V path with a live iPhone.
 fn mode_av(link: &mut Link, secs: u64) {
@@ -892,6 +965,11 @@ fn main() {
             args.get(4).and_then(|s| s.parse().ok()).unwrap_or(0),
             args.get(5).map(String::as_str),
         ),
+        "airplay-probe" => {
+            if !mode_airplay_probe(&mut link, args.get(4).and_then(|s| s.parse().ok()).unwrap_or(0)) {
+                std::process::exit(1);
+            }
+        }
         "push" => {
             let local = args.get(4).map(String::as_str).unwrap_or("");
             let remote = args.get(5).map(String::as_str).unwrap_or("");

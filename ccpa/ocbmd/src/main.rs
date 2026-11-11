@@ -7,7 +7,8 @@ use ocbm_proto as p;
 use std::ffi::CStr;
 use std::fs::{File, OpenOptions};
 use std::io::{IoSlice, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::collections::HashMap;
+use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
@@ -34,9 +35,27 @@ enum Kind {
     Acc,    // the reader thread's pipe: what the host sent ([`start_acc_relay`])
     AccOut, // the writer thread's pipe: room for output, or POLLERR once that thread has ended
     Pty,
+    Conn(u16), // Twofish: a CH_IP relay socket
     Mic,             // the mic-uplink seam to carplayd (readable: `uplink on/off` back-channel)
     AvListen(usize), // a local A/V seam listener (index into av_listeners)
     AvConn(usize),   // an accepted A/V seam connection (index into av_conns)
+}
+
+/// A relayed CH_IP connection — TCP stream or UDP datagram socket.
+///
+/// Twofish: upstream retired CH_IP in 1.0.5 (cf96a13; its only box-side user was aa-bridge). This fork
+/// keeps it because Carlink's app AirPlay fetches the receiver's HLS playlists through it.
+enum Conn {
+    Tcp(TcpStream),
+    Udp(UdpSocket),
+}
+impl Conn {
+    fn raw_fd(&self) -> RawFd {
+        match self {
+            Conn::Tcp(s) => s.as_raw_fd(),
+            Conn::Udp(s) => s.as_raw_fd(),
+        }
+    }
 }
 
 /// An in-progress CH_FILE push. Bytes land in a `.ocbm.part` temp; on a verified close
@@ -182,6 +201,7 @@ struct Daemon {
     // byte-stream reassembly for that channel desyncs permanently. Connection lifecycle only — the seam
     // payload is still forwarded byte-for-byte untouched (box forwards, app processes).
     av_conns: Vec<(TcpStream, u16, bool)>,
+    conns: HashMap<u16, Conn>, // Twofish: CH_IP relay sockets by the host's conn id
     out_hi: OutQueue, // priority output FIFO: CTRL (reliable, latency-sensitive)
     out_console: OutQueue,                        // CH_CONSOLE — drained AFTER A/V so a console flood can't starve it (audit B3)
     // LIVE A/V — one queue PER stream so each video seam's read-gate keys on ITS OWN backlog, not a
@@ -206,11 +226,16 @@ struct Daemon {
     lo_dropped: u64,        // reliable-bulk frames dropped because out_lo hit its OOM cap
     lo_capped: bool,        // currently over the out_lo cap (for transition-only logging)
     lo_resync: bool, // dropping bulk frames until the next F_SOM after a mid-message cap-clear (#567)
+    /// Set when a CT_HELLO cleared stale CH_IP sockets earlier in THIS dispatch pass, so the poll
+    /// loop does not send the new host an IP_CLOSE for a conn id that was the dead host's. Cleared at
+    /// the end of every pass.
+    hello_cleared_conns: bool,
     last_phone_check: Option<std::time::Instant>, // throttle the /tmp/phone_present stat (#673)
     // Session presence (docs/carplay/02_SESSION_LIFECYCLE.md lifecycle): the host app SUBSCRIBEs + HEARTBEATs; a watchdog declares
     // it gone if beats stop. `present` is the cross-process signal (also mirrored to /tmp/host_present)
     // that carplayd will read to gate advertising + drive teardown.
     subscribed: bool,
+    mirror_ready: bool,
     last_hb: Option<std::time::Instant>,
     present: bool,
     /// When a `CT_HEARTBEAT` from an UNSUBSCRIBED host was last answered with a `SEV_HOST_GONE`
@@ -831,6 +856,38 @@ const PAIRING_CODE_FILE: &str = "/tmp/pairing_code";
 const WIRELESS_CONTROL_ADDR: &str = "127.0.0.1:9115";
 #[cfg(test)]
 const WIRELESS_CONTROL_ADDR: &str = "127.0.0.1:19115";
+#[cfg(not(test))]
+const MIRROR_REQUEST: &str = "/tmp/mirror_requested";
+#[cfg(test)]
+const MIRROR_REQUEST: &str = "/tmp/ocbmd_test_mirror_requested";
+const MIRROR_ENABLE: &str = "/etc/ocbm/mirror-enabled";
+fn mirror_runtime_available() -> bool {
+    std::path::Path::new(MIRROR_ENABLE).exists()
+        && std::path::Path::new("/usr/sbin/mirror-receiver").exists()
+}
+
+/// A wireless CarPlay session is the normal entry point. The supervisor's phone-present flag
+/// includes Wi-Fi, so use the phone-facing USB state to protect wired CarPlay, even before it claims
+/// ownership or after the iPhone role-switches out of the USB device list.
+fn mirror_admission(
+    owner: box_common::flags::ProjectionOwner,
+    usb_devices: &str,
+    phone_gadget_state: &str,
+) -> Result<(), &'static str> {
+    use box_common::flags::ProjectionOwner;
+    use box_common::phone::{detect, PhoneType};
+
+    if !matches!(owner, ProjectionOwner::None | ProjectionOwner::WirelessCp | ProjectionOwner::Mirror) {
+        return Err("projection has a competing owner");
+    }
+    if std::fs::read_to_string(phone_gadget_state).is_ok_and(|state| state.trim() == "CONFIGURED")
+        || detect(usb_devices).iter().any(|device| device.kind == PhoneType::Apple)
+    {
+        return Err("iPhone connected to the phone-side USB port");
+    }
+    Ok(())
+}
+
 /// Present while btd's pairing window is open (`ssp_agent::PAIR_WINDOW_FLAG`); mirrored as `BH_PAIR_WINDOW`.
 const PAIR_WINDOW_FILE: &str = "/tmp/bt_pair_window";
 /// Written by `wireless::bt_driver::publish_bt_phase` on every iAP2 handshake transition.
@@ -1658,6 +1715,7 @@ impl Daemon {
     /// Frame directly into the target priority queue and enqueue (never blocks). The seq is consumed up
     /// front so a capped/resync-dropped frame still advances it, exactly as the old frame-then-drop did.
     fn send(&mut self, ch: u16, flags: u8, payload: &[u8]) {
+        if ch == p::CH_MIRROR && (!self.subscribed || !self.mirror_ready) { return; }
         let n = p::HDR_LEN + payload.len();
         let seq = self.seq;
         self.seq = self.seq.wrapping_add(1);
@@ -1709,7 +1767,7 @@ impl Daemon {
             }
         } else if matches!(
             ch,
-            p::CH_VIDEO | p::CH_ALT_VIDEO | p::CH_MEDIA_AUDIO | p::CH_ALT_AUDIO
+            p::CH_VIDEO | p::CH_MIRROR | p::CH_ALT_VIDEO | p::CH_MEDIA_AUDIO | p::CH_ALT_AUDIO
         ) {
             // LIVE-UI (VNC) path — CarPlay is the screen NOW, not a replay. BACKPRESSURE, don't drop
             // (task #33 efficiency): the poll loop only pulls the next chunk for a given stream once THAT
@@ -1726,7 +1784,7 @@ impl Daemon {
             // remainder into the queue + owns the wire, so drain() finishes it exactly as a queued frame;
             // WouldBlock / error / oversize fall through to the queued path unchanged.
             let q_empty = match ch {
-                p::CH_VIDEO => self.out_video.is_empty(),
+                p::CH_VIDEO | p::CH_MIRROR => self.out_video.is_empty(),
                 p::CH_ALT_VIDEO => self.out_alt_video.is_empty(),
                 _ => self.out_audio.is_empty(),
             };
@@ -1749,7 +1807,7 @@ impl Daemon {
                         // Partial: re-queue the whole frame with `w` bytes marked written, own the wire so
                         // drain() resumes THIS queue mid-frame (never interleaves another stream).
                         let wire = match ch {
-                            p::CH_VIDEO => { self.out_video.push_partial(ch, flags, seq, payload, w); Wire::Video }
+                            p::CH_VIDEO | p::CH_MIRROR => { self.out_video.push_partial(ch, flags, seq, payload, w); Wire::Video }
                             p::CH_ALT_VIDEO => { self.out_alt_video.push_partial(ch, flags, seq, payload, w); Wire::AltVideo }
                             _ => { self.out_audio.push_partial(ch, flags, seq, payload, w); Wire::Audio }
                         };
@@ -1761,7 +1819,7 @@ impl Daemon {
                 }
             }
             let q = match ch {
-                p::CH_VIDEO => &mut self.out_video,
+                p::CH_VIDEO | p::CH_MIRROR => &mut self.out_video,
                 p::CH_ALT_VIDEO => &mut self.out_alt_video,
                 _ => &mut self.out_audio, // CH_MEDIA_AUDIO | CH_ALT_AUDIO
             };
@@ -1824,6 +1882,9 @@ impl Daemon {
                     eprintln!("[ocbmd] out_lo cap hit ({OUT_QUEUE_CAP} B) — cleared + resyncing (host stalled)");
                     self.lo_capped = true;
                 }
+                // Twofish: a relayed CH_IP stream cannot survive a gap (the host would read a
+                // truncated HTTP body); close every relayed stream so both ends see a clean end.
+                self.close_ip_conns_after_gap();
             }
         }
     }
@@ -2024,6 +2085,8 @@ impl Daemon {
             eprintln!("[ocbmd] session: host GONE (not signalled — it sent CT_STOP and left)");
         }
         self.subscribed = false;
+        self.mirror_ready = false;
+        let _ = std::fs::remove_file(MIRROR_REQUEST);
         self.cfg.clear();
         // A latched replacement flag must not outlive the session that set it. It is consumed only by
         // the SUBSCRIBE handler, and a host can send HELLO without ever subscribing (a link-only
@@ -2056,6 +2119,15 @@ impl Daemon {
         // Stop streaming the log and drop what was buffered for a host that is no longer there.
         // The file itself keeps being capped — log_tick runs unsubscribed for exactly that reason.
         self.log_reset();
+        // Twofish: close orphaned CH_IP relay sockets; a departed host's relays otherwise persist
+        // until the remote closes. No IP_CLOSE is sent — the host is, by definition, gone.
+        if !self.conns.is_empty() {
+            eprintln!(
+                "[ocbmd] session: closing {} orphaned CH_IP relay socket(s)",
+                self.conns.len()
+            );
+            self.conns.clear();
+        }
         // The one-file install: the session after the confirm is over, so stock goes now.
         finish_if_confirmed(INSTALL_MODE_FILE, start_install_finish);
     }
@@ -2918,6 +2990,92 @@ impl Daemon {
         );
     }
 
+    fn send_ip(&mut self, typ: u8, id: u16, data: &[u8]) {
+        let mut pl = Vec::with_capacity(3 + data.len());
+        pl.push(typ);
+        pl.extend_from_slice(&id.to_le_bytes());
+        pl.extend_from_slice(data);
+        self.send(p::CH_IP, p::F_SOM | p::F_EOM, &pl);
+    }
+
+    /// Tear down every relayed CH_IP stream after the reliable queue dropped frames (Twofish).
+    fn close_ip_conns_after_gap(&mut self) {
+        if self.conns.is_empty() {
+            return;
+        }
+        eprintln!(
+            "[ocbmd] out_lo gap — closing {} relayed CH_IP stream(s); a stream cannot survive a gap",
+            self.conns.len()
+        );
+        self.conns.clear();
+    }
+
+    /// OCBM_CH_IP stream mux: OPEN (connect to a literal ip:port), DATA (relay), CLOSE. Twofish:
+    /// restored from before upstream's cf96a13 for app AirPlay's playlist fetches.
+    fn handle_ip(&mut self, pl: &[u8]) {
+        if pl.len() < 3 {
+            return;
+        }
+        let typ = pl[0];
+        let id = u16::from_le_bytes([pl[1], pl[2]]);
+        let data = &pl[3..];
+        match typ {
+            p::IP_OPEN => {
+                // connect_seam blocks up to 2 s on an unreachable target; if it measurably stalled,
+                // refresh last_hb so the watchdog doesn't miscount that stall as a lapsed heartbeat.
+                let start = Instant::now();
+                let conn = std::str::from_utf8(data)
+                    .ok()
+                    .and_then(|t| connect_seam(t, Duration::from_secs(2)));
+                if start.elapsed() >= Duration::from_secs(1) && self.last_hb.is_some() {
+                    self.last_hb = Some(Instant::now());
+                }
+                match conn {
+                    Some(s) => {
+                        self.conns.insert(id, Conn::Tcp(s));
+                    }
+                    None => self.send_ip(p::IP_CLOSE, id, &[]),
+                }
+            }
+            p::IP_OPEN_UDP => {
+                let sock = std::str::from_utf8(data).ok().and_then(|t| {
+                    // Literal only, same reason as connect_seam: getaddrinfo has no deadline.
+                    let addr = t.parse::<SocketAddr>().ok()?;
+                    let s = UdpSocket::bind("0.0.0.0:0").ok()?;
+                    s.connect(addr).ok()?;
+                    s.set_nonblocking(true).ok()?;
+                    Some(s)
+                });
+                match sock {
+                    Some(s) => {
+                        self.conns.insert(id, Conn::Udp(s));
+                    }
+                    None => self.send_ip(p::IP_CLOSE, id, &[]),
+                }
+            }
+            p::IP_DATA => {
+                // Non-blocking TCP relay: a short or failed write drops the connection and tells the
+                // host (IP_CLOSE) — a clean reset beats silently truncating a reliable stream.
+                let drop = match self.conns.get_mut(&id) {
+                    Some(Conn::Tcp(s)) => s.write_all(data).is_err(),
+                    Some(Conn::Udp(s)) => {
+                        let _ = s.send(data);
+                        false
+                    }
+                    None => false,
+                };
+                if drop {
+                    self.conns.remove(&id);
+                    self.send_ip(p::IP_CLOSE, id, &[]);
+                }
+            }
+            p::IP_CLOSE => {
+                self.conns.remove(&id);
+            }
+            _ => {}
+        }
+    }
+
     /// Relay a CH_INPUT sub-frame (one HID event, e.g. INPUT_TOUCH) to carplayd's local ingest,
     /// length-prefixed (`[len u16 LE][payload]`) so carplayd frames it back out of the TCP stream.
     /// Lazy-connects; drops the socket on ANY failed/incomplete send so the next event reconnects with
@@ -3493,6 +3651,9 @@ impl Daemon {
         match ch {
             p::CH_CTRL => {
                 if pl.first() == Some(&p::CT_HELLO) {
+                    // Every host incarnation must explicitly re-arm mirror consumption.
+                    self.mirror_ready = false;
+                    let _ = std::fs::remove_file(MIRROR_REQUEST);
                     // Host instance nonce (trailing u32 LE, 0 = not supplied). A DIFFERENT nonce while
                     // we still think a host is present means the previous one died without CT_STOP:
                     // its carplayd went with it, but presence never dropped, so nothing would re-ARM.
@@ -3573,9 +3734,24 @@ impl Daemon {
                     self.lo_capped = false;
                     self.av_backpressured = false;
                     self.seq = 0;
+                    // Twofish: a NEW host attached, so any CH_IP relay socket still open belongs to
+                    // the previous one; drop them (the host's conn ids are per attempt).
+                    if !self.conns.is_empty() {
+                        eprintln!(
+                            "[ocbmd] session: HELLO — dropping {} stale CH_IP relay socket(s) from the previous host",
+                            self.conns.len()
+                        );
+                        self.conns.clear();
+                        self.hello_cleared_conns = true;
+                    }
                     let mut caps =
-                        p::CAP_CONSOLE | p::CAP_FILE | p::CAP_PHONE_POLICY | p::CAP_PAIR_WINDOW
+                        p::CAP_CONSOLE | p::CAP_IP | p::CAP_FILE | p::CAP_PHONE_POLICY | p::CAP_PAIR_WINDOW
                         | p::CAP_INSTALL | p::CAP_PHONE_SWITCH;
+                    if self.av_listeners.iter().any(|(_, ch)| *ch == p::CH_MIRROR) {
+                        caps |= p::CAP_MIRROR_SEAM;
+                        // The installed receiver carries both modes: screen mirror and app AirPlay.
+                        if mirror_runtime_available() { caps |= p::CAP_MIRROR_MODE | p::CAP_APP_AIRPLAY; }
+                    }
                     if std::path::Path::new(UPDATE_SCRIPT).exists() {
                         caps |= p::CAP_UPDATE;
                     }
@@ -3596,6 +3772,42 @@ impl Daemon {
                         p::MODE_PROJECTION
                     };
                     self.send(p::CH_CTRL, p::F_SOM | p::F_EOM, &a);
+                } else if pl.len() == 2 && pl[0] == p::CT_MIRROR_READY {
+                    let mode = pl[1];
+                    let runtime = mirror_runtime_available();
+                    self.mirror_ready = (mode == 1 || (mode == 2 && runtime)) && self.subscribed
+                        && self.av_listeners.iter().any(|(_, ch)| *ch == p::CH_MIRROR);
+                    if runtime {
+                        if self.mirror_ready {
+                            let owner = box_common::flags::owner();
+                            match mirror_admission(owner, "/sys/bus/usb/devices", "/sys/class/android_usb/android0/state") {
+                                Ok(()) => {
+                                    let tmp = format!("{MIRROR_REQUEST}.tmp");
+                                    if let Err(error) = std::fs::write(&tmp, [b'0' + mode])
+                                        .and_then(|_| std::fs::rename(&tmp, MIRROR_REQUEST))
+                                    {
+                                        eprintln!("[ocbmd] mirror mode {mode} request failed: {error}");
+                                        self.mirror_ready = false;
+                                    }
+                                }
+                                Err(reason) => {
+                                    eprintln!("[ocbmd] mirror mode {mode} refused (owner={owner:?}): {reason}");
+                                    self.mirror_ready = false;
+                                }
+                            }
+                        }
+                        if !self.mirror_ready { let _ = std::fs::remove_file(MIRROR_REQUEST); }
+                    }
+                    self.send(p::CH_CTRL, p::F_SOM | p::F_EOM,
+                              &[p::CT_MIRROR_READY, if self.mirror_ready { mode } else { 0 }]);
+                } else if pl.len() == 29 && pl[0] == p::CT_APP_AIRPLAY_STATUS && &pl[1..5] == b"MAPP"
+                    && self.mirror_ready && std::fs::read(MIRROR_REQUEST).is_ok_and(|value| value == b"2") {
+                    if let Some((stream, _, _)) = self.av_conns.iter_mut().find(|(_, channel, fresh)| *channel == p::CH_MIRROR && !*fresh) {
+                        if stream.write_all(&pl[1..]).is_err() {
+                            // A partial status record cannot be retried. The poll loop retires this socket.
+                            let _ = stream.shutdown(std::net::Shutdown::Both);
+                        }
+                    }
                 } else if pl.len() >= 2 && pl[0] == p::CT_MODE_SELECT && pl[1] == p::MODE_CONSOLE {
                     self.start_console();
                 } else if pl.len() >= 9 && pl[0] == p::CT_SETTIME {
@@ -3881,6 +4093,7 @@ impl Daemon {
                     let _ = ptm.write_all(pl);
                 }
             }
+            p::CH_IP => self.handle_ip(pl), // Twofish: app AirPlay's relay
             p::CH_FILE => self.handle_file(pl),
             p::CH_INPUT => self.forward_input(pl), // HID input host -> carplayd -> iPhone (task #20)
             p::CH_MIC => self.forward_mic(pl), // mic PCM host -> carplayd -> iPhone (type-100 uplink)
@@ -4381,6 +4594,7 @@ fn main() {
         (9003u16, p::CH_ALT_AUDIO, false),
         (9004u16, p::CH_METADATA, false),
         (9005u16, p::CH_ALT_VIDEO, false),
+        (9006u16, p::CH_MIRROR, false),
     ] {
         match TcpListener::bind(("127.0.0.1", port)) {
             Ok(l) => {
@@ -4405,6 +4619,7 @@ fn main() {
         file: FileState::default(),
         av_listeners,
         av_conns: Vec::new(),
+        conns: HashMap::new(),
         out_hi: OutQueue::default(),
         out_console: OutQueue::default(),
         out_video: OutQueue::default(),
@@ -4419,8 +4634,10 @@ fn main() {
         lo_dropped: 0,
         lo_capped: false,
         lo_resync: false,
+        hello_cleared_conns: false,
         last_phone_check: None,
         subscribed: false,
+        mirror_ready: false,
         last_hb: None,
         present: false,
         hb_unsub_nudged_at: None,
@@ -4463,6 +4680,8 @@ fn main() {
     // Hoisted out of the Kind::AvConn dispatch arm (perf): it declared a fresh ~64 KiB stack array,
     // whose zero-init on EVERY readable wake wipes the Cortex-A7's whole L1D.
     // Reuse is safe: contents are always overwritten by the read and only buf[..n] is consumed.
+    // Twofish: CH_IP reads leave room for send_ip's 3-byte sub-header within MAX_PAYLOAD.
+    let mut connbuf = vec![0u8; p::MAX_PAYLOAD - 3];
     let mut avbuf = vec![0u8; p::MAX_PAYLOAD];
     // Initialize the presence flag to "0" at startup: `present` starts false but set_present is
     // edge-guarded, so without this an ocbmd restart could leave a stale "1" from a prior crash.
@@ -4494,6 +4713,15 @@ fn main() {
     let mut fds: Vec<libc::pollfd> = Vec::new();
     let mut kinds: Vec<Kind> = Vec::new();
     loop {
+        // Twofish: producer indices must stay stable throughout poll dispatch, so retire disarmed
+        // mirror sockets before the pollfd set is built.
+        if d.mirror_ready && mirror_runtime_available() && !std::path::Path::new(MIRROR_REQUEST).exists() {
+            d.mirror_ready = false;
+            d.send(p::CH_CTRL, p::F_SOM | p::F_EOM, &[p::CT_MIRROR_READY, 0]);
+        }
+        if !d.subscribed || !d.mirror_ready {
+            d.av_conns.retain(|(_, channel, _)| *channel != p::CH_MIRROR);
+        }
         // rebuild the pollfd set each pass: the accessory relay's two pipes (+POLLOUT if backlog) and the
         // device itself (hangup only) + PTY + the seams
         let want_out = !d.out_hi.is_empty()
@@ -4540,6 +4768,14 @@ fn main() {
             });
             kinds.push(Kind::Mic);
         }
+        for (id, s) in d.conns.iter() {
+            fds.push(libc::pollfd {
+                fd: s.raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            });
+            kinds.push(Kind::Conn(*id));
+        }
         for (idx, (l, _)) in d.av_listeners.iter().enumerate() {
             fds.push(libc::pollfd {
                 fd: l.as_raw_fd(),
@@ -4554,7 +4790,7 @@ fn main() {
             // P-frames (task #33) — and the cluster (:9005) can never gate the main 4K seam (:9001). Audio
             // (low-rate) is never gated so it never starves behind video.
             let gated = match *ch {
-                p::CH_VIDEO => !d.out_video.is_empty(),
+                p::CH_VIDEO | p::CH_MIRROR => !d.out_video.is_empty(),
                 p::CH_ALT_VIDEO => !d.out_alt_video.is_empty(),
                 _ => false,
             };
@@ -4616,6 +4852,10 @@ fn main() {
                     match kinds[i] {
                         Kind::Pty => d.ptm = None, // console shell exited → drop the master pty
                         Kind::Mic => d.drop_mic_seam("poll HUP/ERR"), // ensure_mic_seam reconnects on the next tick
+                        Kind::Conn(id) => {
+                            d.conns.remove(&id);
+                            d.send_ip(p::IP_CLOSE, id, &[]);
+                        }
                         Kind::AvConn(idx) => av_close.push(idx),
                         Kind::AvListen(_) => {} // a listen socket hangup shouldn't occur; nothing to drop
                         Kind::Acc | Kind::AccOut => {
@@ -4696,6 +4936,39 @@ fn main() {
                         Err(_) => d.ptm = None,
                     }
                 }
+                Kind::Conn(id) => {
+                    // (bytes, should_close). WouldBlock/Interrupted on a level-triggered wake is not death.
+                    let outcome = match d.conns.get_mut(&id) {
+                        Some(Conn::Tcp(s)) => match s.read(&mut connbuf) {
+                            Ok(0) => (0usize, true),
+                            Ok(n) => (n, false),
+                            Err(ref e)
+                                if matches!(
+                                    e.kind(),
+                                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                                ) =>
+                            {
+                                (0usize, false)
+                            }
+                            Err(_) => (0usize, true),
+                        },
+                        Some(Conn::Udp(s)) => match s.recv(&mut connbuf) {
+                            Ok(n) => (n, false),
+                            Err(_) => (0, false),
+                        },
+                        // Removed earlier in this pass (IP_CLOSE, CT_STOP or the HELLO clear): the peer knows.
+                        None => (0, false),
+                    };
+                    if outcome.0 > 0 {
+                        d.send_ip(p::IP_DATA, id, &connbuf[..outcome.0]);
+                    } else if outcome.1 {
+                        d.conns.remove(&id);
+                        // Only tell a host that is still there, and never a NEW host about a dead id.
+                        if d.present && !d.hello_cleared_conns {
+                            d.send_ip(p::IP_CLOSE, id, &[]);
+                        }
+                    }
+                }
                 Kind::Mic => {
                     // the mic seam's `uplink on/off` back-channel → CH_CTRL CT_UPLINK to the host
                     d.drain_mic_backchannel();
@@ -4706,8 +4979,15 @@ fn main() {
                     // this pass's AvConn(idx) entries were built with (audit M-a).
                     let ch = d.av_listeners[idx].1;
                     let accepted = d.av_listeners[idx].0.accept();
-                    if let Ok((s, _)) = accepted {
+                    if let Ok((mut s, _)) = accepted {
                         let _ = s.set_nonblocking(true);
+                        if ch == p::CH_MIRROR {
+                            if !d.subscribed || !d.mirror_ready { continue; }
+                            // Only a subscribed, explicitly armed media host may make the
+                            // headless receiver discoverable. A successful TCP connect alone
+                            // is not readiness. Loopback peers receive this small version ACK.
+                            if s.write_all(b"MIRACK1\n").is_err() { continue; }
+                        }
                         av_new.push((s, ch));
                     }
                 }
@@ -4717,6 +4997,10 @@ fn main() {
                     // per video frame, cutting per-frame syscall/framing overhead on the CPU-bound box.
                     // `avbuf` is hoisted above the loop — see its comment (L1D wipe per wake).
                     let ch = d.av_conns[idx].1;
+                    if ch == p::CH_MIRROR && (!d.subscribed || !d.mirror_ready) {
+                        av_close.push(idx);
+                        continue;
+                    }
                     let res = d.av_conns[idx].0.read(&mut avbuf);
                     match res {
                         Ok(0) => av_close.push(idx),
@@ -4761,6 +5045,8 @@ fn main() {
             d.av_conns.retain(|(_, c, _)| *c != ch);
             d.av_conns.push((s, ch, true));
         }
+        // Twofish: the HELLO-cleared-conns suppression is scoped to one dispatch pass.
+        d.hello_cleared_conns = false;
         // Watchdog AFTER the dispatch loop: any heartbeat that arrived in this wake has now refreshed
         // `last_hb`, so we never spuriously tear down a live session on a beat that already landed.
         d.presence_tick(Instant::now());
@@ -4895,6 +5181,7 @@ mod tests {
             file: FileState::default(),
             av_listeners: Vec::new(),
             av_conns: Vec::new(),
+            conns: HashMap::new(),
             out_hi: OutQueue::default(),
             out_console: OutQueue::default(),
             out_video: OutQueue::default(),
@@ -4909,8 +5196,10 @@ mod tests {
             lo_dropped: 0,
             lo_capped: false,
             lo_resync: false,
+            hello_cleared_conns: false,
             last_phone_check: None,
             subscribed: false,
+            mirror_ready: false,
             last_hb: None,
             present: false,
             hb_unsub_nudged_at: None,
@@ -4980,6 +5269,48 @@ mod tests {
             v.push((ch, fl, out[..n].to_vec()));
         }
         v
+    }
+
+    #[test]
+    fn mirror_requires_subscription_listener_and_explicit_host_readiness() {
+        let mut d = td();
+        d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &[p::CT_MIRROR_READY, 1]);
+        assert!(!d.mirror_ready);
+        d.subscribed = true;
+        d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &[p::CT_MIRROR_READY, 1]);
+        assert!(!d.mirror_ready, "a missing seam must not claim readiness");
+        d.av_listeners.push((TcpListener::bind(("127.0.0.1", 0)).unwrap(), p::CH_MIRROR));
+        d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &[p::CT_MIRROR_READY, 1]);
+        assert!(d.mirror_ready);
+        d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &[p::CT_HELLO, p::VERSION]);
+        assert!(!d.mirror_ready, "reattaching hosts must re-arm explicitly");
+        d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &[p::CT_MIRROR_READY, 1]);
+        assert!(d.mirror_ready);
+        d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &[p::CT_MIRROR_READY, 0]);
+        assert!(!d.mirror_ready);
+    }
+
+    #[test]
+    fn mirror_admission_accepts_wireless_carplay_and_rejects_wired_iphone() {
+        use box_common::flags::ProjectionOwner;
+
+        let root = install_tmp("mirror_usb");
+        let usb = format!("{root}/devices");
+        let gadget = format!("{root}/state");
+        std::fs::create_dir_all(format!("{usb}/1-1")).unwrap();
+        std::fs::write(&gadget, "DISCONNECTED\n").unwrap();
+        let admission = |owner| mirror_admission(owner, &usb, &gadget);
+        assert!(admission(ProjectionOwner::WirelessCp).is_ok());
+        assert!(admission(ProjectionOwner::None).is_ok());
+        assert!(admission(ProjectionOwner::WiredCp).is_err());
+
+        let vendor = format!("{usb}/1-1/idVendor");
+        std::fs::write(&vendor, "05ac\n").unwrap();
+        assert!(admission(ProjectionOwner::WirelessCp).is_err());
+        std::fs::remove_file(&vendor).unwrap();
+        std::fs::write(&gadget, "CONFIGURED\n").unwrap();
+        assert!(admission(ProjectionOwner::None).is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     // ---- the one-file install's mode (ccpa/installer/) ----------------------------------------
@@ -5635,6 +5966,63 @@ mod tests {
         pl.extend_from_slice(&inst.to_le_bytes());
         pl.extend_from_slice(label);
         pl
+    }
+
+    // ---- CH_IP relay (Twofish: app AirPlay's playlist fetches) -----------------------------------
+
+    #[test]
+    fn ip_open_to_a_hostname_is_refused_with_ip_close() {
+        let mut d = td();
+        let mut req = vec![p::IP_OPEN, 7, 0];
+        req.extend_from_slice(b"localhost:7000");
+        d.handle_ip(&req);
+        assert!(d.conns.is_empty());
+        assert_eq!(sent_lo(&mut d), vec![(p::CH_IP, p::F_SOM | p::F_EOM, vec![p::IP_CLOSE, 7, 0])]);
+    }
+
+    #[test]
+    fn ip_relay_opens_writes_and_closes_a_loopback_stream() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target = listener.local_addr().unwrap().to_string();
+        let mut d = td();
+        let mut open = vec![p::IP_OPEN, 17, 0];
+        open.extend_from_slice(target.as_bytes());
+        d.handle_ip(&open);
+        assert!(d.conns.contains_key(&17), "a literal loopback target must connect");
+        let (mut peer, _) = listener.accept().unwrap();
+
+        let mut data = vec![p::IP_DATA, 17, 0];
+        data.extend_from_slice(b"GET /master.m3u8 HTTP/1.1\r\n\r\n");
+        d.handle_ip(&data);
+        let mut got = [0u8; 29];
+        peer.read_exact(&mut got).unwrap();
+        assert_eq!(&got, b"GET /master.m3u8 HTTP/1.1\r\n\r\n");
+
+        d.handle_ip(&[p::IP_CLOSE, 17, 0]);
+        assert!(d.conns.is_empty());
+        assert!(sent_lo(&mut d).is_empty(), "a host's own close needs no answer");
+    }
+
+    #[test]
+    fn ip_relays_are_dropped_when_the_session_goes_idle() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut d = td();
+        let mut open = vec![p::IP_OPEN, 1, 0];
+        open.extend_from_slice(listener.local_addr().unwrap().to_string().as_bytes());
+        d.handle_ip(&open);
+        assert_eq!(d.conns.len(), 1);
+        d.go_idle(false);
+        assert!(d.conns.is_empty(), "orphaned CH_IP relays must be closed");
+    }
+
+    #[test]
+    fn ip_short_or_unknown_frames_never_panic() {
+        let mut d = td();
+        d.handle_ip(&[]);
+        d.handle_ip(&[p::IP_DATA, 9]);
+        d.handle_ip(&[p::IP_DATA, 9, 0, 1, 2, 3]); // no such conn
+        d.handle_ip(&[0x7F, 1, 0]);
+        assert!(d.conns.is_empty());
     }
 
     // ---- F_REPLAY on the state mirrors (2026-08-27) -------------------------------------------
