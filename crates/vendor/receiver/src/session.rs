@@ -447,6 +447,40 @@ pub struct AvSession {
     /// `(width, height, max_fps)` from the advertised `DeviceConfig`, via [`SessionDelegate::set_resolution`].
     /// `(0, 0, 0)` = unset (never threaded in — e.g. under `NoSession`/tests).
     resolution: (i64, i64, i64),
+    /// Each RCS (type-130) channel this connection SETUP, by `channelID`: what a partial TEARDOWN is matched
+    /// against ([`rcs_channels_named`]), so tearing down one channel never takes the others with it.
+    rcs_channels: HashMap<String, RcsChannel>,
+}
+
+/// One RCS (type-130) channel as its SETUP made it: the transport token returned for it (`streamID`), and
+/// whether it is the iAP channel, which carries the session's metadata, calls and location.
+#[derive(Debug, Clone, Copy)]
+struct RcsChannel {
+    stream_id: i64,
+    iap: bool,
+}
+
+/// The RCS channels one partial-TEARDOWN entry names, and how it named them: by its `channelID`, else by its
+/// `streamID` (the transport token SETUP returned), else, with neither, every channel but the iAP one.
+///
+/// The type alone names nothing once two channels share 130. Stopping every channel of the type is what lost
+/// the iAP2 link for the rest of a session when the phone tore its two video channels down (the Mac's 10 Nov
+/// probe bench: "outbound sink cleared"; metadata, call state and location gone).
+fn rcs_channels_named(entry: &Dictionary, channels: &HashMap<String, RcsChannel>) -> (Vec<String>, &'static str) {
+    if let Some(ch) = entry.get("channelID").and_then(Value::as_string) {
+        return (vec![ch.to_string()], "channelID");
+    }
+    let stream_id = entry.get("streamID").and_then(|v| {
+        v.as_signed_integer()
+            .or_else(|| v.as_unsigned_integer().and_then(|u| i64::try_from(u).ok()))
+    });
+    let mut named: Vec<String> = match stream_id {
+        Some(sid) => channels.iter().filter(|(_, c)| c.stream_id == sid).map(|(k, _)| k.clone()).collect(),
+        None => channels.iter().filter(|(_, c)| !c.iap).map(|(k, _)| k.clone()).collect(),
+    };
+    named.sort();
+    let how = if stream_id.is_some() { "streamID" } else { "no channelID or streamID: every channel but the iAP one" };
+    (named, how)
 }
 
 /// How often stream threads wake from a blocking socket read to check the session-liveness flag.
@@ -522,6 +556,7 @@ impl AvSession {
             activity: Arc::new(AtomicU64::new(0)),
             av_streams: Arc::new(Mutex::new(HashMap::new())),
             negotiated_features: Vec::new(),
+            rcs_channels: HashMap::new(),
             resolution: (0, 0, 0),
         }
     }
@@ -1221,6 +1256,9 @@ impl AvSession {
                              → streamID={stream_id}{}",
                             if is_iap { "  [iAP channel]" } else { "  [NON-iAP channel]" }
                         );
+                        // What a partial TEARDOWN of this channel is matched against.
+                        self.rcs_channels
+                            .insert(channel_id.clone(), RcsChannel { stream_id, iap: is_iap });
                         // The AirPlay video probe's route A (probe.rs): name the channel — the brief
                         // expects UrlFling, SenderSettingsData and OverlayUI once video is offered — and
                         // log the shape of what it carries (`drain_rcs`). Taken like any other: the
@@ -1876,21 +1914,28 @@ impl SessionDelegate for AvSession {
             {
                 let mut m = crate::plock(&self.av_streams);
                 for s in &streams {
-                    if let Some(ty) = s
-                        .as_dictionary()
-                        .and_then(|sd| sd.get("type"))
-                        .and_then(|v| v.as_signed_integer())
-                    {
-                        // Reap every channel of this type. With one instance per type — every
-                        // path any capture shows — this is bit-identical to the old
-                        // `m.remove(&ty)`; it only differs once a second RCS channel exists.
-                        let keys: Vec<(i64, String)> =
-                            m.keys().filter(|(k, _)| *k == ty).cloned().collect();
-                        for k in keys {
-                            if let Some(flag) = m.remove(&k) {
-                                flag.store(false, Ordering::Release);
-                                stopped.push(ty);
-                            }
+                    let Some(sd) = s.as_dictionary() else {
+                        continue;
+                    };
+                    let Some(ty) = sd.get("type").and_then(|v| v.as_signed_integer()) else {
+                        continue;
+                    };
+                    let keys: Vec<(i64, String)> = if ty == 130 {
+                        // RCS channels share the type: stop the one(s) the entry names, never all.
+                        let (named, how) = rcs_channels_named(sd, &self.rcs_channels);
+                        eprintln!("[session] partial TEARDOWN of DataStream(130) by {how}: {named:?}");
+                        named.into_iter().map(|ch| (ty, ch)).collect()
+                    } else {
+                        // An A/V stream: one instance per type, so every stream of the type.
+                        m.keys().filter(|(k, _)| *k == ty).cloned().collect()
+                    };
+                    for k in keys {
+                        if ty == 130 {
+                            self.rcs_channels.remove(&k.1);
+                        }
+                        if let Some(flag) = m.remove(&k) {
+                            flag.store(false, Ordering::Release);
+                            stopped.push(ty);
                         }
                     }
                 }
@@ -3288,6 +3333,43 @@ mod tests {
         assert!(!iap.load(Ordering::Acquire), "re-SETUP of the same channel must supersede");
         assert!(iap2.load(Ordering::Acquire));
         assert!(log.load(Ordering::Acquire), "superseding one channel must not touch another");
+    }
+
+    /// A partial TEARDOWN stops the RCS channel it names. By type alone it stopped every one: the phone's
+    /// TEARDOWN of its two video channels took the iAP2 link with them (the Mac's 10 Nov probe bench).
+    #[test]
+    fn a_partial_teardown_stops_only_the_rcs_channel_it_names() {
+        let mut s = AvSession::new();
+        let iap = s.stream_flag_keyed(130, "RCS-1".into());
+        let settings = s.stream_flag_keyed(130, "RCS-2".into());
+        let playback = s.stream_flag_keyed(130, "RCS-3".into());
+        for (ch, stream_id, iap) in [("RCS-1", 1, true), ("RCS-2", 2, false), ("RCS-3", 3, false)] {
+            s.rcs_channels.insert(ch.into(), RcsChannel { stream_id, iap });
+        }
+        let req = |id: Option<(&str, Value)>| {
+            let mut e = Dictionary::new();
+            e.insert("type".into(), Value::Integer(130.into()));
+            if let Some((k, v)) = id {
+                e.insert(k.into(), v);
+            }
+            let mut d = Dictionary::new();
+            d.insert("streams".into(), Value::Array(vec![Value::Dictionary(e)]));
+            let mut b = Vec::new();
+            Value::Dictionary(d).to_writer_binary(&mut b).unwrap();
+            b
+        };
+        s.teardown(&req(Some(("streamID", Value::Integer(3.into())))));
+        assert!(!playback.load(Ordering::Acquire), "named by its streamID");
+        assert!(iap.load(Ordering::Acquire) && settings.load(Ordering::Acquire));
+        s.teardown(&req(Some(("channelID", Value::String("RCS-2".into())))));
+        assert!(!settings.load(Ordering::Acquire), "named by its channelID");
+        assert!(iap.load(Ordering::Acquire), "the iAP channel stays");
+        let other = s.stream_flag_keyed(130, "RCS-4".into());
+        s.rcs_channels.insert("RCS-4".into(), RcsChannel { stream_id: 4, iap: false });
+        s.teardown(&req(None));
+        assert!(!other.load(Ordering::Acquire), "no id: every channel but the iAP one");
+        assert!(iap.load(Ordering::Acquire), "never the iAP channel on a guess");
+        assert!(s.alive.load(Ordering::Acquire), "partial: the session stays");
     }
 
     /// A/V streams keep supersede-by-type exactly as before — one screen, one alt-screen.
