@@ -1015,6 +1015,17 @@ fn input_sub_frame_fits(pl: &[u8]) -> bool {
     !pl.is_empty() && (pl.len() <= 64 || (pl[0] == ocbm_proto::INPUT_DATASTREAM && pl.len() <= MAX_INPUT_SUB_FRAME))
 }
 
+/// `setVideoPlaybackAllowed`'s `playbackStatus` for a `VIDEO_STATUS_*` byte (LIVI's words): nothing queued, a
+/// queued video allowed to show, one queued that may not. None for a byte the box doesn't know.
+fn video_status_word(status: u8) -> Option<&'static str> {
+    match status {
+        ocbm_proto::VIDEO_STATUS_IDLE => Some("idle"),
+        ocbm_proto::VIDEO_STATUS_VIDEO => Some("video"),
+        ocbm_proto::VIDEO_STATUS_AUDIO_ONLY => Some("audioOnly"),
+        _ => None,
+    }
+}
+
 /// Read length-prefixed input sub-frames off one ocbmd connection until it closes/errors/is evicted.
 fn read_input(mut stream: TcpStream, gen: u32) {
     let mut hdr = [0u8; 2];
@@ -1373,6 +1384,25 @@ fn handle_input_frame(pl: &[u8]) {
             // limitedUI (Drive/Park) — restrict / release the CarPlay UI at runtime.
             ocbm_proto::CMD_LIMITED_UI_ON => ("setLimitedUI(true)", events::send_set_limited_ui(true)),
             ocbm_proto::CMD_LIMITED_UI_OFF => ("setLimitedUI(false)", events::send_set_limited_ui(false)),
+            // Route A: whether video may play (the car known to be parked) and the play queue's status,
+            // `[cmd][allowed][status]`. Sent now in a session past RECORD that negotiated videoPlayback, else
+            // kept for RECORD (receiver::playback).
+            ocbm_proto::CMD_VIDEO_ALLOWED => {
+                if pl.len() < 3 {
+                    eprintln!("[input] videoAllowed frame too short ({} bytes) — dropped", pl.len());
+                    return;
+                }
+                let allowed = pl[2] != 0;
+                let status = pl.get(3).copied().unwrap_or(ocbm_proto::VIDEO_STATUS_IDLE);
+                let Some(word) = video_status_word(status) else {
+                    eprintln!("[input] videoAllowed status {status} is not one the box knows — dropped");
+                    return;
+                };
+                (
+                    if allowed { "setVideoPlaybackAllowed(true)" } else { "setVideoPlaybackAllowed(false)" },
+                    receiver::playback::host_allows(allowed, word),
+                )
+            }
             other => {
                 eprintln!("[input] unknown INPUT_COMMAND 0x{other:02x} — dropped");
                 return;
@@ -1791,6 +1821,15 @@ mod tests {
         big[0] = ocbm_proto::INPUT_DATASTREAM;
         assert!(input_sub_frame_fits(&big));
         assert!(!input_sub_frame_fits(&vec![ocbm_proto::INPUT_DATASTREAM; MAX_INPUT_SUB_FRAME + 1]));
+    }
+
+    /// Route A's playbackStatus words are LIVI's three; a byte past them is refused, never guessed.
+    #[test]
+    fn video_status_bytes_are_livis_three_words() {
+        assert_eq!(video_status_word(ocbm_proto::VIDEO_STATUS_IDLE), Some("idle"));
+        assert_eq!(video_status_word(ocbm_proto::VIDEO_STATUS_VIDEO), Some("video"));
+        assert_eq!(video_status_word(ocbm_proto::VIDEO_STATUS_AUDIO_ONLY), Some("audioOnly"));
+        assert_eq!(video_status_word(3), None);
     }
 
     const ID: &[u8] = b"0D4C5E7A-1111-2222-3333-444455556666";

@@ -13,10 +13,56 @@
 //!
 //! Behind the AirPlay video probe's `video` switch (`probe.rs`): with it off, nothing here runs.
 
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Mutex, OnceLock};
 
 use plist::{Dictionary, Value};
+
+/// Whether video may play, as the host last said (ocbm-proto's `CMD_VIDEO_ALLOWED`): 0 not said yet, 1 no, 2 yes.
+/// Kept across a session's end: the host says it again at each session's start, and on every change.
+static HOST_SAYS: AtomicU8 = AtomicU8::new(0);
+
+/// This session negotiated videoPlayback and is past RECORD, with the probe's `allow` on: the phone hears each
+/// word from the host as it comes.
+static TELLING: AtomicBool = AtomicBool::new(false);
+
+/// The host's word on whether video may play (it plays only while the car is known to be parked), with the play
+/// queue's `status` word (`idle`, `video` or `audioOnly`, LIVI's words; carplayd maps the wire byte). Told to the
+/// phone at once in a session past RECORD that negotiated videoPlayback, else kept for RECORD. True when it went
+/// out now.
+pub fn host_allows(allowed: bool, status: &str) -> bool {
+    HOST_SAYS.store(if allowed { 2 } else { 1 }, Ordering::SeqCst);
+    if !TELLING.load(Ordering::SeqCst) {
+        crate::probe::line(format_args!("the host says video {}: kept for RECORD", if allowed { "may play" } else { "may not play" }));
+        return false;
+    }
+    tell_allowed(allowed, status)
+}
+
+/// RECORD, in a session that negotiated videoPlayback with the probe's `allow` on: the phone hears the host's
+/// word from now on, starting with the one already given (status `idle`, as LIVI sends at RECORD: nothing is
+/// queued yet). Until the host has said, nothing goes out.
+pub fn on_record() {
+    TELLING.store(true, Ordering::SeqCst);
+    match HOST_SAYS.load(Ordering::SeqCst) {
+        0 => crate::probe::line(format_args!("RECORD: setVideoPlaybackAllowed waits for the host's word")),
+        said => {
+            tell_allowed(said == 2, "idle");
+        }
+    }
+}
+
+/// The session ended: the next one tells the phone again from its own RECORD.
+pub fn session_ended() {
+    TELLING.store(false, Ordering::SeqCst);
+}
+
+fn tell_allowed(allowed: bool, status: &str) -> bool {
+    let sent = crate::events::send_command(&crate::probe::allowed_command(allowed, status));
+    crate::probe::line(format_args!("setVideoPlaybackAllowed({allowed}, {status}) sent={sent}"));
+    sent
+}
 
 /// The stream a `POST /command` belongs to, from its `X-Apple-StreamID` header: a shared DataStream's message.
 pub fn stream_of(req: &rtsp::message::Request) -> Option<i64> {
@@ -350,6 +396,21 @@ impl JsonReader<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_hosts_word_on_video_waits_for_record_then_goes_out_at_each_change() {
+        session_ended();
+        assert!(!host_allows(false, "idle"), "before RECORD the word is kept, not sent");
+        assert_eq!(HOST_SAYS.load(Ordering::SeqCst), 1);
+        on_record();
+        assert!(TELLING.load(Ordering::SeqCst), "from RECORD on the phone hears each word");
+        // No event channel in a test, so the send itself fails: what matters is that it was tried.
+        assert!(!host_allows(true, "video"));
+        assert_eq!(HOST_SAYS.load(Ordering::SeqCst), 2, "the last word is kept for the next session");
+        session_ended();
+        assert!(!TELLING.load(Ordering::SeqCst));
+        assert_eq!(HOST_SAYS.load(Ordering::SeqCst), 2);
+    }
 
     fn insert_item() -> Value {
         let mut item = Dictionary::new();

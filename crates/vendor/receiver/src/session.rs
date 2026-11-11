@@ -635,6 +635,7 @@ impl AvSession {
         #[cfg(feature = "mic-uplink")]
         crate::uplink::clear();
         crate::events::clear();
+        crate::playback::session_ended();
         clear_sinks();
     }
 
@@ -2171,13 +2172,13 @@ impl SessionDelegate for AvSession {
         }
         if control_started {
             crate::events::mark_session_started(true);
-            // The AirPlay video probe's route A (probe.rs): tell the phone video may play (the bench is
-            // parked), once, as LIVI does at RECORD. Only in a session that negotiated videoPlayback;
-            // `noallow` in the switch file leaves it out.
+            // The AirPlay video probe's route A (probe.rs): from RECORD on, tell the phone whether video may
+            // play, as the host decides it (parked, known), and again at each change, as LIVI does as parking
+            // changes (playback.rs). Only in a session that negotiated videoPlayback; `noallow` in the switch
+            // file leaves it out.
             let negotiated = self.negotiated_features.iter().any(|f| f == "videoPlayback");
             if negotiated && crate::probe::switches().allow {
-                let sent = crate::events::send_command(&crate::probe::allowed_command(true));
-                crate::probe::line(format_args!("RECORD: setVideoPlaybackAllowed(true, idle) sent={sent}"));
+                crate::playback::on_record();
             }
         }
         eprintln!("[session] RECORD done");

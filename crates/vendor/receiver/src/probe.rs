@@ -250,13 +250,14 @@ pub fn echoes_video(s: &Switches, req: Option<&Dictionary>) -> bool {
 }
 
 /// `setVideoPlaybackAllowed`, in LIVI's shape: `{type, params: {videoPlaybackAllowed, playbackStatus}}`
-/// on the event channel, as `setNightMode` goes. LIVI sends it at RECORD with status `idle`, and again
-/// as parking changes; the probe sends it once. No Apple binary the Mac has carries the name, so on
-/// CarPlay it stays [I].
-pub fn allowed_command(allowed: bool) -> Vec<u8> {
+/// on the event channel, as `setNightMode` goes. LIVI sends it at RECORD with status `idle`, at play
+/// start and as parking changes, the status `idle`, `video` or `audioOnly`; route A sends the host's
+/// word from RECORD on (playback.rs). No Apple binary the Mac has carries the name, so on CarPlay it
+/// stays [I].
+pub fn allowed_command(allowed: bool, status: &str) -> Vec<u8> {
     let mut params = Dictionary::new();
     params.insert("videoPlaybackAllowed".into(), Value::Boolean(allowed));
-    params.insert("playbackStatus".into(), Value::String("idle".into()));
+    params.insert("playbackStatus".into(), Value::String(status.into()));
     let mut d = Dictionary::new();
     d.insert("type".into(), Value::String("setVideoPlaybackAllowed".into()));
     d.insert("params".into(), Value::Dictionary(params));
@@ -938,7 +939,7 @@ mod tests {
 
     #[test]
     fn set_video_playback_allowed_is_livis_shape() {
-        let v = Value::from_reader(std::io::Cursor::new(allowed_command(true))).unwrap();
+        let v = Value::from_reader(std::io::Cursor::new(allowed_command(true, "idle"))).unwrap();
         let d = v.as_dictionary().unwrap();
         assert_eq!(d.get("type").and_then(Value::as_string), Some("setVideoPlaybackAllowed"));
         let p = d.get("params").and_then(Value::as_dictionary).unwrap();

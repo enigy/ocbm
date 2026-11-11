@@ -515,6 +515,17 @@ pub const CMD_VIEW_AREA: u8 = 0x11;
 // `showUI{uuid: DISPLAY_UUID, url}` — same command id, different body.
 pub const CMD_REQUEST_UI_URL: u8 = 0x12;
 pub const REQUEST_UI_URL_MAX: usize = 255;
+// Route A (2026-11-11; the phone's AirPlay video inside CarPlay, behind the AirPlay video probe's `video` switch):
+// whether video may play now, as the host decides it (the car known to be parked), and the play queue's status.
+// `[INPUT_COMMAND][CMD_VIDEO_ALLOWED][allowed 0|1][VIDEO_STATUS_*]` -> `setVideoPlaybackAllowed{videoPlaybackAllowed,
+// playbackStatus}` to the phone in a session that negotiated videoPlayback, as LIVI sends it: at RECORD (status
+// idle), at play start and as parking changes. Before RECORD the word is kept for RECORD's; until the host has said,
+// nothing goes out (receiver `playback::host_allows`). A missing status byte is idle.
+pub const CMD_VIDEO_ALLOWED: u8 = 0x13;
+// playbackStatus (LIVI's words): nothing queued, a queued video allowed to show, one queued that may not show.
+pub const VIDEO_STATUS_IDLE: u8 = 0; // "idle"
+pub const VIDEO_STATUS_VIDEO: u8 = 1; // "video"
+pub const VIDEO_STATUS_AUDIO_ONLY: u8 = 2; // "audioOnly"
 pub const APPEARANCE_STREAM_MAIN: u8 = 0x00;
 pub const APPEARANCE_STREAM_ALT: u8 = 0x01;
 pub const APPEARANCE_MODE_LIGHT: u8 = 0x00;
@@ -1069,7 +1080,7 @@ mod tests {
             CMD_REQUEST_UI, CMD_REQUEST_SIRI, CMD_SIRI_DOWN, CMD_SIRI_UP, CMD_NAV_START, CMD_NAV_STOP,
             CMD_NAV_CARD, CMD_LIMITED_UI_ON, CMD_LIMITED_UI_OFF, CMD_NAV_APP, CMD_NAV_APPEARANCE,
             CMD_NAV_ZOOM_IN, CMD_NAV_ZOOM_OUT, CMD_UI_APPEARANCE, CMD_MAP_APPEARANCE, CMD_NIGHT_MODE,
-            CMD_VIEW_AREA, CMD_REQUEST_UI_URL,
+            CMD_VIEW_AREA, CMD_REQUEST_UI_URL, CMD_VIDEO_ALLOWED,
         ];
         let mut sorted = ids.to_vec();
         sorted.sort_unstable();
@@ -1077,6 +1088,7 @@ mod tests {
         assert_eq!(sorted.len(), ids.len(), "duplicate CMD_* id");
         assert_eq!(CMD_VIEW_AREA, 0x11);
         assert_eq!(CMD_REQUEST_UI_URL, 0x12);
+        assert_eq!(CMD_VIDEO_ALLOWED, 0x13);
     }
 
     #[test]
