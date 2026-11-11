@@ -590,6 +590,108 @@ pub fn log_request(place: &str, req: &Request) {
     ));
 }
 
+/// [`body_shape`], then one level into a `data` field when there is one: a binary plist's `params.data` or
+/// `data`, or an OPACK dictionary's `data`. The Playback channel's commands ride POST /command as
+/// `{params: {data}}`, and the SenderSettingsData messages are OPACK `{data, messageType}` (the Mac's 10 Nov
+/// bench): the play request's keys are in those bytes.
+pub fn payload_shape(b: &[u8]) -> String {
+    let outer = body_shape(None, b);
+    let inner = if b.starts_with(b"bplist") {
+        Value::from_reader(std::io::Cursor::new(b))
+            .ok()
+            .and_then(|v| v.as_dictionary().and_then(dict_data).map(inner_shape))
+    } else {
+        opack_data(b).map(inner_shape)
+    };
+    match inner {
+        Some(i) => format!("{outer}; its data: {i}"),
+        None => outer,
+    }
+}
+
+/// A plist dictionary's `params.data`, else its own `data`, when that is bytes.
+pub fn dict_data(d: &Dictionary) -> Option<&[u8]> {
+    let in_params = d.get("params").and_then(Value::as_dictionary).and_then(|p| p.get("data"));
+    in_params.or_else(|| d.get("data")).and_then(Value::as_data)
+}
+
+/// One level into a message's data, no deeper: an RCS envelope (its kind, its message type, its payload's
+/// shape), else the bytes' own shape.
+pub fn inner_shape(b: &[u8]) -> String {
+    match crate::datastream::unwrap(b) {
+        Some(f) => format!("an RCS '{}' '{}' message, {}", f.kind_str(), f.msg_type_str(), body_shape(None, f.payload)),
+        None => body_shape(None, b),
+    }
+}
+
+/// The bytes of an OPACK dictionary's `data` entry, when the value at the top is a dictionary that has one.
+fn opack_data(b: &[u8]) -> Option<&[u8]> {
+    let tag = *b.first()?;
+    if !(0xE0..=0xEF).contains(&tag) {
+        return None;
+    }
+    let count = (tag < 0xEF).then_some(usize::from(tag - 0xE0));
+    let mut at = 1;
+    let mut n = 0usize;
+    let mut scratch = String::new();
+    loop {
+        if count == Some(n) || (count.is_none() && b.get(at) == Some(&0x03)) {
+            return None;
+        }
+        let key = opack_string(b, at);
+        let value_at = opack_value(b, at, &mut scratch, None, 1)?;
+        if key == Some("data") {
+            return opack_bytes(b, value_at);
+        }
+        at = opack_value(b, value_at, &mut scratch, None, 1)?;
+        scratch.clear();
+        n += 1;
+    }
+}
+
+/// The bytes of the OPACK data value at `b[at..]`.
+fn opack_bytes(b: &[u8], at: usize) -> Option<&[u8]> {
+    let tag = *b.get(at)?;
+    let (len, after) = match tag {
+        0x70..=0x90 => (usize::from(tag - 0x70), at + 1),
+        0x91..=0x94 => {
+            let n = 1usize << (tag - 0x91);
+            (le(b, at + 1, n)?, at + 1 + n)
+        }
+        _ => return None,
+    };
+    b.get(after..after.checked_add(len)?)
+}
+
+/// A TEARDOWN's streams for the log: each entry's `type` and ids by value (`channelID`, `streamID`,
+/// `streamConnectionID`, protocol numbers and names), its other keys by shape.
+pub fn teardown_streams(streams: &[Value]) -> String {
+    const IDS: [&str; 4] = ["type", "channelID", "streamID", "streamConnectionID"];
+    let entries: Vec<String> = streams
+        .iter()
+        .map(|s| match s.as_dictionary() {
+            Some(d) => {
+                let parts: Vec<String> = d
+                    .iter()
+                    .map(|(k, v)| match v {
+                        Value::Integer(i) if IDS.contains(&k.as_str()) => {
+                            let n = i.as_signed().map(|n| n.to_string()).or_else(|| i.as_unsigned().map(|n| n.to_string()));
+                            format!("{k}={}", n.unwrap_or_default())
+                        }
+                        Value::String(t) if IDS.contains(&k.as_str()) && t.len() <= 64 && t.chars().all(|c| c.is_ascii_graphic()) => {
+                            format!("{k}={t:?}")
+                        }
+                        _ => format!("{}: {}", key_text(k), shape(v)),
+                    })
+                    .collect();
+                format!("{{{}}}", parts.join(", "))
+            }
+            None => shape(s),
+        })
+        .collect();
+    format!("[{}]", entries.join(", "))
+}
+
 // ---- Route C: an ordinary AirPlay receiver beside CarPlay ----
 
 /// Route C's Bonjour instance name.
@@ -906,6 +1008,70 @@ mod tests {
         assert_eq!(opack_shape(&[0xE1, 0x41]), None, "cut short");
         assert_eq!(opack_shape(&[0x09, 0x09]), None, "two values, not one");
         assert_eq!(opack_shape(&[0xFF]), None);
+    }
+
+    #[test]
+    fn a_payload_shows_one_level_into_its_data() {
+        let bplist = |d: Dictionary| {
+            let mut b = Vec::new();
+            Value::Dictionary(d).to_writer_binary(&mut b).unwrap();
+            b
+        };
+        let mut inner = Dictionary::new();
+        inner.insert("type".into(), Value::String("setRate".into()));
+        let inner = bplist(inner);
+        // SenderSettingsData's form: OPACK {data, messageType}.
+        let mut opack = vec![0xE2, 0x44];
+        opack.extend(b"data");
+        opack.extend([0x91, u8::try_from(inner.len()).unwrap()]);
+        opack.extend(&inner);
+        opack.push(0x4B);
+        opack.extend(b"messageType");
+        opack.push(0x0B);
+        assert_eq!(
+            payload_shape(&opack),
+            format!(
+                "{} B opack {{data: data({n}), messageType: int}}; its data: {n} B bplist {{type: \"setRate\"}}",
+                opack.len(),
+                n = inner.len()
+            )
+        );
+        // The Playback channel's form: POST /command {params: {data}}, here holding an RCS envelope.
+        let envelope = crate::datastream::wrap(&inner);
+        let mut params = Dictionary::new();
+        params.insert("data".into(), Value::Data(envelope.clone()));
+        let mut cmd = Dictionary::new();
+        cmd.insert("params".into(), Value::Dictionary(params));
+        assert_eq!(dict_data(&cmd), Some(envelope.as_slice()));
+        let cmd = bplist(cmd);
+        assert!(
+            payload_shape(&cmd).ends_with(&format!(
+                "; its data: an RCS 'asyn' 'cmnd' message, {} B bplist {{type: \"setRate\"}}",
+                inner.len()
+            )),
+            "{}",
+            payload_shape(&cmd)
+        );
+        // No data field: the shape alone.
+        assert_eq!(payload_shape(&inner), format!("{} B bplist {{type: \"setRate\"}}", inner.len()));
+        let mut top = Dictionary::new();
+        top.insert("data".into(), Value::Data(vec![0xFF, 1]));
+        assert_eq!(dict_data(&top), Some(&[0xFF, 1][..]), "a top-level data field too");
+    }
+
+    #[test]
+    fn a_teardown_shows_its_stream_ids() {
+        let mut e = Dictionary::new();
+        e.insert("type".into(), Value::Integer(130.into()));
+        e.insert("streamID".into(), Value::Integer(7.into()));
+        e.insert("channelID".into(), Value::String("AA:BB-RCS-2".into()));
+        e.insert("note".into(), Value::String("A Private Title".into()));
+        let mut screen = Dictionary::new();
+        screen.insert("type".into(), Value::Integer(110.into()));
+        assert_eq!(
+            teardown_streams(&[Value::Dictionary(e), Value::Dictionary(screen)]),
+            r#"[{type=130, streamID=7, channelID="AA:BB-RCS-2", note: string(15)}, {type=110}]"#
+        );
     }
 
     #[test]

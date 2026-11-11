@@ -214,7 +214,7 @@ fn log_datastream_frame(pt: &[u8], is_iap: bool, probe: Option<&str>) {
                         "DataStream {name}: '{}' '{}' message, {}",
                         f.kind_str(),
                         f.msg_type_str(),
-                        crate::probe::body_shape(None, f.payload)
+                        crate::probe::payload_shape(f.payload)
                     )),
                     None => eprintln!("[datastream] non-iAP channel payload — logged only, not routed to iap_tunnel"),
                 }
@@ -1774,7 +1774,10 @@ impl SessionDelegate for AvSession {
             let shape = parsed
                 .as_ref()
                 .map_or_else(|| crate::probe::body_shape(None, request_plist), crate::probe::dict_shape);
-            crate::probe::line(format_args!("POST /command: {shape}"));
+            // The Playback channel's commands ride here as `{params: {data}}` with no type: one level into the data.
+            let inner = parsed.as_ref().and_then(crate::probe::dict_data).map(crate::probe::inner_shape);
+            let inner = inner.map(|i| format!("; its data: {i}")).unwrap_or_default();
+            crate::probe::line(format_args!("POST /command: {shape}{inner}"));
         }
         // Wireless-metadata investigation (2026-07-17): unconditionally capture EVERY inbound
         // /command plist to a fixed box file, so the exact iAP2-over-AirPlay tunnel frames (type
@@ -1907,6 +1910,10 @@ impl SessionDelegate for AvSession {
         // implemented the opposite. The other two shapes were already right: absent body and
         // non-array `streams` both fall through to `reset()`, matching `CFDictionaryGetCFArray`.
         if let Some(streams) = streams.filter(|s| !s.is_empty()) {
+            // The AirPlay video probe (probe.rs): which streams the phone names, with their ids.
+            if crate::probe::switches().video {
+                crate::probe::line(format_args!("TEARDOWN: {}", crate::probe::teardown_streams(&streams)));
+            }
             // Stop exactly the named streams by type via their per-stream flags (#406/#413) — the thread
             // exits on its next poll and drops its socket — instead of the old no-op that leaked a thread
             // + UDP/TCP socket per re-SETUP. The session (timing/event/keepAlive) stays alive.

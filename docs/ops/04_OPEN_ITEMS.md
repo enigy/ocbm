@@ -472,6 +472,14 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
   advertises "Carlink Video", an ordinary `_airplay._tcp` service with the Apple TV TXT record from
   nto's and openairplay's public specifications, on port 7000; its listener logs each connection's
   first requests and answers 501. Each line is tagged `[probe]` and gives keys, types and sizes only.
+  **Benched 2026-11-10** (the Mac, Scott's iPhone on iOS 27.2): route A works on the phone side. The
+  phone opened SenderSettingsData, sent `setVideoPlaybackParameters` and `setProxyParameters`, put the
+  Apple TV app in CarPlay's grid (its UI ran on the car screen), and YouTube listed "CarPlay" as an
+  AirPlay receiver. A video opened the Playback stream (`A6B27562`, no dedicated socket), whose messages
+  ride `POST /command` as `{params: {data}}` with no type; nothing answered it, so nothing played. Route
+  C's "Carlink Video" was never listed. Probe 2 logs one level into those `data` bytes and a TEARDOWN's
+  stream ids; the TEARDOWN that also stopped the iAP2 channel is fixed (a partial TEARDOWN now stops only
+  the RCS channel it names).
 
 - **`fileTransfer` is blocked-untestable — even the advertise step is byte-unsafe.** The
   `fileTransferInfo` dict's keys are unknown, as is which transport carries the chunk dict.
