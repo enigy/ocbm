@@ -445,6 +445,13 @@ pub const TUNNEL_OPEN: u8 = 0x01; // host->box: data = [port u16 BE][the proxyUr
 pub const TUNNEL_DATA: u8 = 0x02; // both ways: the stream's bytes
 pub const TUNNEL_CLOSE: u8 = 0x03; // host->box: close it; box->host: it closed, data = the reason (UTF-8, may be empty)
 pub const TUNNEL_OPENED: u8 = 0x04; // box->host: connected to the phone's proxy
+pub const INPUT_VEHICLE_STATUS: u8 = 0x0C; // [INPUT_VEHICLE_STATUS][id u8][value]… -> the car's status for the phone
+                                           // (LIVI research item 3): Apple's 0xA101 parameter ids with their values,
+                                           // u16/i16 big-endian, a bool one byte (iap2_core::vehicle). carplayd sends
+                                           // VehicleStatusUpdate (0xA101) on the wireless tunnel with only what the
+                                           // phone's StartVehicleStatusUpdates asked for, which the box tells the app
+                                           // as META_JSON {"kind":"vehicleStatus"}. Declared only when the app pushed
+                                           // `vehicleStatus: [...]`.
 pub const INPUT_KNOB: u8 = 0x07; // [INPUT_KNOB][flags u8][nudge_x i8][nudge_y i8][rotation i8] -> box sends
                                  // one report on the Knob HID (uid 4): flags bit0 Select/bit1 Home/bit2 Back,
                                  // signed X/Y nudge (±127 = a 4-way arrow), signed relative rotation (±1/detent).

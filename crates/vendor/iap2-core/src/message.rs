@@ -379,6 +379,28 @@ pub(crate) fn build_ident_info_excluding_with_policy(
         location
     };
 
+    // VehicleStatus (`vehicle.rs`) is the AirPlayTunnel arm's too: param 21 and its three messages in params 6
+    // and 7, declared together, never one without the other. A reject naming any of the three retries without
+    // it, for the reason the location declaration does.
+    let tunnel = matches!(transport, TransportComponent::AirPlayTunnel { .. });
+    let without_status;
+    let identity = if tunnel
+        && identity.status_caps.is_some()
+        && exclude.iter().any(|p| {
+            [
+                spec::ident::MESSAGES_SENT_BY_ACCESSORY,
+                spec::ident::MESSAGES_RECEIVED_FROM_DEVICE,
+                spec::ident::VEHICLE_STATUS_COMPONENT,
+            ]
+            .contains(p)
+        }) {
+        without_status = crate::config::VehicleIdentity { status_caps: None, ..identity.clone() };
+        &without_status
+    } else {
+        identity
+    };
+    let status_messages = tunnel && identity.status_caps.as_ref().is_some_and(|caps| !caps.is_empty());
+
     // A 0x1D03 IdentificationRejected retry must NEVER strip a REQUIRED IdentificationInformation param
     // (#407): dropping e.g. Name / the MessagesSent-or-Received lists / PowerProvidingCapability makes
     // the retry structurally invalid, so iOS rejects it again → the handshake aborts. Filter the caller's
@@ -559,6 +581,13 @@ pub(crate) fn build_ident_info_excluding_with_policy(
             s.extend_from_slice(&spec::MSG_LOCATION_INFORMATION.to_be_bytes()); // 0xFFFB
             r.extend_from_slice(&spec::MSG_START_LOCATION_INFORMATION.to_be_bytes()); // 0xFFFA
             r.extend_from_slice(&spec::MSG_STOP_LOCATION_INFORMATION.to_be_bytes()); // 0xFFFC
+        }
+        // The car's status (`vehicle.rs`), only beside the param 21 the app pushed: the update is ours
+        // (param 6), its Start AND Stop are the phone's (param 7).
+        if status_messages {
+            s.extend_from_slice(&spec::MSG_VEHICLE_STATUS_UPDATE.to_be_bytes()); // 0xA101
+            r.extend_from_slice(&spec::MSG_START_VEHICLE_STATUS_UPDATES.to_be_bytes()); // 0xA100
+            r.extend_from_slice(&spec::MSG_STOP_VEHICLE_STATUS_UPDATES.to_be_bytes()); // 0xA102
         }
         (s, r)
     } else {
@@ -969,6 +998,12 @@ pub fn build_end_call() -> Vec<u8> {
 // inference, NOT a proven rule. It is precisely the "declaring a capability we never service" case
 // this block warns about. The companion declaration is workstream C-4 and MUST land first; plan_C's
 // claim that C-4 and C-5 are order-swappable is retracted (docs/carplay/04_CAPABILITIES_AND_CONFIG.md, C row).
+//
+// UPDATED 2026-11-11 (LIVI item 3, `vehicle.rs`): the AirPlayTunnel arm now declares C-4 with it. Its param 21
+// comes from OUR top-level `vehicleStatus:` key (`Iap2Config::arm_vehicle`), and with it 0xA101 joins param 6
+// and 0xA100/0xA102 param 7; a reject naming 6, 7 or 21 retries without all of it. The wired arm is unchanged:
+// Apple's `iapConfig.vehicleStatus` there still declares no messages, so that warning stands for it, and the
+// app pushes only the tunnel's key. Unproven on a device until the Mac's bench.
 //
 // Treat emitting either as a SESSION-CRITICAL opt-in: deploy the declaration ALONE, restart, replug,
 // confirm the baseline session still establishes, THEN wire a data path. Names/ids are
@@ -2176,6 +2211,74 @@ mod tests {
         for transport in [TransportComponent::Usb { cp_iface: 1 }, TransportComponent::Wireless { bt_mac: [0, 1, 2, 3, 4, 5] }] {
             assert_eq!(located_body(transport, &gga, &[]), proven_ident_body("CarLink", transport), "{transport:?} never declares location");
         }
+    }
+
+    /// The proven tunnel body with an explicit vehicle identity, no location, and an exclude list.
+    fn identity_body(transport: TransportComponent, identity: &crate::config::VehicleIdentity, exclude: &[u16]) -> Vec<u8> {
+        build_ident_info_excluding_with_policy(
+            "CarLink",
+            transport,
+            false,
+            exclude,
+            crate::features::Policy {
+                sent: crate::features::Tier::Proven,
+                recv: crate::features::Tier::Proven,
+                subscribe: crate::features::Tier::Proven,
+            },
+            &[],
+            identity,
+            &[],
+        )
+    }
+
+    fn truck() -> crate::config::VehicleIdentity {
+        crate::config::VehicleIdentity {
+            engine_types: vec![crate::spec::ident::vehicle_info::ENGINE_TYPE_DIESEL],
+            status_caps: Some(vec![vehicle_status::RANGE, vehicle_status::OUTSIDE_TEMPERATURE, vehicle_status::RANGE_WARNING]),
+            ..crate::config::VehicleIdentity::baseline()
+        }
+    }
+
+    #[test]
+    fn vehicle_status_rides_the_tunnel_with_its_messages_and_the_cars_engine() {
+        let tunnel = TransportComponent::AirPlayTunnel { bt_mac: [0, 1, 2, 3, 4, 5] };
+        let plain = proven_ident_body("CarLink", tunnel);
+        let body = identity_body(tunnel, &truck(), &[]);
+        let sent = be16_ids(&top_level_param_value(&body, spec::ident::MESSAGES_SENT_BY_ACCESSORY).unwrap());
+        let rcv = be16_ids(&top_level_param_value(&body, spec::ident::MESSAGES_RECEIVED_FROM_DEVICE).unwrap());
+        let mut want_sent = be16_ids(&top_level_param_value(&plain, spec::ident::MESSAGES_SENT_BY_ACCESSORY).unwrap());
+        let mut want_rcv = be16_ids(&top_level_param_value(&plain, spec::ident::MESSAGES_RECEIVED_FROM_DEVICE).unwrap());
+        want_sent.push(spec::MSG_VEHICLE_STATUS_UPDATE);
+        want_rcv.extend([spec::MSG_START_VEHICLE_STATUS_UPDATES, spec::MSG_STOP_VEHICLE_STATUS_UPDATES]);
+        assert_eq!(sent, want_sent, "0xA101 appended to param 6");
+        assert_eq!(rcv, want_rcv, "0xA100 and its Stop 0xA102 appended to param 7");
+        for &id in &sent {
+            assert_eq!(spec::source_of(id), Some(spec::Source::Accessory), "param-6 id {id:#06x}");
+        }
+        for &id in &rcv {
+            assert_eq!(spec::source_of(id), Some(spec::Source::Device), "param-7 id {id:#06x}");
+        }
+        assert!(top_level_param_ids(&body).contains(&spec::ident::VEHICLE_STATUS_COMPONENT));
+        let g20 = top_level_param_value(&body, spec::ident::VEHICLE_INFORMATION_COMPONENT).unwrap();
+        let mut diesel = Tlv::new();
+        diesel.u8v(crate::spec::ident::vehicle_info::ENGINE_TYPE, crate::spec::ident::vehicle_info::ENGINE_TYPE_DIESEL);
+        assert!(g20.windows(diesel.0.len()).any(|w| w == diesel.0), "param 20 says diesel");
+    }
+
+    #[test]
+    fn a_reject_naming_params_6_7_or_21_retries_without_vehicle_status() {
+        let tunnel = TransportComponent::AirPlayTunnel { bt_mac: [0, 1, 2, 3, 4, 5] };
+        let engine_only = crate::config::VehicleIdentity { status_caps: None, ..truck() };
+        for rejected in [spec::ident::MESSAGES_SENT_BY_ACCESSORY, spec::ident::MESSAGES_RECEIVED_FROM_DEVICE, spec::ident::VEHICLE_STATUS_COMPONENT] {
+            assert_eq!(identity_body(tunnel, &truck(), &[rejected]), identity_body(tunnel, &engine_only, &[]), "reject of param {rejected}");
+        }
+        // The other arms never gain the messages: the BT-time Identify ignores the identity outright, and the
+        // wired arm keeps its historical shape (C-4 there is still to come).
+        let bt = TransportComponent::Wireless { bt_mac: [0, 1, 2, 3, 4, 5] };
+        assert_eq!(identity_body(bt, &truck(), &[]), proven_ident_body("CarLink", bt));
+        let usb = identity_body(TransportComponent::Usb { cp_iface: 1 }, &truck(), &[]);
+        let usb_sent = be16_ids(&top_level_param_value(&usb, spec::ident::MESSAGES_SENT_BY_ACCESSORY).unwrap());
+        assert!(!usb_sent.contains(&spec::MSG_VEHICLE_STATUS_UPDATE));
     }
 
     #[test]

@@ -922,6 +922,10 @@ pub fn dispatch(msg_id: u16, body: &[u8]) -> bool {
         // the AirPlayTunnel arm, and only when the app pushed `location:`.
         MSG_START_LOCATION_INFORMATION => one(crate::location::on_start(body)),
         MSG_STOP_LOCATION_INFORMATION => one(crate::location::on_stop()),
+        // The phone asking for the car's status, and done with it (`vehicle.rs`): declared only on the
+        // AirPlayTunnel arm, and only when the app pushed `vehicleStatus:`.
+        MSG_START_VEHICLE_STATUS_UPDATES => one(crate::vehicle::on_start(body)),
+        MSG_STOP_VEHICLE_STATUS_UPDATES => one(crate::vehicle::on_stop()),
         _ => return false,
     }
     true

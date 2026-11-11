@@ -781,6 +781,8 @@ fn load_device_config() -> DeviceConfig {
                 // The car's GPS for the phone (LIVI item 4): the same first-arm-wins snapshot, armed before
                 // `iap_tunnel::start` builds the tunnel Identify. Nothing pushed = nothing declared.
                 iap2_cfg.arm_location();
+                // ...and the car's status (LIVI item 3): the engine types and our `vehicleStatus:` for the tunnel Identify.
+                iap2_cfg.arm_vehicle();
                 levers::set_hevc(vc.accessory_config.enables_hevc);
                 // mainBuffered from the pushed config alone (docs/carplay/04_CAPABILITIES_AND_CONFIG.md B4) — deliberately NO env OR:
                 // a stale bench flag must never override an app that said `false` (media-silence
@@ -1128,6 +1130,12 @@ fn handle_input_frame(pl: &[u8]) {
             }
             Err(_) => eprintln!("[input] location sentence isn't UTF-8 ({} B) — dropped", pl.len() - 1),
         }
+        return;
+    }
+    // The car's status (LIVI item 3): the app's values, sent as VehicleStatusUpdate on the tunnel when the phone
+    // asked for them (`iap_tunnel::send_vehicle_status`). Not a HID report.
+    if pl.first() == Some(&ocbm_proto::INPUT_VEHICLE_STATUS) {
+        receiver::iap_tunnel::send_vehicle_status(&pl[1..]);
         return;
     }
     // Media key (task #35): a complete tap on the advertised media-buttons HID device (uid 2). The

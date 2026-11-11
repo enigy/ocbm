@@ -236,6 +236,15 @@ construction.
   Sentences ride CH_INPUT `INPUT_LOCATION`; docs/carplay/05_METADATA_AND_CONTROLS.md §2.1 has the flow. Absent =
   nothing declared, byte-identical. Device-proven 2026-11-10 on the dev adapter (iOS 15 and 27.2): the tunnel Identify
   with location (330 B) accepted every time, no 0x1D03, and the BT-time Identify unchanged (301 B).
+- **Applied, lever (2026-11-11, LIVI item 3):** top-level `vehicleStatus:`, Apple's names of what the app reads from
+  the car (`vehicleStatus: [range, outsideTemperature, rangeWarning]`), with Apple's own
+  `iapConfig.vehicleInfo.engineTypes` (`Iap2Config::tunnel_vehicle_identity`). The AirPlayTunnel Identify takes the
+  engine types into param 20 and, when `vehicleStatus:` names any, param 21 with `0xA101` in param 6 and
+  `0xA100`/`0xA102` in param 7; a reject naming 6, 7 or 21 retries without the status. Our key, not Apple's
+  `iapConfig.vehicleStatus`, which the wired arm reads and which still declares no messages (C-4 there). The phone's
+  Start reaches the app as META_JSON `{"kind":"vehicleStatus","want":[ids]}`, and the app's CH_INPUT
+  `INPUT_VEHICLE_STATUS` values go out as `VehicleStatusUpdate`, only what was asked for (`iap2_core::vehicle`).
+  Absent = the tunnel Identify as before (Gasoline, no param 21). Not yet proven on a device.
 - **Guard:** dimensions are applied only when both are > 0; a partial/garbled config falls through to the
   box default (never zeros the resolution out from under a session). The guard stays; the box default
   it falls to is an interim safety floor — target state per docs/carplay/04_CAPABILITIES_AND_CONFIG.md is hold-IDLE-until-config, with

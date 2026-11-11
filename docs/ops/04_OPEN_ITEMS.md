@@ -637,6 +637,13 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
   `grep -rn "0xFFFB\|MSG_LOCATION_INFORMATION" --include="*.rs" crates ccpa` → the spec table and
   `crates/vendor/metadata/src/location.rs` (a parser); no emitter.
 
+- **The car's status for the phone: built, unbenched (2026-11-11, LIVI item 3).** With the app's
+  `vehicleStatus:` pushed, the AirPlayTunnel Identify declares param 21 with its three messages and the app's
+  engine types (`crates/vendor/iap2-core/src/vehicle.rs`); the phone's Start goes to the app, and the app's values
+  (range in km, outside temperature in °C, the low-range warning) go out as VehicleStatusUpdate. The box's own
+  warning stands until a bench: a never-verified capability group has broken a whole session before (param 6
+  INCIDENT 2026-07-06), so Carlink ships these shares off and the bench turns them on.
+
 - **App-owned CarPlay pairing peer store.** Today `carplayd`'s `DiskPeers`
   (`ccpa/carplayd/src/main.rs` ~:342-439) persists `id → Ed25519 LTPK` on box flash, and
   `PeerSaver::save_peer` (`crates/vendor/pairing/src/setup.rs` ~:29-30) is infallible because

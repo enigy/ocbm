@@ -48,6 +48,13 @@ pub struct Iap2Config {
     /// tier with it): see [`Iap2Config::location_names`].
     #[serde(default)]
     pub location: Option<serde_yaml::Value>,
+    /// `vehicleStatus:` — OUR extension (LIVI research item 3), top level like `location:`: Apple's names of
+    /// what the app can read from the car (`vehicleStatus: [range, outsideTemperature, rangeWarning]`). Arms the
+    /// AirPlayTunnel Identify's param 21 and its messages (`vehicle.rs`); absent or empty declares nothing.
+    /// Not Apple's `iapConfig.vehicleStatus`, which the wired arm reads and which declares no messages. Held as
+    /// a raw value for the reason `location` is.
+    #[serde(rename = "vehicleStatus", default)]
+    pub tunnel_vehicle_status: Option<serde_yaml::Value>,
 }
 
 /// `iapConfig:` — vehicle identity for Identify params 20/21 (docs/carplay/04_CAPABILITIES_AND_CONFIG.md C6).
@@ -514,6 +521,44 @@ impl Iap2Config {
         let names = self.location_names();
         !names.is_empty() && crate::location::arm(&names)
     }
+
+    /// The top-level `vehicleStatus:` names, read as `location:`'s are: a list, or one string of names.
+    fn tunnel_status_names(&self) -> Vec<String> {
+        use serde_yaml::Value;
+        match &self.tunnel_vehicle_status {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::String(s)) => s.split([' ', ',']).filter(|n| !n.is_empty()).map(str::to_string).collect(),
+            Some(Value::Sequence(items)) => items.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
+            Some(other) => {
+                eprintln!("[iap2-config] vehicleStatus: {other:?} isn't a list of names — nothing declared");
+                Vec::new()
+            }
+        }
+    }
+
+    /// The tunnel's vehicle identity (`vehicle.rs`): `iapConfig.vehicleInfo`'s engine types (param 20) and the
+    /// capabilities our `vehicleStatus:` names (param 21, ascending, deduped). Nothing else of the pushed identity
+    /// reaches the tunnel, and nothing pushed is the baseline.
+    pub fn tunnel_vehicle_identity(&self) -> VehicleIdentity {
+        let mut id = VehicleIdentity::baseline();
+        id.engine_types = self.vehicle_identity().engine_types;
+        let mut caps: Vec<u16> = Vec::new();
+        for n in self.tunnel_status_names() {
+            match status_cap_id(&n) {
+                Some(c) if caps.contains(&c) => eprintln!("[iap2-config] duplicate vehicleStatus name {n:?} — dropped"),
+                Some(c) => caps.push(c),
+                None => eprintln!("[iap2-config] unknown vehicleStatus name {n:?} — skipped"),
+            }
+        }
+        caps.sort_unstable();
+        id.status_caps = (!caps.is_empty()).then_some(caps);
+        id
+    }
+
+    /// Arm the tunnel's vehicle identity (`vehicle::arm`, first arm wins per process).
+    pub fn arm_vehicle(&self) -> bool {
+        crate::vehicle::arm(self.tunnel_vehicle_identity())
+    }
 }
 
 #[cfg(test)]
@@ -553,6 +598,19 @@ mod tests {
         let odd = serde_yaml::from_slice::<Iap2Config>(b"metadata:\n  tier: extended\nlocation: 5\n").unwrap();
         assert!(odd.location_names().is_empty());
         assert_eq!(odd.metadata.tier.as_deref(), Some("extended"), "the tier still parses");
+    }
+
+    #[test]
+    fn the_tunnels_vehicle_identity_takes_the_engine_and_our_status_names_only() {
+        use crate::message::vehicle_status as cap;
+        let id = |y: &str| serde_yaml::from_slice::<Iap2Config>(y.as_bytes()).unwrap().tunnel_vehicle_identity();
+        let truck = id("iapConfig:\n  vehicleInfo:\n    engineTypes: [diesel]\nvehicleStatus: [rangeDiesel, range, outsideTemperature, range, nonsense]\n");
+        assert_eq!(truck.engine_types, [crate::spec::ident::vehicle_info::ENGINE_TYPE_DIESEL]);
+        assert_eq!(truck.status_caps, Some(vec![cap::RANGE, cap::OUTSIDE_TEMPERATURE, cap::RANGE_DIESEL]), "ascending, deduped, a typo skipped");
+        assert_eq!(id("name: X\n"), VehicleIdentity::baseline(), "nothing pushed: the baseline");
+        let apples = id("iapConfig:\n  vehicleStatus:\n    capabilities: [range]\n");
+        assert_eq!(apples.status_caps, None, "Apple's iapConfig.vehicleStatus is the wired arm's, not the tunnel's");
+        assert_eq!(id("vehicleStatus: \"range outsideTemperature\"\n").status_caps, Some(vec![cap::RANGE, cap::OUTSIDE_TEMPERATURE]));
     }
 
     #[test]

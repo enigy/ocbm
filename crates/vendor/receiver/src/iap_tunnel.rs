@@ -222,6 +222,7 @@ pub fn start() {
         "TX detect+SYN over AirPlay tunnel (detect_sent={sent_detect} syn_sent={sent_syn}) — starting fresh iAP2 session"
     ));
     iap2_core::location::reset(); // a fresh iAP2 session: the phone must ask for location again
+    iap2_core::vehicle::reset(); // ...and for the car's status
     *guard = Some(Session {
         link,
         state: State::Init,
@@ -291,6 +292,7 @@ pub fn tick() {
 pub fn reset() {
     *crate::plock(&SESSION) = None;
     iap2_core::location::reset();
+    iap2_core::vehicle::reset();
     HANDSHAKE_REBUILDS.store(0, Ordering::Relaxed); // re-arm the budget retry cap for the next session
 }
 
@@ -344,6 +346,29 @@ pub fn send_location(sentence: &str) -> bool {
     let n = LOCATION_SENT.fetch_add(1, Ordering::Relaxed) + 1;
     if !ok || n == 1 || n.is_multiple_of(60) {
         log(&format!("TX 0xFFFB LocationInformation #{n} ({len} B, sent={ok}): {what}"));
+    }
+    ok
+}
+
+static VEHICLE_SENT: AtomicU32 = AtomicU32::new(0);
+
+/// The app's car values (CH_INPUT `INPUT_VEHICLE_STATUS`, `[id][value]…`) to the phone as `VehicleStatusUpdate`
+/// (0xA101), only what its Start asked for (`iap2_core::vehicle::update_body`). Nothing before a Start, and a
+/// frame the box can't read sends nothing. Logged on the first and every 60th, by size only. LIVI research
+/// item 3, off unless the app pushed `vehicleStatus:`.
+pub fn send_vehicle_status(values: &[u8]) -> bool {
+    let body = match iap2_core::vehicle::update_body(values) {
+        Ok(Some(body)) => body,
+        Ok(None) => return false,
+        Err(why) => {
+            log(&format!("vehicle status from the app refused ({} B): {why}", values.len()));
+            return false;
+        }
+    };
+    let (ok, len) = send_message(spec::MSG_VEHICLE_STATUS_UPDATE, &body);
+    let n = VEHICLE_SENT.fetch_add(1, Ordering::Relaxed) + 1;
+    if !ok || n == 1 || n.is_multiple_of(60) {
+        log(&format!("TX 0xA101 VehicleStatusUpdate #{n} ({len} B, sent={ok})"));
     }
     ok
 }
@@ -698,12 +723,15 @@ fn execute(action: Action, link: &mut Link) -> ExecOutcome {
             None => ExecOutcome::NoCommit,
         },
         Action::SendIdentify => {
-            let ib = message::build_ident_info(
+            // The app's vehicle identity (LIVI item 3, `iap2_core::vehicle`): its engine types and, when pushed, its
+            // VehicleStatus. Nothing pushed is the baseline, the bytes this arm always sent.
+            let ib = message::build_ident_info_with(
                 "CarLink",
                 message::TransportComponent::AirPlayTunnel {
                     bt_mac: accessory_bt_mac(),
                 },
                 false,
+                &iap2_core::vehicle::tunnel_identity(),
             );
             let sent = crate::events::send_iap_message(&link.build_msg(
                 1,
@@ -721,13 +749,14 @@ fn execute(action: Action, link: &mut Link) -> ExecOutcome {
             }
         }
         Action::RetryIdentify(excluded) => {
-            let ib = message::build_ident_info_excluding(
+            let ib = message::build_ident_info_excluding_with(
                 "CarLink",
                 message::TransportComponent::AirPlayTunnel {
                     bt_mac: accessory_bt_mac(),
                 },
                 false,
                 &excluded,
+                &iap2_core::vehicle::tunnel_identity(),
             );
             let sent = crate::events::send_iap_message(&link.build_msg(
                 1,
