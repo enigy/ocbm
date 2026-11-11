@@ -27,8 +27,18 @@ WLANIP=192.168.43.1
 [ -e /etc/wifi_ip ] && WLANIP=$(cat /etc/wifi_ip)
 base=${WLANIP%.*}
 sed -i "s/192\.168\.[0-9]*\.100/${base}.100/; s/192\.168\.[0-9]*\.200/${base}.200/" /etc/udhcpd.conf 2>/dev/null
-# The lease file is kept (bench 2026-11-02): udhcpd saves it at every ACK, and a phone whose lease was
-# deleted here lost its address under a live CarPlay session. radio_ap_up.sh has the detail.
+# The lease file is kept (bench 2026-11-02): a phone whose lease was deleted here lost its address under
+# a live CarPlay session. The server is BusyBox's udhcpd, which NAKs a request it has no lease for, where
+# the vendor's stayed silent (10 Nov); it writes leases on auto_time, so that is set. radio_ap_up.sh has
+# the detail.
+for _kv in "lease_file /var/lib/udhcpd.leases" "pidfile /var/run/udhcpd.pid" "auto_time 60"; do
+  _k=${_kv%% *}
+  if grep -q "^[[:space:]]*$_k[[:space:]]" /etc/udhcpd.conf 2>/dev/null; then
+    sed -i "s|^[[:space:]]*$_k[[:space:]].*|$_k	${_kv#* }|" /etc/udhcpd.conf
+  else
+    printf '%s\t%s\n' "$_k" "${_kv#* }" >> /etc/udhcpd.conf
+  fi
+done
 
 # The AP interface NAME is not a constant across the CCPA variants: it is an insmod parameter
 # (Realtek if2name=sta0, Broadcom iface_name=sta), and on Broadcom wlan0 does not exist until it
@@ -45,7 +55,7 @@ ps | grep -w hostapd | grep -v grep >/dev/null || hostapd /etc/hostapd.conf -B
 
 # wlan0 DHCP server — explicit, separate from the NCM udhcpd (which serves ncm0 via its
 # own /tmp config). The stock script masked this behind a global udhcpd check; fixed here.
-ps | grep -v grep | grep -q "udhcpd .*etc/udhcpd.conf" || udhcpd /etc/udhcpd.conf
+ps | grep -v grep | grep -q "udhcpd .*etc/udhcpd.conf" || busybox udhcpd /etc/udhcpd.conf
 
 rm -f "$LOCK"
 echo "[start_bluetooth_wifi] AP up: ssid=$(sed -n 's/^ssid=//p' /etc/hostapd.conf) ip=$WLANIP ch=$ch hostapd=$(ps|grep -v grep|grep -c '[ /]hostapd') udhcpd=$(ps|grep -v grep|grep -c '[ /]udhcpd')"

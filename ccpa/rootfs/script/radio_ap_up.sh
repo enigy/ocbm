@@ -181,14 +181,33 @@ base=${WLANIP%.*}
 sed -i "s/192\.168\.[0-9]*\.100/${base}.100/; s/192\.168\.[0-9]*\.200/${base}.200/" /etc/udhcpd.conf 2>/dev/null
 # Point udhcpd at the interface we are actually serving.
 grep -q '^interface' /etc/udhcpd.conf 2>/dev/null && sed -i "s/^interface.*/interface	$IF/" /etc/udhcpd.conf
-# THE LEASE FILE IS KEPT (bench 2026-11-02). It used to be deleted here, as the vendor script does,
-# so after every AP restart udhcpd had no record of a phone. An iPhone rejoining a network it knows
-# keeps using its old address and asks for it again (INIT-REBOOT); udhcpd stays silent on such a
-# request from a client it has no lease for (upstream udhcp: "else remain silent"), so the phone
-# carried on at .101, gave up asking, was handed .100, and its CarPlay sockets on .101 died. This
-# udhcpd saves the file at every ACK ("save dhcp lease file" in radio_ap_dhcp.log), on the jffs2 root,
-# so kept it holds each phone's lease through AP restarts and power cuts alike: a phone keeps its
-# address from one drive to the next, and its request is ACKed (one for another address is NAKed).
+# THE AP'S DHCP SERVER IS BUSYBOX'S udhcpd (1.32.1, the one serving NCM), NOT THE VENDOR'S v0.9.9-pre.
+# An iPhone rejoining a network it knows keeps its old address and asks for it again (INIT-REBOOT). The
+# vendor's server stays silent on such a request from a client it has no lease for (upstream udhcp:
+# "else remain silent"), so the phone ran CarPlay on its old address for ~5 s, then DISCOVERed, and the
+# session died when it was handed another. Keeping the lease file (bench 2026-11-02) covered AP restarts
+# and power cuts, but not the first session after a conversion, or after a Restore and reinstall, where
+# no lease exists (the Mac, 10 Nov: the LIVI bench at 16:58 got a new address and dropped). BusyBox's
+# udhcpd NAKs a REQUEST it has no lease for ("No, we don't have this IP for you"), and the phone takes
+# a fresh address within a second, before CarPlay starts.
+#
+# Same file, same pool, lease and interface as before. Three keys BusyBox's server needs, set if absent:
+# the lease file (on the jffs2 root, kept across AP restarts and power cuts) and the pidfile the
+# teardown paths kill by, which the stock file names already, and auto_time. BusyBox writes leases on
+# that timer and at exit, where the vendor's wrote them at every ACK, and a drive ends in a power cut.
+# Its lease file has another format (a timestamp, then 36-byte records); a vendor-format file reads as
+# a timestamp from far outside its 12-hour window, so BusyBox ignores it and rewrites it in its own. A
+# file older than that window, or one the clock jumped past at boot, is ignored too: the NAK covers it.
+_dhcp_key() {
+  if grep -q "^[[:space:]]*$1[[:space:]]" /etc/udhcpd.conf 2>/dev/null; then
+    sed -i "s|^[[:space:]]*$1[[:space:]].*|$1	$2|" /etc/udhcpd.conf
+  else
+    printf '%s\t%s\n' "$1" "$2" >> /etc/udhcpd.conf
+  fi
+}
+_dhcp_key lease_file /var/lib/udhcpd.leases
+_dhcp_key pidfile /var/run/udhcpd.pid
+_dhcp_key auto_time 60
 
 echo 1 > "/proc/sys/net/ipv6/conf/$IF/disable_ipv6" 2>/dev/null
 ifconfig "$IF" "$WLANIP" netmask 255.255.255.0 mtu 1500 up || {
@@ -207,15 +226,16 @@ ps | grep -v grep | grep -qw hostapd || hostapd /etc/hostapd.conf -B >>/tmp/box.
 # name: the NCM server is `busybox udhcpd -f /tmp/udhcpd_ncm.conf` and must never be mistaken for
 # this one, nor killed with it.
 #
-# Redirect and detach. This udhcpd does not daemonise on this build (v0.9.9-pre, not busybox's),
-# so left alone it inherits the caller's stdout and holds the pipe open - which makes an ssh
-# invocation of the seam hang long after the script itself has finished, and would break the
-# HAL's convergent-on-return contract for any caller that reads our output.
+# Redirect and detach. It runs in the foreground (-f, as NCM's does) under setsid, so left alone it
+# would inherit the caller's stdout and hold the pipe open - which makes an ssh invocation of the seam
+# hang long after the script itself has finished, and would break the HAL's convergent-on-return
+# contract for any caller that reads our output. `busybox udhcpd -f /etc/udhcpd.conf` still matches the
+# CONFIG-PATH patterns here and in radio_hal.sh, and it writes /var/run/udhcpd.pid for wlan_off.sh.
 if ! ps | grep -v grep | grep -q "udhcpd .*etc/udhcpd.conf"; then
   # radio_ap_dhcp.log stays a small `>`-truncated status file: this udhcpd is a setsid-backgrounded
-  # daemon (it does not fork/daemonise itself on this build), so piping its own stdout to tee would
-  # change its lifecycle. Only the readback below (on failure) is universal-logged.
-  setsid udhcpd /etc/udhcpd.conf </dev/null >/tmp/radio_ap_dhcp.log 2>&1 &
+  # foreground process, so piping its own stdout to tee would change its lifecycle. Only the readback
+  # below (on failure) is universal-logged.
+  setsid busybox udhcpd -f /etc/udhcpd.conf </dev/null >/tmp/radio_ap_dhcp.log 2>&1 &
 fi
 
 # ---- converge ---------------------------------------------------------------------------------

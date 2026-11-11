@@ -202,6 +202,22 @@ through an AP restart and a power cut alike, and a phone keeps its address from 
 next. With a lease for the phone's MAC it ACKs a request for that address and NAKs any other. SIGTERM
 writes nothing, and need not: the file is as of the last ACK.
 
+**Since 2026-11-10 the AP's server is BusyBox's `udhcpd` (1.32.1, the one serving NCM), not the
+vendor's.** A kept file can't help where no lease exists: the first session after a conversion, or after
+a Restore and reinstall. There the phone's INIT-REBOOT request met the vendor server's silence, it ran
+CarPlay on its old address for ~5 s, then DISCOVERed, and the session died when it was handed another
+(the Mac's LIVI bench, 10 Nov 16:58; the probe bench at 17:39 got the same address back and survived).
+BusyBox's server NAKs a REQUEST it has no lease for ("No, we don't have this IP for you"), so the phone
+takes a fresh address within a second, before CarPlay starts. Both scripts start it as
+`busybox udhcpd -f /etc/udhcpd.conf` (`radio_ap_up.sh`; the IW416 overlay without `-f`) on the same file,
+pool (`.100`-`.200`), lease (864000 s), interface and lease file, and set `auto_time 60`. BusyBox writes
+leases on that timer and at SIGTERM, not at each ACK, and a drive ends in a power cut, so a lease
+reaches flash within a minute of its ACK. Its lease file has another format: an 8-byte timestamp, then
+36-byte records. A vendor-format file, or one older than 12 hours by the box's clock (including a clock
+that restarted behind it), is ignored and rewritten; the NAK covers that case. Nothing in OCBM reads the
+vendor server's `/tmp/.dhcp_record` or `PHONE_P2PGC_ADDR`; the teardown paths kill it by its config path
+and `/var/run/udhcpd.pid`, which BusyBox writes too.
+
 ### 5. Hardware-validated results (RTL8822CS, 2026-08-15)
 
 Detection and mapping, on a chipset with **no repo backend**:
