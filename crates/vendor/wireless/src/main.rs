@@ -252,8 +252,9 @@ fn run_active_session(
     // whose session never reaches CarPlay is ended the same way once the hold is over (fix 6,
     // `Control::switch_stranded`), and the next session calls the other phones first. So is a session
     // whose CarPlay ended and did not come back (`Control::carplay_lost`): the next one pages that phone
-    // for a fresh handoff.
-    let restart = || ctrl.restart_requested() || ctrl.switch_stranded() || ctrl.carplay_lost();
+    // for a fresh handoff. And so is one whose phone never reached CarPlay at all (`Control::carplay_never_reached`,
+    // bench 2026-11-12): the next one calls the other phones first, then pages it again.
+    let restart = || ctrl.restart_requested() || ctrl.switch_stranded() || ctrl.carplay_lost() || ctrl.carplay_never_reached();
     match arbiter {
         Some(mut reader) => arbiter_client::wait_for_preempt(&mut reader, shutdown, &restart),
         None => {

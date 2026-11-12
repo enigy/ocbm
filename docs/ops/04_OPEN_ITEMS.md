@@ -233,7 +233,16 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
      session; Carlink covers the last frame on every drop; the app leaving with no session took the
      COMPLETE teardown and left no `carplayd`; `usb_has` found the adapter at `ioreg` line 355 of 485.
      Not exercised: `carplay_lost`, which needs CarPlay to drop with Bluetooth up (turning Wi-Fi off
-     drops both; the address flip that did it is fixed). Found, fixed the same day, NOT yet benched: the
+     drops both; the address flip that did it is fixed). **Bench 2026-11-12, 06:39 (`a53508f`, one
+     iPhone by the box, the other away):** the phone's Wi-Fi blipped mid-session; its next Bluetooth
+     session reached pair-verify, the phone withdrew its CarPlay service and never sent SETUP, and
+     `carplayd`'s idle backstop ended it. `btd` then held the Bluetooth link, Identified with no CarPlay,
+     for 9.5 min until the host re-attached: `carplay_lost` covers only a session that reached CarPlay,
+     and fix 6 only a switched-to phone. Fixed the same day, NOT yet benched:
+     `Control::carplay_never_reached` ends such a session 10 s after its `carplayd` leaves without
+     CarPlay (the transport flag cleared), or 90 s into one with no `carplayd` at all (the supervisor's
+     `ESTAB_CONNECT_GRACE`, which covers an Allow tap), passes the phone over, and lets the next session
+     call the other phones first and then page it. Found, fixed the same day, NOT yet benched: the
      AirPlay peer store kept one key per pairing identifier and both iPhones present the same one, so
      every change of phone redid pair-setup (one switch failed when the phone abandoned it after M3);
      it now keeps up to 8 keys per identifier ([../carplay/02_SESSION_LIFECYCLE.md](../carplay/02_SESSION_LIFECYCLE.md)).
