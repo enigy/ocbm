@@ -219,10 +219,13 @@ ifconfig "$IF" "$WLANIP" netmask 255.255.255.0 mtu 1500 up || {
 
 # ---- bring up ---------------------------------------------------------------------------------
 test -e /tmp/bin/hostapd || cp /usr/sbin/hostapd /tmp/bin/hostapd 2>/dev/null
-# Nothing reads /tmp/radio_ap_hostapd.log back (checked: no tail/cat/grep of it anywhere in the
-# scripts), so it folds straight into the universal log with a source prefix.
+# Its output folds straight into the universal log. Not -B: daemonizing points stdout at /dev/null, so
+# the station events after start-up (AP-STA-CONNECTED, AP-STA-DISCONNECTED, and the IEEE 802.11 lines
+# that say why a phone left) never reached box.log, and the Mac's 12 Nov re-bench couldn't see why a
+# fresh session's link was lost. It runs in the foreground under setsid instead, as udhcpd does below,
+# appending (O_APPEND, for bound_logs' in-place truncate); the converge step waits for it.
 echo "[radio] hostapd starting on $IF" >> /tmp/box.log
-ps | grep -v grep | grep -qw hostapd || hostapd /etc/hostapd.conf -B >>/tmp/box.log 2>&1
+ps | grep -v grep | grep -qw hostapd || { setsid hostapd /etc/hostapd.conf </dev/null >>/tmp/box.log 2>&1 & }
 
 # The AP's DHCP server, explicitly scoped. The stock script masked this behind a global udhcpd
 # check, so the always-running NCM instance satisfied it and the AP's own server never started -
@@ -261,6 +264,9 @@ n=0
 while [ "$n" -lt 50 ]; do ap_serving && break; n=$((n+1)); sleep 0.2; done
 # Re-test the FULL predicate after the loop: falling out of it on the bound is not success, and
 # re-checking only hostapd here would let a missing address or a dead DHCP server report as up.
+# A second on: in the foreground hostapd is in the process list before its start-up is through,
+# where -B returned only after it, so one that refuses its config would otherwise pass the loop.
+sleep 1
 if ! ap_serving; then
   echo "$L AP did not converge (ssid=$NAME ch=$ch if=$IF):"
   ps | grep -v grep | grep -qw hostapd \

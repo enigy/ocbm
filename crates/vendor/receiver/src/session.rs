@@ -2403,6 +2403,16 @@ fn forward_screen2(
                     if crate::events::send_force_key_frame_stream(sid) {
                         eprintln!("[screen] requested ForceKeyFrame for the new :{port} consumer");
                     }
+                    // Route A: a new main-screen consumer is a host that (re)attached, and it needs the phone's
+                    // setProxyParameters, which went by once at the session's start. Here, not on /tmp/host_present's
+                    // edge: a re-attach inside the heartbeat never drops presence (the Mac's 12 Nov re-bench).
+                    // Once more a few seconds on, in case the host's metadata subscription came after its video's;
+                    // the host takes the same offer twice as once.
+                    if port == 9001 && crate::tunnel::replay_proxy() {
+                        eprintln!("[tunnel] a new :{port} consumer → the phone's setProxyParameters sent again");
+                        std::thread::sleep(Duration::from_secs(3));
+                        crate::tunnel::replay_proxy();
+                    }
                 });
             }
             Err(_) => {
