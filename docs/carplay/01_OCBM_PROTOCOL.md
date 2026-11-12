@@ -1,5 +1,17 @@
 # 02 — OCBM: the Open CCPA Bulk Multiplexer
 
+Mirror transport addition (2026-11-02, software-tested; hardware unverified):
+`CH_MIRROR=0x0025` carries bounded MIR1 compressed-media records from the optional loopback
+`:9006` seam. It uses the existing media backpressure queue, separately from encrypted CarPlay
+payloads. `CAP_MIRROR_SEAM=0x800` indicates transport availability, not receiver installation
+or display readiness. The subscribed host must explicitly send `[CT_MIRROR_READY=0x1D, 1]`;
+the box echoes actual armed state. `[0x1D, 0]`, host HELLO, STOP, or heartbeat loss disarms it.
+Only an armed, subscribed host causes an accepted producer to receive `MIRACK1\n`; otherwise
+the socket is closed. The producer sends HELLO before waiting for this acknowledgement and
+must remain undiscoverable until acknowledged. New producer bytes carry `F_NEW_SOURCE` so
+partial old MIR1 records can be discarded. Normal sessions never arm this seam by default.
+This addition does not implement presentation ownership, radio switching, or a player.
+
 > **STATUS:** CURRENT · the OCBM wire specification, kept in step with `crates/ocbm-proto` and
 > `ccpa/ocbmd`
 

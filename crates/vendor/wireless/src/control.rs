@@ -1046,6 +1046,22 @@ pub fn handle_request(ctrl: &Control, line: &str) -> String {
         return r#"{"ok":false,"error":"no cmd"}"#.to_string();
     };
     match cmd.as_str() {
+        "pause_carplay_for_mirror" => {
+            if !std::path::Path::new("/tmp/mirror_requested").exists() {
+                return r#"{"ok":false,"error":"mirror was not requested"}"#.to_string();
+            }
+            crate::av::pause_for_mirror();
+            r#"{"ok":true}"#.to_string()
+        }
+        "resume_carplay" => {
+            if box_common::flags::owner() == box_common::flags::ProjectionOwner::None
+                && !std::path::Path::new("/tmp/mirror_requested").exists() {
+                crate::av::ensure_av_layer();
+                r#"{"ok":true}"#.to_string()
+            } else {
+                r#"{"ok":false,"error":"projection is owned"}"#.to_string()
+            }
+        }
         "list" => {
             let peer = ctrl.session_peer();
             let active = ctrl.session_active();

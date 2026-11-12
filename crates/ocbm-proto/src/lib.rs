@@ -29,6 +29,11 @@ pub const CH_MEDIA_AUDIO: u16 = 0x0021; // box->host A/V: media audio, same forw
 pub const CH_ALT_AUDIO: u16 = 0x0022; // box->host A/V: voice-sink streams (telephony/speechRecognition/alert/default), same seam framing as media
 pub const CH_METADATA: u16 = 0x0023; // box->host: session metadata (Metadata window). Seam :9004, framing [u32 BE "META"][u32 BE len][marker][payload] (v2, audit Fix #17); META_* markers below
 pub const CH_ALT_VIDEO: u16 = 0x0024; // box->host: the ALT / navigation (instrument-cluster) screen stream. Same seq+SEAM_MAGIC forward-encrypted framing as CH_VIDEO; the host decodes it on a DEDICATED decoder. Box seam :9005.
+/// Ordinary AirPlay mirror records (MIR1), separate from encrypted CarPlay seams. Box seam :9006.
+pub const CH_MIRROR: u16 = 0x0025;
+/// Twofish: the userspace TCP/UDP relay, kept in this fork for app AirPlay's playlist fetches after
+/// upstream retired it in 1.0.5 (cf96a13). Same number as before, which upstream holds reserved.
+pub const CH_IP: u16 = 0x0010;
 
 // CH_METADATA seam markers (wire values; producers declare their own local consts — iap2d does not
 // link this crate). Payloads are PLAINTEXT (the box decrypts the control connection; the host is
@@ -158,6 +163,10 @@ pub const BTP_BOND_LOST: u8 = 0x08; // a bonded phone most likely forgot the pai
                                     // link key (AUTH_FAILED 0x05/0x06), or answered and reset the link on 3+
                                     // reconnect pages in a row. The app may ask the driver to forget the
                                     // adapter on the iPhone and pair again (btd; 5 Nov bench)
+/// Host arms a presentation: [verb, 0=off, 1=screen mirror, 2=app AirPlay]. Box echoes the actual mode.
+pub const CT_MIRROR_READY: u8 = 0x1D;
+/// Fixed 28-byte player status forwarded to the selected receiver over the mirror socket.
+pub const CT_APP_AIRPLAY_STATUS: u8 = 0x1E;
 pub const CT_RADIO: u8 = 0x16; // host->box [CT_RADIO][0=radios off now | 1=radios on if cfg allows]
                                // (docs/carplay/04_CAPABILITIES_AND_CONFIG.md radio gating: mid-session kill switch; radios-on is otherwise
                                // implied by SUBSCRIBE + config push, and app loss powers radios off)
@@ -292,6 +301,7 @@ pub const LOG_ENTRY_HDR: usize = 14;
 pub const PM_NONE: u8 = 0x00; // idle — no projection session; a phone may claim the box
 pub const PM_WIRED_CP: u8 = 0x01; // wired CarPlay (projection_up -> iap2d + carplayd)
 pub const PM_WIRELESS_CP: u8 = 0x02; // wireless CarPlay (btd: BT + WiFi AP)
+pub const PM_MIRROR: u8 = 5; // Twofish: local AirPlay mirror (3 and 4 were Android Auto, retired upstream)
 
 pub const SEV_HOST_PRESENT: u8 = 0x01; // subscribed + heartbeat-alive
 pub const SEV_HOST_GONE: u8 = 0x02; // STOP, or heartbeat watchdog expired
@@ -372,6 +382,11 @@ pub const CAP_PAIR_WINDOW: u32 = 0x0000_0080; // box takes MGMT_PAIR_WINDOW and 
 pub const CAP_INSTALL: u32 = 0x0000_0100; // box takes MGMT_INSTALL_CONFIRM / MGMT_GO_STOCK and reports "install" in MGMT_INFO
 pub const CAP_UPDATE: u32 = 0x0000_0200; // box takes MGMT_UPDATE and reports "update" in MGMT_INFO
 pub const CAP_PHONE_SWITCH: u32 = 0x0000_0400; // box takes MGMT_SWITCH_DEVICE: Connect may end another phone's wireless session
+/// Transport capability only; does not claim receiver installation or presentation readiness.
+pub const CAP_IP: u32 = 0x0000_0008; // Twofish: the box relays CH_IP (number reserved upstream)
+pub const CAP_MIRROR_SEAM: u32 = 0x0000_0800;
+pub const CAP_MIRROR_MODE: u32 = 0x0000_1000;
+pub const CAP_APP_AIRPLAY: u32 = 0x0000_2000;
 
 // OCBM_CH_FILE sub-frame types. Host pushes one file at a time to the box so binary
 // deploys ride the reliable accessory pipe instead of corruption-prone base64-over-UART.
@@ -896,6 +911,13 @@ impl Reassembler {
         }
     }
 }
+
+// Twofish: OCBM_CH_IP stream-mux sub-frame types. Payload = [type u8][conn_id u16 LE][data].
+// The OPEN target is an "ip:port" LITERAL, never a hostname: the box has no resolver deadline.
+pub const IP_OPEN: u8 = 0x01; // TCP: data = target "ip:port"; box connect()s and relays
+pub const IP_DATA: u8 = 0x02; // data = stream bytes (TCP) or one datagram (UDP)
+pub const IP_CLOSE: u8 = 0x03; // no data
+pub const IP_OPEN_UDP: u8 = 0x04; // UDP: data = target "ip:port"; box binds + connect()s a UdpSocket
 
 #[cfg(test)]
 mod tests {

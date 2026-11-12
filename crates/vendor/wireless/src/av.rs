@@ -303,9 +303,20 @@ pub fn ensure_av_layer() {
     println!("@{now_ms} [av] ensure_av_layer done in {} ms", t0.elapsed().as_millis());
 }
 
+/// Called via the existing btd control server; serialize against an in-flight spawn.
+pub fn pause_for_mirror() {
+    let _guard = AV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    teardown_av_layer();
+}
+
 fn ensure_av_layer_timed() {
     // Serialize (see AV_LOCK): two rapid 0x5703s must not both spawn the daemons.
     let _guard = AV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if std::path::Path::new("/tmp/mirror_requested").exists()
+        || box_common::flags::owner() == box_common::flags::ProjectionOwner::Mirror {
+        return;
+    }
+
 
     // docs/wireless/00_WIRELESS_CARPLAY.md #1.6: claim the transport flag HERE, at spawn time, rather than waiting for carplayd to
     // see the phone's first control connection (that write happens seconds later, inside carplayd
