@@ -568,6 +568,7 @@ dependencies = [
  "ocbm-proto",
  "rusb",
  "sha1",
+ "sha2",
 ]
 
 [[package]]

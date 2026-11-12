@@ -8,6 +8,7 @@
 //!                                                `rm /script/ncm_only; reboot` over ssh.
 //!   ocbm-host push  [vid pid] <local> <remote> [mode-octal]   verified file deploy (default mode 755)
 //!   ocbm-host pull  [vid pid] <remote> <local> [mode-octal]   verified file retrieval (box -> host)
+//!   ocbm-host update  vid pid <package.tgz>       push an update package and send MGMT_UPDATE (trial + rollback)
 //!   ocbm-host wifi-link vid pid set <ssid>|clear   provision the Wi-Fi transport (MGMT_WIFI_LINK): link key
 //!                                                (~/.config/ocbm/link_key, made if absent) + hotspot; the
 //!                                                password is read with echo off, only its WPA hash is sent
@@ -460,6 +461,42 @@ fn mode_wifi_link(link: &mut Link, what: &str, ssid: Option<&str>) {
         }
     }
     eprintln!("wifi-link {what}: no answer within 5 s (box without the Wi-Fi transport?)");
+    std::process::exit(1);
+}
+
+/// `update <package.tgz>`: push an OCBM update package (tools/make_ocbm_update.sh) to /tmp/ocbm-update.tgz
+/// and send MGMT_UPDATE with its SHA-256, as Carlink does. The box checks the package and installs it as a
+/// trial that keeps the new version on a passing self-test and puts the old one back otherwise; it restarts.
+fn mode_update(link: &mut Link, pkg: &str) {
+    let data = std::fs::read(pkg).unwrap_or_else(|e| {
+        eprintln!("update: can't read {pkg}: {e}");
+        std::process::exit(2);
+    });
+    let sha: String = {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(&data).iter().map(|b| format!("{b:02x}")).collect()
+    };
+    if !mode_push(link, pkg, "/tmp/ocbm-update.tgz", 0o644) {
+        eprintln!("update: the push failed; nothing was started");
+        std::process::exit(1);
+    }
+    let mut req = vec![p::MGMT_UPDATE];
+    req.extend_from_slice(sha.as_bytes());
+    link.send(p::CH_MGMT, p::F_SOM | p::F_EOM, &req);
+    let mut out = vec![0u8; p::MAX_PAYLOAD];
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let Some((ch, _flags, l)) = link.recv(&mut out, deadline) else { break };
+        if ch == p::CH_MGMT && l >= 3 && out[0] == p::MGMT_ACK && out[1] == p::MGMT_UPDATE {
+            if out[2] == 0 {
+                println!("update: accepted (sha256 {}); the box installs it as a trial and restarts", &sha[..16]);
+                return;
+            }
+            eprintln!("update: refused by the box (status {}): no package, a different SHA-256, or no update script", out[2]);
+            std::process::exit(1);
+        }
+    }
+    eprintln!("update: no answer within 10 s");
     std::process::exit(1);
 }
 
@@ -1088,6 +1125,10 @@ fn main() {
             };
             mode_install(&mut link, what)
         }
+        "update" => mode_update(&mut link, args.get(4).map(String::as_str).unwrap_or_else(|| {
+            eprintln!("usage: ocbm-host update <vid pid | tcp:<ip> -> <package.tgz>");
+            std::process::exit(2)
+        })),
         "wifi-link" => mode_wifi_link(
             &mut link,
             args.get(4).map(String::as_str).unwrap_or(""),
