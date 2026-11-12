@@ -239,11 +239,9 @@ fn handle_inbound_event(pt: &[u8]) {
         // `disableBluetooth` entry in its type histogram) that this command DOES arrive — not a
         // guess.
         eprintln!("[events] disableBluetooth received (BT link may now be released; no action taken)");
-    } else if crate::probe::switches().video {
-        // The AirPlay video probe's route A (probe.rs): the shape of anything else the phone sends here.
+    } else {
+        // Route A (probe.rs): the shape of anything else the phone sends here.
         crate::probe::line(format_args!("event channel: the phone sent {}", crate::probe::dict_shape(&d)));
-    } else if events_log() {
-        eprintln!("[events] ← iPhone event: type='{ty}' ({} B)", pt.len());
     }
 }
 
@@ -299,7 +297,7 @@ fn reply_status(pt: &[u8]) -> Option<String> {
     };
     let status = d.get("status").and_then(Value::as_signed_integer)?;
     let shape = match d.get("params").and_then(Value::as_dictionary) {
-        Some(p) if crate::probe::switches().video => format!(", params {}", crate::probe::dict_shape(p)),
+        Some(p) => format!(", params {}", crate::probe::dict_shape(p)),
         _ => String::new(),
     };
     Some(format!("status {status}{shape}"))
@@ -863,36 +861,6 @@ pub fn send_take_screen() -> bool {
     send_command(&body)
 }
 
-/// Route A: **borrow the main screen for the phone's video**, or give it back, as LIVI does while its video plays
-/// (borrowID `VideoPlayback`, resourceID 1). Apple's four-verb model (docs/carplay/02_SESSION_LIFECYCLE.md):
-/// Borrow (`transferType` 3) and Unborrow (4) must carry the borrowID, which Take and Untake never do. Wire [I],
-/// shaped on [`send_take_screen`]: `{type:"changeModes", params:{resources:[{resourceID:1, transferType:3,
-/// transferPriority:500, borrowID:"VideoPlayback"}], reasonStr:"video playback"}}`, and for the give-back
-/// `{resourceID:1, transferType:4, borrowID:"VideoPlayback"}`. The phone's answer is logged like any command's.
-pub fn send_video_borrow(borrow: bool) -> bool {
-    send_command(&video_borrow_body(borrow))
-}
-
-fn video_borrow_body(borrow: bool) -> Vec<u8> {
-    let mut r = Dictionary::new();
-    r.insert("resourceID".into(), Value::Integer(1.into())); // MainScreen
-    r.insert("transferType".into(), Value::Integer(if borrow { 3 } else { 4 }.into())); // Borrow / Unborrow
-    if borrow {
-        r.insert("transferPriority".into(), Value::Integer(500.into())); // UserInitiated
-    }
-    r.insert("borrowID".into(), Value::String("VideoPlayback".into()));
-    let mut params = Dictionary::new();
-    params.insert("resources".into(), Value::Array(vec![Value::Dictionary(r)]));
-    params.insert("reasonStr".into(), Value::String("video playback".into()));
-    let mut d = Dictionary::new();
-    d.insert("type".into(), Value::String("changeModes".into()));
-    d.insert("params".into(), Value::Dictionary(params));
-    let mut body = Vec::new();
-    // A dictionary of plain values always serializes; an empty body would just fail to send.
-    let _ = Value::Dictionary(d).to_writer_binary(&mut body);
-    body
-}
-
 /// Ask the controller to bring the accessory's UI forward — `requestUI` with no URL, emitted right after
 /// the initial `changeModes` (carplayd Add #6). Wire (`AirPlayReceiverSessionRequestUI`, NULL url):
 /// `{type:"requestUI"}` (no `params`).
@@ -1327,27 +1295,14 @@ pub fn send_hid_report(uid: u32, report: &[u8]) -> bool {
 mod tests {
     use super::*;
 
-    /// Route A's screen borrow: Borrow (3) and Unborrow (4) of the main screen, each carrying LIVI's borrowID.
-    #[test]
-    fn the_video_borrow_names_the_main_screen_and_its_borrow_id() {
-        for (borrow, transfer) in [(true, 3), (false, 4)] {
-            let v = Value::from_reader(std::io::Cursor::new(video_borrow_body(borrow))).unwrap();
-            let d = v.as_dictionary().unwrap();
-            assert_eq!(d.get("type").and_then(Value::as_string), Some("changeModes"));
-            let params = d.get("params").and_then(Value::as_dictionary).unwrap();
-            let resources = params.get("resources").and_then(Value::as_array).unwrap();
-            let r = resources[0].as_dictionary().unwrap();
-            assert_eq!(r.get("resourceID").and_then(Value::as_signed_integer), Some(1));
-            assert_eq!(r.get("transferType").and_then(Value::as_signed_integer), Some(transfer));
-            assert_eq!(r.get("borrowID").and_then(Value::as_string), Some("VideoPlayback"));
-            assert_eq!(r.contains_key("transferPriority"), borrow, "a priority on the borrow only");
-        }
-    }
-
     /// A reply names the command it answers, once: by the body's `type`, or the stream a message rode.
     #[test]
     fn a_reply_names_its_command_by_cseq() {
-        assert_eq!(command_label(&video_borrow_body(true), ""), "changeModes");
+        let mut d = plist::Dictionary::new();
+        d.insert("type".into(), Value::String("changeModes".into()));
+        let mut body = Vec::new();
+        Value::Dictionary(d).to_writer_binary(&mut body).unwrap();
+        assert_eq!(command_label(&body, ""), "changeModes");
         assert_eq!(command_label(b"bp", "X-Apple-StreamID: 3\r\n"), "stream 3 message");
         assert_eq!(command_label(b"not a plist", ""), "unreadable command");
         note_sent(900_001, "changeModes".into());
@@ -1373,7 +1328,7 @@ mod tests {
         Value::Dictionary(d).to_writer_binary(&mut body).unwrap();
         let mut reply = b"RTSP/1.0 200 OK\r\nCSeq: 7\r\nContent-Length: 0\r\n\r\n".to_vec();
         reply.extend_from_slice(&body);
-        assert_eq!(reply_status(&reply).as_deref(), Some("status -6705"));
+        assert_eq!(reply_status(&reply).as_deref(), Some("status -6705, params {resources: [0]}"), "route A logs the params' shape");
         assert_eq!(reply_status(b"RTSP/1.0 200 OK\r\nCSeq: 7\r\n\r\n"), None);
         assert_eq!(reply_status(b"RTSP/1.0 400 Bad Request\r\nCSeq: 7\r\n\r\nnot a plist"), None);
     }

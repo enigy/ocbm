@@ -10,8 +10,6 @@
 //! `{"kind":"dataStream","stream":N,"client":"<clientTypeUUID>","message":{...}}`. The host's answers come back
 //! as `INPUT_DATASTREAM` sub-frames, `[stream u32 LE][JSON]` (carplayd strips the type byte), which
 //! [`send_reply`] turns back into a binary plist for the phone.
-//!
-//! Behind the AirPlay video probe's `video` switch (`probe.rs`): with it off, nothing here runs.
 
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{channel, Sender};
@@ -23,8 +21,7 @@ use plist::{Dictionary, Value};
 /// Kept across a session's end: the host says it again at each session's start, and on every change.
 static HOST_SAYS: AtomicU8 = AtomicU8::new(0);
 
-/// This session negotiated videoPlayback and is past RECORD, with the probe's `allow` on: the phone hears each
-/// word from the host as it comes.
+/// This session negotiated videoPlayback and is past RECORD: the phone hears each word from the host as it comes.
 static TELLING: AtomicBool = AtomicBool::new(false);
 
 /// The host's word on whether video may play (it plays only while the car is known to be parked), with the play
@@ -40,7 +37,7 @@ pub fn host_allows(allowed: bool, status: &str) -> bool {
     tell_allowed(allowed, status)
 }
 
-/// RECORD, in a session that negotiated videoPlayback with the probe's `allow` on: the phone hears the host's
+/// RECORD, in a session that negotiated videoPlayback: the phone hears the host's
 /// word from now on, starting with the one already given (status `idle`, as LIVI sends at RECORD: nothing is
 /// queued yet). Until the host has said, nothing goes out.
 pub fn on_record() {
@@ -97,10 +94,6 @@ pub fn on_phone_message(stream: i64, client: Option<&str>, body: &[u8]) -> Vec<u
 /// The host's answer on shared DataStream `stream`: `[stream u32 LE][JSON]`, sent to the phone as a binary
 /// plist in `{params: {data}}` on the event channel. False when it is malformed or couldn't be sent.
 pub fn send_reply(pl: &[u8]) -> bool {
-    if !crate::probe::switches().video {
-        crate::probe::line(format_args!("a DataStream reply from the host with route A off — dropped"));
-        return false;
-    }
     let Some((stream, json)) = pl.split_first_chunk::<4>().map(|(s, j)| (u32::from_le_bytes(*s), j)) else {
         crate::probe::line(format_args!("a DataStream reply of {} B with no stream id — dropped", pl.len()));
         return false;

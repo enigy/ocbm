@@ -376,7 +376,7 @@ explicitly requests `CONSOLE`. New modes are pure additions — no rewrite.
 | `0x0022` | ALT_AUDIO | box→host: voice-sink streams — telephony / speechRecognition / alert / default (box seam `:9003`, same seam framing as media) | projection |
 | `0x0023` | METADATA | box→host: session metadata, **plaintext** (box seam `:9004`; `[u32 BE "META"][u32 BE len][marker][payload]` v2 — the magic lets the host resync after a truncated frame, audit Fix #17 — with `META_CMD 0x01` / `META_JSON 0x02` / `META_ARTWORK 0x03` / `META_CORNERMASK 0x04` `[u32 BE display_width_px][PNG]`, iOS's own `topLeftCornerMask`, docs/carplay/06_AV_PIPELINE.md) | projection |
 | `0x0024` | ALT_VIDEO | box→host: the ALT / navigation (instrument-cluster) screen stream, decoded host-side on a **dedicated** decoder (box seam `:9005`) | projection |
-| `0x0025` | TUNNEL | box→host: route A's tunnels to the phone's proxy (`setProxyParameters`), so the video the phone hands off is fetched over the phone's network (box seam `:9006`; `[u32 BE "TUNL"][u32 BE len][op][id][data]`, the metadata seam's shape). Ops `TUNNEL_OPEN 0x01` (host→box `[port u16 BE][the proxyUrl's host]`), `TUNNEL_DATA 0x02` (both ways), `TUNNEL_CLOSE 0x03` (both ways; box→host carries the reason), `TUNNEL_OPENED 0x04`. Host→box rides INPUT as `INPUT_TUNNEL 0x0B` `[op][id][data ≤ 16 KiB]`. The bytes are the host's TLS 1.3 PSK session with the proxy, so ocbmd read-gates this seam on its own queue and never drops a frame; carplayd connects a tunnel only to the phone's own address or a link-local one on its link (`receiver::tunnel`), never elsewhere on the box's network. Behind the AirPlay video probe's `video` switch (2026-11-11) | route A |
+| `0x0025` | TUNNEL | box→host: route A's tunnels to the phone's proxy (`setProxyParameters`), so the video the phone hands off is fetched over the phone's network (box seam `:9006`; `[u32 BE "TUNL"][u32 BE len][op][id][data]`, the metadata seam's shape). Ops `TUNNEL_OPEN 0x01` (host→box `[port u16 BE][the proxyUrl's host]`), `TUNNEL_DATA 0x02` (both ways), `TUNNEL_CLOSE 0x03` (both ways; box→host carries the reason), `TUNNEL_OPENED 0x04`. Host→box rides INPUT as `INPUT_TUNNEL 0x0B` `[op][id][data ≤ 16 KiB]`. The bytes are the host's TLS 1.3 PSK session with the proxy, so ocbmd read-gates this seam on its own queue and never drops a frame; carplayd connects a tunnel only to the phone's own address or a link-local one on its link (`receiver::tunnel`), never elsewhere on the box's network. Always on since OCBM 2.0; see "Route A" below (2026-11-11) | route A |
 | `0x0030` | INPUT | host→box: **binary `INPUT_*` sub-frames** — `INPUT_TOUCH 0x01` (normalized u16 coords) / `INPUT_KEYFRAME 0x02` / `INPUT_MEDIA_BTN 0x03` (Consumer-Control HID uid 2) / `INPUT_COMMAND 0x04` / `INPUT_NAV 0x05` (D-Pad HID uid 3, `NAV_*`) / `INPUT_KEYFRAME_ALT 0x06` (re-IDRs the ALT/cluster stream **specifically**; a bare `INPUT_KEYFRAME` only re-IDRs main) / `INPUT_KNOB 0x07` (Knob HID uid 4) / `INPUT_TELEPHONY 0x08` (Telephony HID). `INPUT_COMMAND`'s payload is the `CMD_*` set — `CMD_REQUEST_UI 0x01`, `CMD_REQUEST_SIRI 0x02` *(deprecated, iOS ignores it)*, `CMD_SIRI_DOWN 0x03` / `CMD_SIRI_UP 0x04`, `CMD_NAV_START 0x05` / `CMD_NAV_STOP 0x06` / `CMD_NAV_CARD 0x07` / `CMD_NAV_APP 0x0A`, `CMD_LIMITED_UI_ON 0x08` / `CMD_LIMITED_UI_OFF 0x09`, `CMD_NAV_APPEARANCE 0x0B`, `CMD_NAV_ZOOM_IN 0x0C` / `CMD_NAV_ZOOM_OUT 0x0D`, `CMD_UI_APPEARANCE 0x0E` / `CMD_MAP_APPEARANCE 0x0F` / `CMD_NIGHT_MODE 0x10`, `CMD_VIEW_AREA 0x11` (`[cmd][index]` → `updateViewArea` for the MAIN display, refused if `/info` never declared the index; 2026-09-07), `CMD_REQUEST_UI_URL 0x12` (`[cmd][url…]`, UTF-8, no terminator, 1..=255 bytes → `requestUI{url}` on the MAIN screen, e.g. `maps:` / `nowplaying:`; empty, over-long or non-UTF-8 is refused with a log line; 2026-10-25, for the Carlink3 split-screen pane). ocbmd relays every sub-frame opaquely to carplayd; carplayd taps the iPhone HID devices for touch/media/nav/knob/telephony, dispatches `INPUT_COMMAND` as an AirPlay `/command`, and turns `INPUT_KEYFRAME` / `INPUT_KEYFRAME_ALT` into a `forceKeyFrame` on the event channel (main / `VideoStream.Alt1`). Constants are authoritative in `crates/ocbm-proto/src/lib.rs` | all |
 | `0x0031` | MIC | host→box: mic-uplink PCM (S16LE at the CT_UPLINK-negotiated rate/ch); ocbmd relays to carplayd's mic-ingest seam → RTP uplink to the iPhone | projection |
 | `0x0040` | MGMT | box management, request/response (the app's "CCPA" tab): host→box `MGMT_GET_INFO 0x01` / `MGMT_REBOOT 0x02` / `MGMT_FORGET_ALL 0x03` / `MGMT_FORGET_DEVICE 0x04` / `MGMT_RESTART_WIRELESS 0x05` / `MGMT_ENTER_NCM 0x06` (added 2026-09-03: box arms the persistent `/script/ncm_only` flag, drops any `/script/ocbm_trial` dead-man, ACKs, reboots into NCM maintenance mode; sticky — return over ssh with `rm /script/ncm_only; reboot`. Bench: `ocbm-host ncm`); `MGMT_INSTALL_CONFIRM 0x0A` / `MGMT_GO_STOCK 0x0B` (added 2026-10-28 for the one-file install, advertised as `CAP_INSTALL 0x100`; `MGMT_INFO` carries `"install":"trial"\|"confirmed"\|"final"\|"none"`. CONFIRM moves `/script/ocbm_mode` from `trial` to `confirmed`, and when that session ends, or at the next start if the power was cut first, the box removes the Carlinkit stack for good (`ccpa/installer/ocbm_finish.sh`), so only an app that shows the user "Go back to stock" for the rest of the session may send it. GO_STOCK, while stock is still kept, ACKs and runs `ocbm_revert.sh`, which restarts the box on stock firmware; status 1 in `final` or on a box without the one-file install. Bench: `ocbm-host install [vid pid] info\|confirm\|stock`); `MGMT_SET_POLICY 0x07` / `MGMT_CONNECT_DEVICE 0x08` (`CAP_PHONE_POLICY 0x40`); `MGMT_SWITCH_DEVICE 0x0D` `[ascii MAC]` (added 2026-11-01, `CAP_PHONE_SWITCH 0x400`: the device screen's Connect while another phone projects. With another phone's WIRELESS session live, btd ends it through the arbiter-preempt go-quiet teardown, pages the named phone, and for 45 s refuses every other phone so the dropped one cannot re-dial in first; idle or already that phone, it is a connect. Never ends a wired session. `MGMT_ACK` 1 = not a MAC, not bonded, or btd unreachable); box→host `MGMT_INFO 0x81` / `MGMT_ACK 0x82` | all |
@@ -620,6 +620,44 @@ requested `mode`, then **atomically renames** the temp onto the final path — a
 transfer leaves neither a half-written binary nor a stale non-executable one. `mode` carries the
 exec bits (e.g. `0o755`), which fixes the long-standing "deploy dropped the +x bit → unbootable
 rcS" gotcha. This is the incremental, always-available cousin of the `FIRMWARE_UPDATE` mode below.
+
+## Route A: the phone's video inside CarPlay (OCBM 2.0, 12 Nov 2026)
+
+iOS 26 and later let a CarPlay head unit show the phone's AirPlay video. The box offers it in every
+session and only carries the traffic; the play queue, the player and the parked rule are the host's.
+Always on since 2.0: the AirPlay video probe's switch file, `/etc/ocbm/airplay_probe`, is gone, and a
+copy left on an adapter is ignored. Source: `crates/vendor/receiver/src/{probe,playback,tunnel}.rs`.
+
+- **The offer.** `/info` carries `videoPlaybackInfo` (`videoPlaybackAllowed` true, `featuresEx` = the
+  `features` bits as bytes, low byte first, trailing zeros dropped, Base64) and `playbackCapabilities`
+  (no FairPlay secure stop, no UI for audio-only content). The phase-1 SETUP echoes `videoPlayback`
+  when the phone proposes it, and only then.
+- **Whether video may play** is the host's word: `[INPUT_COMMAND][CMD_VIDEO_ALLOWED 0x13][allowed
+  0|1][VIDEO_STATUS_*]`, status `IDLE 0` / `VIDEO 1` / `AUDIO_ONLY 2` (a missing byte is idle).
+  carplayd sends it to the phone as `setVideoPlaybackAllowed{videoPlaybackAllowed, playbackStatus}` in a
+  session that negotiated `videoPlayback`: at RECORD, then on each change. Before RECORD the word is
+  kept; until the host has said, nothing goes out. Carlink allows it only while the car is known to be
+  parked.
+- **The play queue** rides the phone's shared DataStream (the Playback client,
+  `A6B27562-B43A-4F2D-B75F-82391E250194`). Phone to host: each message reaches CH_METADATA as a
+  `META_JSON` record `{"kind":"dataStream","stream":N,"client":"<clientTypeUUID>","message":{...}}`,
+  the message's plist as JSON. Host to phone: `[INPUT_DATASTREAM 0x0A][stream u32 LE][JSON]`, up to
+  `MAX_INPUT_DATASTREAM` (16 KiB), turned back into a binary plist on the event channel.
+- **The phone's network.** The phone's `setProxyParameters` reaches the host as every `/command` does
+  (`META_CMD`). The host runs TLS 1.3 with the phone's pre-shared key and the proxy's CONNECT, and the
+  box carries the bytes: host to box `[INPUT_TUNNEL 0x0B][op][id u8][data]` (data up to
+  `MAX_INPUT_TUNNEL`, 16 KiB), box to host on CH_TUNNEL `0x0025` (seam `:9006`, `[u32 BE
+  "TUNL"][u32 BE len][op][id][data]`, len = 2 + data). Ops: `TUNNEL_OPEN 0x01` (host to box, data
+  `[port u16 BE][the proxyUrl's host, UTF-8]`), `TUNNEL_DATA 0x02` (both ways), `TUNNEL_CLOSE 0x03`
+  (host to box: close it; box to host: it closed, data the reason, maybe empty), `TUNNEL_OPENED 0x04`
+  (box to host). A tunnel connects only to the session's phone, by its own address or a link-local
+  IPv6 one on its link, never elsewhere on the box's network.
+- `INPUT_DATASTREAM` and `INPUT_TUNNEL` are the only `INPUT_*` sub-frames allowed past carplayd's
+  64 B.
+- **Retired in 2.0, never to be reused:** `CMD_VIDEO_SCREEN 0x14`, the probe's screen borrow
+  (`changeModes` borrowID `VideoPlayback`), which iOS answered `400` nine times of nine and which
+  video plays without. The probe's other words (route C's second `_airplay._tcp` receiver, `bits`,
+  `noallow`) were never protocol and are gone too.
 
 ## Self-describing streams (how features stay data, not protocol)
 

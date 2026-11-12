@@ -506,9 +506,13 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
   (`CMD_VIDEO_SCREEN`; `changeModes` `{resourceID 1, transferType 3, transferPriority 500, borrowID
   "VideoPlayback"}`) and gives it back after (`transferType` 4). **Benched 2026-11-11** (the Mac): iOS
   answers the borrow `400 Bad Request` nine times of nine and accepts the give-back, and video plays the
-  same without the borrow. The wire form is [I], so carplayd passes both on only with the probe word
-  `borrow` and otherwise drops them with a log line. Each command reply now names its command by CSeq,
-  and a reply body's `status` is logged.
+  same without the borrow. Each command reply now names its command by CSeq, and a reply body's `status`
+  is logged.
+  **OCBM 2.0 (2026-11-12, Scott): route A is always on**, parked-gated by the host's
+  `CMD_VIDEO_ALLOWED`. The probe's switches and `/etc/ocbm/airplay_probe` are gone (a file left on an
+  adapter is ignored), and with them route C, `bits`, `noallow` and the screen borrow:
+  `CMD_VIDEO_SCREEN` `0x14` is retired, never to be reused. `probe.rs` keeps route A's shapes and its
+  `[probe]` log lines.
 
 - **`fileTransfer` is blocked-untestable — even the advertise step is byte-unsafe.** The
   `fileTransferInfo` dict's keys are unknown, as is which transport carries the chunk dict.

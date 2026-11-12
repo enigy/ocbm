@@ -648,8 +648,8 @@ impl AvSession {
         crate::tunnel::set_phone(addr);
     }
 
-    /// `echo_video`: the AirPlay video probe's route A is on and the phone proposed `videoPlayback`
-    /// ([`crate::probe::echoes_video`]); false on every other path, which leaves the echo as it was.
+    /// `echo_video`: the phone proposed `videoPlayback`, which route A takes ([`crate::probe::echoes_video`]);
+    /// false on every other path, which leaves the echo as it was.
     fn setup_phase1(&mut self, keep_alive: bool, echo_video: bool) -> Result<Vec<u8>, SetupError> {
         // Idempotent, per Apple's reference (see `control_setup`). A repeat phase-1 SETUP with no
         // intervening TEARDOWN returns the SAME ports rather than re-binding: the phone is already
@@ -830,9 +830,9 @@ impl AvSession {
         if std::env::var("CARPLAY_SESSION_MGMT").is_ok() {
             feats.push(Value::String("sessionManagement".into()));
         }
-        // videoPlayback: the AirPlay video probe's route A (probe.rs). The SETUP-response half of
+        // videoPlayback: route A (probe.rs), always offered. The SETUP-response half of
         // offering video in the CarPlay session; the /info half is `videoPlaybackInfo` +
-        // `playbackCapabilities` (info.rs), on the same switch. Echoed only when the phone proposed it
+        // `playbackCapabilities` (info.rs). Echoed only when the phone proposed it
         // (Scott's iPhone does, iOS 27.2, 10 Nov), so a plain session's echo is unchanged.
         if echo_video {
             feats.push(Value::String("videoPlayback".into()));
@@ -1271,12 +1271,11 @@ impl AvSession {
                         // What a partial TEARDOWN of this channel is matched against.
                         self.rcs_channels
                             .insert(channel_id.clone(), RcsChannel { stream_id, iap: is_iap, client_type: client_type.clone() });
-                        // The AirPlay video probe's route A (probe.rs): name the channel — the brief
+                        // Route A (probe.rs): name the channel — the brief
                         // expects UrlFling, SenderSettingsData and OverlayUI once video is offered — and
                         // log the shape of what it carries (`drain_rcs`). Taken like any other: the
                         // session never ends over one.
-                        let probe_channel = (crate::probe::switches().video && !is_iap)
-                            .then(|| crate::probe::channel_name(&client_type));
+                        let probe_channel = (!is_iap).then(|| crate::probe::channel_name(&client_type));
                         if let Some(name) = probe_channel {
                             crate::probe::line(format_args!(
                                 "DataStream SETUP: {name}, clientTypeUUID {client_type}, streamID {stream_id}; \
@@ -1682,7 +1681,7 @@ impl AvSession {
                                     );
                                 }
                             }
-                        } else if crate::probe::switches().video {
+                        } else {
                             // A shared channel: once route A offers video, the phone's video Playback
                             // channel asks for no socket, and its messages ride POST /command with this
                             // streamID in X-Apple-StreamID. The relay (playback.rs) carries them to the
@@ -1690,18 +1689,6 @@ impl AvSession {
                             eprintln!(
                                 "[session] DataStream(130) streamID {stream_id} shares the control connection: \
                                  its messages ride POST /command, relayed to the host (playback.rs)"
-                            );
-                        } else {
-                            // A shared channel with nothing to carry it: the relay (playback.rs) runs only
-                            // under the probe's `video` switch. Be loud about it rather than silently
-                            // returning a streamID the phone will talk into a void.
-                            eprintln!(
-                                "[session] *** DataStream(130) wantsDedicatedSocket=false — the \
-                                 SHARED-CONNECTION transport is NOT IMPLEMENTED ***"
-                            );
-                            eprintln!(
-                                "[session] *** streamID {stream_id} is returned, but inbound \
-                                 delivery for this channel will be DROPPED ***"
                             );
                         }
                         resp.push(Value::Dictionary(r));
@@ -1722,12 +1709,10 @@ impl AvSession {
                         // MainBuffered. They are not requested in any capture on record (mainBuffered
                         // and enhancedSiri both negotiate to disabled), so this is currently unreachable.
                         eprintln!("[session] SETUP phase2 stream type {ty} NOT IMPLEMENTED — omitted from the response");
-                        if crate::probe::switches().video {
-                            crate::probe::line(format_args!(
-                                "SETUP phase2: stream type {ty} omitted; the request was {}",
-                                crate::probe::dict_shape(sd)
-                            ));
-                        }
+                        crate::probe::line(format_args!(
+                            "SETUP phase2: stream type {ty} omitted; the request was {}",
+                            crate::probe::dict_shape(sd)
+                        ));
                     }
                 }
             }
@@ -1762,12 +1747,9 @@ impl SessionDelegate for AvSession {
         self.resolution = (w, h, fps);
     }
 
-    /// Route A (`playback.rs`, behind the probe's `video` switch): a shared DataStream's message goes to the
-    /// host, labelled with its channel's client type. With the switch off it is an ordinary command, as before.
+    /// Route A (`playback.rs`): a shared DataStream's message goes to the host, labelled with its channel's
+    /// client type.
     fn stream_message(&mut self, stream: i64, body: &[u8]) -> Option<Vec<u8>> {
-        if !crate::probe::switches().video {
-            return None;
-        }
         let client = self.rcs_channels.values().find(|c| c.stream_id == stream).map(|c| c.client_type.clone());
         Some(crate::playback::on_phone_message(stream, client.as_deref(), body))
     }
@@ -1796,9 +1778,9 @@ impl SessionDelegate for AvSession {
                 ""
             }
         );
-        // The AirPlay video probe's route A (probe.rs): the shape of every command this session
-        // doesn't act on. The iAP2 tunnel frames, modesChanged and requestViewArea are handled below.
-        if crate::probe::switches().video && !is_iap && ty != "modesChanged" && ty != "requestViewArea" {
+        // Route A (probe.rs): the shape of every command this session doesn't act on. The iAP2 tunnel
+        // frames, modesChanged and requestViewArea are handled below.
+        if !is_iap && ty != "modesChanged" && ty != "requestViewArea" {
             let shape = parsed
                 .as_ref()
                 .map_or_else(|| crate::probe::body_shape(None, request_plist), crate::probe::dict_shape);
@@ -1938,10 +1920,8 @@ impl SessionDelegate for AvSession {
         // implemented the opposite. The other two shapes were already right: absent body and
         // non-array `streams` both fall through to `reset()`, matching `CFDictionaryGetCFArray`.
         if let Some(streams) = streams.filter(|s| !s.is_empty()) {
-            // The AirPlay video probe (probe.rs): which streams the phone names, with their ids.
-            if crate::probe::switches().video {
-                crate::probe::line(format_args!("TEARDOWN: {}", crate::probe::teardown_streams(&streams)));
-            }
+            // Route A (probe.rs): which streams the phone names, with their ids.
+            crate::probe::line(format_args!("TEARDOWN: {}", crate::probe::teardown_streams(&streams)));
             // Stop exactly the named streams by type via their per-stream flags (#406/#413) — the thread
             // exits on its next poll and drops its socket — instead of the old no-op that leaked a thread
             // + UDP/TCP socket per re-SETUP. The session (timing/event/keepAlive) stays alive.
@@ -2061,7 +2041,7 @@ impl SessionDelegate for AvSession {
             }
             Ok(self.setup_phase2(dict.as_ref().unwrap()))
         } else {
-            let echo_video = crate::probe::echoes_video(crate::probe::switches(), dict.as_ref());
+            let echo_video = crate::probe::echoes_video(dict.as_ref());
             self.setup_phase1(keep_alive, echo_video)
         }
     }
@@ -2175,12 +2155,11 @@ impl SessionDelegate for AvSession {
         }
         if control_started {
             crate::events::mark_session_started(true);
-            // The AirPlay video probe's route A (probe.rs): from RECORD on, tell the phone whether video may
-            // play, as the host decides it (parked, known), and again at each change, as LIVI does as parking
-            // changes (playback.rs). Only in a session that negotiated videoPlayback; `noallow` in the switch
-            // file leaves it out.
+            // Route A (probe.rs): from RECORD on, tell the phone whether video may play, as the host decides it
+            // (parked, known), and again at each change, as LIVI does as parking changes (playback.rs). Only in a
+            // session that negotiated videoPlayback.
             let negotiated = self.negotiated_features.iter().any(|f| f == "videoPlayback");
-            if negotiated && crate::probe::switches().allow {
+            if negotiated {
                 crate::playback::on_record();
             }
         }
@@ -3496,11 +3475,10 @@ mod tests {
         assert!(d.get("eventPort").unwrap().as_unsigned_integer().unwrap() > 0);
     }
 
-    /// The AirPlay video probe's route A: `videoPlayback` is echoed only when the switch is on AND the
-    /// phone proposed it (`probe::echoes_video`); a phone proposing it to a box without the switch file
-    /// gets today's echo.
+    /// Route A: `videoPlayback` is echoed whenever the phone proposed it (`probe::echoes_video`), and only
+    /// then; the host decides when video may play (`setVideoPlaybackAllowed`, parked).
     #[test]
-    fn video_playback_is_echoed_only_when_the_probe_offers_it() {
+    fn video_playback_is_echoed_when_the_phone_proposes_it() {
         let echoed = |resp: &[u8]| -> bool {
             let d = Value::from_reader(Cursor::new(resp)).unwrap().into_dictionary().unwrap();
             d["enabledFeatures"].as_array().unwrap().iter().any(|f| f.as_string() == Some("videoPlayback"))
@@ -3510,8 +3488,11 @@ mod tests {
         let mut body = Vec::new();
         Value::Dictionary(req).to_writer_binary(&mut body).unwrap();
         let mut s = AvSession::new();
-        assert!(!echoed(&s.setup(&body).unwrap()), "no switch file on a test host: not echoed");
-        assert!(!s.negotiated_features.iter().any(|f| f == "videoPlayback"));
+        assert!(echoed(&s.setup(&body).unwrap()), "proposed: echoed");
+        assert!(s.negotiated_features.iter().any(|f| f == "videoPlayback"));
+        let mut quiet = Vec::new();
+        Value::Dictionary(Dictionary::new()).to_writer_binary(&mut quiet).unwrap();
+        assert!(!echoed(&AvSession::new().setup(&quiet).unwrap()), "not proposed: not echoed");
         assert!(echoed(&s.setup_phase1(false, true).unwrap()));
         assert!(s.negotiated_features.iter().any(|f| f == "videoPlayback"), "RECORD reads this");
         assert!(!echoed(&s.setup_phase1(false, false).unwrap()));

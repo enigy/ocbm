@@ -817,12 +817,6 @@ pub fn build_info(cfg: &DeviceConfig) -> Vec<u8> {
 /// `build_info` with the second main view area already resolved (`None` = the shipped single-area
 /// declaration). Split out so tests can drive both shapes without touching the environment.
 fn build_info_with_view_area_2(cfg: &DeviceConfig, second: Option<ViewArea2>) -> Vec<u8> {
-    build_info_with(cfg, second, crate::probe::switches())
-}
-
-/// `build_info_with_view_area_2` with the AirPlay video probe's switches given (`probe.rs`), so tests
-/// can drive route A's keys without the switch file.
-fn build_info_with(cfg: &DeviceConfig, second: Option<ViewArea2>, probe: &crate::probe::Switches) -> Vec<u8> {
     let mut d = Dictionary::new();
 
     // audioFormats — the 8 wireless-CarPlay entries (C `_BuildAudioFormatsArray`).
@@ -1124,14 +1118,12 @@ fn build_info_with(cfg: &DeviceConfig, second: Option<ViewArea2>, probe: &crate:
         );
         d.insert("sessionManagementInfo".into(), Value::Dictionary(smi));
     }
-    // The AirPlay video probe's route A (`probe.rs`, off unless /etc/ocbm/airplay_probe says `video`):
+    // Route A (`probe.rs`), always offered (the host gates playback on parked):
     // LIVI item 5's `videoPlaybackInfo` + `playbackCapabilities`, the /info half of offering video in
     // the CarPlay session. The SETUP half is the `videoPlayback` echo (session.rs). `features` above
     // and `extendedFeatures` stay as they are.
-    if probe.video {
-        for (k, v) in crate::probe::info_keys(cfg.features, probe.bits) {
-            d.insert(k.into(), v);
-        }
+    for (k, v) in crate::probe::info_keys(cfg.features) {
+        d.insert(k.into(), v);
     }
 
     if cfg.features != 0 {
@@ -1820,25 +1812,9 @@ mod tests {
     }
 
     #[test]
-    fn the_video_probe_adds_nothing_to_info_while_off() {
+    fn route_a_adds_livis_two_keys_and_leaves_the_features() {
         let cfg = DeviceConfig::default();
-        let off = build_info_with(&cfg, None, &crate::probe::Switches::default());
-        assert_eq!(off, build_info_with_view_area_2(&cfg, None), "no switch file on a test host: off");
-        let d = Value::from_reader(Cursor::new(off)).unwrap().into_dictionary().unwrap();
-        assert!(!d.contains_key("videoPlaybackInfo") && !d.contains_key("playbackCapabilities"));
-        // Route C alone leaves /info alone too.
-        let receiver = crate::probe::Switches::parse("receiver bits");
-        assert_eq!(build_info_with(&cfg, None, &receiver), build_info_with(&cfg, None, &Default::default()));
-    }
-
-    #[test]
-    fn the_video_probe_adds_livis_two_keys_and_leaves_the_features() {
-        let cfg = DeviceConfig::default();
-        let on = |words: &str| {
-            let v = Value::from_reader(Cursor::new(build_info_with(&cfg, None, &crate::probe::Switches::parse(words))));
-            v.unwrap().into_dictionary().unwrap()
-        };
-        let d = on("video");
+        let d = Value::from_reader(Cursor::new(build_info_with_view_area_2(&cfg, None))).unwrap().into_dictionary().unwrap();
         let info = d["videoPlaybackInfo"].as_dictionary().unwrap();
         assert_eq!(info["videoPlaybackAllowed"].as_boolean(), Some(true));
         assert_eq!(info["featuresEx"].as_string(), Some("gAtERGE="), "0x61_4444_0B80, low byte first");
@@ -1847,9 +1823,5 @@ mod tests {
         assert_eq!(caps["supportsUIForAudioOnlyContent"].as_boolean(), Some(false));
         assert_eq!(d["features"].as_signed_integer(), Some(0x0000_0061_4444_0B80), "features unchanged");
         assert_eq!(d["extendedFeatures"].as_array().map(Vec::len), Some(2), "extendedFeatures unchanged");
-        let d = on("video bits");
-        let ex = d["videoPlaybackInfo"].as_dictionary().unwrap()["featuresEx"].as_string();
-        assert_eq!(ex, Some("gQtERGEAAg=="), "bits 0 and 49 in featuresEx only");
-        assert_eq!(d["features"].as_signed_integer(), Some(0x0000_0061_4444_0B80));
     }
 }

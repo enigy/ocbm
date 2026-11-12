@@ -1394,24 +1394,6 @@ fn handle_input_frame(pl: &[u8]) {
             // Route A: whether video may play (the car known to be parked) and the play queue's status,
             // `[cmd][allowed][status]`. Sent now in a session past RECORD that negotiated videoPlayback, else
             // kept for RECORD (receiver::playback).
-            // Route A: borrow the main screen while Carlink shows the phone's video, or give it back, `[cmd][borrow]`.
-            ocbm_proto::CMD_VIDEO_SCREEN => {
-                if pl.len() < 3 {
-                    eprintln!("[input] videoScreen frame too short ({} bytes) — dropped", pl.len());
-                    return;
-                }
-                // Its own probe word, not route A's: iOS answered the borrow `400 Bad Request` nine times of nine (Mac bench,
-                // 11 Nov), the wire form is still [I], and video plays without it.
-                if !receiver::probe::switches().borrow {
-                    eprintln!("[input] videoScreen dropped — the screen borrow is off (probe word `borrow`)");
-                    return;
-                }
-                let borrow = pl[2] != 0;
-                (
-                    if borrow { "changeModes(borrow VideoPlayback)" } else { "changeModes(unborrow VideoPlayback)" },
-                    events::send_video_borrow(borrow),
-                )
-            }
             ocbm_proto::CMD_VIDEO_ALLOWED => {
                 if pl.len() < 3 {
                     eprintln!("[input] videoAllowed frame too short ({} bytes) — dropped", pl.len());
@@ -1815,9 +1797,6 @@ fn main() {
                 "ON-BOX DECODE — OCBM_FWD_ENC explicitly disabled (dev/legacy fallback)"
             }
         );
-        // The AirPlay video probe's switches (receiver::probe): /etc/ocbm/airplay_probe, read once, here,
-        // before anything serves. No file, nothing on and nothing logged.
-        let _ = receiver::probe::switches();
         start_input_listener(); // HID input ingest (task #20) — process-lifetime, before the accept loop
         start_host_present_watcher(); // wireless: keyframe-on-host-subscribe (fn doc)
         // Mic-uplink ingest seam — a DEDICATED port, separate from the :9110 HID seam so the working HID

@@ -440,18 +440,14 @@ impl<'a, P: Pairings, S: MfiSigner> ControlServer<'a, P, S> {
             Route::Flush | Route::Feedback | Route::DiagInfo | Route::Log => {
                 Ok(Response::ok(req, None, Vec::new()))
             }
-            // The AirPlay video probe's route A (probe.rs) logs the requests no route takes — the
-            // video verbs a phone may try once video is offered — and answers them as before.
+            // Route A (probe.rs) logs the requests no route takes (the video verbs a phone may try once video
+            // is offered) and answers them as before.
             Route::NotFound => {
-                if crate::probe::switches().video {
-                    crate::probe::log_request("control channel, answered 404", req);
-                }
+                crate::probe::log_request("control channel, answered 404", req);
                 Ok(Response::status(req, 404, "Not Found"))
             }
             Route::NotImplemented => {
-                if crate::probe::switches().video {
-                    crate::probe::log_request("control channel, answered 501", req);
-                }
+                crate::probe::log_request("control channel, answered 501", req);
                 Ok(Response::status(req, 501, "Not Implemented"))
             }
         }

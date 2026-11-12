@@ -7,7 +7,6 @@
 //!
 //! A tunnel reaches only the phone: its address must be the phone's own (this session's control connection
 //! came from it) or a link-local IPv6 one on the phone's link, never anything else on the box's network.
-//! Behind the AirPlay video probe's `video` switch, as the rest of route A is.
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV6, TcpStream};
@@ -73,10 +72,6 @@ pub fn close_all() {
 }
 
 fn open(id: u8, data: &[u8]) -> bool {
-    if !crate::probe::switches().video {
-        refuse(id, "route A is off");
-        return false;
-    }
     let Some((port, host)) = data.split_first_chunk::<2>().map(|(p, h)| (u16::from_be_bytes(*p), h)) else {
         refuse(id, "no port");
         return false;
