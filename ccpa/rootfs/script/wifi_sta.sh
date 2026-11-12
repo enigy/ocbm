@@ -70,6 +70,10 @@ umask 077
 } > "$WPACONF"
 umask 022
 mkdir -p "$CTRL"
+# A fresh start owns the link from scratch: an address left from a previous keeper (re-provisioning
+# stops the old one's udhcpc with a signal, which doesn't deconfigure) would be advertised over mDNS
+# as the box's until the new hotspot's DHCP answered.
+ifconfig "$STA_IF" 0.0.0.0 2>/dev/null
 log "keeping $STA_IF on \"$ssid\""
 
 wpa_up() { ps | grep -v grep | grep -q "wpa_supplicant .*-i $STA_IF"; }

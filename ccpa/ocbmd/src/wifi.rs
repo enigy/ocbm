@@ -124,19 +124,125 @@ pub fn apply_provision(p: &Provision) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Stop the STA keeper and its supplicant, and start the keeper again if the file names a hotspot.
-/// Fire and forget: ocbmd ignores SIGCHLD, so nothing here may wait on the child.
+/// The STA interface (wifi_sta.sh's `$STA_IF`; `sta` + 0 from the IW416's `sta_name=sta`).
+#[cfg(not(test))]
+fn sta_if() -> String {
+    std::env::var("OCBMD_STA_IF").unwrap_or_else(|_| "sta0".to_string())
+}
+
+/// What the STA side runs, for [`stop_sta_side`]: which processes to stop, picked by pid or exact argv.
+///
+/// WHY NOT `pkill -f`. The first version restarted the keeper with one `sh -c "pkill -f '[w]ifi_sta.sh';
+/// ...; exec sh /script/wifi_sta.sh"`. The `[w]` trick only keeps a pattern from matching its own text;
+/// that shell's command line also named `wifi_sta.sh` in its `exec`, so the pkill killed the restart
+/// itself: the old supplicant stayed on the old hotspot and no new keeper started, until a reboot (truck,
+/// 2026-11-11: re-provisioning one hotspot -> another). Matching argv exactly, here in ocbmd, can't do that.
+#[derive(Debug, PartialEq, Eq)]
+pub enum StaProc {
+    Keeper,
+    Supplicant,
+    Dhcp,
+}
+
+/// Which STA-side process a `/proc/<pid>/cmdline` (NUL-separated argv) is, if any, for interface `iface`.
+pub fn sta_proc_kind(cmdline: &[u8], iface: &str) -> Option<StaProc> {
+    let argv: Vec<&str> = cmdline
+        .split(|b| *b == 0)
+        .filter(|a| !a.is_empty())
+        .filter_map(|a| std::str::from_utf8(a).ok())
+        .collect();
+    let prog = argv.first()?.rsplit('/').next()?;
+    let names_iface = argv.windows(2).any(|w| w[0] == "-i" && w[1] == iface) || argv.iter().any(|a| *a == format!("-i{iface}"));
+    match prog {
+        // The keeper is `sh /script/wifi_sta.sh` (or a bench copy): sh with the script as its first argument.
+        "sh" | "ash" | "busybox" => argv.get(1).filter(|a| a.ends_with("/wifi_sta.sh") || **a == "wifi_sta.sh").map(|_| StaProc::Keeper),
+        "wpa_supplicant" if names_iface => Some(StaProc::Supplicant),
+        "udhcpc" if names_iface => Some(StaProc::Dhcp),
+        _ => None,
+    }
+}
+
+/// Every running STA-side process for `iface`: the keeper, its supplicant and its DHCP client.
+#[cfg(not(test))]
+fn sta_side_pids(iface: &str) -> Vec<(i32, StaProc)> {
+    let me = std::process::id() as i32;
+    let mut found = Vec::new();
+    let Ok(dir) = std::fs::read_dir("/proc") else { return found };
+    for e in dir.flatten() {
+        let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) else { continue };
+        if pid == me {
+            continue;
+        }
+        if let Ok(cmd) = std::fs::read(format!("/proc/{pid}/cmdline")) {
+            if let Some(kind) = sta_proc_kind(&cmd, iface) {
+                found.push((pid, kind));
+            }
+        }
+    }
+    found
+}
+
+/// Stop the keeper, its supplicant and its DHCP client (SIGTERM, then SIGKILL after ~2 s), and wait for
+/// them to be gone, so a keeper started next finds no supplicant on the old hotspot (it would skip
+/// starting its own) and no live lock holder. Bounded: at most ~2.5 s, on the provisioning path only.
+#[cfg(not(test))]
+fn stop_sta_side(iface: &str) {
+    let victims = sta_side_pids(iface);
+    if victims.is_empty() {
+        return;
+    }
+    for (pid, kind) in &victims {
+        eprintln!("[ocbmd] wifi: stopping the STA side's {kind:?} (pid {pid})");
+        // SAFETY: kill(2) on a pid we just matched by its argv.
+        unsafe { libc::kill(*pid, libc::SIGTERM) };
+    }
+    let gone = |pid: i32| !std::path::Path::new(&format!("/proc/{pid}")).exists()
+        || std::fs::read_to_string(format!("/proc/{pid}/stat")).ok().and_then(|s| s.rsplit_once(')').map(|(_, r)| r.trim_start().starts_with('Z'))).unwrap_or(true);
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < deadline && !victims.iter().all(|(p, _)| gone(*p)) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    for (pid, kind) in &victims {
+        if !gone(*pid) {
+            eprintln!("[ocbmd] wifi: {kind:?} (pid {pid}) ignored SIGTERM; SIGKILL");
+            // SAFETY: as above.
+            unsafe { libc::kill(*pid, libc::SIGKILL) };
+        }
+    }
+    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+    while std::time::Instant::now() < deadline && !victims.iter().all(|(p, _)| gone(*p)) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Stop the STA side, then start the keeper again if the file names a hotspot: exactly as ocbm_boot.sh
+/// starts it (`setsid sh /script/wifi_sta.sh >> /tmp/box.log 2>&1 </dev/null &`), so its lines reach
+/// box.log. Clear (or no ssid=) stops it and starts nothing. Fire and forget for the new keeper: ocbmd
+/// ignores SIGCHLD, so nothing may wait on the child.
 #[cfg(not(test))]
 fn restart_sta_keeper() {
-    let script = "pkill -f '[w]ifi_sta.sh' ; pkill -f '[w]pa_supplicant .*-i sta0' ; sleep 1 ; \
-                  grep -q '^ssid=' /etc/ocbm/wifi_link 2>/dev/null && [ -r /script/wifi_sta.sh ] && \
-                  exec sh /script/wifi_sta.sh";
-    let _ = std::process::Command::new("setsid")
-        .args(["sh", "-c", script])
+    let iface = sta_if();
+    stop_sta_side(&iface);
+    let wants_sta = std::fs::read_to_string(WIFI_LINK_FILE).map(|t| t.lines().any(|l| l.starts_with("ssid="))).unwrap_or(false);
+    if !wants_sta || !std::path::Path::new("/script/wifi_sta.sh").exists() {
+        eprintln!("[ocbmd] wifi: STA side stopped; no hotspot to join");
+        return;
+    }
+    let log = |_: ()| std::fs::OpenOptions::new().append(true).create(true).open("/tmp/box.log").ok();
+    let (out, err) = match (log(()), log(())) {
+        (Some(o), Some(e)) => (std::process::Stdio::from(o), std::process::Stdio::from(e)),
+        _ => (std::process::Stdio::null(), std::process::Stdio::null()),
+    };
+    match std::process::Command::new("setsid")
+        .args(["sh", "/script/wifi_sta.sh"])
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
+        .stdout(out)
+        .stderr(err)
+        .spawn()
+    {
+        Ok(_) => eprintln!("[ocbmd] wifi: STA keeper restarted for the new hotspot"),
+        Err(e) => eprintln!("[ocbmd] wifi: could not start the STA keeper ({e})"),
+    }
 }
 
 /// The link key, if the Wi-Fi transport is on.
@@ -395,6 +501,36 @@ mod tests {
             Ok(Provision::Set { key: [3; 32], ssid: String::new(), psk: String::new() })
         );
         assert!(!link_file_text(&[3; 32], "", "").contains("ssid="));
+    }
+
+    fn argv(a: &[&str]) -> Vec<u8> {
+        let mut v = Vec::new();
+        for s in a {
+            v.extend_from_slice(s.as_bytes());
+            v.push(0);
+        }
+        v
+    }
+
+    #[test]
+    fn sta_side_processes_are_matched_by_argv_never_by_a_mention() {
+        assert_eq!(sta_proc_kind(&argv(&["sh", "/script/wifi_sta.sh"]), "sta0"), Some(StaProc::Keeper));
+        assert_eq!(sta_proc_kind(&argv(&["sh", "/tmp/wifi/wifi_sta.sh"]), "sta0"), Some(StaProc::Keeper));
+        assert_eq!(
+            sta_proc_kind(&argv(&["/usr/sbin/wpa_supplicant", "-D", "nl80211,wext", "-i", "sta0", "-c", "/tmp/wpa_sta.conf"]), "sta0"),
+            Some(StaProc::Supplicant)
+        );
+        assert_eq!(sta_proc_kind(&argv(&["udhcpc", "-i", "sta0", "-b", "-p", "/var/run/udhcpc.sta0.pid"]), "sta0"), Some(StaProc::Dhcp));
+        // The 2026-11-11 bug: a shell whose -c text merely NAMES the keeper is not the keeper.
+        assert_eq!(
+            sta_proc_kind(&argv(&["sh", "-c", "pkill -f '[w]ifi_sta.sh'; exec sh /script/wifi_sta.sh"]), "sta0"),
+            None
+        );
+        // Another interface's supplicant (a future second radio), the AP's DHCP server, and strangers.
+        assert_eq!(sta_proc_kind(&argv(&["wpa_supplicant", "-i", "wlan0", "-c", "x"]), "sta0"), None);
+        assert_eq!(sta_proc_kind(&argv(&["udhcpd", "/etc/udhcpd.conf"]), "sta0"), None);
+        assert_eq!(sta_proc_kind(&argv(&["/usr/sbin/hostapd", "/etc/hostapd.conf"]), "sta0"), None);
+        assert_eq!(sta_proc_kind(b"", "sta0"), None);
     }
 
     #[test]
