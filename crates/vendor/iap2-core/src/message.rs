@@ -191,8 +191,8 @@ pub enum TransportComponent {
 }
 
 /// The per-device accessory name the iPhone displays for this box, e.g. `"CarLink-b0df"`. `base` is the
-/// brand (`"CarLink"`); the suffix is the **last two hex octets of the Wi-Fi MAC** — the SAME derivation
-/// as the Wi-Fi SSID (`ccpa-<suffix>`) and the low-level BT name in `bt_on.sh`, so a box shows ONE
+/// brand (`"CarLink"`); the suffix is the **last two hex octets of the Wi-Fi MAC** — the SAME name
+/// as the Wi-Fi SSID and the controller name the radio seam sets (`radio_hal.sh box_name`, since OCBM 2.0), so a box shows ONE
 /// consistent, distinct name on EVERY transport. Falls back to the SoC serial's last 4 hex when wlan0
 /// isn't up (radio-independent, always present), and to bare `base` if neither source is readable.
 /// Shared by the wired (`iap2d`) and wireless (`btd`) identify paths so multiple boxes stop
@@ -205,7 +205,7 @@ pub fn accessory_name(base: &str) -> String {
     }
 }
 
-/// The device suffix: the Wi-Fi MAC's last two octets (matching the SSID `ccpa-<suffix>`) when wlan0 is
+/// The device suffix: the Wi-Fi MAC's last two octets (the SSID's too, `radio_hal.sh box_name`) when wlan0 is
 /// up, else the box serial's last 4 hex — radio-independent, so a WIRED-ONLY box (radios never up) still
 /// gets a per-device name. `/etc/serial_number` is the box's real serial file (the same fallback
 /// `wlan_on.sh`/`bt_on.sh` use); `/sys/devices/soc0/serial_number` is a last resort (empty on this SoC).
@@ -1165,7 +1165,7 @@ mod tests {
 
     #[test]
     fn device_suffix_extraction() {
-        // Wi-Fi MAC -> last 2 octets, lowercase, colons stripped (matches the SSID `ccpa-b0df`).
+        // Wi-Fi MAC -> last 2 octets, lowercase, colons stripped (the SSID CarLink-b0df too).
         assert_eq!(suffix_from("00:e0:4c:91:b0:df").as_deref(), Some("b0df"));
         assert_eq!(suffix_from("00:E0:4C:91:B0:DF\n").as_deref(), Some("b0df")); // upper + trailing NL
                                                                                  // SoC serial -> last 4 hex.

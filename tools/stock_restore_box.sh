@@ -124,12 +124,12 @@ is_radio() {
   return 1
 }
 
-# The Bluetooth name flag OCBM's seam writes (radio_hal.sh bt_set_name): ccpa-<4 hex> in
+# The Bluetooth name flag OCBM's seam writes (radio_hal.sh bt_set_name): CarLink-<4 hex> (ccpa-<4 hex> before 2.0) in
 # /etc/.custom_bluetooth_name, and while it is there stock's bluetoothDaemon applies that name.
 # is_radio() matches "*bluetooth*", so the guard kept it (the dev adapter's restore, 31 Oct). Like the
-# seam it is let through, but only with the seam's content: a name set on stock is not ccpa-<4 hex>.
+# seam it is let through, but only with the seam's content: a name set on stock is neither.
 ocbm_bt_flag() {  # $1 path relative to ROOT
-  [ "$1" = "$BT_FLAG" ] && grep -qxE 'ccpa-[0-9a-f]{4}' "$ROOT/$1" 2>/dev/null
+  [ "$1" = "$BT_FLAG" ] && grep -qxE '(ccpa|CarLink)-[0-9a-f]{4}' "$ROOT/$1" 2>/dev/null
 }
 
 free_kb() {

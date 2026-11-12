@@ -76,25 +76,29 @@ trap 'rm -rf "$LOCK"; trap - EXIT; exit 143' INT TERM HUP
 [ -f /etc/hostapd.conf ] || { echo "$L /etc/hostapd.conf missing"; exit 1; }
 
 # ---- device-unique name ---------------------------------------------------------------------
-# ccpa-<last 4 hex of the AP interface MAC>, matching the BT name so one box presents one
-# identity on both radios. Falls back to the serial when the MAC is unreadable. Read from sysfs,
-# not from `set_wifi_mac`, so this works on a unit where that vendor helper was stripped.
+# The box's one name, the one the iPhone lists on Bluetooth (btd's CarLink-<last 4 hex of wlan0's
+# MAC>, else of the serial; radio_hal.sh box_name, which says why it is decided once and kept in
+# /etc/carplay_ident). The seam resolves it and passes it in, so the SSID and the Bluetooth name come
+# from ONE decision. The derivation below is only for a direct/bench invocation, and is box_name's.
 #
 # This overwrites ssid= in /etc/hostapd.conf, which is also what the box hands the phone in the
 # iAP2 0x5703 handoff, so the two always name the same AP.
-# The seam resolves the identity once and passes it in, so the SSID and the Bluetooth name come
-# from ONE decision. The local derivation below is only for a direct/bench invocation; it reads
-# the same persisted /etc/carplay_ident first, so the two paths cannot diverge.
 NAME="${RADIO_BOX_NAME:-}"
-if [ -z "$NAME" ] && [ -s /etc/carplay_ident ]; then NAME=$(head -1 /etc/carplay_ident); fi
-if [ -z "$NAME" ]; then
-  SUF=$(cat "/sys/class/net/$IF/address" 2>/dev/null | tr -d ':' | tr 'A-F' 'a-f' | sed 's/.*\(....\)$/\1/')
-  case "$SUF" in ''|*[!0-9a-f]*) SUF="" ;; esac
-  [ -n "$SUF" ] || SUF=$(cat /etc/serial_number 2>/dev/null | tr -cd '0-9a-fA-F' | tr 'A-F' 'a-f' | sed 's/.*\(....\)$/\1/')
-  if [ -n "$SUF" ]; then NAME="ccpa-$SUF"; echo "$NAME" > /etc/carplay_ident 2>/dev/null
-  else NAME="ccpa-0000"; fi
+if [ -z "$NAME" ] && [ -s /etc/carplay_ident ]; then
+  NAME=$(head -1 /etc/carplay_ident)
+  case "$NAME" in CarLink-*) ;; *) NAME="" ;; esac   # an older OCBM's ccpa-<4 hex> is derived again
 fi
-SUF=${NAME#ccpa-}
+if [ -z "$NAME" ]; then
+  SUF=$(cat /sys/class/net/wlan0/address 2>/dev/null | tr -cd '0-9a-fA-F' | tr 'A-F' 'a-f' | sed -n 's/.*\(....\)$/\1/p')
+  [ -n "$SUF" ] || SUF=$(sed -n 's/^wlan0=//p' /etc/ocbm/addresses.txt 2>/dev/null | head -1 | tr -cd '0-9a-fA-F' | tr 'A-F' 'a-f' | sed -n 's/.*\(....\)$/\1/p')
+  if [ -n "$SUF" ]; then NAME="CarLink-$SUF"; echo "$NAME" > /etc/carplay_ident 2>/dev/null
+  else
+    SUF=$(cat /etc/serial_number 2>/dev/null | tr -cd '0-9a-fA-F' | tr 'A-F' 'a-f' | sed -n 's/.*\(....\)$/\1/p')
+    NAME="CarLink${SUF:+-$SUF}"
+  fi
+fi
+# The AP interface's own suffix, for the passphrase check below: an older fallback key was "carplay" and it.
+SUF=$(cat "/sys/class/net/$IF/address" 2>/dev/null | tr -cd '0-9a-fA-F' | tr 'A-F' 'a-f' | sed -n 's/.*\(....\)$/\1/p')
 sed -i "s/^ssid=.*/ssid=$NAME/" /etc/hostapd.conf
 echo "$NAME" > /etc/wifi_name
 

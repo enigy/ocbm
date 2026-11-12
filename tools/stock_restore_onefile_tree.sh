@@ -20,7 +20,7 @@
 #     (RUNTIME below)
 #   - put /etc/hostapd.conf and /etc/bluetooth_name back from /etc/ocbm/identity.tgz, as
 #     ocbm_revert.sh does: OCBM rewrites the access point's name, passphrase and interface, and the
-#     Bluetooth name. The seam's Bluetooth name flag /etc/.custom_bluetooth_name (ccpa-<4 hex>; while
+#     Bluetooth name. The seam's Bluetooth name flag /etc/.custom_bluetooth_name (CarLink-<4 hex>, ccpa- before 2.0; while
 #     it is there stock's bluetoothDaemon applies that name) comes back as the install found it, or
 #     is dropped when the install found none
 #   - put start_main_service.stock.sh back as start_main_service.sh
@@ -126,7 +126,7 @@ if [ "$TRIAL" = 1 ]; then
   if [ -f "$t/$BT_FLAG" ]; then
     cp -p "$t/$BT_FLAG" "$OUT/$BT_FLAG" || die "could not put back /$BT_FLAG"
     say "/$BT_FLAG: put back from the identity archive"
-  elif grep -qxE 'ccpa-[0-9a-f]{4}' "$OUT/$BT_FLAG" 2>/dev/null; then
+  elif grep -qxE '(ccpa|CarLink)-[0-9a-f]{4}' "$OUT/$BT_FLAG" 2>/dev/null; then
     rm -f "$OUT/$BT_FLAG" && say "/$BT_FLAG dropped: OCBM's Bluetooth name flag, which the install did not find"
   fi
   rm -rf "$t"   # it held the Wi-Fi passphrase and Bluetooth keys

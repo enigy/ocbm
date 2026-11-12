@@ -75,4 +75,27 @@ d="$T/three"; make_unit "$d" 'if [ $supportStaMode -eq 1 ]; then' '	nxpWiFiConfi
 got="$(detect "$d")"
 check '[ "$got" = "\"insmod /tmp/mlan.ko;\"" ]' "three assignments are not closed-form: moal.ko stays refused ($got)"
 
+
+# radio_hal.sh's box_name, the one name for Wi-Fi and Bluetooth: btd's CarLink-<wlan0's last 4 hex> (Scott,
+# 12 Nov: the dev adapter's Wi-Fi said ccpa-fe01, from the AP interface sta0, beside Bluetooth's CarLink-fd6c).
+# The functions are taken out of radio_hal.sh, with /etc and /sys moved into a scratch root.
+names() {  # $1 root: prints box_name's answer there
+  local R="$1"
+  sed -n '/^IDENT_FILE=/,/^}/p' "$REPO/ccpa/rootfs/script/radio_hal.sh" | sed "s#/etc/#$R/etc/#g; s#/sys/#$R/sys/#g" > "$R/fns.sh"
+  sh -c ". '$R/fns.sh'; box_name"
+}
+R="$T/name"; mkdir -p "$R/etc/ocbm" "$R/sys/class/net/wlan0" "$R/sys/class/net/sta0"
+echo "a8:5b:36:2c:fe:01" > "$R/sys/class/net/sta0/address"; echo "A8:5B:36:2C:FD:6C" > "$R/sys/class/net/wlan0/address"
+echo "ccpa-fe01" > "$R/etc/carplay_ident"; echo "SN 00A1B2C3" > "$R/etc/serial_number"
+check '[ "$(names "$R")" = CarLink-fd6c ]' "an older ccpa- name is derived again from wlan0, as btd's"
+check '[ "$(head -1 "$R/etc/carplay_ident")" = CarLink-fd6c ]' "and kept"
+rm "$R/sys/class/net/wlan0/address"
+check '[ "$(names "$R")" = CarLink-fd6c ]' "kept: the radios' state doesn't change it"
+rm "$R/etc/carplay_ident"; printf 'wlan0=a8:5b:36:2c:fd:6c\nhci0=a8:5b:36:2c:fd:6d\n' > "$R/etc/ocbm/addresses.txt"
+check '[ "$(names "$R")" = CarLink-fd6c ]' "radios down: wlan0's MAC from the installer's record"
+rm "$R/etc/carplay_ident" "$R/etc/ocbm/addresses.txt"
+check '[ "$(names "$R")" = CarLink-b2c3 ]' "no wlan0 MAC: the serial's, as btd's"
+check '[ ! -e "$R/etc/carplay_ident" ]' "and not kept, so wlan0's decides once known"
+rm "$R/etc/serial_number"
+check '[ "$(names "$R")" = CarLink ]' "nothing readable: the bare brand, as btd's"
 [ "$fails" -eq 0 ] && echo "radio_detect_test: all passed" || { echo "radio_detect_test: $fails failed"; exit 1; }

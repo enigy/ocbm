@@ -183,10 +183,10 @@ cold-start the adapter.
 
 It puts `/etc/hostapd.conf` back from `/etc/ocbm/identity.tgz`, and the unit's HiCar identity
 (`/etc/hichain`, archived by installs since 31 Oct) with it, and the Bluetooth name the seam rewrote
-(`radio_hal.sh bt_set_name` writes `ccpa-<4 hex>` into `/etc/bluetooth_name` and into the flag
+(`radio_hal.sh bt_set_name` writes `CarLink-<4 hex>`, `ccpa-<4 hex>` before 2.0, into `/etc/bluetooth_name` and into the flag
 `/etc/.custom_bluetooth_name`, and while the flag is there stock's bluetoothDaemon applies that name):
 `/etc/bluetooth_name` from the archive, the flag as the install found it (archived since 31 Oct), or
-removed when it holds the seam's `ccpa-<4 hex>`; a name set on stock stays. Each comes back with
+removed when it holds the seam's `CarLink-` or `ccpa-<4 hex>`; a name set on stock stays. Each comes back with
 `cp -p`, mode and owner as the install found them (a plain copy left the dev adapter's 0777
 `hostapd.conf` 0755, 31 Oct). It records `reverted version=<VERSION>`
 in `/etc/ocbm/last_result.txt` (a stick install then refuses that version unless the stick holds
@@ -320,9 +320,9 @@ over the OCBM console, from one of the unit's own backups:
   script over the dispatcher is the switch; OCBM's files go after it, each through `is_radio()` except OCBM's own
   radio seam (`radio_ap_up.sh`, `radio_detect.sh`, `radio_hal.sh`: stock has none, and without OCBM
   they are dead files; the radio guard still keeps every file of the unit's own) and the seam's
-  Bluetooth name flag, `/etc/.custom_bluetooth_name` while it holds `ccpa-<4 hex>` (its name matches
+  Bluetooth name flag, `/etc/.custom_bluetooth_name` while it holds `CarLink-` or `ccpa-<4 hex>` (its name matches
   the guard's `*bluetooth*`, so the dev adapter's restore of 31 Oct kept it and verify passed it by;
-  a name set on stock is not `ccpa-<4 hex>` and stays), and then `/etc/carplay`, whole: its files skip
+  a name set on stock is neither and stays), and then `/etc/carplay`, whole: its files skip
   that pass, where the guard took `bt_link_keys` (`bt_*`) for a radio file and logged it as kept
   although the next step removed it (the dev adapter, 1 Nov). The OCBM still running (`ocbmd` carries the console until the restart) can write
   `/etc/carplay/bt_link_keys` again: verify tolerates it, and the `stock` phase removes it once more

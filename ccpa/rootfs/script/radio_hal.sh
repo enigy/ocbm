@@ -218,43 +218,43 @@ bt_responsive_confirmed() {  # $1 = hci dev
 
 ap_running() { pgrep -x hostapd >/dev/null 2>&1 || ps | grep -v grep | grep -qw hostapd; }
 
-# THE BOX IDENTITY. Wi-Fi and Bluetooth MUST advertise the same ccpa-<4hex>, and the only way to
+# THE BOX IDENTITY. Wi-Fi and Bluetooth MUST advertise the same name, and the only way to
 # guarantee that is to decide it ONCE and persist it.
 #
 # Deriving it per-radio does not work, and the failure is not hypothetical. The natural sources
 # disagree: on the validated unit the WLAN MAC and the BT controller address share no octets at
-# all (Realtek sets no bd_addr, so BT uses its own chip efuse), giving suffixes like ccpa-AABB
-# from Wi-Fi and ccpa-CCDD from Bluetooth. So which name a radio gets would depend on which radio
-# happened to be up when it was asked. Worse, the answer could change between boots, and the phone
-# stores the name in its bonded record.
+# all (Realtek sets no bd_addr, so BT uses its own chip efuse). So which name a radio gets would
+# depend on which radio happened to be up when it was asked. Worse, the answer could change
+# between boots, and the phone stores the name in its bonded record.
 #
-# So: first successful derivation wins and is written to /etc/carplay_ident; everything after
-# reads that file. One small flash write, once per box.
+# The name is the one the iPhone lists on Bluetooth: btd's, iap2-core's accessory_name,
+# CarLink-<last 4 hex of wlan0's MAC>, else of the serial. The AP takes it too (Scott, 12 Nov: the
+# dev adapter's Wi-Fi said ccpa-fe01, from the AP interface sta0's MAC, beside Bluetooth's
+# CarLink-fd6c). Before the radios are up, wlan0's MAC comes from the one-file installer's record
+# (/etc/ocbm/addresses.txt), as ocbmd's name does.
+#
+# So: the first derivation from wlan0's MAC wins and is written to /etc/carplay_ident; everything
+# after reads that file. One small flash write, once per box. A name an older OCBM persisted
+# (ccpa-<4 hex>) is derived again; the serial's fallback is not persisted, so a later call with
+# wlan0's MAC known decides.
 IDENT_FILE=/etc/carplay_ident
-box_name() {  # $1 = optional hci dev, used only as a late fallback source
-  if [ -s "$IDENT_FILE" ]; then head -1 "$IDENT_FILE"; return 0; fi
-  _sfx=""
-  # Preference order is about STABILITY, not availability: the Wi-Fi MAC is what the SSID has
-  # historically been derived from, so a box that already has a name keeps it.
-  _wi=$(wlan_iface 2>/dev/null) && _sfx=$(cat "/sys/class/net/$_wi/address" 2>/dev/null | tr -d ':' | tr 'A-F' 'a-f' | sed 's/.*\(....\)$/\1/')
-  case "$_sfx" in ''|*[!0-9a-f]*) _sfx="" ;; esac
-  # The vendor helper reports the Wi-Fi MAC without the interface being up, which is exactly the
-  # bridge-role case. Kept by the base install's radio guard where it exists.
-  if [ -z "$_sfx" ] && command -v set_wifi_mac >/dev/null 2>&1; then
-    _sfx=$(set_wifi_mac 2>/dev/null | grep -oE '([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}' | head -1 \
-           | tr -d ':' | tr 'A-F' 'a-f' | sed 's/.*\(....\)$/\1/')
-    case "$_sfx" in ''|*[!0-9a-f]*) _sfx="" ;; esac
+BOX_BRAND=CarLink
+# The last 4 hex digits of stdin, lowercase (iap2-core's suffix_from). Empty with fewer than 4.
+hex_suffix() { tr -cd '0-9a-fA-F' | tr 'A-F' 'a-f' | sed -n 's/.*\(....\)$/\1/p'; }
+box_name() {  # $1 = hci dev, unused (kept for callers): the name never comes from the BT address
+  if [ -s "$IDENT_FILE" ]; then
+    _id=$(head -1 "$IDENT_FILE")
+    case "$_id" in "$BOX_BRAND"-*) echo "$_id"; return 0 ;; esac
   fi
-  if [ -z "$_sfx" ] && [ -n "${1:-}" ]; then
-    _sfx=$(cat "/sys/class/bluetooth/$1/address" 2>/dev/null | tr -d ':' | tr 'A-F' 'a-f' | sed 's/.*\(....\)$/\1/')
-    case "$_sfx" in ''|*[!0-9a-f]*) _sfx="" ;; esac
+  _sfx=$(cat /sys/class/net/wlan0/address 2>/dev/null | hex_suffix)
+  [ -n "$_sfx" ] || _sfx=$(sed -n 's/^wlan0=//p' /etc/ocbm/addresses.txt 2>/dev/null | head -1 | hex_suffix)
+  if [ -n "$_sfx" ]; then
+    echo "$BOX_BRAND-$_sfx" > "$IDENT_FILE" 2>/dev/null
+    echo "$BOX_BRAND-$_sfx"
+    return 0
   fi
-  [ -n "$_sfx" ] || _sfx=$(cat /etc/serial_number 2>/dev/null | tr -cd '0-9a-fA-F' | tr 'A-F' 'a-f' | sed 's/.*\(....\)$/\1/')
-  # Do NOT persist a placeholder: if every source failed we want the next call to try again
-  # rather than freezing ccpa-0000 into flash forever.
-  [ -n "$_sfx" ] || { echo "ccpa-0000"; return 0; }
-  echo "ccpa-$_sfx" > "$IDENT_FILE" 2>/dev/null
-  echo "ccpa-$_sfx"
+  _sfx=$(cat /etc/serial_number 2>/dev/null | hex_suffix)
+  if [ -n "$_sfx" ]; then echo "$BOX_BRAND-$_sfx"; else echo "$BOX_BRAND"; fi
 }
 
 # Name the controller. The owned bt_on.sh has always done this; the mapped path did not, which

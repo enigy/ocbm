@@ -828,6 +828,14 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
   `grep -rn "carplay_ident" ccpa crates tools pi host` → four hits, all in
   `radio_hal.sh`/`radio_ap_up.sh`, none in Rust; `grep -n "wlan0" crates/vendor/wireless/src/av.rs crates/vendor/wireless/src/box_identity.rs crates/vendor/iap2-core/src/message.rs ccpa/ocbmd/src/main.rs`
   → `const WLAN_IFACE: &str = "wlan0"` plus three `/sys/class/net/wlan0/address` reads.
+  **2.0 (12 Nov, Scott: one name on both radios):** the seam now takes btd's name rather than its own:
+  `radio_hal.sh box_name` (and `radio_ap_up.sh`'s bench fallback) is `CarLink-<last 4 hex of wlan0's
+  MAC>`, from the installer's `/etc/ocbm/addresses.txt` before the radios are up, else the serial's
+  (not kept), so the SSID and the controller name match what the iPhone lists. The dev adapter's Wi-Fi
+  had said `ccpa-fe01`, from its AP interface `sta0`, beside Bluetooth's `CarLink-fd6c`. A `ccpa-`
+  name an older OCBM kept in `/etc/carplay_ident` is derived again. Still open: the Rust side derives
+  its own copy (same rule, so same answer) and never reads the file. Tested in
+  `tools/radio_detect_test.sh`; not benched.
 
 - ~~**The hardcoded Raspberry Pi BT MAC in `bt_driver.rs` is unparameterised.**~~ **CLOSED** — the
   literal is gone: `bt_driver.rs` reads the controller's address and falls back to a
