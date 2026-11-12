@@ -57,13 +57,21 @@ script/radio_hal.sh
 script/run_ocbmd.sh
 script/run_supervisor.sh
 script/session_supervisor.sh
+script/wifi_sta.sh
+script/wifi_sta_dhcp.sh
 usr/bin/iap_role_switch
 usr/sbin/btd
 usr/sbin/carplayd
 usr/sbin/iap2d
 usr/sbin/ocbmd"
-have="$(bash "$HERE/make_ocbm_installer.sh" --list | grep -vE '^script/(ocbm_(dispatch|selftest|revert|finish|update|restore)|stock_restore_box)\.sh$' | LC_ALL=C sort -u)"
+# The Wi-Fi transport's supplicant is in the payload only where tools/build_wpa_supplicant.sh built it:
+# pin both cases, not whatever this machine has.
+mkdir -p "$T/nowpa" "$T/wpa"
+have="$(WPA_INSTALL_DIR="$T/nowpa" bash "$HERE/make_ocbm_installer.sh" --list | grep -vE '^script/(ocbm_(dispatch|selftest|revert|finish|update|restore)|stock_restore_box)\.sh$' | LC_ALL=C sort -u)"
 check '[ "$want" = "$have" ]' "the payload is the pinned file set"
+printf 'x' > "$T/wpa/wpa_supplicant"; printf 'x' > "$T/wpa/wpa_cli"; chmod +x "$T/wpa/wpa_supplicant" "$T/wpa/wpa_cli"
+have_wpa="$(WPA_INSTALL_DIR="$T/wpa" bash "$HERE/make_ocbm_installer.sh" --list | grep -E '^usr/sbin/wpa_' | LC_ALL=C sort -u | tr '\n' ' ')"
+check '[ "$have_wpa" = "usr/sbin/wpa_cli usr/sbin/wpa_supplicant " ]' "a built supplicant joins the payload"
 mkdir -p "$T/noinst"; cp "$REPO/ccpa/installer/"* "$T/noinst/"; rm -f "$T/noinst/ocbm_dispatch.sh"
 check '! BIN_DIR="$T/bin" IRS_BIN="$T/irs" INSTALLER_DIR="$T/noinst" bash "$HERE/make_ocbm_installer.sh" "$T/out2" >/dev/null 2>&1' \
   "the builder refuses without the Stage B scripts"
