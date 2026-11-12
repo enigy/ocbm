@@ -509,14 +509,30 @@ apply_pending() {
 # a wireless session owns the box, read ITS log (/tmp/carplayd_wl.log), never the wired $AL. Grepping
 # both unconditionally would let a stale, never-truncated wl.log falsely mark an unrelated WIRED session
 # healthy (the exact cross-attribution bug per-transport logs were created to prevent).
+#
+# The wireless log is truncated only when btd starts, and holds every carplayd btd spawned since, so it is read
+# after the last carplayd's spawn mark (btd's av::SPAWN_MARK) only. Mac bench 12 Nov: a phone that never joined
+# latched the previous session's "pair-verify OK" and "RECORD done", with nothing connected.
+WL_SPAWN_MARK="[av] === carplayd spawned for a new session ==="
+
+# Does log $1 hold $2 (a fixed string)? For the wireless log, only after its last spawn mark.
+milestone_in() {
+  if [ "$1" = /tmp/carplayd_wl.log ]; then
+    awk -v mark="$WL_SPAWN_MARK" -v want="$2" \
+      'index($0, mark) { seen = 0 } index($0, want) { seen = 1 } END { exit !seen }' "$1" 2>/dev/null
+  else
+    grep -qF "$2" "$1" 2>/dev/null
+  fi
+}
+
 scan_milestones() {
   if wireless_owns_session; then _ml=/tmp/carplayd_wl.log; else _ml="$AL"; fi
-  if [ "$saw_paired" = 0 ] && grep -q "pair-verify OK" "$_ml" 2>/dev/null; then
+  if [ "$saw_paired" = 0 ] && milestone_in "$_ml" "pair-verify OK"; then
     saw_paired=1
     estab_deadline=$(( $(now) + ESTAB_STREAM_GRACE ))
     echo "[sup] milestone: pair-verify OK — control encrypted (RECORD grace ${ESTAB_STREAM_GRACE}s)"
   fi
-  if [ "$saw_record" = 0 ] && grep -q "RECORD done" "$_ml" 2>/dev/null; then
+  if [ "$saw_record" = 0 ] && milestone_in "$_ml" "RECORD done"; then
     saw_record=1; healthy=1; established_since=$(now); write_healthy 1
     echo "[sup] milestone: RECORD — session ESTABLISHED (health=1)"
   fi

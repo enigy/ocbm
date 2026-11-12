@@ -113,13 +113,15 @@ const CARPLAY_LOST_GRACE: Duration = Duration::from_secs(20);
 /// that connection had it back from the box's dial-out in 2 s.
 const CARPLAYD_GONE_GRACE: Duration = Duration::from_secs(10);
 
-/// How long a session may stay without CarPlay and without carplayd before btd ends it anyway
+/// How long a session may stay without CarPlay before btd ends it anyway, carplayd or not
 /// ([`Control::carplay_never_reached`]): the supervisor's own grace for reaching pair-verify
-/// (`ESTAB_CONNECT_GRACE`), which covers the driver's "Allow CarPlay" tap on a first pairing.
+/// (`ESTAB_CONNECT_GRACE`), which covers the driver's "Allow CarPlay" tap on a first pairing. carplayd's idle
+/// backstop covers only a phone that connected (Mac bench 12 Nov: one that never joined held the box 8 minutes).
 const NO_CARPLAY_DEADLINE: Duration = Duration::from_secs(90);
 
 /// carplayd writes "wireless" here on its control connection and clears it when that session ends
-/// (`box_common::flags`); the session supervisor arbitrates the transports by it.
+/// (`box_common::flags`); the session supervisor arbitrates the transports by it. btd writes it too, earlier, at
+/// the 0x5703 handoff (`av::ensure_av_layer`), and that claim is not a carplayd ([`carplayd_live`]).
 const CARPLAY_TRANSPORT_FILE: &str = box_common::flags::CARPLAY_TRANSPORT;
 
 /// Where carplayd names the phone whose SETUP it took (`receiver::session::PHONE_IDENT_FILE`). It is
@@ -435,6 +437,13 @@ fn read_carplayd() -> Option<SystemTime> {
     let written = std::fs::metadata(CARPLAY_TRANSPORT_FILE).and_then(|m| m.modified()).ok()?;
     let token = std::fs::read_to_string(CARPLAY_TRANSPORT_FILE).ok()?;
     (token.trim() == "wireless").then_some(written)
+}
+
+/// Whether the transport flag, last written at `written`, is a carplayd with this session's control connection:
+/// written since the session `started`, and not btd's own claim at the handoff (`claimed`, `av::claimed_at`),
+/// which carplayd's write on the phone's connection replaces.
+fn carplayd_live(written: Option<SystemTime>, started: SystemTime, claimed: Option<SystemTime>) -> bool {
+    written.is_some_and(|w| w >= started && Some(w) != claimed)
 }
 
 /// `/tmp/phone_identity` as last written: when, and the phone its `deviceID` names. `None` = no file.
@@ -832,19 +841,20 @@ impl Control {
     /// [`Control::switch_stranded`] only a switched-to phone.
     ///
     /// True once, when the live session's phone has not reached CarPlay and either carplayd had its control
-    /// connection and has been gone for [`CARPLAYD_GONE_GRACE`], or the session is [`NO_CARPLAY_DEADLINE`] old
-    /// with no carplayd live. The phone is then passed over, as a stranded switch is, and the caller ends the
+    /// connection and has been gone for [`CARPLAYD_GONE_GRACE`], or the session is [`NO_CARPLAY_DEADLINE`] old,
+    /// carplayd live or not. The phone is then passed over, as a stranded switch is, and the caller ends the
     /// session: the next one calls the other phones first, then pages this one again for a fresh handoff. A
     /// switched-to phone is left to [`Control::switch_stranded`]. Polled by `run_active_session`'s wait loop, once
     /// a second, after [`Control::carplay_lost`], which marks the session reached.
     pub fn carplay_never_reached(&self) -> bool {
-        self.carplay_never_reached_at(Instant::now(), read_carplayd)
+        self.carplay_never_reached_at(Instant::now(), read_carplayd, crate::av::claimed_at())
     }
 
     fn carplay_never_reached_at(
         &self,
         now: Instant,
         carplayd: impl FnOnce() -> Option<SystemTime>,
+        claimed: Option<SystemTime>,
     ) -> bool {
         // The switch watch first, never inside the CarPlay watch's lock: `switch_projected` takes them the other way.
         let switching = self.switch_watch.lock().ok().and_then(|w| *w).map(|w| w.addr);
@@ -853,7 +863,7 @@ impl Control {
         if w.reached || switching == Some(w.addr) || self.session_peer() != Some(w.addr) {
             return false;
         }
-        let live = carplayd().is_some_and(|written| written >= w.started);
+        let live = carplayd_live(carplayd(), w.started, claimed);
         if live {
             w.carplayd_seen = true;
             w.carplayd_gone_since = None;
@@ -861,7 +871,7 @@ impl Control {
             w.carplayd_gone_since = Some(now);
         }
         let left = w.carplayd_gone_since.is_some_and(|t| now.duration_since(t) >= CARPLAYD_GONE_GRACE);
-        let stale = !live && now.duration_since(w.since) >= NO_CARPLAY_DEADLINE;
+        let stale = now.duration_since(w.since) >= NO_CARPLAY_DEADLINE;
         if !left && !stale {
             *l = Some(w);
             return false;
@@ -1508,12 +1518,12 @@ mod tests {
         // Bench 2026-11-12, 06:39: pair-verify, no SETUP, carplayd's idle backstop, and btd held the link 9.5 min.
         let t0 = Instant::now();
         let c = watched(PHONE_A, None);
-        assert!(!c.carplay_never_reached_at(t0, carplayd_now), "carplayd has the session");
+        assert!(!c.carplay_never_reached_at(t0, carplayd_now, None), "carplayd has the session");
         let gone = t0 + Duration::from_secs(30);
-        assert!(!c.carplay_never_reached_at(gone, || None));
-        assert!(!c.carplay_never_reached_at(gone + CARPLAYD_GONE_GRACE - Duration::from_secs(1), || None));
-        assert!(c.carplay_never_reached_at(gone + CARPLAYD_GONE_GRACE, || None));
-        assert!(!c.carplay_never_reached_at(gone + CARPLAYD_GONE_GRACE, || None), "once");
+        assert!(!c.carplay_never_reached_at(gone, || None, None));
+        assert!(!c.carplay_never_reached_at(gone + CARPLAYD_GONE_GRACE - Duration::from_secs(1), || None, None));
+        assert!(c.carplay_never_reached_at(gone + CARPLAYD_GONE_GRACE, || None, None));
+        assert!(!c.carplay_never_reached_at(gone + CARPLAYD_GONE_GRACE, || None, None), "once");
         assert_eq!(c.passed_over_at(gone + CARPLAYD_GONE_GRACE), Some(PHONE_A));
         assert_eq!(c.call_order(vec![PHONE_A, PHONE_B]), vec![PHONE_B, PHONE_A], "the other bonded phone is called first");
         assert_eq!(c.take_request(), None, "no hold: it is paged in its turn");
@@ -1523,13 +1533,13 @@ mod tests {
     fn a_carplayd_that_comes_back_inside_the_grace_is_left_alone() {
         let t0 = Instant::now();
         let c = watched(PHONE_A, None);
-        assert!(!c.carplay_never_reached_at(t0, carplayd_now));
-        assert!(!c.carplay_never_reached_at(t0 + Duration::from_secs(5), || None));
-        assert!(!c.carplay_never_reached_at(t0 + Duration::from_secs(7), carplayd_now), "back from the box's dial-out");
+        assert!(!c.carplay_never_reached_at(t0, carplayd_now, None));
+        assert!(!c.carplay_never_reached_at(t0 + Duration::from_secs(5), || None, None));
+        assert!(!c.carplay_never_reached_at(t0 + Duration::from_secs(7), carplayd_now, None), "back from the box's dial-out");
         let again = t0 + Duration::from_secs(20);
-        assert!(!c.carplay_never_reached_at(again, || None));
-        assert!(!c.carplay_never_reached_at(again + CARPLAYD_GONE_GRACE - Duration::from_secs(1), || None), "the grace starts over");
-        assert!(c.carplay_never_reached_at(again + CARPLAYD_GONE_GRACE, || None));
+        assert!(!c.carplay_never_reached_at(again, || None, None));
+        assert!(!c.carplay_never_reached_at(again + CARPLAYD_GONE_GRACE - Duration::from_secs(1), || None, None), "the grace starts over");
+        assert!(c.carplay_never_reached_at(again + CARPLAYD_GONE_GRACE, || None, None));
     }
 
     #[test]
@@ -1537,12 +1547,40 @@ mod tests {
         let c = watched(PHONE_A, None);
         let t0 = Instant::now(); // after the watch's start, which the deadline counts from
         let leftover = || Some(SystemTime::UNIX_EPOCH);
-        assert!(!c.carplay_never_reached_at(t0 + Duration::from_secs(1), leftover));
-        assert!(!c.carplay_never_reached_at(t0 + CARPLAYD_GONE_GRACE * 3, || None), "the last session's flag is not this carplayd");
-        assert!(!c.carplay_never_reached_at(t0 + NO_CARPLAY_DEADLINE - Duration::from_secs(1), || None), "time for an Allow tap");
-        assert!(c.carplay_never_reached_at(t0 + NO_CARPLAY_DEADLINE, || None));
+        assert!(!c.carplay_never_reached_at(t0 + Duration::from_secs(1), leftover, None));
+        assert!(!c.carplay_never_reached_at(t0 + CARPLAYD_GONE_GRACE * 3, || None, None), "the last session's flag is not this carplayd");
+        assert!(!c.carplay_never_reached_at(t0 + NO_CARPLAY_DEADLINE - Duration::from_secs(1), || None, None), "time for an Allow tap");
+        assert!(c.carplay_never_reached_at(t0 + NO_CARPLAY_DEADLINE, || None, None));
         let busy = watched(PHONE_A, None);
-        assert!(!busy.carplay_never_reached_at(t0 + NO_CARPLAY_DEADLINE * 2, carplayd_now), "carplayd still at it: its backstop decides");
+        let t1 = Instant::now();
+        assert!(
+            !busy.carplay_never_reached_at(t1 + NO_CARPLAY_DEADLINE - Duration::from_secs(1), carplayd_now, None),
+            "carplayd at it, inside the deadline"
+        );
+        assert!(busy.carplay_never_reached_at(t1 + NO_CARPLAY_DEADLINE, carplayd_now, None), "the deadline holds, carplayd or not");
+    }
+
+    #[test]
+    fn btds_own_claim_at_the_handoff_is_not_a_carplayd() {
+        // Mac bench 2026-11-12, 08:11:56: page, Identify, 0x5703, btd wrote "wireless" and spawned carplayd; the phone,
+        // its Wi-Fi off, never made a control connection, and no ident came. The claim held the deadline off 8 minutes.
+        let c = watched(PHONE_A, None);
+        let t0 = Instant::now();
+        let claim = SystemTime::now();
+        let flag = || Some(claim);
+        assert!(!c.carplay_never_reached_at(t0 + Duration::from_secs(5), flag, Some(claim)));
+        assert!(
+            !c.carplay_never_reached_at(t0 + CARPLAYD_GONE_GRACE * 3, flag, Some(claim)),
+            "never seen, so never gone: only the deadline"
+        );
+        assert!(!c.carplay_never_reached_at(t0 + NO_CARPLAY_DEADLINE - Duration::from_secs(1), flag, Some(claim)));
+        assert!(c.carplay_never_reached_at(t0 + NO_CARPLAY_DEADLINE, flag, Some(claim)), "ended at the deadline");
+        assert_eq!(c.passed_over_at(t0 + NO_CARPLAY_DEADLINE), Some(PHONE_A));
+        // carplayd's own write on the phone's connection replaces the claim, and counts.
+        let later = claim + Duration::from_millis(1500);
+        assert!(carplayd_live(Some(later), claim, Some(claim)));
+        assert!(!carplayd_live(Some(claim), claim, Some(claim)));
+        assert!(!carplayd_live(None, claim, Some(claim)));
     }
 
     #[test]
@@ -1550,13 +1588,13 @@ mod tests {
         let t0 = Instant::now();
         let c = watched(PHONE_A, None);
         assert!(!c.carplay_lost_at(t0, || ident(100, PHONE_A)), "reached");
-        assert!(!c.carplay_never_reached_at(t0 + NO_CARPLAY_DEADLINE, || None), "carplay_lost's");
+        assert!(!c.carplay_never_reached_at(t0 + NO_CARPLAY_DEADLINE, || None, None), "carplay_lost's");
         let s = switched(t0, t0, None);
         s.watch_carplay_with(Some(PHONE_A), || None);
-        assert!(!s.carplay_never_reached_at(t0 + NO_CARPLAY_DEADLINE, || None), "switch_stranded's");
+        assert!(!s.carplay_never_reached_at(t0 + NO_CARPLAY_DEADLINE, || None, None), "switch_stranded's");
         let gone = live(PHONE_B);
         gone.watch_carplay_with(Some(PHONE_A), || None);
-        assert!(!gone.carplay_never_reached_at(t0 + NO_CARPLAY_DEADLINE, || None), "that session is over");
+        assert!(!gone.carplay_never_reached_at(t0 + NO_CARPLAY_DEADLINE, || None, None), "that session is over");
     }
 
     #[test]

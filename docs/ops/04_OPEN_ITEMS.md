@@ -242,7 +242,12 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
      `Control::carplay_never_reached` ends such a session 10 s after its `carplayd` leaves without
      CarPlay (the transport flag cleared), or 90 s into one with no `carplayd` at all (the supervisor's
      `ESTAB_CONNECT_GRACE`, which covers an Allow tap), passes the phone over, and lets the next session
-     call the other phones first and then page it. Found, fixed the same day, NOT yet benched: the
+     call the other phones first and then page it. **Benched 12 Nov (the Mac): FAIL** for a phone that never
+     joins: with its Wi-Fi off 2.5 min, btd's own "wireless" claim at the 0x5703 handoff read as a live
+     `carplayd`, held the 90 s deadline off, and the box sat 8 min with no page. Fixed, NOT yet benched:
+     btd's claim no longer counts as a `carplayd` (`av::claimed_at`), the 90 s deadline holds with a
+     `carplayd` live or not, and the supervisor reads milestones only after the last `carplayd` spawn
+     mark in `/tmp/carplayd_wl.log`, so an earlier session's "pair-verify OK" no longer latches. Found, fixed the same day, NOT yet benched: the
      AirPlay peer store kept one key per pairing identifier and both iPhones present the same one, so
      every change of phone redid pair-setup (one switch failed when the phone abandoned it after M3);
      it now keeps up to 8 keys per identifier ([../carplay/02_SESSION_LIFECYCLE.md](../carplay/02_SESSION_LIFECYCLE.md)).

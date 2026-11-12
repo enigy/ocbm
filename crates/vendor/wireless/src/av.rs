@@ -18,13 +18,27 @@
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 /// Serializes `ensure_av_layer` so two 0x5703 handshakes in quick succession can't BOTH spawn carplayd
 /// / rx-connect (the observed "Address in use" double-spawn): the double-fork means a just-spawned
 /// daemon isn't visible to `pgrep` for a few ms, so without this lock + the post-spawn visibility wait
 /// the second caller's `running()` check misses the first spawn and starts a duplicate.
 static AV_LOCK: Mutex<()> = Mutex::new(());
+
+/// When btd itself last wrote `/tmp/carplay_transport` ("wireless", at the 0x5703 handoff), as the file's own
+/// modification time. A flag still bearing it is btd's claim, not a carplayd with a phone's control connection
+/// (`control::carplay_never_reached`; Mac bench 12 Nov: the phone never joined, and the claim held the box).
+static CLAIMED_AT: Mutex<Option<SystemTime>> = Mutex::new(None);
+
+/// See [`CLAIMED_AT`].
+pub(crate) fn claimed_at() -> Option<SystemTime> {
+    *CLAIMED_AT.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The line btd writes to carplayd's wireless log before each spawn. The session supervisor reads milestones only
+/// after the last one, so an earlier session's "pair-verify OK" never counts for this one (Mac bench 12 Nov).
+pub const SPAWN_MARK: &str = "[av] === carplayd spawned for a new session ===";
 
 /// In-memory "have we already brought the AV layer up this session" latch (2026-07-24 field bug fix).
 /// Live-hardware test: a real iPhone retried the BT 0x5702 RequestAccessoryWiFiConfig handshake 3x
@@ -226,6 +240,14 @@ pub fn teardown_av_layer() {
 
 /// Spawn `bin` detached (own session via setsid, so a SIGTERM to us won't take it down), stdout+stderr
 /// appended to `log`, with `envs` set. Fire-and-forget; we never reap it.
+/// Append [`SPAWN_MARK`] to `log`, on a line of its own.
+fn mark_spawn(log: &str) {
+    use std::io::Write as _;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(log) {
+        let _ = writeln!(f, "{SPAWN_MARK}");
+    }
+}
+
 fn spawn_detached(bin: &str, log: &str, envs: &[(&str, &str)]) {
     let mut cmd = Command::new(bin);
     cmd.stdin(Stdio::null());
@@ -314,6 +336,8 @@ fn ensure_av_layer_timed() {
     // wireless carplayd mid-handoff. Reaching this function at all means a 0x5703 handoff just
     // succeeded, so wireless legitimately owns the session from this point on.
     let _ = std::fs::write("/tmp/carplay_transport", "wireless");
+    let claimed = std::fs::metadata("/tmp/carplay_transport").and_then(|m| m.modified()).ok();
+    *CLAIMED_AT.lock().unwrap_or_else(|e| e.into_inner()) = claimed;
 
     let carplayd = env_or("AIRPLAYD_BIN", AIRPLAYD_BIN_DEFAULT);
 
@@ -457,6 +481,7 @@ fn ensure_av_layer_timed() {
         else if std::path::Path::new("/tmp/setup_dump").exists() {
             envs.push(("CARPLAY_SETUP_DUMP", "/tmp/setup_req"));
         }
+        mark_spawn("/tmp/carplayd_wl.log");
         spawn_detached(&carplayd, "/tmp/carplayd_wl.log", &envs);
         wait_visible(&carplayd) // confirm up before a concurrent call could re-check (no double-spawn)
     };
