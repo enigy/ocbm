@@ -33,9 +33,29 @@ static GENERATION: AtomicU64 = AtomicU64::new(0);
 /// The one connection to the seam, shared by every tunnel; a frame is written whole under this lock.
 static SEAM: Mutex<Option<TcpStream>> = Mutex::new(None);
 
-/// The phone of the session that just connected: the one address a tunnel may reach.
+/// This session's `setProxyParameters` as the phone sent it (the command's plist), for a host that subscribes after it
+/// went by ([`replay_proxy`]). The phone sends it once, at the session's start (Mac bench 12 Nov: a Carlink installed
+/// 15 s into a session never had it, and couldn't reach the video).
+static PROXY: Mutex<Option<Vec<u8>>> = Mutex::new(None);
+
+/// The phone of the session that just connected: the one address a tunnel may reach. A new session forgets the last
+/// one's proxy.
 pub fn set_phone(addr: SocketAddr) {
     *crate::plock(&PHONE) = Some(addr);
+    *crate::plock(&PROXY) = None;
+}
+
+/// Keep this session's `setProxyParameters` plist (the newest, if the phone sends it again).
+pub fn remember_proxy(plist: &[u8]) {
+    *crate::plock(&PROXY) = Some(plist.to_vec());
+}
+
+/// Send this session's `setProxyParameters` to the host again, as the phone's own command went (the metadata seam's
+/// META_CMD), for a host that subscribed mid-session. False when the phone hasn't sent one.
+pub fn replay_proxy() -> bool {
+    let Some(plist) = crate::plock(&PROXY).clone() else { return false };
+    iap2_core::metadata::emit_command_plist(&plist);
+    true
 }
 
 /// One `INPUT_TUNNEL` sub-frame from the host, without its type byte. False when it was refused.
@@ -266,6 +286,18 @@ fn emit(op: u8, id: u8, data: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_proxy_is_kept_for_the_session_and_forgotten_by_the_next() {
+        set_phone("[::1]:5000".parse().unwrap());
+        assert!(!replay_proxy(), "nothing sent yet");
+        remember_proxy(b"bplist00 one");
+        remember_proxy(b"bplist00 two");
+        assert_eq!(crate::plock(&PROXY).as_deref(), Some(&b"bplist00 two"[..]), "the newest");
+        assert!(replay_proxy());
+        set_phone("[::1]:5001".parse().unwrap());
+        assert!(!replay_proxy(), "a new session starts without one");
+    }
 
     fn v6_phone() -> Option<SocketAddr> {
         Some(SocketAddr::V6(SocketAddrV6::new("fe80::1c2b:3d4e:5f60:7182".parse().unwrap(), 7000, 0, 3)))

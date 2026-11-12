@@ -1817,6 +1817,10 @@ impl SessionDelegate for AvSession {
         // channel, so the two connections evicted each other in a loop and both sides silently lost
         // records. See `metadata::emit_command_plist`.
         iap2_core::metadata::emit_command_plist(request_plist);
+        // Route A: kept, so a host that subscribes later in the session gets it too (tunnel::replay_proxy).
+        if ty == "setProxyParameters" {
+            crate::tunnel::remember_proxy(request_plist);
+        }
         if let Ok(p) = std::env::var("CARPLAY_CMD_DUMP") {
             use std::io::Write as _;
             if let Ok(mut f) = std::fs::OpenOptions::new()

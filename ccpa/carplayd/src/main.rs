@@ -1792,6 +1792,10 @@ fn start_host_present_watcher() {
             let now = read();
             if now && !last {
                 pending = true; // host just (re)subscribed — it needs a fresh IDR
+                // Route A: the phone's setProxyParameters went by once, at the session's start; this host needs it too.
+                if receiver::tunnel::replay_proxy() {
+                    eprintln!("[tunnel] host subscribed mid-session → the phone's setProxyParameters sent again");
+                }
             }
             last = now;
             if !now {
