@@ -96,6 +96,14 @@ touch /tmp/UDiskPassThroughMode
     setsid sh /script/radio_hal.sh preload >> /tmp/box.log 2>&1 </dev/null &
   fi
 
+  # The Wi-Fi transport's STA side (wifi_sta.sh): with a hotspot in /etc/ocbm/wifi_link, join it now
+  # and keep it joined, so a host can reach ocbmd over it. Backgrounded like the preload; absent
+  # ssid=, nothing starts and the box is the USB box it always was.
+  if grep -q '^ssid=' /etc/ocbm/wifi_link 2>/dev/null && [ -r /script/wifi_sta.sh ]; then
+    echo "[ocbm-boot] wifi transport: STA keeper starting" >> /tmp/box.log
+    setsid sh /script/wifi_sta.sh >> /tmp/box.log 2>&1 </dev/null &
+  fi
+
   # No remote login in OCBM mode (security review C1, 2026-10-21). The box's rcS starts dropbear
   # and a passwordless telnetd on every boot, bound to no interface, so in this mode they would
   # also answer on the Wi-Fi AP raised for every session. OCBM mode is managed over the OCBM

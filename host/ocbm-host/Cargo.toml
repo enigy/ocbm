@@ -14,3 +14,11 @@ rusb = "0.9"
 libc = "0.2"
 # Committed-model validation (`avdec`): decrypt the box-forwarded ENCRYPTED video on the HOST.
 chacha20poly1305 = "0.10"
+# `tcp:<host>` targets: the box's Wi-Fi transport (OCBW v1).
+ocbm-link = { path = "../../crates/ocbm-link" }
+# `wifi-link set`: the hotspot's WPA key from its password (PBKDF2-HMAC-SHA1), so only the hash is sent.
+hmac = "0.12"
+sha1 = "0.10"
+sha2 = "0.10"
+
+[dev-dependencies]

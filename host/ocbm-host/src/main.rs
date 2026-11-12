@@ -8,6 +8,12 @@
 //!                                                `rm /script/ncm_only; reboot` over ssh.
 //!   ocbm-host push  [vid pid] <local> <remote> [mode-octal]   verified file deploy (default mode 755)
 //!   ocbm-host pull  [vid pid] <remote> <local> [mode-octal]   verified file retrieval (box -> host)
+//!   ocbm-host update  vid pid <package.tgz>       push an update package and send MGMT_UPDATE (trial + rollback)
+//!   ocbm-host wifi-link vid pid set <ssid>|clear   provision the Wi-Fi transport (MGMT_WIFI_LINK): link key
+//!                                                (~/.config/ocbm/link_key, made if absent) + hotspot; the
+//!                                                password is read with echo off, only its WPA hash is sent
+//!   ocbm-host <mode> tcp:<host>[:port] - [args]   any mode over the box's Wi-Fi transport (OCBW v1,
+//!                                                port 7020), key from OCBM_LINK_KEY or ~/.config/ocbm/link_key
 //! Every connection also auto-pushes the host clock right after the HELLO_ACK. Without one, nothing
 //! else is sent and ocbm-host exits 1.
 
@@ -17,10 +23,22 @@ use rusb::{Context, Device, DeviceHandle, Direction, TransferType, UsbContext};
 use std::os::unix::fs::PermissionsExt;
 use std::time::{Duration, Instant};
 
+/// What carries the OCBM byte stream: the USB accessory's bulk pair, or the Wi-Fi transport's TCP link
+/// (OCBW v1: `ocbm-link`'s handshake and records; see `ccpa/ocbmd/src/wifi.rs`).
+enum Wire {
+    Usb {
+        h: DeviceHandle<Context>,
+        ep_in: u8,
+        ep_out: u8,
+    },
+    Tcp {
+        s: std::net::TcpStream,
+        session: ocbm_link::Session,
+    },
+}
+
 struct Link {
-    h: DeviceHandle<Context>,
-    ep_in: u8,
-    ep_out: u8,
+    wire: Wire,
     seq: u32,
     reasm: p::Reassembler,
 }
@@ -36,10 +54,18 @@ impl Link {
             }
         };
         self.seq = self.seq.wrapping_add(1);
-        self.h
-            .write_bulk(self.ep_out, &buf[..n], Duration::from_secs(2))
-            .map(|w| w == n)
-            .unwrap_or(false)
+        match &mut self.wire {
+            Wire::Usb { h, ep_out, .. } => h
+                .write_bulk(*ep_out, &buf[..n], Duration::from_secs(2))
+                .map(|w| w == n)
+                .unwrap_or(false),
+            Wire::Tcp { s, session } => {
+                use std::io::Write;
+                buf[..n]
+                    .chunks(ocbm_link::MAX_RECORD)
+                    .all(|c| s.write_all(&session.tx.seal(c)).is_ok())
+            }
+        }
     }
     fn recv(&mut self, out: &mut [u8], deadline: Instant) -> Option<(u16, u8, usize)> {
         loop {
@@ -50,16 +76,86 @@ impl Link {
                 return None;
             }
             let mut tmp = [0u8; 16384];
-            if let Ok(n) = self
-                .h
-                .read_bulk(self.ep_in, &mut tmp, Duration::from_millis(100))
-            {
-                if n > 0 {
-                    self.reasm.push(&tmp[..n]);
+            match &mut self.wire {
+                Wire::Usb { h, ep_in, .. } => {
+                    if let Ok(n) = h.read_bulk(*ep_in, &mut tmp, Duration::from_millis(100)) {
+                        if n > 0 {
+                            self.reasm.push(&tmp[..n]);
+                        }
+                    }
+                }
+                Wire::Tcp { s, session } => {
+                    use std::io::Read;
+                    match s.read(&mut tmp) {
+                        Ok(0) => {
+                            eprintln!("[ocbm] wifi: the box closed the link");
+                            std::process::exit(1);
+                        }
+                        Ok(n) => {
+                            session.rx.push(&tmp[..n]);
+                            loop {
+                                match session.rx.next() {
+                                    Ok(Some(plain)) => self.reasm.push(&plain),
+                                    Ok(None) => break,
+                                    Err(e) => {
+                                        eprintln!("[ocbm] wifi: {e}; dropping the link");
+                                        std::process::exit(1);
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+                        Err(e) => {
+                            eprintln!("[ocbm] wifi: read failed ({e}); dropping the link");
+                            std::process::exit(1);
+                        }
+                    }
                 }
             }
         }
     }
+}
+
+/// The link key for `tcp:` targets: `OCBM_LINK_KEY` (64 hex), else `~/.config/ocbm/link_key`.
+fn host_link_key() -> ocbm_link::LinkKey {
+    let text = std::env::var("OCBM_LINK_KEY").ok().or_else(|| {
+        let home = std::env::var("HOME").ok()?;
+        std::fs::read_to_string(format!("{home}/.config/ocbm/link_key")).ok()
+    });
+    text.as_deref()
+        .and_then(|t| t.lines().find_map(|l| ocbm_link::LinkKey::from_hex(l.trim().trim_start_matches("key="))))
+        .unwrap_or_else(|| {
+            eprintln!("[ocbm] wifi: no link key (set OCBM_LINK_KEY or ~/.config/ocbm/link_key)");
+            std::process::exit(1);
+        })
+}
+
+/// Connect to a box's Wi-Fi transport at `target` (`host` or `host:port`) and run the handshake.
+fn open_tcp(target: &str) -> Link {
+    use std::net::ToSocketAddrs;
+    let with_port = if target.contains(':') { target.to_string() } else { format!("{target}:{}", ocbm_link::PORT) };
+    let addr = with_port
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut a| a.next())
+        .unwrap_or_else(|| {
+            eprintln!("[ocbm] wifi: can't resolve {with_port}");
+            std::process::exit(1);
+        });
+    let mut s = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(5)).unwrap_or_else(|e| {
+        eprintln!("[ocbm] wifi: connect {addr}: {e}");
+        std::process::exit(1);
+    });
+    let _ = s.set_nodelay(true);
+    let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
+    let nonce = ocbm_link::random32().expect("randomness");
+    let session = ocbm_link::host_handshake(&mut s, &host_link_key(), nonce).unwrap_or_else(|e| {
+        eprintln!("[ocbm] wifi: handshake with {addr} failed: {e}");
+        std::process::exit(1);
+    });
+    let _ = s.set_read_timeout(Some(Duration::from_millis(100)));
+    eprintln!("[ocbm] wifi: linked to {addr} (OCBW v1)");
+    Link { wire: Wire::Tcp { s, session }, seq: 0, reasm: p::Reassembler::new() }
 }
 
 fn open(vid: u16, pid: u16) -> Link {
@@ -114,9 +210,7 @@ fn open(vid: u16, pid: u16) -> Link {
         ifnum, ep_in, ep_out
     );
     Link {
-        h,
-        ep_in,
-        ep_out,
+        wire: Wire::Usb { h, ep_in, ep_out },
         seq: 0,
         reasm: p::Reassembler::new(),
     }
@@ -255,6 +349,154 @@ fn mode_install(link: &mut Link, what: &str) {
         }
     }
     eprintln!("install {what}: no answer within 5 s");
+    std::process::exit(1);
+}
+
+/// WPA's key from a passphrase: PBKDF2-HMAC-SHA1(passphrase, ssid, 4096, 32) (IEEE 802.11i H.4).
+fn wpa_psk(passphrase: &[u8], ssid: &[u8]) -> [u8; 32] {
+    use hmac::{Hmac, Mac};
+    type H = Hmac<sha1::Sha1>;
+    let mut out = [0u8; 32];
+    for (block, chunk) in out.chunks_mut(20).enumerate() {
+        let mut m = <H as Mac>::new_from_slice(passphrase).expect("any key length");
+        m.update(ssid);
+        m.update(&(block as u32 + 1).to_be_bytes());
+        let mut u = m.finalize().into_bytes();
+        let mut t = u;
+        for _ in 1..4096 {
+            let mut m = <H as Mac>::new_from_slice(passphrase).expect("any key length");
+            m.update(&u);
+            u = m.finalize().into_bytes();
+            t.iter_mut().zip(u.iter()).for_each(|(a, b)| *a ^= b);
+        }
+        chunk.copy_from_slice(&t[..chunk.len()]);
+    }
+    out
+}
+
+/// A line from stdin with the terminal's echo off (a password).
+fn read_hidden(prompt: &str) -> String {
+    use std::io::{BufRead, Write};
+    eprint!("{prompt}");
+    let _ = std::io::stderr().flush();
+    // SAFETY: termios get/set on stdin; restored before returning.
+    let mut saved: libc::termios = unsafe { std::mem::zeroed() };
+    let tty = unsafe { libc::isatty(0) } == 1 && unsafe { libc::tcgetattr(0, &mut saved) } == 0;
+    if tty {
+        let mut quiet = saved;
+        quiet.c_lflag &= !libc::ECHO;
+        unsafe { libc::tcsetattr(0, libc::TCSANOW, &quiet) };
+    }
+    let mut line = String::new();
+    let _ = std::io::stdin().lock().read_line(&mut line);
+    if tty {
+        unsafe { libc::tcsetattr(0, libc::TCSANOW, &saved) };
+        eprintln!();
+    }
+    line.trim_end_matches(['\r', '\n']).to_string()
+}
+
+/// The link key at ~/.config/ocbm/link_key, made (0600) if there is none.
+fn host_link_key_or_new() -> [u8; 32] {
+    use std::os::unix::fs::OpenOptionsExt;
+    let dir = format!("{}/.config/ocbm", std::env::var("HOME").unwrap_or_else(|_| ".".into()));
+    let path = format!("{dir}/link_key");
+    if let Some(k) = std::fs::read_to_string(&path).ok().and_then(|t| ocbm_link::LinkKey::from_hex(t.trim())) {
+        eprintln!("[ocbm] wifi: reusing the link key at {path}");
+        return k.0;
+    }
+    let k = ocbm_link::random32().expect("randomness");
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&path)
+        .unwrap_or_else(|e| { eprintln!("[ocbm] wifi: can't write {path}: {e}"); std::process::exit(1) });
+    use std::io::Write;
+    let _ = writeln!(f, "{}", ocbm_link::LinkKey(k).to_hex());
+    eprintln!("[ocbm] wifi: new link key -> {path}");
+    k
+}
+
+/// `wifi-link set <ssid>` / `wifi-link clear`: provision the box's Wi-Fi transport (MGMT_WIFI_LINK). The
+/// hotspot password is read with echo off and only its WPA hash is sent.
+fn mode_wifi_link(link: &mut Link, what: &str, ssid: Option<&str>) {
+    let body: Vec<u8> = match (what, ssid) {
+        ("clear", _) => vec![p::MGMT_WIFI_LINK],
+        ("set", Some(ssid)) => {
+            let key = host_link_key_or_new();
+            let psk = if ssid.is_empty() {
+                String::new()
+            } else {
+                let pw = read_hidden(&format!("Password for \"{ssid}\": "));
+                if !(8..=63).contains(&pw.len()) {
+                    eprintln!("[ocbm] wifi: WPA2 passwords are 8-63 characters");
+                    std::process::exit(2);
+                }
+                wpa_psk(pw.as_bytes(), ssid.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
+            };
+            let mut b = vec![p::MGMT_WIFI_LINK, 1];
+            b.extend_from_slice(&key);
+            b.push(ssid.len() as u8);
+            b.extend_from_slice(ssid.as_bytes());
+            b.push(psk.len() as u8);
+            b.extend_from_slice(psk.as_bytes());
+            b
+        }
+        _ => {
+            eprintln!("usage: ocbm-host wifi-link <vid pid | tcp:<ip> -> set <ssid> | clear");
+            std::process::exit(2);
+        }
+    };
+    link.send(p::CH_MGMT, p::F_SOM | p::F_EOM, &body);
+    let mut out = vec![0u8; p::MAX_PAYLOAD];
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let Some((ch, _flags, l)) = link.recv(&mut out, deadline) else { break };
+        if ch == p::CH_MGMT && l >= 3 && out[0] == p::MGMT_ACK && out[1] == p::MGMT_WIFI_LINK {
+            if out[2] == 0 {
+                println!("wifi-link {what}: done{}", if what == "set" { "; the box joins the hotspot now, and listens on Wi-Fi from ocbmd's next start" } else { "" });
+                return;
+            }
+            eprintln!("wifi-link {what}: refused by the box (status {})", out[2]);
+            std::process::exit(1);
+        }
+    }
+    eprintln!("wifi-link {what}: no answer within 5 s (box without the Wi-Fi transport?)");
+    std::process::exit(1);
+}
+
+/// `update <package.tgz>`: push an OCBM update package (tools/make_ocbm_update.sh) to /tmp/ocbm-update.tgz
+/// and send MGMT_UPDATE with its SHA-256, as Carlink does. The box checks the package and installs it as a
+/// trial that keeps the new version on a passing self-test and puts the old one back otherwise; it restarts.
+fn mode_update(link: &mut Link, pkg: &str) {
+    let data = std::fs::read(pkg).unwrap_or_else(|e| {
+        eprintln!("update: can't read {pkg}: {e}");
+        std::process::exit(2);
+    });
+    let sha: String = {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(&data).iter().map(|b| format!("{b:02x}")).collect()
+    };
+    if !mode_push(link, pkg, "/tmp/ocbm-update.tgz", 0o644) {
+        eprintln!("update: the push failed; nothing was started");
+        std::process::exit(1);
+    }
+    let mut req = vec![p::MGMT_UPDATE];
+    req.extend_from_slice(sha.as_bytes());
+    link.send(p::CH_MGMT, p::F_SOM | p::F_EOM, &req);
+    let mut out = vec![0u8; p::MAX_PAYLOAD];
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let Some((ch, _flags, l)) = link.recv(&mut out, deadline) else { break };
+        if ch == p::CH_MGMT && l >= 3 && out[0] == p::MGMT_ACK && out[1] == p::MGMT_UPDATE {
+            if out[2] == 0 {
+                println!("update: accepted (sha256 {}); the box installs it as a trial and restarts", &sha[..16]);
+                return;
+            }
+            eprintln!("update: refused by the box (status {}): no package, a different SHA-256, or no update script", out[2]);
+            std::process::exit(1);
+        }
+    }
+    eprintln!("update: no answer within 10 s");
     std::process::exit(1);
 }
 
@@ -856,7 +1098,12 @@ fn main() {
     let pid = u16::from_str_radix(args.get(3).map(String::as_str).unwrap_or("2d00"), 16)
         .unwrap_or(0x2d00);
 
-    let mut link = open(vid, pid);
+    // `tcp:<host>[:port]` in the vid slot (and anything, e.g. `-`, in the pid slot, so every mode's
+    // later arguments keep their places) reaches the box over its Wi-Fi transport instead of USB.
+    let mut link = match args.get(2).and_then(|a| a.strip_prefix("tcp:")) {
+        Some(target) => open_tcp(target),
+        None => open(vid, pid),
+    };
     // Nothing but HELLO goes out until the HELLO_ACK: a trial's ocbmd takes a host's first other frame
     // as the proof it answered (the one-file install's answer_watch), so a clock push after "no
     // HELLO_ACK" vouched for a box that never answered (truck bench, 2 Nov).
@@ -878,6 +1125,15 @@ fn main() {
             };
             mode_install(&mut link, what)
         }
+        "update" => mode_update(&mut link, args.get(4).map(String::as_str).unwrap_or_else(|| {
+            eprintln!("usage: ocbm-host update <vid pid | tcp:<ip> -> <package.tgz>");
+            std::process::exit(2)
+        })),
+        "wifi-link" => mode_wifi_link(
+            &mut link,
+            args.get(4).map(String::as_str).unwrap_or(""),
+            args.get(5).map(String::as_str),
+        ),
         "av" => mode_av(
             &mut link,
             args.get(4).and_then(|s| s.parse().ok()).unwrap_or(0),
@@ -930,6 +1186,12 @@ fn main() {
 mod tests {
     use chacha20poly1305::aead::{Aead, KeyInit, Payload};
     use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+
+    #[test]
+    fn wpa_psk_matches_ieee_80211i_vector() {
+        let k: String = super::wpa_psk(b"password", b"IEEE").iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(k, "f42c6fc52df0ebef9ebb4b90b38a5f902e83fe1b135a70e23aed762e9710a12e");
+    }
 
     /// The nonce must be stable within a process (a reattach is the SAME host) and never 0
     /// ("not supplied"), or the box's replacement detection reads it wrong in either direction.

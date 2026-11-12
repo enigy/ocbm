@@ -18,6 +18,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN_DIR="${BIN_DIR:-$REPO/target/armv7-unknown-linux-musleabihf/release}"
 IRS_BIN="${IRS_BIN:-$REPO/accessory_init/iap_role_switch.armv7}"
 INSTALLER_DIR="${INSTALLER_DIR:-$REPO/ccpa/installer}"
+WPA_INSTALL_DIR="${WPA_INSTALL_DIR:-$REPO/scratchpad/wpa/install}"
 
 die() { printf 'make_ocbm_installer: %s\n' "$*" >&2; exit 1; }
 
@@ -32,6 +33,12 @@ payload() {  # SOURCE|PATH-ON-BOX: the programs and boot scripts, then Stage B/C
   for s in ocbm_dispatch ocbm_selftest ocbm_revert ocbm_finish ocbm_update ocbm_restore; do echo "$INSTALLER_DIR/$s.sh|script/$s.sh"; done
   echo "$REPO/tools/stock_restore_box.sh|script/stock_restore_box.sh"   # ocbm_restore.sh's engine: back to stock from a stick
   echo "$INSTALLER_DIR/retired.list|etc/ocbm/retired.list"   # what later versions dropped: a commit and once.sh delete it
+  # The Wi-Fi transport's STA side: the keeper and its DHCP hook always (inert without /etc/ocbm/wifi_link),
+  # and the supplicant when tools/build_wpa_supplicant.sh has built it (WPA_INSTALL_DIR).
+  for s in wifi_sta wifi_sta_dhcp; do echo "$REPO/ccpa/rootfs/script/$s.sh|script/$s.sh"; done
+  if [ -x "$WPA_INSTALL_DIR/wpa_supplicant" ]; then
+    for b in wpa_supplicant wpa_cli; do echo "$WPA_INSTALL_DIR/$b|usr/sbin/$b"; done
+  fi
 }
 
 if [ "${1:-}" = --list ]; then payload | cut -d'|' -f2; exit 0; fi
@@ -57,6 +64,10 @@ install -m 755 "$INSTALLER_DIR/once.sh" "$stage/tmp/once.sh"
 install -m 755 "$INSTALLER_DIR/finish.sh" "$stage/tmp/finish.sh"
 install -m 644 "$INSTALLER_DIR/prune.list" "$INSTALLER_DIR/identity.list" "$P/"
 install -m 644 "$REPO/ccpa/carplayd/fdk-aac.NOTICE" "$P/NOTICE.fdk-aac"   # carplayd links libfdk-aac: its licence travels with it
+if [ -x "$WPA_INSTALL_DIR/wpa_supplicant" ]; then   # likewise wpa_supplicant (BSD) and the libnl it links (LGPL-2.1)
+  install -m 644 "$WPA_INSTALL_DIR/COPYING.wpa_supplicant" "$P/NOTICE.wpa_supplicant"
+  install -m 644 "$WPA_INSTALL_DIR/COPYING.libnl" "$P/NOTICE.libnl"
+fi
 while IFS='|' read -r src dst; do
   mkdir -p "$P/$(dirname "$dst")"
   install -m 755 "$src" "$P/$dst"

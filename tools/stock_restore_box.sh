@@ -89,7 +89,11 @@ BOOT_SET="script/custom_init.sh etc/mdev/udisk_insert.sh script/start_main_servi
 LOGIN_SET="etc/passwd etc/passwd- etc/shadow etc/shadow- etc/dropbear/dropbear_rsa_host_key etc/dropbear/dropbear_dss_host_key root/.ssh/authorized_keys"
 PROTECT="script/ncm_only script/ncm_wifi"
 CONSOLE="usr/sbin/ocbmd"                          # onefile: the program the restore's own console needs
-SEAM="script/radio_ap_up.sh script/radio_detect.sh script/radio_hal.sh"   # OCBM's radio seam, payload
+SEAM="script/radio_ap_up.sh script/radio_detect.sh script/radio_hal.sh script/wifi_sta.sh script/wifi_sta_dhcp.sh"   # OCBM's radio seam, payload
+# The Wi-Fi transport's supplicant: OCBM's payload on a unit whose stock has none (the IW416 CCPA), but
+# other Carlinkit variants ship their own at these paths. Removed with OCBM only when the stock tree being
+# restored has no copy of its own; where it has one, the restore has just written it back.
+OCBM_WPA="usr/sbin/wpa_supplicant usr/sbin/wpa_cli"
 OCBM_STATE="etc/carplay"                          # OCBM's Bluetooth bond store, written while it runs
 BT_FLAG="etc/.custom_bluetooth_name"              # the seam's Bluetooth name flag (ocbm_bt_flag)
 
@@ -102,6 +106,13 @@ in_list() {  # $1 word, $2 list
 }
 
 md5() { md5sum < "$1" | cut -c1-32; }
+
+# OCBM's own radio files, which go with OCBM although the guard below would keep them by name.
+ocbm_radio() {  # $1 path from the rootfs, no leading /
+  in_list "$1" "$SEAM" && return 0
+  in_list "$1" "$OCBM_WPA" && [ ! -e "$SRC/$1" ] && [ ! -L "$SRC/$1" ] && return 0
+  return 1
+}
 
 # THE WLAN/BT GUARD, as in ccpa/installer/once.sh and ocbm_finish.sh: no deletion may take a radio
 # file. Used by the onefile profile's removals ($1 is a path from /).
@@ -416,7 +427,7 @@ remove_guarded() {  # $1 list of paths, $2 label, $3 paths to leave: as remove_l
     # the guard took bt_link_keys (bt_*) for a radio file, and the log said "1 kept by the radio guard"
     # of a file the next line removed (the dev adapter, 1 Nov).
     case "$p" in "$OCBM_STATE"/*) [ -e "$SRC/$OCBM_STATE" ] || continue ;; esac
-    if is_radio "/$p" && ! in_list "$p" "$SEAM" && ! ocbm_bt_flag "$p"; then k=$((k + 1)); continue; fi
+    if is_radio "/$p" && ! ocbm_radio "$p" && ! ocbm_bt_flag "$p"; then k=$((k + 1)); continue; fi
     if [ -L "$ROOT/$p" ] || [ -e "$ROOT/$p" ]; then
       [ -d "$ROOT/$p" ] && [ ! -L "$ROOT/$p" ] && continue
       rm -f "$ROOT/$p" || die "could not remove $p"
@@ -471,7 +482,7 @@ remaining() {  # $1 out: differences that still count (not the NCM flags; onefil
   while IFS="$TAB" read -r act typ key p; do
     in_list "$p" "$PROTECT" && continue
     if [ "$PROFILE" = onefile ] && [ "$act" = extra ]; then
-      is_radio "/$p" && ! in_list "$p" "$SEAM" && ! ocbm_bt_flag "$p" && continue
+      is_radio "/$p" && ! ocbm_radio "$p" && ! ocbm_bt_flag "$p" && continue
       # Written again by the OCBM still running; the restart into stock comes after its removal.
       case "$p" in "$OCBM_STATE"|"$OCBM_STATE"/*) [ -e "$SRC/$OCBM_STATE" ] || continue ;; esac
     fi
