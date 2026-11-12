@@ -14,6 +14,8 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 mod jffs2;
+mod mdns;
+mod wifi;
 
 const ACC_DEV: &str = "/dev/usb_accessory";
 
@@ -3335,6 +3337,41 @@ impl Daemon {
                 };
                 self.mgmt_ack(verb, u8::from(!ok));
             }
+            // The Wi-Fi transport's provisioning (wifi.rs). Logs the hotspot's name only, never a key.
+            p::MGMT_WIFI_LINK => {
+                let ok = match wifi::parse_provision(&pl[1..]) {
+                    Ok(prov) => {
+                        let what = match &prov {
+                            wifi::Provision::Clear => "cleared: USB only from the next start".to_string(),
+                            wifi::Provision::Set { ssid, .. } if ssid.is_empty() => "link key set, no hotspot".to_string(),
+                            wifi::Provision::Set { ssid, .. } => format!("link key set, hotspot \"{ssid}\""),
+                        };
+                        match wifi::apply_provision(&prov) {
+                            Ok(()) => {
+                                eprintln!("[ocbmd] wifi: provisioned ({what}); restarting in 1.5 s so it takes effect");
+                                // The listener and the key are read at start, so restart once the ACK has gone
+                                // out: a USB host that just provisioned then finds the box on Wi-Fi, and a Wi-Fi
+                                // host reconnects with the new key. The same exit as a lost transport.
+                                std::thread::spawn(|| {
+                                    std::thread::sleep(Duration::from_millis(1500));
+                                    clear_session_state_for_exit(INSTALL_MODE_FILE, start_install_finish);
+                                    std::process::exit(0);
+                                });
+                                true
+                            }
+                            Err(e) => {
+                                eprintln!("[ocbmd] wifi: provisioning failed ({e})");
+                                false
+                            }
+                        }
+                    }
+                    Err(why) => {
+                        eprintln!("[ocbmd] wifi: refused a MGMT_WIFI_LINK ({why})");
+                        false
+                    }
+                };
+                self.mgmt_ack(verb, u8::from(!ok));
+            }
             p::MGMT_CONNECT_DEVICE => {
                 let mac = std::str::from_utf8(&pl[1..]).unwrap_or("");
                 let ok = match connect_request(mac) {
@@ -4101,6 +4138,61 @@ fn start_acc_io(
     }
 }
 
+/// The Wi-Fi race ([`wifi`]): USB relay threads and the TCP listener both up, then the loop's ends are
+/// whichever transport's host speaks first. Before the loop exists, so this keeps the supervisor's
+/// liveness stamp fresh itself, and clears a presence flag a crashed predecessor left.
+fn race_transports(
+    acc: File,
+    acc_io: AccIo,
+    key: ocbm_link::LinkKey,
+) -> (AccRelay, Option<std::sync::Arc<WriterWatch>>) {
+    // Discovery on the hotspot (mdns.rs): the box's address there comes from DHCP. The STA interface is
+    // sta0 on the IW416 (drv_mode=3, sta_name=sta); OCBMD_STA_IF names another.
+    let sta_if = std::env::var("OCBMD_STA_IF").unwrap_or_else(|_| "sta0".to_string());
+    mdns::start(sta_if, ocbm_link::PORT, ocbm_link::box_id(&key));
+    let (tcp_from, tcp_to) = match wifi::start_tcp_transport(key) {
+        Ok(ends) => ends,
+        Err(e) => {
+            eprintln!("[ocbmd] wifi: listener could not start ({e}); USB only this start");
+            return start_acc_io(acc, acc_io).unwrap_or_else(|e| {
+                eprintln!("[ocbmd] accessory I/O could not start ({e}) — exiting");
+                std::process::exit(1);
+            });
+        }
+    };
+    // The relay threads even on a serializing driver: only the reader runs until a USB host speaks, and
+    // if one does on such a driver, the respawn below hands it a plain Direct loop.
+    let (usb, watch) = start_acc_relay(acc).unwrap_or_else(|e| {
+        eprintln!("[ocbmd] accessory I/O could not start ({e}) — exiting");
+        std::process::exit(1);
+    });
+    write_flag_atomic(HOST_PRESENT_FLAG, false);
+    let _ = File::create(ALIVE_FILE);
+    eprintln!("[ocbmd] wifi: racing USB and Wi-Fi; the first host to speak gets the link");
+    let mut last_touch = Instant::now();
+    match wifi::wait_first_host(&usb.from_host, &tcp_from, || {
+        if last_touch.elapsed() >= ALIVE_TOUCH_INTERVAL {
+            touch_alive_file();
+            last_touch = Instant::now();
+        }
+    }) {
+        wifi::Winner::Tcp => {
+            eprintln!("[ocbmd] transport: Wi-Fi (OCBW v1)");
+            (AccRelay { from_host: tcp_from, to_host: tcp_to }, None)
+        }
+        wifi::Winner::Usb if acc_io == AccIo::Direct => {
+            eprintln!("[ocbmd] transport: USB won on a serializing driver; respawning USB-only for it");
+            wifi::set_usb_once();
+            let _ = std::fs::remove_file(ALIVE_FILE);
+            std::process::exit(0);
+        }
+        wifi::Winner::Usb => {
+            eprintln!("[ocbmd] transport: USB");
+            (usb, Some(watch))
+        }
+    }
+}
+
 /// What the relay threads are doing, for [`SerialCheck`].
 #[derive(Default)]
 struct WriterWatch {
@@ -4360,10 +4452,22 @@ fn main() {
             AccIo::Direct => "single-threaded (this unit's driver serializes reads and writes)",
         }
     );
-    let (AccRelay { from_host, to_host }, writer_watch) = start_acc_io(acc, acc_io).unwrap_or_else(|e| {
-        eprintln!("[ocbmd] accessory I/O could not start ({e}) — exiting");
-        std::process::exit(1);
-    });
+    // The Wi-Fi transport (wifi.rs): with a link key on flash, race USB against an authenticated TCP host
+    // and run on whichever speaks first. Without one (or right after USB won on a serializing driver),
+    // this is the USB daemon it always was.
+    let wifi_key = if wifi::take_usb_once() {
+        eprintln!("[ocbmd] wifi: this start is USB only (USB won the last race on a serializing driver)");
+        None
+    } else {
+        wifi::link_key()
+    };
+    let (AccRelay { from_host, to_host }, writer_watch) = match wifi_key {
+        None => start_acc_io(acc, acc_io).unwrap_or_else(|e| {
+            eprintln!("[ocbmd] accessory I/O could not start ({e}) — exiting");
+            std::process::exit(1);
+        }),
+        Some(key) => race_transports(acc, acc_io, key),
+    };
     let mut serial_check = writer_watch.map(SerialCheck::new);
     // Local A/V seam listeners: the box session forwards video->:9001, media audio->:9002; ocbmd
     // muxes each onto its OCBM channel. Non-blocking so they slot into the poll loop.

@@ -167,6 +167,42 @@ wlan_iface() {
   return 1
 }
 
+# ---- the Wi-Fi transport's STA side (ocbmd src/wifi.rs, /script/wifi_sta.sh) ----------------
+# With ssid= in /etc/ocbm/wifi_link the box ALSO joins the car's hotspot on $STA_IF, and the host
+# reaches ocbmd over it. Then the session's AP must not touch that interface: it goes on the
+# driver's other wireless interface (IW416 drv_mode=3 makes sta0 + wlan0 from one load), and it
+# shares the STA's channel because the chip has one radio. Without ssid= nothing here changes.
+WIFI_LINK_FILE=/etc/ocbm/wifi_link
+STA_IF=${RADIO_STA_IF:-sta0}
+sta_mode() { [ -r "$WIFI_LINK_FILE" ] && grep -q '^ssid=' "$WIFI_LINK_FILE"; }
+# The AP's interface: in STA mode the first wireless interface that isn't $STA_IF, else wlan_iface.
+ap_iface() {
+  sta_mode || { wlan_iface; return; }
+  for _apif_d in /sys/class/net/*/; do
+    [ -e "$_apif_d/wireless" ] || [ -e "$_apif_d/phy80211" ] || continue
+    _apif_n=$(basename "$_apif_d")
+    [ "$_apif_n" = "$STA_IF" ] && continue
+    echo "$_apif_n"; return 0
+  done
+  return 1
+}
+wpa_tool() {  # $1 = wpa_supplicant | wpa_cli: the image's copy, else a bench copy in /tmp/bin
+  for _wpat_d in /usr/sbin /tmp/bin; do [ -x "$_wpat_d/$1" ] && { echo "$_wpat_d/$1"; return 0; }; done
+  return 1
+}
+# The channel the STA is associated on, empty if it isn't.
+sta_channel() {
+  _stch_cli=$(wpa_tool wpa_cli) || return 1
+  _stch_f=$("$_stch_cli" -i "$STA_IF" status 2>/dev/null | sed -n 's/^freq=//p')
+  "$_stch_cli" -i "$STA_IF" status 2>/dev/null | grep -q '^wpa_state=COMPLETED' || return 1
+  case "$_stch_f" in
+    2484) echo 14 ;;
+    24[0-9][0-9]) echo $(( (_stch_f - 2407) / 5 )) ;;
+    5[0-9][0-9][0-9]) echo $(( (_stch_f - 5000) / 5 )) ;;
+    *) return 1 ;;
+  esac
+}
+
 hci_dev() {
   for _hcid_d in /sys/class/bluetooth/hci*/; do
     [ -d "$_hcid_d" ] && { basename "${_hcid_d%/}"; return 0; }
@@ -388,9 +424,10 @@ do_wifi_ap_on() {
       wlan_driver_up || {
         publish "$WLAN_STATE" "result=fail" "backend=mapped" "chipset=$RADIO_SDIO_DEVICE" "detail=driver-load"
         return 1; }
-      # Converge on the interface appearing, discovered by enumeration.
-      _n=0; while [ "$_n" -lt 100 ]; do wlan_iface >/dev/null 2>&1 && break; _n=$((_n+1)); sleep 0.1; done
-      _i=$(wlan_iface 2>/dev/null) || {
+      # Converge on the interface appearing, discovered by enumeration. In STA mode that is the
+      # AP's own interface (ap_iface), never the STA's.
+      _n=0; while [ "$_n" -lt 100 ]; do ap_iface >/dev/null 2>&1 && break; _n=$((_n+1)); sleep 0.1; done
+      _i=$(ap_iface 2>/dev/null) || {
         log "driver loaded but no wireless interface appeared"
         publish "$WLAN_STATE" "result=fail" "backend=mapped" "chipset=$RADIO_SDIO_DEVICE" "detail=no-iface"
         return 1; }
@@ -415,7 +452,11 @@ do_wifi_ap_on() {
         return 1; }
       # RADIO_BOX_NAME is resolved HERE, not inside the AP layer, so the SSID and the Bluetooth
       # name provably come from one decision rather than two derivations that can disagree.
-      ONDEMAND_WIFI=1 RADIO_WLAN_IF="$_i" RADIO_BOX_NAME="$(box_name)" \
+      # One radio: in STA mode the AP sits on the hotspot's channel (empty = the AP's own choice).
+      _apch=""
+      sta_mode && { _apch=$(sta_channel) && log "STA mode: AP follows the hotspot to channel $_apch" \
+                                         || log "STA mode: STA not associated, AP keeps its own channel"; }
+      ONDEMAND_WIFI=1 RADIO_WLAN_IF="$_i" RADIO_BOX_NAME="$(box_name)" RADIO_AP_CHANNEL="$_apch" \
         sh /script/radio_ap_up.sh AP 2>&1 | sed "s/^/$LOGP   /"
       _n=0; while [ "$_n" -lt 50 ]; do ap_running && break; _n=$((_n+1)); sleep 0.2; done
       if ap_running; then
@@ -438,6 +479,18 @@ do_wifi_ap_on() {
 
 ap_ip_of() { ifconfig "$1" 2>/dev/null | sed -n 's/.*inet addr:\([0-9.]*\).*/\1/p' | head -1; }
 
+do_wifi_sta_up() {
+  caps || return 3
+  [ "$RADIO_BACKEND" = mapped ] || { log "wifi_sta_up: backend ${RADIO_BACKEND:-none} has no STA path"; return 3; }
+  [ -e "/sys/class/net/$STA_IF" ] && return 2
+  wlan_driver_up || return 1
+  _n=0; while [ "$_n" -lt 100 ] && [ ! -e "/sys/class/net/$STA_IF" ]; do _n=$((_n+1)); sleep 0.1; done
+  [ -e "/sys/class/net/$STA_IF" ] || { log "wifi_sta_up: driver loaded but no $STA_IF"; return 1; }
+  ifconfig "$STA_IF" up 2>/dev/null
+  log "wifi_sta_up: $STA_IF ready (mac $(cat /sys/class/net/$STA_IF/address 2>/dev/null))"
+  return 0
+}
+
 do_wifi_ap_off() {
   caps || true
   # Chipset-neutral teardown. Deliberately NO module unload: whether rmmod is safe (and whether
@@ -458,7 +511,8 @@ do_wifi_ap_off() {
     kill "$_p" 2>/dev/null
   done
   [ -e /var/run/udhcpd.pid ] && kill "$(cat /var/run/udhcpd.pid 2>/dev/null)" 2>/dev/null
-  _i=$(wlan_iface 2>/dev/null) && ifconfig "$_i" down 2>/dev/null
+  # The AP's interface only: in STA mode the host's link rides $STA_IF and must survive the session.
+  _i=$(ap_iface 2>/dev/null) && ifconfig "$_i" down 2>/dev/null
   _n=0; while [ "$_n" -lt 25 ] && ap_running; do _n=$((_n+1)); sleep 0.2; done
   ap_running && { log "hostapd still running after teardown"; publish "$WLAN_STATE" "result=fail" "detail=ap-survived"; return 1; }
   rm -f "$WLAN_STATE"
@@ -783,9 +837,12 @@ case "$VERB" in
   wifi_ap_off) lock_take wlan || exit 1; do_wifi_ap_off; _r=$?; lock_drop wlan; exit $_r ;;
   bt_on)       lock_take bt   || exit 1; do_bt_on;       _r=$?; lock_drop bt;   exit $_r ;;
   bt_off)      lock_take bt   || exit 1; do_bt_off;      _r=$?; lock_drop bt;   exit $_r ;;
+  # The Wi-Fi transport: load the WLAN driver and wait for $STA_IF, nothing else (no AP). /script/
+  # wifi_sta.sh calls it; the wlan lock keeps it off a session's wifi_ap_on.
+  wifi_sta_up) lock_take wlan || exit 1; do_wifi_sta_up; _r=$?; lock_drop wlan; exit $_r ;;
   # Both locks, wlan first (the supervisor's own order, one at a time, so no deadlock): bt_on loads
   # the WLAN driver, which an app-driven wifi_ap_on arriving mid-preload must not race.
   preload)     lock_take wlan || exit 1; lock_take bt || { lock_drop wlan; exit 1; }
                do_preload; _r=$?; lock_drop bt; rm -rf /tmp/.radio_lock_wlan 2>/dev/null; exit $_r ;;
-  *) echo "$LOGP usage: radio_hal.sh probe|status|wifi_ap_on|wifi_ap_off|bt_on|bt_off|preload" >&2; exit 64 ;;
+  *) echo "$LOGP usage: radio_hal.sh probe|status|wifi_ap_on|wifi_ap_off|wifi_sta_up|bt_on|bt_off|preload" >&2; exit 64 ;;
 esac

@@ -123,7 +123,17 @@ fi
 # ---- channel + band ---------------------------------------------------------------------------
 ch=$(sed -n 's/^channel=//p' /etc/hostapd.conf | head -1)
 [ -e /etc/wifi_use_24G ] && ch=6
+# The Wi-Fi transport's STA mode (radio_hal.sh): one radio, so the AP takes the hotspot's channel.
+[ -n "${RADIO_AP_CHANNEL:-}" ] && ch=$RADIO_AP_CHANNEL
 case "$ch" in ''|*[!0-9]*) ch=36 ;; esac
+# HT40's secondary channel must exist on the side named: on 5 GHz the lower channel of each 40 MHz
+# pair (36, 44, 52, ...) takes HT40+, the upper (40, 48, ...) HT40-; on 2.4 GHz 1-7 take +, 8-13 -.
+# A fixed HT40+ on channel 40 is a pair hostapd can't build.
+if grep -q '^ht_capab=.*HT40[+-]' /etc/hostapd.conf; then
+  if [ "$ch" -le 14 ]; then [ "$ch" -le 7 ] && _ht=+ || _ht=-
+  else [ $(( (ch / 4) % 2 )) -eq 1 ] && _ht=+ || _ht=-; fi
+  sed -i "s/HT40[+-]/HT40$_ht/" /etc/hostapd.conf
+fi
 # hostapd of this vintage has no ACS and refuses to start with no channel, so it is always pinned.
 if [ "$ch" -ge 1 ] && [ "$ch" -le 14 ]; then
   grep -q "^hw_mode=a" /etc/hostapd.conf && sed -i "s/^hw_mode=a/hw_mode=g/" /etc/hostapd.conf

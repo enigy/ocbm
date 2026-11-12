@@ -356,6 +356,14 @@ pub const MGMT_UPDATE: u8 = 0x0C;
 /// MGMT_CONNECT_DEVICE. Never ends a wired session: btd has none live then. MGMT_ACK status 1 = not a
 /// MAC, not bonded, or btd unreachable. Only on a box with CAP_PHONE_SWITCH.
 pub const MGMT_SWITCH_DEVICE: u8 = 0x0D;
+/// [MGMT_WIFI_LINK][ver 1][link key 32 B][ssid_len u8][ssid][psk_len u8][psk] -> provision the Wi-Fi
+/// transport (ocbmd `src/wifi.rs`): write `/etc/ocbm/wifi_link` (0600) and (re)start the STA keeper on
+/// that hotspot. `psk` = the hotspot's WPA key as 64 hex digits (PBKDF2-SHA1(passphrase, ssid, 4096,
+/// 32)), so the passphrase need never reach the box, or the passphrase itself. Empty ssid = transport on,
+/// no STA. [MGMT_WIFI_LINK] with no body clears it. After the MGMT_ACK (status 0) ocbmd restarts itself
+/// (~1.5 s) so the change takes effect: the host's link drops, and it reconnects (over Wi-Fi, with the
+/// key it just set). MGMT_ACK status 1 = malformed, or the file couldn't be written; nothing restarts.
+pub const MGMT_WIFI_LINK: u8 = 0x0E;
                                             //   Box->host:
 pub const MGMT_INFO: u8 = 0x81; // [MGMT_INFO][utf8 JSON] — identity + health + bonded-device snapshot
 pub const MGMT_ACK: u8 = 0x82; // [MGMT_ACK][verb u8][status u8] — 0 ok / 1 error, echoing the request verb
