@@ -787,6 +787,26 @@ const ANSWERED_FILE: &str = "/tmp/ocbmd_answered";
 #[cfg(test)]
 const ANSWERED_FILE: &str = "/tmp/ocbmd_selftest_answered";
 
+/// The session supervisor's pid (its singleton lock). `cfg(test)`: nothing to signal.
+#[cfg(not(test))]
+const SUPERVISOR_PID_FILE: &str = "/tmp/.sup_lock/pid";
+#[cfg(test)]
+const SUPERVISOR_PID_FILE: &str = "/tmp/ocbmd_selftest_no_such_sup_pid";
+
+/// Cut the supervisor's 1 s tick short when a host arrives (SIGUSR1, which it traps): about 0.5 s of every connect on
+/// average (the Mac's 13 Nov brief, item 1). Only a process whose command line names session_supervisor gets it: a
+/// recycled pid must never take a signal whose default action ends it.
+fn wake_supervisor(pid_file: &str) {
+    let Some(pid) = std::fs::read_to_string(pid_file).ok().and_then(|s| s.trim().parse::<libc::pid_t>().ok()) else {
+        return;
+    };
+    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+    if pid > 0 && String::from_utf8_lossy(&cmdline).contains("session_supervisor") {
+        // SAFETY: a signal to the supervisor just identified; it traps USR1.
+        unsafe { libc::kill(pid, libc::SIGUSR1) };
+    }
+}
+
 /// A host silent this long, then speaking again, gets a log line ([`Daemon::handle`]).
 const HOST_SILENCE: Duration = Duration::from_secs(5);
 
@@ -1959,6 +1979,9 @@ impl Daemon {
         }
         self.present = present;
         write_flag_atomic(HOST_PRESENT_FLAG, present);
+        if present {
+            wake_supervisor(SUPERVISOR_PID_FILE);
+        }
         if !present {
             self.present_cleared_at = Some(std::time::Instant::now());
         }

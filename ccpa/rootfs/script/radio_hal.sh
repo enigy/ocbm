@@ -276,12 +276,14 @@ bt_set_name() {  # $1 = hci dev
   echo "$_bn" > /etc/.custom_bluetooth_name 2>/dev/null
   echo "$_bn" > /etc/bluetooth_name 2>/dev/null
   _n=0
+  # Read back at once and wait only before a retry: with no stock daemon to blank it (OCBM mode) the first set sticks,
+  # and the 0.5 s before every read-back was paid on each fresh attach (the Mac's 13 Nov brief, item 6).
   while [ "$_n" -lt 10 ]; do
     hciconfig "$1" name "$_bn" 2>/dev/null
-    sleep 0.5
     _cur=$(timeout 5 hciconfig "$1" name 2>/dev/null | sed -n "s/.*Name: '\(.*\)'.*/\1/p")
     [ "$_cur" = "$_bn" ] && break
     _n=$((_n+1))
+    sleep 0.5
   done
   log "BT name=$_bn (asserted after $_n retries, now '${_cur:-unknown}')"
 }
@@ -521,12 +523,15 @@ PRELOAD_OFF=/script/radio_preload_off
 PRELOAD_MARK=/script/.radio_preload_inflight
 PRELOAD_UNFINISHED=/script/.radio_preload_unfinished
 PRELOAD_GUARD_AFTER=2
+# Each state the preload enters, with the uptime, for btd's [startup] record (crates/vendor/wireless/src/startup.rs).
+preload_state() { echo "$1 $(cut -d' ' -f1 /proc/uptime)" >> /tmp/radio_preload_state; }
 do_preload() {
   if [ -e "$PRELOAD_MARK" ]; then
     _pn=$(cat "$PRELOAD_UNFINISHED" 2>/dev/null); case "$_pn" in ''|*[!0-9]*) _pn=0 ;; esac
     _pn=$((_pn + 1)); rm -f "$PRELOAD_MARK"
     if [ "$_pn" -ge "$PRELOAD_GUARD_AFTER" ]; then
       echo "guard: $_pn unfinished in a row" > "$PRELOAD_OFF"; rm -f "$PRELOAD_UNFINISHED"; sync
+      preload_state off_guard
       log "preload: $_pn boots in a row never finished it - preload DISABLED (rm $PRELOAD_OFF to re-enable)"
       return 1
     fi
@@ -535,8 +540,10 @@ do_preload() {
   fi
   if host_here; then
     log "preload: a host is here - left to its session"
+    preload_state stood_down
     return 0
   fi
+  preload_state running
   touch "$PRELOAD_MARK"; sync
   _p0=$(cut -d' ' -f1 /proc/uptime)
   RADIO_BT_MAX_TRIES=1
@@ -545,6 +552,7 @@ do_preload() {
   # (rc 2: someone else's), and not once a host has come: its session is waiting on this lock for the radio.
   if [ "$_pr" = 0 ] && ! host_here; then do_bt_off; fi
   rm -f "$PRELOAD_MARK" "$PRELOAD_UNFINISHED"; sync
+  preload_state done
   log "preload: done rc=$_pr in $(awk "BEGIN{printf \"%.1f\", $(cut -d' ' -f1 /proc/uptime)-$_p0}") s, wlan=$(wlan_iface 2>/dev/null || echo none) bt=$(hciconfig 2>/dev/null | grep -oE 'UP RUNNING|DOWN' | head -1)"
   return $_pr
 }
@@ -580,15 +588,19 @@ do_bt_on() {
   # when a single `hciconfig up` was the entire fix. Today's testing was all cold bring-up, which
   # never exercises this path.
   if [ -n "$_d" ]; then
+    _bt_was_down=1
     if bt_powered_up "$_d"; then
       log "$_d present but not answering - trying to power it up before assuming it is wedged"
+      _bt_was_down=0
     else
       log "$_d powered down (between-sessions state) - powering it up"
     fi
     hci_rt "$_d" up 2>/dev/null
     if bt_responsive_confirmed "$_d"; then
       log "$_d was only powered down - up and responsive, no reset needed"
-      : > "$BT_WARM"
+      # "opened": this `up` opened a DOWN device, so the kernel set its event mask just now, and btd's first bring-up
+      # can skip its own down/up (bt_bringup.rs; the Mac's 13 Nov brief, item 1).
+      if [ "$_bt_was_down" = 1 ]; then echo opened > "$BT_WARM"; else : > "$BT_WARM"; fi
       publish "$BT_STATE" "result=ok" "backend=$RADIO_BACKEND" "hci_dev=$_d" \
               "bt_mac=$(cat /sys/class/bluetooth/$_d/address 2>/dev/null)"
       return 0

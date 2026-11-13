@@ -1,9 +1,9 @@
 //! hci.rs — raw HCI command packets for `bt_bringup` and the pairing window.
 //!
-//! Two operations live here: Write_Scan_Enable, sent as a raw command rather than through
-//! `hciconfig piscan`/`noscan`, whose HCISETSCAN ioctl loses its wake-up on the CCPA's 3.14 kernel
-//! (see [`write_scan_enable`]), and Write_Page_Timeout for btd's paging ([`write_page_timeout`]).
-//! Everything else in bring-up is still `hciconfig`.
+//! Write_Scan_Enable, sent as a raw command rather than through `hciconfig piscan`/`noscan`, whose HCISETSCAN
+//! ioctl loses its wake-up on the CCPA's 3.14 kernel (see [`write_scan_enable`]); Write_Page_Timeout for btd's
+//! paging ([`write_page_timeout`]); and bring-up's identity writes ([`write_identity`]). Only the down/up is still
+//! `hciconfig`.
 //!
 //! Not the mgmt API: mgmt owns EIR and the discoverable flag, and on 3.14 `SET_DISCOVERABLE` is a
 //! no-op when the flag already holds the asked-for value — so the scan mode is written here too.
@@ -18,6 +18,10 @@ const HCI_CHANNEL_RAW: u16 = 0;
 // HCI opcode, OGF 0x03 (Host Controller & Baseband). opcode = (ogf << 10) | ocf.
 const OP_WRITE_SCAN_ENABLE: u16 = 0x0C1A;
 const OP_WRITE_PAGE_TIMEOUT: u16 = 0x0C18;
+const OP_WRITE_LOCAL_NAME: u16 = 0x0C13;
+const OP_WRITE_CLASS_OF_DEVICE: u16 = 0x0C24;
+const OP_WRITE_EIR: u16 = 0x0C52;
+const OP_WRITE_SIMPLE_PAIRING_MODE: u16 = 0x0C56;
 
 /// The controller's page timeout after a reset: 0x2000 slots of 0.625 ms, 5.12 s.
 pub const PAGE_TIMEOUT_DEFAULT: u16 = 0x2000;
@@ -150,6 +154,60 @@ pub fn write_page_timeout(dev: u16, slots: u16) -> io::Result<()> {
     HciSocket::open_bound(dev)?.cmd(OP_WRITE_PAGE_TIMEOUT, &slots.to_le_bytes())
 }
 
+
+/// HCIGETCONNINFO: `_IOR('H', 213, int)`.
+const HCIGETCONNINFO: libc::c_ulong = 0x8004_48d5;
+const ACL_LINK: u8 = 0x01;
+
+/// Whether an ACL link to `peer` (mgmt byte order, as a `bdaddr_t`) is up on controller `dev`: the page was answered.
+/// btd's SDP connect watches for it, so a phone that answers and then never opens the SDP channel is caught in
+/// well under a second instead of the 4-6 s until it resets the link (the Mac's 13 Nov brief, item 3).
+pub fn acl_up(dev: u16, peer: [u8; 6]) -> bool {
+    let Ok(s) = HciSocket::open_bound(dev) else { return false };
+    // struct hci_conn_info_req { bdaddr_t bdaddr; u8 type; struct hci_conn_info conn_info[1]; }, the info 16 bytes.
+    let mut req = [0u8; 6 + 1 + 1 + 16];
+    req[..6].copy_from_slice(&peer);
+    req[6] = ACL_LINK;
+    // SAFETY: the buffer holds the request and one hci_conn_info, as the kernel writes back.
+    unsafe { libc::ioctl(s.0, HCIGETCONNINFO as _, req.as_mut_ptr()) == 0 }
+}
+
+/// Bring-up's identity writes, in order, on one socket: Simple Pairing on, the class of device, the local name and the
+/// Extended Inquiry Response. What `hciconfig sspmode 1`, `class`, `name` and `inqdata` sent, without four child
+/// processes (0.15-0.2 s of every connect, the Mac's 13 Nov brief). Fire-and-forget like the other writes: the kernel
+/// queues them behind one another and takes the name and class it keeps from their Command Complete events.
+pub fn write_identity(dev: u16, class: u32, name: &str, eir: &[u8]) -> io::Result<()> {
+    let s = HciSocket::open_bound(dev)?;
+    s.cmd(OP_WRITE_SIMPLE_PAIRING_MODE, &[0x01])?;
+    s.cmd(OP_WRITE_CLASS_OF_DEVICE, &class_params(class))?;
+    s.cmd(OP_WRITE_LOCAL_NAME, &local_name_params(name))?;
+    s.cmd(OP_WRITE_EIR, &eir_params(eir)?)
+}
+
+/// Class of Device: 3 bytes, little-endian.
+fn class_params(class: u32) -> [u8; 3] {
+    let b = class.to_le_bytes();
+    [b[0], b[1], b[2]]
+}
+
+/// Write_Local_Name: 248 bytes, the UTF-8 name NUL-padded (cut at 248, as hciconfig does).
+fn local_name_params(name: &str) -> [u8; 248] {
+    let mut p = [0u8; 248];
+    let n = name.len().min(248);
+    p[..n].copy_from_slice(&name.as_bytes()[..n]);
+    p
+}
+
+/// Write_Extended_Inquiry_Response: FEC not required (0), then 240 bytes of EIR, zero-padded.
+fn eir_params(eir: &[u8]) -> io::Result<[u8; 241]> {
+    if eir.len() > 240 {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "EIR exceeds 240 bytes"));
+    }
+    let mut p = [0u8; 241];
+    p[1..=eir.len()].copy_from_slice(eir);
+    Ok(p)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,5 +235,20 @@ mod tests {
     #[test]
     fn page_timeout_opcode_is_ogf3() {
         assert_eq!(OP_WRITE_PAGE_TIMEOUT, (0x03u16 << 10) | 0x0018);
+    }
+
+    #[test]
+    fn the_identity_writes_are_shaped_as_the_spec_says() {
+        assert_eq!(OP_WRITE_LOCAL_NAME, (0x03u16 << 10) | 0x0013);
+        assert_eq!(OP_WRITE_CLASS_OF_DEVICE, (0x03u16 << 10) | 0x0024);
+        assert_eq!(OP_WRITE_EIR, (0x03u16 << 10) | 0x0052);
+        assert_eq!(OP_WRITE_SIMPLE_PAIRING_MODE, (0x03u16 << 10) | 0x0056);
+        assert_eq!(class_params(0x5a_0408), [0x08, 0x04, 0x5a]);
+        let name = local_name_params("CarLink-FD6C");
+        assert_eq!(&name[..12], b"CarLink-FD6C");
+        assert!(name[12..].iter().all(|b| *b == 0));
+        let eir = eir_params(&[3, 9, b'A', 0]).unwrap();
+        assert_eq!(&eir[..5], &[0, 3, 9, b'A', 0], "FEC 0, then the EIR");
+        assert!(eir_params(&[0u8; 241]).is_err());
     }
 }

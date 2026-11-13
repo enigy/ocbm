@@ -113,7 +113,11 @@ _known_psk() { case "$1" in 12345678|"carplay$SUF") return 0 ;; esac; return 1; 
 PSK=$(sed -n 's/^wpa_passphrase=//p' /etc/hostapd.conf | head -1)
 _known_psk "$PSK" && PSK=""
 if [ "${#PSK}" -lt 8 ]; then
-  PSK=$(cat /etc/wifi_password 2>/dev/null | tr -cd '[:print:]' | head -c 63)
+  # OCBM's own from before a go-back to stock first (it puts stock's 12345678 back): each phone knows it, and a new one
+  # cost each phone about 6 s of PSK-MISMATCH retries at its first connect after the reinstall (the Mac, 13 Nov).
+  PSK=$(cat /etc/ocbm/wifi_psk 2>/dev/null | tr -cd '[:print:]' | head -c 63)
+  _known_psk "$PSK" && PSK=""
+  [ "${#PSK}" -lt 8 ] && PSK=$(cat /etc/wifi_password 2>/dev/null | tr -cd '[:print:]' | head -c 63)
   _known_psk "$PSK" && PSK=""
   [ "${#PSK}" -lt 8 ] && PSK=$(head -c 64 /dev/urandom | md5sum | cut -c1-20)
   if grep -q '^wpa_passphrase=' /etc/hostapd.conf; then
@@ -121,7 +125,11 @@ if [ "${#PSK}" -lt 8 ]; then
   else
     echo "wpa_passphrase=$PSK" >> /etc/hostapd.conf
   fi
-  echo "$L wpa_passphrase was absent, too short or a known default - set a random one"
+  echo "$L wpa_passphrase was absent, too short or a known default - set one (kept or random)"
+fi
+# Kept where a go-back leaves it (/etc/ocbm stays on flash; ocbm_revert.sh), for the install after it. Not logged.
+if [ -d /etc/ocbm ] && [ "$(cat /etc/ocbm/wifi_psk 2>/dev/null)" != "$PSK" ]; then
+  ( umask 077; echo "$PSK" > /etc/ocbm/wifi_psk.new && mv -f /etc/ocbm/wifi_psk.new /etc/ocbm/wifi_psk ) 2>/dev/null
 fi
 
 # ---- channel + band ---------------------------------------------------------------------------

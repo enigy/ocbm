@@ -137,7 +137,10 @@ fn round_page_slots(first_round: bool, phones: usize) -> u16 {
 /// the truck that hands it to a passenger's phone after a short stop with the engine off. The reset
 /// cycle behind [`FIRST_RETRY_SECS`] found the very next attempt succeeds, but that retry only runs once
 /// no phone in the round connected.
-const RESET_RETRY_SECS: u64 = 2;
+///
+/// None since the Mac's 13 Nov brief (item 11): the re-page 2 s later connected about 1 s in, every time, and a reset
+/// is now caught 0.7 s after the answer (`sdp_client`'s watch), so the re-page goes at once.
+const RESET_RETRY_SECS: u64 = 0;
 /// For the first [`EARLY_WINDOW`] after btd starts (a host has just come), rounds are this far apart, not the doubling
 /// backoff: a phone that comes back (a driver who walks up after the display is on) waited 10, 20, then 40 s for
 /// the next page (the Mac, 13 Nov). A phone that said no still gets [`BACKOFF_MAX_SECS`].
@@ -153,8 +156,9 @@ const EARLY_WINDOW: Duration = Duration::from_secs(120);
 /// `session_active` refuses to page over it. 1 s keeps a moment for that inbound connect.
 /// Override: `BT_RECONNECT_SETTLE_SECS` or `/tmp/reconnect_settle_secs` (whole seconds, `0` allowed).
 /// None when the controller was warm ([`BT_WARM`]): nothing was just attached, so paging starts at once (the Mac's
-/// 13 Nov connect-time brief).
-const INITIAL_SETTLE_DEFAULT_SECS: u64 = 1;
+/// 13 Nov connect-time brief). None after a fresh attach either since its 13 Nov brief (item 6): an adapter still
+/// booting when the host came paid it on top of the attach, and the lever stays for a bench that wants it back.
+const INITIAL_SETTLE_DEFAULT_SECS: u64 = 0;
 
 /// Left by `radio_hal.sh bt_on` when this session's bring-up found the controller attached and at most powered
 /// down, rather than attaching it.

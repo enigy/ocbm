@@ -100,6 +100,14 @@ fn rfcomm_accept(
     rfcomm::accept_one(channel, shutdown)
 }
 
+/// Whether radio_hal.sh's bt_on opened the controller from DOWN just before this btd started ("opened" in
+/// `/tmp/.radio_bt_warm`), true for this process's first bring-up only: a later one follows a session that used it.
+fn just_opened() -> bool {
+    static FIRST: AtomicBool = AtomicBool::new(true);
+    FIRST.swap(false, Ordering::Relaxed)
+        && std::fs::read_to_string("/tmp/.radio_bt_warm").is_ok_and(|s| s.trim() == "opened")
+}
+
 /// Run one active wireless session: bring Bluetooth up discoverable, serve SSP + SDP + RFCOMM/iAP2,
 /// and hold until either the arbiter preempts us (wired claimed) or SIGTERM. `arbiter` is the claim
 /// connection when a real arbiter granted us; `None` in standalone mode (no arbiter server present).
@@ -113,7 +121,7 @@ fn run_active_session(
     // Complete Local Name (what the iPhone shows) and the wireless iAP2 identify.
     startup::begin();
     let accessory_name = carplay_iap2_core::message::accessory_name(ACCESSORY_BRAND);
-    if let Err(e) = bt_bringup::bring_up(HCI_DEV, &accessory_name) {
+    if let Err(e) = bt_bringup::bring_up(HCI_DEV, &accessory_name, just_opened()) {
         log(&format!("Bluetooth bring-up failed: {e} -- retrying"));
         // Chunked so SIGTERM isn't stuck behind the full 5s retry delay.
         for _ in 0..5 {

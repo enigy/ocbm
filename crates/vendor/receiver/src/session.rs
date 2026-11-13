@@ -494,6 +494,11 @@ fn rcs_channels_named(entry: &Dictionary, channels: &HashMap<String, RcsChannel>
 /// How often stream threads wake from a blocking socket read to check the session-liveness flag.
 const SHUTDOWN_POLL: Duration = Duration::from_millis(500);
 
+/// How often a waiting accept looks again. The screen's used [`SHUTDOWN_POLL`], so the phone's screen connection
+/// waited up to 0.5 s to be taken, and the event channel's 0.1 s (the Mac's 13 Nov brief, item 2). A few dozen
+/// wake-ups until the phone connects, typically under a second.
+const ACCEPT_POLL: Duration = Duration::from_millis(10);
+
 /// How long after the phone tears down its screen stream we wait for it to set one up again before
 /// asking for its UI ([`AvSession::nudge_screen_back`]).
 ///
@@ -2092,7 +2097,9 @@ impl SessionDelegate for AvSession {
         if let Some(listener) = self.event_listener.take() {
             listener.set_nonblocking(true).ok();
             let mut accepted = false;
-            for _ in 0..50 {
+            // 5 s by the clock, as 50 x 100 ms was, now that each wait is [`ACCEPT_POLL`].
+            let accept_until = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < accept_until {
                 match listener.accept() {
                     Ok((stream, peer)) => {
                         eprintln!("[session] RECORD: event channel accepted from {peer}");
@@ -2137,7 +2144,7 @@ impl SessionDelegate for AvSession {
                         break;
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(std::time::Duration::from_millis(100));
+                        thread::sleep(ACCEPT_POLL);
                     }
                     Err(e) => {
                         eprintln!("[session] RECORD: event accept error: {e}");
@@ -2512,7 +2519,7 @@ fn spawn_screen(
                     if !alive.load(Ordering::Acquire) {
                         return;
                     }
-                    thread::sleep(SHUTDOWN_POLL);
+                    thread::sleep(ACCEPT_POLL);
                 }
                 Err(e) => {
                     eprintln!("[screen] accept failed: {e}");

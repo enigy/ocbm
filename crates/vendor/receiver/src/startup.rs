@@ -38,8 +38,20 @@ fn summary(marks: &str, frame_ms: u64) -> Option<String> {
         return None;
     }
     let off = |stage: &str| at(stage).map_or_else(|| "-".to_string(), |t| format!("+{} ms", t.saturating_sub(start)));
+    // The adapter's uptime when the host came and the boot preload's state then: whether the head unit beat it.
+    let word = |stage: &str| {
+        marks.lines().find_map(|l| {
+            let mut w = l.split_whitespace();
+            (w.next() == Some(stage)).then(|| w.next().map(str::to_string)).flatten()
+        })
+    };
+    let boot = match (at("host_uptime"), word("preload")) {
+        (Some(u), Some(p)) => format!(" (adapter up {}.{} s, preload {p})", u / 1000, u % 1000 / 100),
+        (None, Some(p)) => format!(" (preload {p})"),
+        _ => String::new(),
+    };
     Some(format!(
-        "host present +0 ms, Bluetooth up {}, phone connected {}, Wi-Fi handoff {}, first frame +{} ms",
+        "host present +0 ms{boot}, Bluetooth up {}, phone connected {}, Wi-Fi handoff {}, first frame +{} ms",
         off("bt_up"),
         off("phone"),
         off("handoff"),
@@ -65,6 +77,15 @@ mod tests {
         assert_eq!(
             summary(marks, 27100).as_deref(),
             Some("host present +0 ms, Bluetooth up +10900 ms, phone connected +19200 ms, Wi-Fi handoff +21800 ms, first frame +26100 ms")
+        );
+    }
+
+    #[test]
+    fn the_line_says_when_the_adapter_came_up_and_where_the_preload_was() {
+        let marks = "host_present 1000\npreload running\nhost_uptime 4270\nhandoff 5000\n";
+        assert_eq!(
+            summary(marks, 9000).as_deref(),
+            Some("host present +0 ms (adapter up 4.2 s, preload running), Bluetooth up -, phone connected -, Wi-Fi handoff +4000 ms, first frame +8000 ms")
         );
     }
 

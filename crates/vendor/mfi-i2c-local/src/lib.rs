@@ -230,10 +230,31 @@ pub enum MfiError {
 }
 
 /// [`cert`] with the failure reason. `cert` is kept as the `Option` shim for existing callers.
+///
+/// Read from the chip once per boot, then from [`CERT_CACHE`]: the certificate is the chip's public one, the same on
+/// every read and sent as-is to every phone (the private key never leaves the chip, and signing still goes to it
+/// every time). The tunnel's first read of a session failed with a chip NAK and cost a retry in 23 of 23 sessions
+/// (the Mac's 13 Nov brief, item 2).
 pub fn try_cert() -> Result<Vec<u8>, MfiError> {
+    if let Ok(c) = std::fs::read(CERT_CACHE) {
+        if !c.is_empty() && c.len() <= 2048 {
+            return Ok(c);
+        }
+    }
     let _lock = MfiLock::acquire()?;
-    cert_locked().ok_or(MfiError::Chip)
+    let c = cert_locked().ok_or(MfiError::Chip)?;
+    let tmp = format!("{CERT_CACHE}.{}", std::process::id());
+    if std::fs::write(&tmp, &c).and_then(|_| std::fs::rename(&tmp, CERT_CACHE)).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    Ok(c)
 }
+
+/// The certificate as last read from the chip this boot (tmpfs). `cfg(test)`: a path of its own.
+#[cfg(not(test))]
+const CERT_CACHE: &str = "/tmp/carplay_mfi_cert.der";
+#[cfg(test)]
+const CERT_CACHE: &str = "/tmp/mfi_i2c_local_selftest_cert.der";
 
 /// [`sign`] with the failure reason.
 pub fn try_sign(chal: &[u8]) -> Result<Vec<u8>, MfiError> {

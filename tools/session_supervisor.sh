@@ -43,6 +43,9 @@ while ! mkdir "$_sup_lock" 2>/dev/null; do
   echo "[supervisor] already running pid=${_sup_holder:-unknown} — exiting" >> /tmp/box.log
   exit 0
 done
+# ocbmd sends SIGUSR1 when a host arrives, to cut the 1 s tick short (the main loop's wait). Set before the pid is
+# published, so the signal never finds the default action (which would end this process).
+trap ':' USR1
 echo $$ > "$_sup_lock/pid" 2>/dev/null
 trap 'rm -rf "$_sup_lock" 2>/dev/null' EXIT
 trap 'rm -rf "$_sup_lock" 2>/dev/null; trap - EXIT; exit 143' INT TERM HUP
@@ -688,7 +691,7 @@ wireless_up() {
   fi
   mode=$(pairing_mode)
   restore_stock_hostapd
-  echo "[sup] host PRESENT + wireless enabled -> CLEAN bring-up of wireless stack (detached, pairing=$mode)"
+  echo "[sup] host PRESENT + wireless enabled -> CLEAN bring-up of wireless stack (detached, pairing=$mode) at uptime $(cut -d' ' -f1 /proc/uptime)"
   # Detached session: the Wi-Fi AP and the BT radio come up side by side, then the CarLink advertiser, each
   # redirected (not piped).
   # NO inner pgrep guard: the wrapper `sh -c` argv itself contains "/usr/sbin/btd", so an
@@ -709,6 +712,7 @@ wireless_up() {
     # radio_hal.sh keeps them apart where they meet: separate wlan and bt locks, the WLAN driver load under its own
     # lock (wlan_driver_up), and a descriptor file per caller (radio_detect.sh).
     # The outer subshell returns at once, so the AP bring-up is no child of the btd exec below (which would never reap it).
+    echo "[sup] radios starting at uptime $(cut -d" " -f1 /proc/uptime)" >> /tmp/box.log
     ( sh /script/radio_hal.sh wifi_ap_on >/tmp/wlan.log 2>&1 & )
     # bt.log stays the small truncated per-attempt status file that docs/wireless/01_BT_AND_RADIO.md
     # tells an operator to cat directly. This call is foreground (no trailing ampersand), so teeing
@@ -876,6 +880,13 @@ while :; do
   # Read presence, acting only on a DEFINITE 0/1 — an empty/partial read (or missing file) keeps the
   # last state rather than flapping. (ocbmd writes the flag atomically, so this is defensive.)
   p=$(cat "$FLAG" 2>/dev/null)
+  # A host just came: bring wireless up FIRST, before the rest of this tick's checks, each a fork on this CPU. They
+  # put about 1.3 s between the host and radio_hal.sh's first line (the Mac's 13 Nov brief, item 1).
+  wl_edge_done=0
+  if [ "$p" = 1 ] && [ "${last_p:-}" != 1 ]; then
+    echo "[sup] host PRESENT seen at uptime $(cut -d' ' -f1 /proc/uptime)"
+    wireless_up; wl_edge_done=1
+  fi
 
   # docs/wireless/00_WIRELESS_CARPLAY.md #1.3 (extended, review finding 2026-07-24): `wireless_down`'s own branch already resets
   # saw_paired/saw_record/healthy when IT tears a wireless session down — but a wireless session can
@@ -951,7 +962,7 @@ while :; do
     0|1)
       if [ "$p" = 1 ] && [ "$last_p" != 1 ]; then
         edge_ts="$edge_ts $(now)"
-        wireless_up      # host appeared: bring wireless up alongside the always-on wired path (gated)
+        [ "$wl_edge_done" = 1 ] || wireless_up   # host appeared (normally done at the top of the tick)
       fi
       if [ "$p" = 0 ] && [ "$last_p" = 1 ]; then
         wireless_down    # host went away: idle the wireless radios (wired baseline stays ready)
@@ -1199,5 +1210,7 @@ while :; do
 
   tick=$((tick + 1))
   [ $((tick % 30)) -eq 0 ] && bound_logs
-  sleep 1
+  # 1 s, cut short by ocbmd's SIGUSR1 when a host arrives (the trap above): wait returns on a trapped signal.
+  sleep 1 & _tick_sleep=$!
+  wait "$_tick_sleep" 2>/dev/null || kill "$_tick_sleep" 2>/dev/null
 done

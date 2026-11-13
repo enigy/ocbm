@@ -96,16 +96,21 @@ touch /tmp/UDiskPassThroughMode
   # (/script/ocbm_trial), whose self-revert has no self-test to wait for.
   if [ ! -e /script/radio_preload_off ] && [ ! -e /script/ocbm_trial ] && [ -r /script/radio_hal.sh ]; then
     echo "[ocbm-boot] radio preload starting${OCBM_PRELOAD_AFTER:+ once the self-test passes}" >> /tmp/box.log
+    # Its states, with the uptime, for btd's [startup] record; radio_hal.sh adds the rest.
+    [ -n "${OCBM_PRELOAD_AFTER:-}" ] && echo "waiting $(cut -d" " -f1 /proc/uptime)" >> /tmp/radio_preload_state
     setsid sh -c 'i=0; while [ -n "$1" ] && [ ! -e "$1" ]; do
-        [ "$i" -ge 120 ] && { echo "[ocbm-boot] radio preload skipped: no self-test pass in 120 s"; exit 0; }
+        [ "$i" -ge 120 ] && { echo "[ocbm-boot] radio preload skipped: no self-test pass in 120 s"
+          echo "skipped $(cut -d" " -f1 /proc/uptime)" >> /tmp/radio_preload_state; exit 0; }
         i=$((i + 1)); sleep 1
       done
       exec sh /script/radio_hal.sh preload' preload "${OCBM_PRELOAD_AFTER:-}" >> /tmp/box.log 2>&1 </dev/null &
   elif [ -e /script/radio_preload_off ]; then   # every boot, so no drive log misses it
     if grep -q "^guard" /script/radio_preload_off 2>/dev/null; then
       echo "[ocbm-boot] radio preload DISABLED by its guard ($(head -1 /script/radio_preload_off)); rm /script/radio_preload_off to re-enable" >> /tmp/box.log
+      echo "off_guard $(cut -d" " -f1 /proc/uptime)" >> /tmp/radio_preload_state
     else
       echo "[ocbm-boot] radio preload off (/script/radio_preload_off)" >> /tmp/box.log
+      echo "off_owner $(cut -d" " -f1 /proc/uptime)" >> /tmp/radio_preload_state
     fi
   fi
 

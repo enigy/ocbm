@@ -123,8 +123,17 @@ fn stop_conflicting_daemons() {
     // `hfpd` is in this list because `bluetoothDaemon` starts it: it is the vendor's HFP/HSP
     // implementation, a second Bluetooth stack talking to the phone. It is also in `bt_off.sh` and
     // the installer kill list.
-    for d in ["hcid", "bluetoothDaemon", "sdpd", "hfpd"] {
-        let _ = Command::new("killall").arg(d).status();
+    // A SIGTERM to each by its /proc comm, as `killall` sends, without a child process per name.
+    let names = ["hcid", "bluetoothDaemon", "sdpd", "hfpd"];
+    let Ok(procs) = std::fs::read_dir("/proc") else { return };
+    for p in procs.flatten() {
+        let Some(pid) = p.file_name().to_str().and_then(|s| s.parse::<libc::pid_t>().ok()) else { continue };
+        let comm = std::fs::read_to_string(p.path().join("comm")).unwrap_or_default();
+        // comm is cut at 15 bytes: "bluetoothDaemon" is exactly 15.
+        if names.contains(&comm.trim()) {
+            // SAFETY: a signal to a pid just read from /proc; a pid that exited meanwhile is ESRCH.
+            unsafe { libc::kill(pid, libc::SIGTERM) };
+        }
     }
 }
 
@@ -165,7 +174,7 @@ fn stamp(t0: std::time::Instant, what: &str) {
 
 /// Bring the controller up as a discoverable/connectable CarPlay-style accessory: set class, name,
 /// EIR, then enable page+inquiry scan (discoverable + connectable, no timeout).
-pub fn bring_up(hci_dev: &str, name: &str) -> std::io::Result<()> {
+pub fn bring_up(hci_dev: &str, name: &str, just_opened: bool) -> std::io::Result<()> {
     let t0 = std::time::Instant::now();
     stamp(t0, "start");
     // Name the real fault at its source rather than letting it surface as an unexplained EINVAL.
@@ -210,20 +219,34 @@ pub fn bring_up(hci_dev: &str, name: &str) -> std::io::Result<()> {
     // `up` re-reads Read_Buffer_Size. That discards `attach_bluetooth.sh`'s SCO setup, which is
     // harmless: CarPlay carries all audio, telephony included, over the AirPlay/Wi-Fi session, never
     // over SCO.
-    let _ = run_rt(&[hci_dev, "down"]);
-    stamp(t0, "down");
-    run_rt(&[hci_dev, "up"])?;
-    stamp(t0, "up");
+    //
+    // ONE CYCLE, NOT TWO (the Mac's 13 Nov brief, item 1: about 0.5 s of every connect). `just_opened`: radio_hal.sh's
+    // bt_on opened this controller from DOWN moments before this daemon started (`/tmp/.radio_bt_warm` reads
+    // "opened"), which is the same `hci_dev_do_open` and the same event mask, after the same reset on close. Only the
+    // first bring-up of a btd may trust it: a later one follows a session.
+    if just_opened {
+        stamp(t0, "opened by radio_hal.sh just now: no down/up");
+    } else {
+        let _ = run_rt(&[hci_dev, "down"]);
+        stamp(t0, "down");
+        run_rt(&[hci_dev, "up"])?;
+        stamp(t0, "up");
+    }
     // Force Simple Pairing mode ON at the HCI level (HCI Write_Simple_Pairing_Mode). The NXP IW416
     // firmware defaults SSP OFF and the mgmt SET_SSP path can be rejected silently, leaving "Simple
     // Pairing mode: Disabled" → pairing degrades to legacy PIN → iOS refuses the iAP2/CarPlay handshake
     // (SDP loops, RFCOMM never opens). This deterministically flips the readback; SSP is required for
     // BOTH Just-Works and Numeric Comparison. Non-fatal if the build's hciconfig lacks `sspmode`.
-    let _ = run(&[hci_dev, "sspmode", "1"]);
-    stamp(t0, "sspmode");
-    run(&[hci_dev, "class", &format!("0x{CLASS_OF_DEVICE:06x}")])?;
-    run(&[hci_dev, "name", name])?;
-    run(&[hci_dev, "inqdata", &eir_hex(name)])?;
+    // All four as raw commands on one socket ([`crate::hci::write_identity`]), not four hciconfig children; hciconfig
+    // only if that fails.
+    if let Err(e) = crate::hci::write_identity(crate::hci::dev_id(hci_dev)?, CLASS_OF_DEVICE, name, &eir_bytes(name)) {
+        eprintln!("[bt-bringup] raw identity writes failed ({e}) -- by hciconfig");
+        let _ = run(&[hci_dev, "sspmode", "1"]);
+        run(&[hci_dev, "class", &format!("0x{CLASS_OF_DEVICE:06x}")])?;
+        run(&[hci_dev, "name", name])?;
+        run(&[hci_dev, "inqdata", &eir_hex(name)])?;
+    }
+    stamp(t0, "sspmode, class, name, EIR");
     // NOT `hciconfig piscan`: its HCISETSCAN ioctl loses its wake-up on this 3.14 kernel about one
     // bring-up in three and sleeps the full 10 s request timeout (`hci::write_scan_enable`).
     crate::hci::write_scan_enable(crate::hci::dev_id(hci_dev)?, crate::hci::SCAN_PAGE_AND_INQUIRY)?;

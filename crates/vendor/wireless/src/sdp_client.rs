@@ -59,6 +59,46 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join("")
 }
 
+/// How long after the page is answered (the ACL is up) the SDP channel may take to open. All 83 good answers on the
+/// Mac's benches opened it within 14-512 ms; all 10 answered-then-reset links never did, and the phone dropped the
+/// link 4-6 s later (13 Nov brief, item 3). Past this, the connect is cut and reads as a reset.
+const SDP_AFTER_ACL: std::time::Duration = std::time::Duration::from_millis(700);
+
+/// Watch an SDP connect in flight: once the ACL to `peer` is up, give the channel [`SDP_AFTER_ACL`], then shut the
+/// socket down so the blocked connect returns. `done` (true once the connect returned) is held while shutting down,
+/// so the fd is never touched after the caller closes it. True in `stalled` when it cut the connect.
+fn watch_connect(
+    fd: libc::c_int,
+    peer: [u8; 6],
+    done: std::sync::Arc<std::sync::Mutex<bool>>,
+    stalled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    let Ok(dev) = crate::hci::dev_id(crate::HCI_DEV) else { return };
+    let _ = std::thread::Builder::new().name("sdp-watch".into()).spawn(move || {
+        let mut acl_at: Option<std::time::Instant> = None;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            let finished = done.lock().map(|g| *g).unwrap_or(true);
+            if finished {
+                return;
+            }
+            match acl_at {
+                None if crate::hci::acl_up(dev, peer) => acl_at = Some(std::time::Instant::now()),
+                Some(t) if t.elapsed() >= SDP_AFTER_ACL => {
+                    let g = done.lock();
+                    if g.as_deref().is_ok_and(|d| !*d) {
+                        stalled.store(true, std::sync::atomic::Ordering::Release);
+                        // SAFETY: the connect has not returned (checked under `done`), so `fd` is still its socket.
+                        unsafe { libc::shutdown(fd, libc::SHUT_RDWR) };
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
+    });
+}
+
 /// L2CAP-connect to `peer`'s SDP PSM (implicitly pages the phone in BlueZ). `timeout_secs` bounds both
 /// the connect and each subsequent read so a quiet phone can't wedge the reconnect thread.
 fn connect_sdp(peer: [u8; 6], timeout_secs: i64) -> std::io::Result<std::fs::File> {
@@ -101,6 +141,9 @@ fn connect_sdp(peer: [u8; 6], timeout_secs: i64) -> std::io::Result<std::fs::Fil
         l2_cid: 0,
         l2_bdaddr_type: 0,
     };
+    let done = std::sync::Arc::new(std::sync::Mutex::new(false));
+    let stalled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    watch_connect(fd, peer, done.clone(), stalled.clone());
     let ret = unsafe {
         libc::connect(
             fd,
@@ -108,10 +151,18 @@ fn connect_sdp(peer: [u8; 6], timeout_secs: i64) -> std::io::Result<std::fs::Fil
             std::mem::size_of::<SockaddrL2>() as libc::socklen_t,
         )
     };
-    if ret < 0 {
-        let e = std::io::Error::last_os_error();
+    let os_err = std::io::Error::last_os_error();
+    if let Ok(mut d) = done.lock() {
+        *d = true;
+    }
+    if stalled.load(std::sync::atomic::Ordering::Acquire) {
         unsafe { libc::close(fd) };
-        return Err(e);
+        log(&format!("answered, but no SDP channel {} ms after -- a reset, re-paging at once", SDP_AFTER_ACL.as_millis()));
+        return Err(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "answered, no SDP channel"));
+    }
+    if ret < 0 {
+        unsafe { libc::close(fd) };
+        return Err(os_err);
     }
     // SAFETY: fd is a freshly opened, connected, exclusively-owned socket descriptor.
     Ok(unsafe { std::fs::File::from_raw_fd(fd) })
