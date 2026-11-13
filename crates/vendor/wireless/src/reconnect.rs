@@ -386,6 +386,8 @@ pub fn run(
     // `None` = nothing logged yet; `Some(true)` = had bonds; `Some(false)` = idle.
     let mut last_state: Option<bool> = None;
     let mut last_manual_log = false;
+    // The phones a round had already paged when the app's policy arrived mid-round: the re-planned rest skips them.
+    let mut paged_before: Vec<[u8; 6]> = Vec::new();
     while !shutdown.load(Ordering::Relaxed) {
         // Never fight an in-progress session (accept path or a prior reconnect). Advisory fast-path
         // only — the authoritative claim is the compare_exchange in attempt().
@@ -419,6 +421,8 @@ pub fn run(
             continue;
         }
 
+        // This round plans by the policy as it is now: only a change while it pages re-plans it.
+        ctrl.take_policy_changed();
         // An explicit request from the device screen. Consumed here, so it fires exactly once.
         let request = ctrl.take_request();
         let auto = ctrl.policy().auto_connect;
@@ -461,9 +465,10 @@ pub fn run(
                     log(&format!("switch hold -- paging only {}", control::fmt_addr(&held)));
                     vec![held]
                 }
-                _ => ctrl.call_order(bonds.clone()),
+                _ => ctrl.call_order(bonds.clone()).into_iter().filter(|p| !paged_before.contains(p)).collect(),
             },
         };
+        paged_before.clear();
 
         let want = round_page_slots(first_round, targets.len());
         if want != page_slots {
@@ -475,9 +480,10 @@ pub fn run(
                 Err(e) => log(&format!("page timeout not set ({e}); paging with the controller's")),
             }
         }
+        let mut paged = Vec::new();
         let Walk { ran, rejected } = walk(
             &targets,
-            || shutdown.load(Ordering::Relaxed) || session_active.load(Ordering::Relaxed),
+            || shutdown.load(Ordering::Relaxed) || session_active.load(Ordering::Relaxed) || ctrl.policy_changed(),
             |peer| {
                 log(&format!(
                     "{} answered and reset the link -- paging it once more in {RESET_RETRY_SECS}s before the next phone",
@@ -488,6 +494,7 @@ pub fn run(
                     && !session_active.load(Ordering::Relaxed)
             },
             |peer| {
+                paged.push(peer);
                 let result = attempt(peer, name, shutdown, session_active, ctrl);
                 if streak.note(peer, result, bonds_written(), std::time::SystemTime::now(), Instant::now())
                     && !session_active.load(Ordering::Relaxed)
@@ -502,6 +509,13 @@ pub fn run(
                 result
             },
         );
+        // The app's policy came while this round paged (btd can page before Carlink's SET_POLICY reaches it): the phones
+        // not yet paged go at once, in its order, and a round that has not ended keeps its first-round page.
+        if !ran && !rejected && ctrl.take_policy_changed() {
+            log("the app's call order came mid-round -- paging the rest by it");
+            paged_before = paged;
+            continue;
+        }
         if rejected {
             backoff = BACKOFF_MAX_SECS; // the phone said no; more paging only rotates codes
         } else if ran {

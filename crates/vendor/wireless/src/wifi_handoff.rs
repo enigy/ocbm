@@ -236,32 +236,45 @@ const WLAN_LOCK: &str = "/tmp/.radio_lock_wlan";
 const AP_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 /// A lock with no pid is the moment between its `mkdir` and its pid write, or one a killed holder left behind.
 const LOCK_NO_PID_SECS: u64 = 30;
+/// How long a 0x5702 waited for the AP: Ok once it serves, Err on the bound or an abort.
+pub type ApWait = Result<std::time::Duration, std::time::Duration>;
 
 /// Whether the AP bring-up is still running. Since the Mac's 13 Nov bench btd starts once Bluetooth is up, beside
 /// `wifi_ap_on` rather than after it (about 1-2 s of every connect), so a 0x5702 can arrive before the AP serves.
 fn ap_bring_up_running(lock: &std::path::Path) -> bool {
     let Ok(meta) = std::fs::metadata(lock) else { return false };
     match std::fs::read_to_string(lock.join("pid")) {
-        Ok(pid) => std::path::Path::new("/proc").join(pid.trim()).exists(),
-        Err(_) => meta.modified().ok().and_then(|m| m.elapsed().ok()).is_some_and(|age| age.as_secs() < LOCK_NO_PID_SECS),
+        Ok(pid) => pid.trim().parse::<libc::pid_t>().is_ok_and(pid_alive),
+        Err(_) => meta
+            .modified()
+            .ok()
+            .and_then(|m| m.elapsed().ok())
+            .is_some_and(|age| age.as_secs() < LOCK_NO_PID_SECS),
     }
+}
+
+/// A signal-0 probe, which works where there is no /proc (the Mac's gate): EPERM is a live process of another user.
+fn pid_alive(pid: libc::pid_t) -> bool {
+    // SAFETY: kill with signal 0 sends nothing; it only checks that the process exists.
+    pid > 0 && (unsafe { libc::kill(pid, 0) } == 0
+            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
 }
 
 /// Wait, up to [`AP_WAIT`], for an AP bring-up still running to finish, so the 0x5703 describes an AP that serves.
-/// True once none is running (at once, when the AP was up first); false on the bound or on `abort`.
-pub fn wait_for_ap(abort: &dyn Fn() -> bool) -> bool {
+/// Ok with the time waited once none is running (zero when the AP was up first); Err with it on the bound or `abort`.
+pub fn wait_for_ap(abort: &dyn Fn() -> bool) -> ApWait {
     wait_for_ap_at(std::path::Path::new(WLAN_LOCK), AP_WAIT, abort)
 }
 
-fn wait_for_ap_at(lock: &std::path::Path, max: std::time::Duration, abort: &dyn Fn() -> bool) -> bool {
+fn wait_for_ap_at(lock: &std::path::Path, max: std::time::Duration, abort: &dyn Fn() -> bool) -> ApWait {
     let start = std::time::Instant::now();
     while ap_bring_up_running(lock) {
         if abort() || start.elapsed() >= max {
-            return false;
+            return Err(start.elapsed());
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    true
+    Ok(start.elapsed())
 }
 
 // ---- On-target AP glue: fill AccessoryWiFiConfig from the box's live hostapd.conf --------------
@@ -386,18 +399,18 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let never = || false;
         let short = std::time::Duration::from_millis(300);
-        assert!(wait_for_ap_at(&lock, short, &never), "no lock: the AP was up first");
+        assert!(wait_for_ap_at(&lock, short, &never).is_ok(), "no lock: the AP was up first");
 
         std::fs::create_dir(&lock).unwrap();
         std::fs::write(lock.join("pid"), std::process::id().to_string()).unwrap();
-        assert!(!wait_for_ap_at(&lock, short, &never), "a live holder: wait to the bound");
-        assert!(!wait_for_ap_at(&lock, std::time::Duration::from_secs(5), &|| true), "abort ends the wait");
+        assert!(wait_for_ap_at(&lock, short, &never).is_err(), "a live holder: wait to the bound");
+        assert!(wait_for_ap_at(&lock, std::time::Duration::from_secs(5), &|| true).is_err(), "abort ends the wait");
 
         std::fs::write(lock.join("pid"), "999999999").unwrap();
-        assert!(wait_for_ap_at(&lock, short, &never), "a dead holder's lock is not a bring-up");
+        assert!(wait_for_ap_at(&lock, short, &never).is_ok(), "a dead holder's lock is not a bring-up");
 
         std::fs::remove_file(lock.join("pid")).unwrap();
-        assert!(!wait_for_ap_at(&lock, short, &never), "a fresh lock before its pid write");
+        assert!(wait_for_ap_at(&lock, short, &never).is_err(), "a fresh lock before its pid write");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

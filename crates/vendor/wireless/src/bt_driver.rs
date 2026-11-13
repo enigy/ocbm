@@ -448,9 +448,17 @@ fn process_one(
         // and claim /tmp/carplay_transport for a session that can never arrive — suppressing the
         // wired supervisor with it.
         // The same while the AP is still coming up: btd starts beside wifi_ap_on now, not after it.
-        if !crate::wifi_handoff::wait_for_ap(abort) {
-            log("RX 0x5702 RequestAccessoryWiFiConfig -- the AP is still coming up; not replying yet");
-            return false;
+        // Every wait is logged, so a bench sees a phone that asked early even when the AP then came in time.
+        match crate::wifi_handoff::wait_for_ap(abort) {
+            Ok(w) if w.as_millis() == 0 => {}
+            Ok(w) => log(&format!("RX 0x5702 RequestAccessoryWiFiConfig -- waited {} ms for the AP", w.as_millis())),
+            Err(w) => {
+                log(&format!(
+                    "RX 0x5702 RequestAccessoryWiFiConfig -- the AP is still coming up after {} ms; not replying yet",
+                    w.as_millis()
+                ));
+                return false;
+            }
         }
         let Some(cfg) = crate::wifi_handoff::read_hostapd_ap_config() else {
             log("RX 0x5702 RequestAccessoryWiFiConfig -- no AP config readable; not replying");

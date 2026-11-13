@@ -377,6 +377,9 @@ pub struct Control {
     /// and every phone-initiated connect — report `active:false`, and the app then offered
     /// **Forget** for the phone that was actively projecting, which deletes a live phone's link key.
     session_active: Arc<AtomicBool>,
+    /// The app's policy changed since the reconnect loop last looked. Carlink sends it every session, but btd can be
+    /// paging before it arrives (the Mac's 13 Nov bench), so a round in progress re-plans by it ([`Self::take_policy_changed`]).
+    policy_changed: AtomicBool,
     /// The head unit's yes/no for a Numeric-Comparison pairing prompt, read by the SSP agent's mgmt
     /// loop. PROCESS-lifetime like the rest of this struct, and cloned into each session's agent
     /// thread — pairing happens on the accept path, before any session exists, so a per-session
@@ -563,7 +566,18 @@ impl Control {
         };
         if changed {
             save_policy(&p);
+            self.policy_changed.store(true, Ordering::Release);
         }
+    }
+
+    /// Whether the policy changed since the last [`Self::take_policy_changed`], without clearing it.
+    pub fn policy_changed(&self) -> bool {
+        self.policy_changed.load(Ordering::Acquire)
+    }
+
+    /// Whether the policy changed since the last call, clearing it.
+    pub fn take_policy_changed(&self) -> bool {
+        self.policy_changed.swap(false, Ordering::AcqRel)
     }
 
     /// Take any pending connect request. Called by the reconnect loop each round.
@@ -1381,6 +1395,18 @@ mod tests {
         assert!(handle_request(&c, r#"{"cmd":"policy","autoConnect":false}"#).contains("\"ok\":true"));
         assert!(!c.policy().auto_connect);
         assert_eq!(c.policy().order.len(), 1, "an omitted order must not wipe the stored one");
+    }
+
+    #[test]
+    fn only_a_changed_policy_flags_the_round_to_re_plan() {
+        let c = Control::default();
+        assert!(!c.take_policy_changed());
+        c.set_policy(Policy { auto_connect: true, order: vec![[2, 0, 0, 0, 0, 0]] });
+        assert!(c.policy_changed(), "peeking must not clear");
+        assert!(c.take_policy_changed());
+        assert!(!c.policy_changed());
+        c.set_policy(Policy { auto_connect: true, order: vec![[2, 0, 0, 0, 0, 0]] });
+        assert!(!c.take_policy_changed(), "Carlink re-sends the same policy every session");
     }
 
     #[test]
