@@ -43,6 +43,14 @@ const FIRST_RETRY_SECS: u64 = 2;
 /// Mac's 13 Nov bench, at times a 2.56 s page-scan interval), which cost 9.7 s. 3.75 s covers that interval.
 const FIRST_ROUND_PAGE_SLOTS: u16 = 6_000;
 
+/// `order` with the phones whose page failed last round moved last, in their order. After a failed first round the
+/// next one paged the absent first-listed phone first again, now for the full 5.12 s; and the present phone,
+/// paged straight after an absent one's timeout, answered and reset the link in 4 of 17 connects (the Mac, 13 Nov).
+fn absent_last(order: Vec<[u8; 6]>, absent: &[[u8; 6]]) -> Vec<[u8; 6]> {
+    let (gone, here): (Vec<_>, Vec<_>) = order.into_iter().partition(|p| absent.contains(p));
+    here.into_iter().chain(gone).collect()
+}
+
 /// A round's order less the phones it had paged before the app's policy re-planned it.
 fn unpaged(order: Vec<[u8; 6]>, paged_before: &[[u8; 6]]) -> Vec<[u8; 6]> {
     order.into_iter().filter(|p| !paged_before.contains(p)).collect()
@@ -64,6 +72,11 @@ fn round_page_slots(first_round: bool, phones: usize) -> u16 {
 /// cycle behind [`FIRST_RETRY_SECS`] found the very next attempt succeeds, but that retry only runs once
 /// no phone in the round connected.
 const RESET_RETRY_SECS: u64 = 2;
+/// For the first [`EARLY_WINDOW`] after btd starts (a host has just come), rounds are this far apart, not the doubling
+/// backoff: a phone that comes back (a driver who walks up after the display is on) waited 10, 20, then 40 s for
+/// the next page (the Mac, 13 Nov). A phone that said no still gets [`BACKOFF_MAX_SECS`].
+const EARLY_GAP_SECS: u64 = 5;
+const EARLY_WINDOW: Duration = Duration::from_secs(120);
 /// Let bring-up/SSP/SDP settle and give the phone a moment to connect IN on its own before we start
 /// paging it ourselves.
 ///
@@ -393,6 +406,9 @@ pub fn run(
     let mut last_manual_log = false;
     // The phones a round had already paged when the app's policy arrived mid-round: the re-planned rest skips them.
     let mut paged_before: Vec<[u8; 6]> = Vec::new();
+    // The phones whose page failed last round: the next one pages them last ([`absent_last`]).
+    let mut absent_before: Vec<[u8; 6]> = Vec::new();
+    let started = Instant::now();
     while !shutdown.load(Ordering::Relaxed) {
         // Never fight an in-progress session (accept path or a prior reconnect). Advisory fast-path
         // only — the authoritative claim is the compare_exchange in attempt().
@@ -470,7 +486,7 @@ pub fn run(
                     log(&format!("switch hold -- paging only {}", control::fmt_addr(&held)));
                     vec![held]
                 }
-                _ => unpaged(ctrl.call_order(bonds.clone()), &paged_before),
+                _ => absent_last(unpaged(ctrl.call_order(bonds.clone()), &paged_before), &absent_before),
             },
         };
         paged_before.clear();
@@ -486,6 +502,8 @@ pub fn run(
             }
         }
         let mut paged = Vec::new();
+        let mut absent_now = Vec::new();
+        let mut prev_failed = false;
         let Walk { ran, rejected } = walk(
             &targets,
             || shutdown.load(Ordering::Relaxed) || session_active.load(Ordering::Relaxed) || ctrl.policy_changed(),
@@ -501,7 +519,16 @@ pub fn run(
             |peer| {
                 paged.push(peer);
                 let result = attempt(peer, name, shutdown, session_active, ctrl);
-                if streak.note(peer, result, bonds_written(), std::time::SystemTime::now(), Instant::now())
+                // A reset straight after another phone's page timed out is most likely the two crossing, not a
+                // forgotten pairing: the phone was up on the next page every time (the Mac, 13 Nov). Not counted.
+                let after_absent = result == Attempt::Reset && prev_failed;
+                prev_failed = result == Attempt::Failed;
+                if prev_failed {
+                    absent_now.push(peer);
+                }
+                if after_absent {
+                    log("the reset came right after another phone's page timed out -- not counted toward a forgotten pairing");
+                } else if streak.note(peer, result, bonds_written(), std::time::SystemTime::now(), Instant::now())
                     && !session_active.load(Ordering::Relaxed)
                 {
                     log(&format!(
@@ -521,6 +548,7 @@ pub fn run(
             paged_before = paged;
             continue;
         }
+        absent_before = absent_now;
         if rejected {
             backoff = BACKOFF_MAX_SECS; // the phone said no; more paging only rotates codes
         } else if ran {
@@ -538,7 +566,16 @@ pub fn run(
         if quick {
             log(&format!("first page round failed -- one quick retry in {FIRST_RETRY_SECS}s"));
         }
-        if !sleep_or_request(if quick { FIRST_RETRY_SECS } else { backoff }, shutdown, ctrl) {
+        // In the first [`EARLY_WINDOW`] after a host came, rounds stay [`EARLY_GAP_SECS`] apart, still a floor.
+        let early = !rejected && started.elapsed() < EARLY_WINDOW;
+        let gap = if quick {
+            FIRST_RETRY_SECS
+        } else if early {
+            EARLY_GAP_SECS.min(backoff)
+        } else {
+            backoff
+        };
+        if !sleep_or_request(gap, shutdown, ctrl) {
             break;
         }
         if rejected {
@@ -553,7 +590,7 @@ pub fn run(
 
 #[cfg(test)]
 mod tests {
-    use super::{round_page_slots, unpaged, FIRST_ROUND_PAGE_SLOTS};
+    use super::{absent_last, round_page_slots, unpaged, FIRST_ROUND_PAGE_SLOTS};
     use super::{default_settle_secs, failure, walk, Attempt, ResetStreak, Walk, INITIAL_SETTLE_DEFAULT_SECS};
     use std::time::{Duration, Instant};
 
@@ -717,6 +754,15 @@ mod tests {
         assert!(!s.note(SCOTT, Attempt::Reset, old, t, m));
         assert!(!s.note(SCOTT, Attempt::Reset, old, t, m), "any phone's session ends every run");
         assert!(s.note(SCOTT, Attempt::Reset, old, t, m));
+    }
+
+    /// The Mac, 13 Nov: after a failed first round the absent first-listed phone was paged first again.
+    #[test]
+    fn a_phone_whose_page_failed_goes_last_next_round() {
+        const THIRD: [u8; 6] = [3, 0, 0, 0, 0, 0];
+        assert_eq!(absent_last(vec![SCOTT, YODA, THIRD], &[SCOTT]), vec![YODA, THIRD, SCOTT]);
+        assert_eq!(absent_last(vec![SCOTT, YODA, THIRD], &[THIRD, SCOTT]), vec![YODA, SCOTT, THIRD], "in their own order");
+        assert_eq!(absent_last(vec![SCOTT, YODA], &[]), vec![SCOTT, YODA]);
     }
 
     #[test]

@@ -223,6 +223,8 @@ struct Daemon {
     /// (Carlink, `ocbm-host`, other bench tooling). Purely diagnostic: nothing gates on it, and an
     /// absent label reads exactly as it always did.
     host_name: Option<String>,
+    /// When the host's last frame came, for the line a host speaking after a silence gets ([`HOST_SILENCE`]).
+    last_frame: Option<Instant>,
     /// Last host instance nonce seen in CT_HELLO (see `ocbm_proto::CT_HELLO`). None until a host that
     /// supplies one connects; 0 is never stored (older hosts opt out by sending it).
     host_instance: Option<u32>,
@@ -784,6 +786,14 @@ const HEARD_FILE: &str = "/tmp/ocbmd_selftest_heard";
 const ANSWERED_FILE: &str = "/tmp/ocbmd_answered";
 #[cfg(test)]
 const ANSWERED_FILE: &str = "/tmp/ocbmd_selftest_answered";
+
+/// A host silent this long, then speaking again, gets a log line ([`Daemon::handle`]).
+const HOST_SILENCE: Duration = Duration::from_secs(5);
+
+/// The system uptime as /proc/uptime gives it (seconds, two decimals), for log lines.
+fn uptime_text() -> String {
+    std::fs::read_to_string("/proc/uptime").unwrap_or_default().split(' ').next().unwrap_or("?").trim().to_string()
+}
 
 /// Write the system uptime, in whole seconds, to `path` (the clock is set by the host and jumps; the
 /// uptime does not).
@@ -3521,6 +3531,17 @@ impl Daemon {
     }
 
     fn handle(&mut self, ch: u16, _flags: u8, pl: &[u8]) {
+        // A host's frames after a silence: the moment a Carlink opened the adapter and spoke, placed on the box's clock
+        // (the Mac, 13 Nov: one wake got no HELLO_ACK for 21 s and nothing showed which side stalled).
+        let now = Instant::now();
+        if self.last_frame.map_or(true, |t| now.duration_since(t) >= HOST_SILENCE) {
+            eprintln!(
+                "[ocbmd] host frames at uptime {} s ({})",
+                uptime_text(),
+                self.last_frame.map_or_else(|| "the first since ocbmd started".to_string(), |t| format!("after {} s of silence", now.duration_since(t).as_secs()))
+            );
+        }
+        self.last_frame = Some(now);
         self.note_host_frame(ch == p::CH_CTRL && pl.first() == Some(&p::CT_HELLO));
         match ch {
             p::CH_CTRL => {
@@ -3616,8 +3637,10 @@ impl Daemon {
                     // the same nonce and label — the ordinary case, and the one a "why is there no
                     // HELLO in the log" investigation starts from — left no trace at all.
                     eprintln!(
-                        "[ocbmd] HELLO nonce={inst:#010x} caps={caps:#x} label={label:?} replaced={} reattached={}",
-                        self.host_replaced, self.host_reattached
+                        "[ocbmd] HELLO nonce={inst:#010x} caps={caps:#x} label={label:?} replaced={} reattached={} uptime={} s",
+                        self.host_replaced,
+                        self.host_reattached,
+                        uptime_text()
                     );
                     let mut a = [0u8; 7];
                     a[0] = p::CT_HELLO_ACK;
@@ -4461,6 +4484,7 @@ fn main() {
         present: false,
         hb_unsub_nudged_at: None,
         host_name: None,
+        last_frame: None,
         box_health: None,
         bt,
         last_box_health_check: None,
@@ -4956,6 +4980,7 @@ mod tests {
             present: false,
             hb_unsub_nudged_at: None,
             host_name: None,
+        last_frame: None,
             box_health: None,
             // No thread: the tests drive the atomics directly. Seeded with a FRESH all-false sample
             // so the default fixture exercises the normal (probe-healthy) path; the staleness path
