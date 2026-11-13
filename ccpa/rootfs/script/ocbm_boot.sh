@@ -90,11 +90,17 @@ touch /tmp/UDiskPassThroughMode
   # Boot radio preload, on unless /script/radio_preload_off (Scott, 13 Nov; it switches itself off after a preload
   # that never finished): drivers + BT attach into the between-sessions state while the head
   # unit boots (radio_hal.sh do_preload has the why and the wedge guards). After ocbmd and the
-  # supervisor, backgrounded, so it can never delay the management link; never on a first-boot
-  # trial, whose self-revert must not share the boot with anything new.
+  # supervisor, backgrounded, so it can never delay the management link. A start with a self-test shares the boot
+  # with nothing new until it passes: the dispatcher names its pass file in OCBM_PRELOAD_AFTER, and the preload
+  # waits up to 120 s for it (a failure reverts or rolls back before then). Never on the legacy first-boot trial
+  # (/script/ocbm_trial), whose self-revert has no self-test to wait for.
   if [ ! -e /script/radio_preload_off ] && [ ! -e /script/ocbm_trial ] && [ -r /script/radio_hal.sh ]; then
-    echo "[ocbm-boot] radio preload starting" >> /tmp/box.log
-    setsid sh /script/radio_hal.sh preload >> /tmp/box.log 2>&1 </dev/null &
+    echo "[ocbm-boot] radio preload starting${OCBM_PRELOAD_AFTER:+ once the self-test passes}" >> /tmp/box.log
+    setsid sh -c 'i=0; while [ -n "$1" ] && [ ! -e "$1" ]; do
+        [ "$i" -ge 120 ] && { echo "[ocbm-boot] radio preload skipped: no self-test pass in 120 s"; exit 0; }
+        i=$((i + 1)); sleep 1
+      done
+      exec sh /script/radio_hal.sh preload' preload "${OCBM_PRELOAD_AFTER:-}" >> /tmp/box.log 2>&1 </dev/null &
   fi
 
   # No remote login in OCBM mode (security review C1, 2026-10-21). The box's rcS starts dropbear

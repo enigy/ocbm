@@ -36,7 +36,7 @@ branches); the old paths survive only in comments recording why they changed. Si
 runs in the background beside `bt_on` (Bluetooth is the critical path), and `btd` starts once both are done:
 its 0x5703 reply reads the AP's SSID and passphrase. They share only the WLAN driver load, which
 `wlan_driver_up` serialises under its own lock, and `radio_detect.sh` writes its descriptor through a
-per-caller temporary file.
+per-caller temporary file. `caps()` detects once per boot and reuses a descriptor that found wireless.
 
 #### Why "it's Linux, it should be generic" does not apply here
 

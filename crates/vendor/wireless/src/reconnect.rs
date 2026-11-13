@@ -36,11 +36,12 @@ const BACKOFF_MAX_SECS: u64 = 60;
 /// very next attempt succeeded - but only after the 10 s floor, so each cost ~15 s. Once per daemon
 /// start, so it cannot spin: every later round still gets the floor and the doubling.
 const FIRST_RETRY_SECS: u64 = 2;
-/// The first round's page, in 0.625 ms slots (2.5 s): an absent first-listed phone cost the whole 5.12 s default
+/// The first round's page, in 0.625 ms slots (3.75 s): an absent first-listed phone cost the whole 5.12 s default
 /// before the next phone was paged (the Mac's 12 Nov bench: 5.2 s of "Host is down"). Scott, 13 Nov: keep the
 /// driver's order, page each phone briefly in turn first, and give later rounds the full default, so a phone slow
-/// to answer is still reached. A present iPhone answers well inside it: it scans for pages every 1.28 s.
-const FIRST_ROUND_PAGE_SLOTS: u16 = 4_000;
+/// to answer is still reached. 2.5 s was tight: a present iPhone answered in 0.23-2.58 s and missed it once in 11 (the
+/// Mac's 13 Nov bench, at times a 2.56 s page-scan interval), which cost 9.7 s. 3.75 s covers that interval.
+const FIRST_ROUND_PAGE_SLOTS: u16 = 6_000;
 
 /// The page timeout for a round: the short one for the first walk over more than one phone, else the default.
 fn round_page_slots(first_round: bool, phones: usize) -> u16 {
@@ -546,7 +547,7 @@ mod tests {
     #[test]
     fn the_first_round_over_several_phones_pages_briefly_and_later_rounds_in_full() {
         assert_eq!(round_page_slots(true, 2), FIRST_ROUND_PAGE_SLOTS);
-        assert_eq!(u64::from(FIRST_ROUND_PAGE_SLOTS) * 5 / 8, 2_500, "2.5 s");
+        assert_eq!(u64::from(FIRST_ROUND_PAGE_SLOTS) * 5 / 8, 3_750, "3.75 s");
         assert_eq!(round_page_slots(false, 2), crate::hci::PAGE_TIMEOUT_DEFAULT, "a later round");
         assert_eq!(round_page_slots(true, 1), crate::hci::PAGE_TIMEOUT_DEFAULT, "one phone: nothing to hand on to");
     }

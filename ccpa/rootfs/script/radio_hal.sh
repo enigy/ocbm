@@ -122,8 +122,13 @@ publish() {  # $1 = state file, rest = KEY=VALUE...
 }
 
 caps() {
-  # Refresh the descriptor unless a caller pre-loaded one. Detection is read-only and cheap.
-  [ -x /script/radio_detect.sh ] && sh /script/radio_detect.sh -q >/dev/null 2>&1
+  # Detect once per boot: /tmp starts empty at every power-up, and what this script reads from the descriptor (the
+  # chip, its driver and attach lines) cannot change within one. Detection costs 1.0 s alone and 1.6 s for two at
+  # once (the Mac's 13 Nov bench), paid by every verb while wifi_ap_on and bt_on run side by side. A descriptor
+  # that found no wireless is detected again. Its post-load facts (interface, MACs) go stale; only btd's start-up
+  # log reads them, and this script enumerates its own (wlan_iface, hci_dev).
+  grep -qx "RADIO_WIRELESS=yes" "$CAPS" 2>/dev/null \
+    || { [ -x /script/radio_detect.sh ] && sh /script/radio_detect.sh -q >/dev/null 2>&1; }
   [ -f "$CAPS" ] || { log "no descriptor at $CAPS and radio_detect.sh is missing"; return 1; }
 
   # A MALFORMED DESCRIPTOR MUST NEVER ABORT THIS SCRIPT. Measured: an extracted vendor line
@@ -493,15 +498,20 @@ do_wifi_ap_off() {
 # 2026-10-20, IW416), done here while the box waits for the head unit to boot. A deliberate,
 # owner-approved exception to docs/carplay/04_CAPABILITIES_AND_CONFIG.md directive 3 - see there.
 # Opt-in until Scott made it the default (13 Nov, the connect-time brief): nothing ever set the opt-in flag,
-# so it never ran. It still never runs on the first boot after an install or update (ocbm_boot.sh).
+# so it never ran. On a boot with a self-test (a trial, or an update's), it waits for the self-test to pass (ocbm_boot.sh).
 #
-# Two guards against a boot-time wedge on a unit with no UART:
+# Three guards, two against a boot-time wedge on a unit with no UART:
 #  * ONE attach attempt (RADIO_BT_MAX_TRIES=1): never reclaim+reset, the GPIO reset under a live
 #    WLAN driver being the wedge-prone step. A failure is left to the app-driven bt_on, exactly as
 #    if this had not run.
 #  * An in-flight marker on flash. A boot that finds it knows the previous preload never finished
 #    (hung, or power lost inside it) and DISABLES the preload by writing the off flag, so a
 #    unit that wedges here costs one bad boot, not one in two.
+#  * A session owns the radios once a host is here. A Carlink already plugged in when the adapter
+#    boots (as after an update) can reach bt_on before this does: the preload then stands down, and
+#    it never powers off a controller it did not bring up itself (the Mac's 13 Nov review).
+HOST_FLAG=/tmp/host_present
+host_here() { [ "$(cat "$HOST_FLAG" 2>/dev/null)" = 1 ]; }
 PRELOAD_OFF=/script/radio_preload_off
 PRELOAD_MARK=/script/.radio_preload_inflight
 do_preload() {
@@ -510,12 +520,17 @@ do_preload() {
     log "preload: the previous boot's preload never finished - preload DISABLED (rm $PRELOAD_OFF to re-enable)"
     return 1
   fi
+  if host_here; then
+    log "preload: a host is here - left to its session"
+    return 0
+  fi
   touch "$PRELOAD_MARK"; sync
   _p0=$(cut -d' ' -f1 /proc/uptime)
   RADIO_BT_MAX_TRIES=1
   do_bt_on; _pr=$?
-  # Attached (fresh, or already there): power it down to the between-sessions state.
-  { [ "$_pr" = 0 ] || [ "$_pr" = 2 ]; } && do_bt_off
+  # Attached by this preload: power it down to the between-sessions state. Not when it found the controller up
+  # (rc 2: someone else's), and not once a host has come: its session is waiting on this lock for the radio.
+  if [ "$_pr" = 0 ] && ! host_here; then do_bt_off; fi
   rm -f "$PRELOAD_MARK"; sync
   log "preload: done rc=$_pr in $(awk "BEGIN{printf \"%.1f\", $(cut -d' ' -f1 /proc/uptime)-$_p0}") s, wlan=$(wlan_iface 2>/dev/null || echo none) bt=$(hciconfig 2>/dev/null | grep -oE 'UP RUNNING|DOWN' | head -1)"
   return $_pr

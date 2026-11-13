@@ -228,6 +228,7 @@ selftest() {
     fi
     first_start PASSED
     [ "$mode" = confirmed ] && [ -x "$S/ocbm_finish.sh" ] && "$S/ocbm_finish.sh" >> "$RUN/box.log" 2>&1
+    : > "$RUN/ocbm_selftest_passed"   # the boot radio preload waits for this (ocbm_boot.sh)
   else
     log "self-test: $(tail -1 "$RUN/ocbm_selftest.txt")"
     if [ "$update_trial" = 1 ]; then   # back to the OCBM the update replaced, not to stock
@@ -443,6 +444,10 @@ if [ -z "$ROOT" ]; then   # the first lines of stock's start script (and ccpa/ro
   rm -f /dev/random && ln -s /dev/urandom /dev/random &                 # non-blocking openssl RNG
   echo y > /sys/module/printk/parameters/time && echo 7 > /proc/sys/kernel/printk &
 fi
+# A start with a self-test (a trial, an update's, a finish) runs nothing new beside it: ocbm_boot.sh's radio preload
+# waits until the self-test has passed (and a confirmed start's finish is done). A failure never gets that far.
+rm -f "$RUN/ocbm_selftest_passed"
+if [ "$mode" != final ] || [ "$update_trial" = 1 ]; then OCBM_PRELOAD_AFTER="$RUN/ocbm_selftest_passed"; export OCBM_PRELOAD_AFTER; fi
 "$S/ocbm_boot.sh"   # gadget as the OCBM accessory, ocbmd, session supervisor; returns at once
 [ -x "$S/init_gpio.sh" ] && "$S/init_gpio.sh" >/dev/null 2>&1 &   # stock: Bluetooth reset line, quick-charge pins
 respawn "$S/run_ocbmd.sh" </dev/null >/dev/null 2>&1 &
