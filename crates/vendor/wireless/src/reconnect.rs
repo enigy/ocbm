@@ -43,7 +43,7 @@ const FIRST_RETRY_SECS: u64 = 2;
 /// Mac's 13 Nov bench, at times a 2.56 s page-scan interval), which cost 9.7 s. 3.75 s covers that interval.
 const FIRST_ROUND_PAGE_SLOTS: u16 = 6_000;
 
-/// `order` with the phones whose page failed last round moved last, in their order. After a failed first round the
+/// `order` with the phones whose page timed out last round moved last, in their order. After a failed first round the
 /// next one paged the absent first-listed phone first again, now for the full 5.12 s; and the present phone,
 /// paged straight after an absent one's timeout, answered and reset the link in 4 of 17 connects (the Mac, 13 Nov).
 fn absent_last(order: Vec<[u8; 6]>, absent: &[[u8; 6]]) -> Vec<[u8; 6]> {
@@ -51,9 +51,75 @@ fn absent_last(order: Vec<[u8; 6]>, absent: &[[u8; 6]]) -> Vec<[u8; 6]> {
     here.into_iter().chain(gone).collect()
 }
 
-/// A round's order less the phones it had paged before the app's policy re-planned it.
-fn unpaged(order: Vec<[u8; 6]>, paged_before: &[[u8; 6]]) -> Vec<[u8; 6]> {
-    order.into_iter().filter(|p| !paged_before.contains(p)).collect()
+/// What a round carries to the next, and across a re-plan within one (the Mac's 13 Nov review, R1-R3).
+#[derive(Debug, Default)]
+struct Rounds {
+    /// The phones whose page timed out in the last finished round: the next one pages them last.
+    absent_before: Vec<[u8; 6]>,
+    /// This round's timed-out pages so far, kept across a re-plan.
+    absent_now: Vec<[u8; 6]>,
+    /// The phones this round has paged, kept across a re-plan: the re-planned rest skips them.
+    paged: Vec<[u8; 6]>,
+    /// Whether the last page, in this round, timed out: a reset right after it is a crossing.
+    prev_absent: bool,
+    /// The app's order came mid-round: the next walk is the rest of this round, not a new one.
+    replanning: bool,
+}
+
+impl Rounds {
+    /// A walk starts: a new round forgets the last one's pages; the rest of a re-planned round keeps them.
+    fn begin(&mut self) {
+        if !self.replanning {
+            self.absent_now.clear();
+            self.paged.clear();
+            self.prev_absent = false;
+        }
+    }
+
+    /// The order to page in: the phones absent last round moved last BEFORE `call_order` (the pass-over), so a
+    /// passed-over phone stays last (R3), and less the phones this round already paged.
+    fn order(&self, bonds: Vec<[u8; 6]>, call_order: impl FnOnce(Vec<[u8; 6]>) -> Vec<[u8; 6]>) -> Vec<[u8; 6]> {
+        call_order(absent_last(bonds, &self.absent_before)).into_iter().filter(|p| !self.paged.contains(p)).collect()
+    }
+
+    /// One page and its result. False for a crossing reset, one straight after another phone's page timed out: the
+    /// two most likely crossed, and it is not counted toward a forgotten pairing (the Mac, 13 Nov).
+    fn paged(&mut self, peer: [u8; 6], result: Attempt) -> bool {
+        self.paged.push(peer);
+        let crossing = result == Attempt::Reset && self.prev_absent;
+        self.prev_absent = result == Attempt::Absent;
+        if self.prev_absent && !self.absent_now.contains(&peer) {
+            self.absent_now.push(peer);
+        }
+        !crossing
+    }
+
+    /// The walk ended. True when it re-plans: the app's order came mid-round (`changed`) and a phone is left to
+    /// page. Otherwise the round is over, and a session in it clears what it learned (R2).
+    fn end(&mut self, ran: bool, changed: bool, bonds: &[[u8; 6]]) -> bool {
+        self.replanning = !ran && changed && bonds.iter().any(|p| !self.paged.contains(p));
+        if !self.replanning {
+            self.absent_before = if ran { Vec::new() } else { std::mem::take(&mut self.absent_now) };
+        }
+        self.replanning
+    }
+
+    /// A session the phone started itself: nobody is absent.
+    fn session(&mut self) {
+        self.absent_before.clear();
+    }
+}
+
+/// The wait before the next round: [`FIRST_RETRY_SECS`] once after a failed first round; [`EARLY_GAP_SECS`] in the
+/// first [`EARLY_WINDOW`] after a host came (`early`); else the backoff, which starts doubling only after that window.
+fn round_gap(quick: bool, early: bool, backoff: u64) -> u64 {
+    if quick {
+        FIRST_RETRY_SECS
+    } else if early {
+        EARLY_GAP_SECS.min(backoff)
+    } else {
+        backoff
+    }
 }
 
 /// The page timeout for a round: the short one for the first walk over more than one phone, else the default.
@@ -167,8 +233,11 @@ fn sleep_or_request(secs: u64, shutdown: &AtomicBool, ctrl: &Control) -> bool {
 enum Attempt {
     /// The iAP2 driver ran (a real session, however short).
     Ran,
-    /// SDP/RFCOMM failed for an ordinary reason (absent phone, page timeout, lost claim).
+    /// SDP/RFCOMM failed for an ordinary reason (no iAP2 service, a lost claim, a refused connect).
     Failed,
+    /// The page timed out (`EHOSTDOWN`, "Host is down"): the phone is not here. The only result that demotes a phone
+    /// in the next round ([`Rounds`]) or makes the next one's reset a crossing.
+    Absent,
     /// The phone answered the page and then reset the link (`ConnectionReset` from SDP or RFCOMM): it is
     /// there but not ready, as an iPhone still letting go of a session a power cut ended. Paged once more
     /// before the next phone ([`walk`]).
@@ -179,10 +248,13 @@ enum Attempt {
     PairRejected,
 }
 
-/// [`Attempt::Reset`] when the phone reset the link, else [`Attempt::Failed`].
+/// [`Attempt::Reset`] when the phone reset the link, [`Attempt::Absent`] when the page timed out, else
+/// [`Attempt::Failed`].
 fn failure(e: &std::io::Error) -> Attempt {
     if e.kind() == std::io::ErrorKind::ConnectionReset {
         Attempt::Reset
+    } else if e.raw_os_error() == Some(libc::EHOSTDOWN) {
+        Attempt::Absent
     } else {
         Attempt::Failed
     }
@@ -248,7 +320,7 @@ impl ResetStreak {
                 self.runs.clear();
                 return false;
             }
-            Attempt::Failed | Attempt::PairRejected => {
+            Attempt::Failed | Attempt::Absent | Attempt::PairRejected => {
                 self.runs.remove(&peer);
                 return false;
             }
@@ -300,7 +372,7 @@ fn walk(
         }
         match result {
             Attempt::Ran => out.ran = true,
-            Attempt::Failed | Attempt::Reset => {}
+            Attempt::Failed | Attempt::Absent | Attempt::Reset => {}
             Attempt::PairRejected => {
                 out.rejected = true;
                 break; // do not page the next phone into the same rejection storm
@@ -404,16 +476,14 @@ pub fn run(
     // `None` = nothing logged yet; `Some(true)` = had bonds; `Some(false)` = idle.
     let mut last_state: Option<bool> = None;
     let mut last_manual_log = false;
-    // The phones a round had already paged when the app's policy arrived mid-round: the re-planned rest skips them.
-    let mut paged_before: Vec<[u8; 6]> = Vec::new();
-    // The phones whose page failed last round: the next one pages them last ([`absent_last`]).
-    let mut absent_before: Vec<[u8; 6]> = Vec::new();
+    let mut rounds = Rounds::default();
     let started = Instant::now();
     while !shutdown.load(Ordering::Relaxed) {
         // Never fight an in-progress session (accept path or a prior reconnect). Advisory fast-path
         // only — the authoritative claim is the compare_exchange in attempt().
         if session_active.load(Ordering::Relaxed) {
             streak.session();
+            rounds.session();
             if !interruptible_sleep(BACKOFF_START_SECS, shutdown) {
                 break;
             }
@@ -444,6 +514,7 @@ pub fn run(
 
         // This round plans by the policy as it is now: only a change while it pages re-plans it.
         ctrl.take_policy_changed();
+        rounds.begin();
         // An explicit request from the device screen. Consumed here, so it fires exactly once.
         let request = ctrl.take_request();
         let auto = ctrl.policy().auto_connect;
@@ -486,10 +557,9 @@ pub fn run(
                     log(&format!("switch hold -- paging only {}", control::fmt_addr(&held)));
                     vec![held]
                 }
-                _ => absent_last(unpaged(ctrl.call_order(bonds.clone()), &paged_before), &absent_before),
+                _ => rounds.order(bonds.clone(), |b| ctrl.call_order(b)),
             },
         };
-        paged_before.clear();
 
         let want = round_page_slots(first_round, targets.len());
         if want != page_slots {
@@ -501,9 +571,6 @@ pub fn run(
                 Err(e) => log(&format!("page timeout not set ({e}); paging with the controller's")),
             }
         }
-        let mut paged = Vec::new();
-        let mut absent_now = Vec::new();
-        let mut prev_failed = false;
         let Walk { ran, rejected } = walk(
             &targets,
             || shutdown.load(Ordering::Relaxed) || session_active.load(Ordering::Relaxed) || ctrl.policy_changed(),
@@ -517,16 +584,10 @@ pub fn run(
                     && !session_active.load(Ordering::Relaxed)
             },
             |peer| {
-                paged.push(peer);
                 let result = attempt(peer, name, shutdown, session_active, ctrl);
                 // A reset straight after another phone's page timed out is most likely the two crossing, not a
                 // forgotten pairing: the phone was up on the next page every time (the Mac, 13 Nov). Not counted.
-                let after_absent = result == Attempt::Reset && prev_failed;
-                prev_failed = result == Attempt::Failed;
-                if prev_failed {
-                    absent_now.push(peer);
-                }
-                if after_absent {
+                if !rounds.paged(peer, result) {
                     log("the reset came right after another phone's page timed out -- not counted toward a forgotten pairing");
                 } else if streak.note(peer, result, bonds_written(), std::time::SystemTime::now(), Instant::now())
                     && !session_active.load(Ordering::Relaxed)
@@ -543,12 +604,12 @@ pub fn run(
         );
         // The app's policy came while this round paged (btd can page before Carlink's SET_POLICY reaches it): the phones
         // not yet paged go at once, in its order, and a round that has not ended keeps its first-round page.
-        if !ran && !rejected && ctrl.take_policy_changed() {
+        // R1: the round's pages and timeouts carry into the rest, and a change with nothing left to page ends it.
+        let changed = !ran && !rejected && ctrl.take_policy_changed();
+        if rounds.end(ran, changed, &bonds) {
             log("the app's call order came mid-round -- paging the rest by it");
-            paged_before = paged;
             continue;
         }
-        absent_before = absent_now;
         if rejected {
             backoff = BACKOFF_MAX_SECS; // the phone said no; more paging only rotates codes
         } else if ran {
@@ -566,22 +627,15 @@ pub fn run(
         if quick {
             log(&format!("first page round failed -- one quick retry in {FIRST_RETRY_SECS}s"));
         }
-        // In the first [`EARLY_WINDOW`] after a host came, rounds stay [`EARLY_GAP_SECS`] apart, still a floor.
         let early = !rejected && started.elapsed() < EARLY_WINDOW;
-        let gap = if quick {
-            FIRST_RETRY_SECS
-        } else if early {
-            EARLY_GAP_SECS.min(backoff)
-        } else {
-            backoff
-        };
-        if !sleep_or_request(gap, shutdown, ctrl) {
+        if !sleep_or_request(round_gap(quick, early, backoff), shutdown, ctrl) {
             break;
         }
         if rejected {
             // The hold-off is over: drop the flag so the next attempt is judged on its own.
             let _ = std::fs::remove_file(bt_common::rfcomm::PAIR_REJECTED_FLAG);
-        } else if !ran && !quick {
+        } else if !ran && !quick && !early {
+            // Not in the early window: it would double under the 5 s gaps and jump to 60 s at its end (the Mac, 13 Nov).
             backoff = (backoff * 2).min(BACKOFF_MAX_SECS);
         }
     }
@@ -590,7 +644,9 @@ pub fn run(
 
 #[cfg(test)]
 mod tests {
-    use super::{absent_last, round_page_slots, unpaged, FIRST_ROUND_PAGE_SLOTS};
+    use super::{absent_last, round_gap, round_page_slots, Rounds, FIRST_ROUND_PAGE_SLOTS};
+    use super::{BACKOFF_START_SECS, EARLY_GAP_SECS, FIRST_RETRY_SECS};
+    use crate::control::Control;
     use super::{default_settle_secs, failure, walk, Attempt, ResetStreak, Walk, INITIAL_SETTLE_DEFAULT_SECS};
     use std::time::{Duration, Instant};
 
@@ -631,32 +687,107 @@ mod tests {
         (paged, walked)
     }
 
-    /// The Mac's 13 Nov bench: btd can page before Carlink's SET_POLICY reaches it. A policy that changes while
-    /// a round pages ends the walk after the phone in hand, and the rest go in the new order, skipping that one.
-    #[test]
-    fn a_policy_that_changes_mid_round_re_plans_the_phones_not_yet_paged() {
-        const THIRD: [u8; 6] = [3, 0, 0, 0, 0, 0];
-        let ctrl = crate::control::Control::default();
+    const THIRD: [u8; 6] = [3, 0, 0, 0, 0, 0];
+
+    fn set_order(ctrl: &Control, order: &[[u8; 6]]) {
+        ctrl.set_policy(crate::control::Policy { auto_connect: true, order: order.to_vec() });
+    }
+
+    /// One walk as `run()` wires it, with the bonds in the policy's order: what it paged, whether each page counted
+    /// toward a forgotten pairing, and whether it re-plans.
+    fn round(r: &mut Rounds, ctrl: &Control, answer: &mut dyn FnMut([u8; 6]) -> Attempt) -> (Vec<[u8; 6]>, Vec<bool>, bool) {
         ctrl.take_policy_changed();
-        let mut paged = Vec::new();
-        let walked = walk(
-            &[SCOTT, YODA, THIRD],
-            || ctrl.policy_changed(),
-            |_| true,
-            |peer| {
-                paged.push(peer);
-                if peer == SCOTT {
-                    // The app's order arrives while the first phone is paged.
-                    ctrl.set_policy(crate::control::Policy { auto_connect: true, order: vec![THIRD, SCOTT, YODA] });
-                }
-                Attempt::Failed
-            },
-        );
-        assert_eq!(paged, vec![SCOTT], "the walk stops after the phone in hand");
-        assert!(!walked.ran && !walked.rejected);
-        assert!(ctrl.take_policy_changed());
-        assert_eq!(unpaged(vec![THIRD, SCOTT, YODA], &paged), vec![THIRD, YODA], "the rest, in the new order");
-        assert!(!ctrl.policy_changed(), "taken once: the re-planned round is not stopped again");
+        r.begin();
+        let bonds = ctrl.policy().order;
+        let targets = r.order(bonds.clone(), |b| ctrl.call_order(b));
+        let (mut paged, mut counted) = (Vec::new(), Vec::new());
+        let walked = walk(&targets, || ctrl.policy_changed(), |_| true, |peer| {
+            let result = answer(peer);
+            paged.push(peer);
+            counted.push(r.paged(peer, result));
+            result
+        });
+        let changed = !walked.ran && !walked.rejected && ctrl.take_policy_changed();
+        let replan = r.end(walked.ran, changed, &bonds);
+        (paged, counted, replan)
+    }
+
+    /// The Mac's 13 Nov bench and review (R1): the app's order arrives while the first phone is paged. The rest go at
+    /// once in the new order; the round's timeouts carry over, so the next round keeps that order; and a reset at the
+    /// head of the rest, straight after the timeout, is still a crossing.
+    #[test]
+    fn a_re_planned_round_keeps_what_it_learned() {
+        let ctrl = Control::default();
+        set_order(&ctrl, &[SCOTT, YODA, THIRD]);
+        let mut r = Rounds::default();
+        let (paged, _, replan) = round(&mut r, &ctrl, &mut |peer| {
+            if peer == SCOTT {
+                set_order(&ctrl, &[THIRD, SCOTT, YODA]);
+            }
+            Attempt::Absent
+        });
+        assert_eq!((paged, replan), (vec![SCOTT], true), "the walk stops after the phone in hand");
+        let (paged, counted, replan) =
+            round(&mut r, &ctrl, &mut |peer| if peer == THIRD { Attempt::Reset } else { Attempt::Absent });
+        assert_eq!(paged, vec![THIRD, THIRD, YODA], "the rest, in the new order, skipping the phone paged");
+        assert_eq!(counted, vec![false, true, true], "the reset straight after the timeout is a crossing");
+        assert!(!replan);
+        let (paged, _, _) = round(&mut r, &ctrl, &mut |_| Attempt::Absent);
+        assert_eq!(paged, vec![THIRD, SCOTT, YODA], "all absent last round: the order just set");
+    }
+
+    /// R1: a change that lands during the last phone's page leaves nothing to re-plan, and the round's timeouts stand.
+    #[test]
+    fn a_change_with_nothing_left_to_page_ends_the_round() {
+        let ctrl = Control::default();
+        set_order(&ctrl, &[SCOTT, YODA]);
+        let mut r = Rounds::default();
+        let (paged, _, replan) = round(&mut r, &ctrl, &mut |peer| {
+            if peer == YODA {
+                set_order(&ctrl, &[YODA, SCOTT]);
+            }
+            if peer == SCOTT { Attempt::Absent } else { Attempt::Failed }
+        });
+        assert_eq!((paged, replan), (vec![SCOTT, YODA], false));
+        let (paged, _, _) = round(&mut r, &ctrl, &mut |_| Attempt::Failed);
+        assert_eq!(paged, vec![YODA, SCOTT], "the new order; the absent phone last, where it is anyway");
+    }
+
+    /// R2: only a timed-out page demotes, and a session clears it. The Mac, 13 Nov: a crossing reset is not counted.
+    #[test]
+    fn only_a_page_timeout_demotes_and_a_session_clears_it() {
+        let ctrl = Control::default();
+        set_order(&ctrl, &[SCOTT, YODA]);
+        let mut r = Rounds::default();
+        let (_, counted, _) =
+            round(&mut r, &ctrl, &mut |peer| if peer == SCOTT { Attempt::Absent } else { Attempt::Reset });
+        assert_eq!(counted, vec![true, false, true], "the first reset crossed the timeout; its re-page counts");
+        assert_eq!(round(&mut r, &ctrl, &mut |_| Attempt::Failed).0, vec![YODA, SCOTT], "the absent phone goes last");
+        assert_eq!(round(&mut r, &ctrl, &mut |_| Attempt::Failed).0, vec![SCOTT, YODA], "a lost claim demotes nobody");
+        round(&mut r, &ctrl, &mut |peer| if peer == SCOTT { Attempt::Absent } else { Attempt::Failed });
+        r.session();
+        assert_eq!(round(&mut r, &ctrl, &mut |_| Attempt::Failed).0, vec![SCOTT, YODA], "a session: nobody is absent");
+        round(&mut r, &ctrl, &mut |peer| if peer == SCOTT { Attempt::Absent } else { Attempt::Ran });
+        assert_eq!(round(&mut r, &ctrl, &mut |_| Attempt::Failed).0, vec![SCOTT, YODA], "a round that ran clears it");
+    }
+
+    /// R3: the demotion comes before the pass-over, so a passed-over phone stays last.
+    #[test]
+    fn a_passed_over_phone_stays_last() {
+        let r = Rounds { absent_before: vec![SCOTT], ..Rounds::default() };
+        let pass_over_yoda = |b: Vec<[u8; 6]>| {
+            let (y, rest): (Vec<_>, Vec<_>) = b.into_iter().partition(|p| *p == YODA);
+            rest.into_iter().chain(y).collect()
+        };
+        assert_eq!(r.order(vec![SCOTT, YODA, THIRD], pass_over_yoda), vec![THIRD, SCOTT, YODA]);
+    }
+
+    /// The Mac, 13 Nov: rounds 5 s apart in the early window, and a backoff that starts at its window's end.
+    #[test]
+    fn rounds_are_5_s_apart_early_then_back_off_from_the_start() {
+        assert_eq!(round_gap(true, true, 10), FIRST_RETRY_SECS);
+        assert_eq!(round_gap(false, true, 10), EARLY_GAP_SECS);
+        assert_eq!(round_gap(false, false, BACKOFF_START_SECS), BACKOFF_START_SECS);
     }
 
     /// The dev bench, 2 Nov: after a power cut the first-called iPhone answered and reset the link, and the
@@ -793,7 +924,8 @@ mod tests {
     fn only_a_reset_link_counts_as_a_reset() {
         let reset = std::io::Error::from_raw_os_error(libc::ECONNRESET);
         assert_eq!(failure(&reset), Attempt::Reset);
-        for errno in [libc::EHOSTDOWN, libc::ETIMEDOUT, libc::ECONNREFUSED] {
+        assert_eq!(failure(&std::io::Error::from_raw_os_error(libc::EHOSTDOWN)), Attempt::Absent, "a page timeout");
+        for errno in [libc::ETIMEDOUT, libc::ECONNREFUSED] {
             assert_eq!(failure(&std::io::Error::from_raw_os_error(errno)), Attempt::Failed, "errno {errno}");
         }
     }

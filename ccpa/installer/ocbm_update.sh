@@ -162,6 +162,7 @@ if [ ! -s "$list" ]; then   # a new version number with no new files
     || refuse "Could not write /etc/ocbm/installed_version."
   result "committed $VER (from $have_line): no files changed"
   log "nothing to place: the adapter's files already match $VER"
+  rm -f "$S/radio_preload_off" "$S/.radio_preload_inflight" "$S/.radio_preload_unfinished"   # a new version starts it on
   clean; unlock; exit 0
 fi
 if grep -q ' script/ocbm_dispatch.sh$' "$list"; then

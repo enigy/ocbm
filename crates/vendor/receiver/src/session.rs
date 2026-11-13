@@ -502,6 +502,11 @@ const SHUTDOWN_POLL: Duration = Duration::from_millis(500);
 /// within about 30 ms (bench 2026-11-02), and a requestUI it did not need is the one RECORD sends anyway.
 const SCREEN_NUDGE_AFTER: Duration = Duration::from_millis(500);
 
+/// A second requestUI this long after the teardown if the first went unanswered: the 0.5 s one is untested on the
+/// older iOS 15 phone, which answered every 3 s one (11 of 11, 13 Nov); without it the session would keep audio and no
+/// picture (the Mac's 13 Nov review, N1).
+const SCREEN_NUDGE_AGAIN: Duration = Duration::from_secs(3);
+
 /// Per-stream liveness flags keyed by `(stream type, channelID)` ([`AvSession`]'s `av_streams`).
 type StreamFlags = Mutex<HashMap<(i64, String), Arc<AtomicBool>>>;
 
@@ -623,6 +628,15 @@ impl AvSession {
             let sent = crate::events::send_request_ui();
             eprintln!(
                 "[session] no screen stream {} ms after the phone tore it down (streams live: {live:?}) — asked for its UI again (requestUI={sent})",
+                torn.elapsed().as_millis()
+            );
+            thread::sleep(SCREEN_NUDGE_AGAIN.saturating_sub(torn.elapsed()));
+            if !alive.load(Ordering::Acquire) || screen_stream_live(&streams) {
+                return;
+            }
+            let sent = crate::events::send_request_ui();
+            eprintln!(
+                "[session] still no screen stream {} ms after the phone tore it down — asked for its UI a second time (requestUI={sent})",
                 torn.elapsed().as_millis()
             );
         });

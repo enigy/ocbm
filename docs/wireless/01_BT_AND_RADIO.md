@@ -38,6 +38,9 @@ runs in the background beside `bt_on` (Bluetooth is the critical path), and `btd
 waits for it, up to 5 s (`wifi_handoff::wait_for_ap`); past that btd stays silent and the phone asks again. They share only the WLAN driver load, which
 `wlan_driver_up` serialises under its own lock, and `radio_detect.sh` writes its descriptor through a
 per-caller temporary file. `caps()` detects once per boot and reuses a descriptor that found wireless.
+ocbmd logs each HELLO and a host's first frames after 5 s of silence with the uptime, to place a stalled open. They
+are written before Carlink arms its log stream, so a drive log carries them only as thinned `[backfill]` replay: read
+them from Save Logs' box log or `/tmp/box.log` over the console, before a reboot (tmpfs) loses them.
 
 #### Why "it's Linux, it should be generic" does not apply here
 

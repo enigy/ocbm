@@ -150,7 +150,9 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   check 'grep -qx "replace script/start_main_service.sh" "$d/root/etc/ocbm/update_pending" && [ "$(grep -E "^(replace|add) " "$d/root/etc/ocbm/update_pending" | tail -1)" = "replace script/start_main_service.sh" ]' \
     "the start script is swapped last"
   check '[ ! -e "$d/run/ocbm-update.tgz" ] && [ ! -d "$d/run/ocbm-update" ]' "the package and its unpacked copy go"
+  : > "$d/root/script/radio_preload_off"   # an older updater's one-event flag, which it left behind
   restart "$d"; touch "$d/run/ocbmd_answered"; boot "$sh" "$d"   # a host answered: Carlink connected
+  check 'waitfor "[ ! -e $d/root/script/radio_preload_off ]" 5' "the update's first start clears a flag an older updater left"
   check 'waitfor "is_new \"$d\"" 5' "the trial passes and a host is answered: the update is kept, installed_version moves on"
   check 'result_is "$d" "committed $NEW (from $OLD)"' "update_result: committed"
   check '[ ! -e "$d/rebooted" ] && [ -e "$d/m.boot" ] && [ "$(cat "$d/root/script/ocbm_mode")" = final ]' "no restart; still final"
