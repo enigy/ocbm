@@ -708,15 +708,15 @@ wireless_up() {
     # until the 0x5703 reply from btd, so the AP no longer goes first (its 3.5 s held Bluetooth back on the 12 Nov bench).
     # radio_hal.sh keeps them apart where they meet: separate wlan and bt locks, the WLAN driver load under its own
     # lock (wlan_driver_up), and a descriptor file per caller (radio_detect.sh).
-    sh /script/radio_hal.sh wifi_ap_on >/tmp/wlan.log 2>&1 &
-    _ap_pid=$!
+    # The outer subshell returns at once, so the AP bring-up is no child of the btd exec below (which would never reap it).
+    ( sh /script/radio_hal.sh wifi_ap_on >/tmp/wlan.log 2>&1 & )
     # bt.log stays the small truncated per-attempt status file that docs/wireless/01_BT_AND_RADIO.md
     # tells an operator to cat directly. This call is foreground (no trailing ampersand), so teeing
     # its combined stdout/stderr into the universal log costs nothing and changes no lifecycle.
     sh /script/radio_hal.sh bt_on 2>&1 | tee -a /tmp/box.log >/tmp/bt.log
-    # btd answers 0x5702 with the SSID and passphrase of the AP from /etc/hostapd.conf, which radio_ap_up.sh rewrites:
-    # it starts only once the AP is up. The AP converges in seconds and wifi_ap_on bounds its own wait.
-    wait "$_ap_pid"
+    # btd starts once Bluetooth is up, not once the AP is (about 1-2 s of every connect on the Mac 13 Nov bench). Paging
+    # and the iAP2 set-up come first; its 0x5702 reply, the first thing that needs the AP, waits while wifi_ap_on still
+    # holds the wlan lock (wifi_handoff::wait_for_ap), so it never describes an AP that is not serving yet.
     # BENCH LEVER (2026-09-03): opt-in btmon capture for this wireless session. Armed by either the
     # file flag or the env var -- the outer `env BT_PAIRING_MODE=... setsid sh -c` wrapper
     # above only lists the vars it OVERRIDES, so CARPLAY_BTMON, if exported by the caller, still

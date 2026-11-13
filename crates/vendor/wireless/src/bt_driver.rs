@@ -447,6 +447,11 @@ fn process_one(
         // to join a network that does not exist, AND publish the handoff phase, spawn the A/V layer
         // and claim /tmp/carplay_transport for a session that can never arrive — suppressing the
         // wired supervisor with it.
+        // The same while the AP is still coming up: btd starts beside wifi_ap_on now, not after it.
+        if !crate::wifi_handoff::wait_for_ap(abort) {
+            log("RX 0x5702 RequestAccessoryWiFiConfig -- the AP is still coming up; not replying yet");
+            return false;
+        }
         let Some(cfg) = crate::wifi_handoff::read_hostapd_ap_config() else {
             log("RX 0x5702 RequestAccessoryWiFiConfig -- no AP config readable; not replying");
             return false;

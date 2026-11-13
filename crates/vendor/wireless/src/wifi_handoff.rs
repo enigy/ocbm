@@ -228,6 +228,42 @@ pub fn build_accessory_wifi_configuration_information(cfg: &AccessoryWiFiConfig)
     tlv.0
 }
 
+// ---- On-target AP glue: wait out an AP bring-up still running -----------------------------------
+
+/// radio_hal.sh's wlan lock: a directory holding the pid of the `wifi_ap_on` (or `wifi_ap_off`) that holds it.
+const WLAN_LOCK: &str = "/tmp/.radio_lock_wlan";
+/// How long a 0x5702 waits for the AP. Past it the phone's own retry asks again (it sends 0x5702 three times).
+const AP_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// A lock with no pid is the moment between its `mkdir` and its pid write, or one a killed holder left behind.
+const LOCK_NO_PID_SECS: u64 = 30;
+
+/// Whether the AP bring-up is still running. Since the Mac's 13 Nov bench btd starts once Bluetooth is up, beside
+/// `wifi_ap_on` rather than after it (about 1-2 s of every connect), so a 0x5702 can arrive before the AP serves.
+fn ap_bring_up_running(lock: &std::path::Path) -> bool {
+    let Ok(meta) = std::fs::metadata(lock) else { return false };
+    match std::fs::read_to_string(lock.join("pid")) {
+        Ok(pid) => std::path::Path::new("/proc").join(pid.trim()).exists(),
+        Err(_) => meta.modified().ok().and_then(|m| m.elapsed().ok()).is_some_and(|age| age.as_secs() < LOCK_NO_PID_SECS),
+    }
+}
+
+/// Wait, up to [`AP_WAIT`], for an AP bring-up still running to finish, so the 0x5703 describes an AP that serves.
+/// True once none is running (at once, when the AP was up first); false on the bound or on `abort`.
+pub fn wait_for_ap(abort: &dyn Fn() -> bool) -> bool {
+    wait_for_ap_at(std::path::Path::new(WLAN_LOCK), AP_WAIT, abort)
+}
+
+fn wait_for_ap_at(lock: &std::path::Path, max: std::time::Duration, abort: &dyn Fn() -> bool) -> bool {
+    let start = std::time::Instant::now();
+    while ap_bring_up_running(lock) {
+        if abort() || start.elapsed() >= max {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    true
+}
+
 // ---- On-target AP glue: fill AccessoryWiFiConfig from the box's live hostapd.conf --------------
 
 /// Read the box's hosted-AP configuration from `/etc/hostapd.conf` (the same file
@@ -341,6 +377,29 @@ impl<'a> Iterator for TlvGroups<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_0x5702_waits_only_while_an_ap_bring_up_holds_the_lock() {
+        let dir = std::env::temp_dir().join(format!("ap_wait_{}", std::process::id()));
+        let lock = dir.join("lock");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let never = || false;
+        let short = std::time::Duration::from_millis(300);
+        assert!(wait_for_ap_at(&lock, short, &never), "no lock: the AP was up first");
+
+        std::fs::create_dir(&lock).unwrap();
+        std::fs::write(lock.join("pid"), std::process::id().to_string()).unwrap();
+        assert!(!wait_for_ap_at(&lock, short, &never), "a live holder: wait to the bound");
+        assert!(!wait_for_ap_at(&lock, std::time::Duration::from_secs(5), &|| true), "abort ends the wait");
+
+        std::fs::write(lock.join("pid"), "999999999").unwrap();
+        assert!(wait_for_ap_at(&lock, short, &never), "a dead holder's lock is not a bring-up");
+
+        std::fs::remove_file(lock.join("pid")).unwrap();
+        assert!(!wait_for_ap_at(&lock, short, &never), "a fresh lock before its pid write");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn request_wifi_information_is_empty_body() {
