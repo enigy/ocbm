@@ -2452,6 +2452,8 @@ fn forward_screen2(
                 eprintln!("[screen] carlink :{port} write failed — will reconnect");
                 *up = false;
             }
+        } else if port == 9001 {
+            crate::startup::first_frame(); // the session's [startup] line, once
         }
     }
 }

@@ -689,7 +689,8 @@ wireless_up() {
   mode=$(pairing_mode)
   restore_stock_hostapd
   echo "[sup] host PRESENT + wireless enabled -> CLEAN bring-up of wireless stack (detached, pairing=$mode)"
-  # Detached session; sequential WiFi AP -> BT radio -> CarLink advertiser, each redirected (not piped).
+  # Detached session: the Wi-Fi AP and the BT radio come up side by side, then the CarLink advertiser, each
+  # redirected (not piped).
   # NO inner pgrep guard: the wrapper `sh -c` argv itself contains "/usr/sbin/btd", so an
   # inner `pgrep -f /usr/sbin/btd` self-matches the wrapper and SKIPS the launch (the bug
   # that left btd never started). The outer `wireless_running && return` above is the guard.
@@ -703,11 +704,19 @@ wireless_up() {
     # scripts, which simply do not exist on a Realtek or Broadcom unit, so wireless bring-up
     # failed SILENTLY here (the calls sit in this detached wrapper, redirected, exit status
     # unread) while wired projection kept working and nothing looked wrong.
-    sh /script/radio_hal.sh wifi_ap_on >/tmp/wlan.log 2>&1
+    # Side by side (the Mac connect-time brief of 13 Nov): Bluetooth is on the critical path, and the AP is not needed
+    # until the 0x5703 reply from btd, so the AP no longer goes first (its 3.5 s held Bluetooth back on the 12 Nov bench).
+    # radio_hal.sh keeps them apart where they meet: separate wlan and bt locks, the WLAN driver load under its own
+    # lock (wlan_driver_up), and a descriptor file per caller (radio_detect.sh).
+    sh /script/radio_hal.sh wifi_ap_on >/tmp/wlan.log 2>&1 &
+    _ap_pid=$!
     # bt.log stays the small truncated per-attempt status file that docs/wireless/01_BT_AND_RADIO.md
     # tells an operator to cat directly. This call is foreground (no trailing ampersand), so teeing
     # its combined stdout/stderr into the universal log costs nothing and changes no lifecycle.
     sh /script/radio_hal.sh bt_on 2>&1 | tee -a /tmp/box.log >/tmp/bt.log
+    # btd answers 0x5702 with the SSID and passphrase of the AP from /etc/hostapd.conf, which radio_ap_up.sh rewrites:
+    # it starts only once the AP is up. The AP converges in seconds and wifi_ap_on bounds its own wait.
+    wait "$_ap_pid"
     # BENCH LEVER (2026-09-03): opt-in btmon capture for this wireless session. Armed by either the
     # file flag or the env var -- the outer `env BT_PAIRING_MODE=... setsid sh -c` wrapper
     # above only lists the vars it OVERRIDES, so CARPLAY_BTMON, if exported by the caller, still

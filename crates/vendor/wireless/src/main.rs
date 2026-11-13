@@ -25,6 +25,7 @@ mod control;
 mod mfi_local;
 mod reconnect;
 mod sdp_client;
+mod startup;
 mod wifi_handoff;
 
 // The Bluetooth primitives live in `bt-common`. Re-exported at the crate root, so every
@@ -110,6 +111,7 @@ fn run_active_session(
 ) {
     // Per-device name derived once per session (reads the Wi-Fi MAC / SoC serial). Used for the EIR
     // Complete Local Name (what the iPhone shows) and the wireless iAP2 identify.
+    startup::begin();
     let accessory_name = carplay_iap2_core::message::accessory_name(ACCESSORY_BRAND);
     if let Err(e) = bt_bringup::bring_up(HCI_DEV, &accessory_name) {
         log(&format!("Bluetooth bring-up failed: {e} -- retrying"));
@@ -125,6 +127,7 @@ fn run_active_session(
     log(&format!(
         "Bluetooth up as \"{accessory_name}\" -- waiting for a phone or preempt (discoverable only while pairing is open)"
     ));
+    startup::mark("bt_up");
 
     let ssp_shutdown = Arc::new(AtomicBool::new(false));
     let t = ssp_shutdown.clone();
@@ -202,6 +205,7 @@ fn run_active_session(
                     continue;
                 }
                 log("RFCOMM client connected -- starting iAP2 handshake");
+                startup::mark("phone");
                 // Claim the single-session slot ATOMICALLY (compare_exchange, not a plain store) so the
                 // accept path and the Model-B reconnect path can never run two concurrent bt_driver::run
                 // sessions against the same phone, and neither clobbers the other's flag. If a reconnect

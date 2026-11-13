@@ -351,7 +351,7 @@ BT_MAC=""
   echo "RADIO_HCI_DEV=$HCI_DEV"
   echo "RADIO_BT_MAC=$BT_MAC"
   echo "RADIO_DETECTED_AT=$(cut -d. -f1 /proc/uptime 2>/dev/null)"
-} > "$OUT.new" 2>/dev/null && mv "$OUT.new" "$OUT"
+} > "$OUT.new.$$" 2>/dev/null && mv "$OUT.new.$$" "$OUT"
 
 [ "${1:-}" = -q ] || cat "$OUT"
 # Exit 0 always: detection is diagnostic. "No radio" is a finding, not a failure, and this runs

@@ -32,7 +32,11 @@ wireless bring-up **failed silently** while wired projection kept working — in
 the calls run inside a detached `setsid sh -c` whose output is redirected and whose exit status
 is never examined. Those four sites now call `radio_hal.sh` (`session_supervisor.sh` —
 `wifi_ap_on` and `bt_on` inside `wireless_up`, `wifi_ap_off` at both `wireless_down` teardown
-branches); the old paths survive only in comments recording why they changed.
+branches); the old paths survive only in comments recording why they changed. Since 13 Nov 2026 `wifi_ap_on`
+runs in the background beside `bt_on` (Bluetooth is the critical path), and `btd` starts once both are done:
+its 0x5703 reply reads the AP's SSID and passphrase. They share only the WLAN driver load, which
+`wlan_driver_up` serialises under its own lock, and `radio_detect.sh` writes its descriptor through a
+per-caller temporary file.
 
 #### Why "it's Linux, it should be generic" does not apply here
 

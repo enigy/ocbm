@@ -58,6 +58,7 @@ VERB="${1:-}"
 CAPS=/tmp/radio_caps
 WLAN_STATE=/tmp/.radio_wlan_state
 BT_STATE=/tmp/.radio_bt_state
+BT_WARM=/tmp/.radio_bt_warm
 LOGP="[radio_hal]"
 
 # Uptime (seconds since boot, /proc/uptime) on every line: the box clock is bogus until the host's
@@ -287,6 +288,23 @@ bt_set_name() {  # $1 = hci dev
 # Returns 0 if the driver is loaded (or was already), 1 if there is nothing to load.
 wlan_driver_up() {
   [ -n "$RADIO_WLAN_INSMOD" ] || { log "no WLAN insmod mapping for this unit"; return 1; }
+  # wifi_ap_on and bt_on run side by side at host_present, and both may load the driver: one at a time, so they
+  # never both insmod a module (or untar the modules) at once. Its own small lock, never the wlan or bt one, and
+  # reclaimed when its holder is gone; after 30 s it goes ahead unlocked rather than stall a bring-up.
+  _wdl=/tmp/.radio_lock_wlandrv; _wdn=0; _wdown=1
+  while ! mkdir "$_wdl" 2>/dev/null; do
+    _wdh=$(cat "$_wdl/pid" 2>/dev/null)
+    if [ -n "$_wdh" ] && [ ! -d "/proc/$_wdh" ]; then rm -rf "$_wdl"; continue; fi
+    _wdn=$((_wdn+1)); [ "$_wdn" -ge 150 ] && { log "wlan driver lock busy >30 s - loading anyway"; _wdown=0; break; }
+    sleep 0.2
+  done
+  [ "$_wdown" = 1 ] && echo $$ > "$_wdl/pid" 2>/dev/null
+  wlan_driver_load; _wdr=$?
+  [ "$_wdown" = 1 ] && rm -rf "$_wdl" 2>/dev/null
+  return $_wdr
+}
+
+wlan_driver_load() {
   [ -e "/tmp/${RADIO_WLAN_MODULES%% *}" ] || tar -xzf "$RADIO_KO_TARBALL" -C /tmp 2>/dev/null \
                                           || tar -xf "$RADIO_KO_TARBALL" -C /tmp 2>/dev/null
   log "wlan driver: $RADIO_WLAN_INSMOD"
@@ -506,6 +524,9 @@ do_preload() {
 # =============================================================================================
 do_bt_on() {
   caps || { publish "$BT_STATE" "result=unsupported" "detail=no-descriptor"; return 3; }
+  # Whether this bring-up found the controller warm (attached, at most powered down): btd then pages at once, with no
+  # settle, since nothing was just attached (the Mac's 13 Nov connect-time brief). A full attach or a failure leaves none.
+  rm -f "$BT_WARM"
 
   _d=$(hci_dev 2>/dev/null) || _d=""
   # Only a POWERED-UP adapter can pass the confirmation: on a DOWN one every name read fails
@@ -514,6 +535,7 @@ do_bt_on() {
   # between-sessions state (measured 2026-10-20: bt_on 9.5 s from DOWN vs 0.4 s for the power-up).
   if [ -n "$_d" ] && bt_powered_up "$_d" && bt_responsive_confirmed "$_d"; then
     log "already converged ($_d responsive)"
+    : > "$BT_WARM"
     publish "$BT_STATE" "result=ok" "backend=$RADIO_BACKEND" "hci_dev=$_d" \
             "bt_mac=$(cat /sys/class/bluetooth/$_d/address 2>/dev/null)"
     return 2
@@ -536,6 +558,7 @@ do_bt_on() {
     hci_rt "$_d" up 2>/dev/null
     if bt_responsive_confirmed "$_d"; then
       log "$_d was only powered down - up and responsive, no reset needed"
+      : > "$BT_WARM"
       publish "$BT_STATE" "result=ok" "backend=$RADIO_BACKEND" "hci_dev=$_d" \
               "bt_mac=$(cat /sys/class/bluetooth/$_d/address 2>/dev/null)"
       return 0

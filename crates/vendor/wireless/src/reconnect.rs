@@ -53,15 +53,31 @@ const RESET_RETRY_SECS: u64 = 2;
 /// phone that connects IN meanwhile is still safe: `attempt()`'s compare_exchange on
 /// `session_active` refuses to page over it. 1 s keeps a moment for that inbound connect.
 /// Override: `BT_RECONNECT_SETTLE_SECS` or `/tmp/reconnect_settle_secs` (whole seconds, `0` allowed).
+/// None when the controller was warm ([`BT_WARM`]): nothing was just attached, so paging starts at once (the Mac's
+/// 13 Nov connect-time brief).
 const INITIAL_SETTLE_DEFAULT_SECS: u64 = 1;
 
-/// The project's bench-lever convention: env first, then the tmpfs file (`/tmp` clears on reboot).
+/// Left by `radio_hal.sh bt_on` when this session's bring-up found the controller attached and at most powered
+/// down, rather than attaching it.
+const BT_WARM: &str = "/tmp/.radio_bt_warm";
+
+/// The project's bench-lever convention: env first, then the tmpfs file (`/tmp` clears on reboot); with no lever,
+/// none after a warm bring-up and [`INITIAL_SETTLE_DEFAULT_SECS`] after a fresh attach.
 fn initial_settle_secs() -> u64 {
     let parse = |v: &str| v.trim().parse::<u64>().ok();
     box_common::lever("BT_RECONNECT_SETTLE_SECS", "CARPLAY_RECONNECT_SETTLE_SECS")
         .and_then(|v| parse(&v))
         .or_else(|| std::fs::read_to_string("/tmp/reconnect_settle_secs").ok().and_then(|v| parse(&v)))
-        .unwrap_or(INITIAL_SETTLE_DEFAULT_SECS)
+        .unwrap_or_else(|| default_settle_secs(std::path::Path::new(BT_WARM).exists()))
+}
+
+/// The settle with no lever set: none when the bring-up found the controller warm.
+fn default_settle_secs(warm: bool) -> u64 {
+    if warm {
+        0
+    } else {
+        INITIAL_SETTLE_DEFAULT_SECS
+    }
 }
 
 /// `@<unix_ms> ` write-time stamp (docs/carplay/01_OCBM_PROTOCOL.md CH_LOG): the box.log tailer
@@ -298,6 +314,7 @@ fn attempt(
         }
     };
     log(&format!("RFCOMM connected OUT to the phone (ch {channel}) — starting iAP2 handshake"));
+    crate::startup::mark("phone");
     // The real success signal is iAP2 progress inside bt_driver::run, NOT the mgmt DEVICE_CONNECTED
     // for our own outbound connect (docs/wireless/01_BT_AND_RADIO.md §Design notes — the Model-A latching gotcha).
     // Claim the single-session slot ATOMICALLY, immediately before running the driver. compare_exchange
@@ -490,8 +507,14 @@ pub fn run(
 
 #[cfg(test)]
 mod tests {
-    use super::{failure, walk, Attempt, ResetStreak, Walk};
+    use super::{default_settle_secs, failure, walk, Attempt, ResetStreak, Walk, INITIAL_SETTLE_DEFAULT_SECS};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_warm_controller_pages_at_once_and_a_fresh_attach_settles() {
+        assert_eq!(default_settle_secs(true), 0);
+        assert_eq!(default_settle_secs(false), INITIAL_SETTLE_DEFAULT_SECS);
+    }
 
     const SCOTT: [u8; 6] = [1, 0, 0, 0, 0, 0];
     const YODA: [u8; 6] = [2, 0, 0, 0, 0, 0];

@@ -22,6 +22,7 @@ pub mod probe;
 pub mod server;
 pub mod session;
 pub mod stream;
+pub mod startup;
 pub mod tunnel;
 pub mod vehicle_config;
 #[cfg(feature = "mic-uplink")]

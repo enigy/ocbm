@@ -456,6 +456,7 @@ fn process_one(
             cfg.ssid, cfg.channel, cfg.security_type
         ));
         publish_bt_phase(ocbm_proto::BTP_WIFI_HANDOFF);
+        crate::startup::mark("handoff");
         let body = crate::wifi_handoff::build_accessory_wifi_configuration_information(&cfg);
         let sent = write_interruptible(
             sock,
