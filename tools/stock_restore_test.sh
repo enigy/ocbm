@@ -64,7 +64,7 @@ make_box() {  # $1 backup dir, $2 box dir: what the converted adapter looks like
   for x in usr/sbin/ocbmd usr/sbin/carplayd usr/bin/iap_role_switch; do blob "$b/$x" 50000; chmod 755 "$b/$x"; done
   echo "ocbm boot"   > "$b/script/ocbm_boot.sh"
   echo "radio hal"   > "$b/script/radio_hal.sh"
-  : > "$b/script/radio_preload"
+  : > "$b/script/radio_preload"; : > "$b/script/radio_preload_off"
   : > "$b/script/ncm_wifi"
   echo "old copy"    > "$b/script/start_main_service.sh.pre"
   blob "$b/etc/ocbm/identity.tgz" 4000

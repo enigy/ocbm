@@ -1,8 +1,9 @@
 //! hci.rs — raw HCI command packets for `bt_bringup` and the pairing window.
 //!
-//! One operation lives here: Write_Scan_Enable, sent as a raw command rather than through
+//! Two operations live here: Write_Scan_Enable, sent as a raw command rather than through
 //! `hciconfig piscan`/`noscan`, whose HCISETSCAN ioctl loses its wake-up on the CCPA's 3.14 kernel
-//! (see [`write_scan_enable`]). Everything else in bring-up is still `hciconfig`.
+//! (see [`write_scan_enable`]), and Write_Page_Timeout for btd's paging ([`write_page_timeout`]).
+//! Everything else in bring-up is still `hciconfig`.
 //!
 //! Not the mgmt API: mgmt owns EIR and the discoverable flag, and on 3.14 `SET_DISCOVERABLE` is a
 //! no-op when the flag already holds the asked-for value — so the scan mode is written here too.
@@ -16,6 +17,10 @@ const HCI_CHANNEL_RAW: u16 = 0;
 
 // HCI opcode, OGF 0x03 (Host Controller & Baseband). opcode = (ogf << 10) | ocf.
 const OP_WRITE_SCAN_ENABLE: u16 = 0x0C1A;
+const OP_WRITE_PAGE_TIMEOUT: u16 = 0x0C18;
+
+/// The controller's page timeout after a reset: 0x2000 slots of 0.625 ms, 5.12 s.
+pub const PAGE_TIMEOUT_DEFAULT: u16 = 0x2000;
 
 /// Scan modes for [`write_scan_enable`]: inquiry scan = discoverable, page scan = connectable.
 pub const SCAN_PAGE_AND_INQUIRY: u32 = 0x03;
@@ -138,6 +143,13 @@ pub fn write_scan_enable(dev: u16, scan: u32) -> io::Result<()> {
     HciSocket::open_bound(dev)?.cmd(OP_WRITE_SCAN_ENABLE, &[scan as u8])
 }
 
+/// How long the controller pages before giving up on a phone (Write_Page_Timeout), in 0.625 ms slots: an absent
+/// phone costs this much per page ("Host is down"). A raw, fire-and-forget command like [`write_scan_enable`]; a
+/// controller reset (btd's DOWN->UP at bring-up) puts back [`PAGE_TIMEOUT_DEFAULT`].
+pub fn write_page_timeout(dev: u16, slots: u16) -> io::Result<()> {
+    HciSocket::open_bound(dev)?.cmd(OP_WRITE_PAGE_TIMEOUT, &slots.to_le_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,5 +172,10 @@ mod tests {
     #[test]
     fn scan_enable_opcode_is_ogf3() {
         assert_eq!(OP_WRITE_SCAN_ENABLE, (0x03u16 << 10) | 0x001A);
+    }
+
+    #[test]
+    fn page_timeout_opcode_is_ogf3() {
+        assert_eq!(OP_WRITE_PAGE_TIMEOUT, (0x03u16 << 10) | 0x0018);
     }
 }

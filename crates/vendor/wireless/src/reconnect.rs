@@ -36,6 +36,20 @@ const BACKOFF_MAX_SECS: u64 = 60;
 /// very next attempt succeeded - but only after the 10 s floor, so each cost ~15 s. Once per daemon
 /// start, so it cannot spin: every later round still gets the floor and the doubling.
 const FIRST_RETRY_SECS: u64 = 2;
+/// The first round's page, in 0.625 ms slots (2.5 s): an absent first-listed phone cost the whole 5.12 s default
+/// before the next phone was paged (the Mac's 12 Nov bench: 5.2 s of "Host is down"). Scott, 13 Nov: keep the
+/// driver's order, page each phone briefly in turn first, and give later rounds the full default, so a phone slow
+/// to answer is still reached. A present iPhone answers well inside it: it scans for pages every 1.28 s.
+const FIRST_ROUND_PAGE_SLOTS: u16 = 4_000;
+
+/// The page timeout for a round: the short one for the first walk over more than one phone, else the default.
+fn round_page_slots(first_round: bool, phones: usize) -> u16 {
+    if first_round && phones > 1 {
+        FIRST_ROUND_PAGE_SLOTS
+    } else {
+        crate::hci::PAGE_TIMEOUT_DEFAULT
+    }
+}
 /// The pause before the one more try a phone gets when it answers the page and then resets the link
 /// ([`Attempt::Reset`]), before the next phone in the call order is paged. Dev bench, 2 Nov: 32 s after
 /// a power cut the first-called iPhone accepted the page and reset it 4 s later (`SDP query failed:
@@ -365,6 +379,8 @@ pub fn run(
     let mut backoff = BACKOFF_START_SECS;
     let mut streak = ResetStreak::default();
     let mut first_round = true;
+    // What the controller pages with now: the reset default, until a round asks for another.
+    let mut page_slots = crate::hci::PAGE_TIMEOUT_DEFAULT;
     // Log only on a change in the bonded/idle state, so the per-round re-read below doesn't spam the log.
     // `None` = nothing logged yet; `Some(true)` = had bonds; `Some(false)` = idle.
     let mut last_state: Option<bool> = None;
@@ -448,6 +464,16 @@ pub fn run(
             },
         };
 
+        let want = round_page_slots(first_round, targets.len());
+        if want != page_slots {
+            match crate::hci::dev_id(crate::HCI_DEV).and_then(|dev| crate::hci::write_page_timeout(dev, want)) {
+                Ok(()) => {
+                    log(&format!("paging {} ms per phone this round", u64::from(want) * 5 / 8));
+                    page_slots = want;
+                }
+                Err(e) => log(&format!("page timeout not set ({e}); paging with the controller's")),
+            }
+        }
         let Walk { ran, rejected } = walk(
             &targets,
             || shutdown.load(Ordering::Relaxed) || session_active.load(Ordering::Relaxed),
@@ -507,6 +533,7 @@ pub fn run(
 
 #[cfg(test)]
 mod tests {
+    use super::{round_page_slots, FIRST_ROUND_PAGE_SLOTS};
     use super::{default_settle_secs, failure, walk, Attempt, ResetStreak, Walk, INITIAL_SETTLE_DEFAULT_SECS};
     use std::time::{Duration, Instant};
 
@@ -514,6 +541,14 @@ mod tests {
     fn a_warm_controller_pages_at_once_and_a_fresh_attach_settles() {
         assert_eq!(default_settle_secs(true), 0);
         assert_eq!(default_settle_secs(false), INITIAL_SETTLE_DEFAULT_SECS);
+    }
+
+    #[test]
+    fn the_first_round_over_several_phones_pages_briefly_and_later_rounds_in_full() {
+        assert_eq!(round_page_slots(true, 2), FIRST_ROUND_PAGE_SLOTS);
+        assert_eq!(u64::from(FIRST_ROUND_PAGE_SLOTS) * 5 / 8, 2_500, "2.5 s");
+        assert_eq!(round_page_slots(false, 2), crate::hci::PAGE_TIMEOUT_DEFAULT, "a later round");
+        assert_eq!(round_page_slots(true, 1), crate::hci::PAGE_TIMEOUT_DEFAULT, "one phone: nothing to hand on to");
     }
 
     const SCOTT: [u8; 6] = [1, 0, 0, 0, 0, 0];

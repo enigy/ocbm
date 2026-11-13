@@ -39,7 +39,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-const HCI_DEV: &str = "hci0";
+pub(crate) const HCI_DEV: &str = "hci0";
 const CONTROLLER_INDEX: u16 = 0;
 const RFCOMM_CHANNEL: u8 = 1; // matches the reference project's default CARPLAY_RFCOMM_CHAN
 // Brand for the advertised name; the actual name is per-device (e.g. "CarLink-b0df") via

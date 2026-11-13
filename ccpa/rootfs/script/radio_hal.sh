@@ -485,27 +485,29 @@ do_wifi_ap_off() {
 }
 
 # =============================================================================================
-# BOOT PRELOAD (opt-in: /script/radio_preload; started by ocbm_boot.sh)
+# BOOT PRELOAD (on by default since 13 Nov 2026, off with /script/radio_preload_off; started by ocbm_boot.sh)
 # =============================================================================================
 # Load this unit's WLAN driver and attach BT, then power BT down: exactly the state the supervisor
 # leaves between sessions (drivers loaded, attached, hci0 DOWN, no AP - nothing a phone can see).
 # The first app connect after power-up then skips the driver and firmware load (~7 s measured
 # 2026-10-20, IW416), done here while the box waits for the head unit to boot. A deliberate,
 # owner-approved exception to docs/carplay/04_CAPABILITIES_AND_CONFIG.md directive 3 - see there.
+# Opt-in until Scott made it the default (13 Nov, the connect-time brief): nothing ever set the opt-in flag,
+# so it never ran. It still never runs on the first boot after an install or update (ocbm_boot.sh).
 #
 # Two guards against a boot-time wedge on a unit with no UART:
 #  * ONE attach attempt (RADIO_BT_MAX_TRIES=1): never reclaim+reset, the GPIO reset under a live
 #    WLAN driver being the wedge-prone step. A failure is left to the app-driven bt_on, exactly as
 #    if this had not run.
 #  * An in-flight marker on flash. A boot that finds it knows the previous preload never finished
-#    (hung, or power lost inside it) and DISABLES the preload by removing the opt-in flag, so a
+#    (hung, or power lost inside it) and DISABLES the preload by writing the off flag, so a
 #    unit that wedges here costs one bad boot, not one in two.
-PRELOAD_FLAG=/script/radio_preload
+PRELOAD_OFF=/script/radio_preload_off
 PRELOAD_MARK=/script/.radio_preload_inflight
 do_preload() {
   if [ -e "$PRELOAD_MARK" ]; then
-    rm -f "$PRELOAD_FLAG" "$PRELOAD_MARK"; sync
-    log "preload: the previous boot's preload never finished - preload DISABLED (touch $PRELOAD_FLAG to re-enable)"
+    : > "$PRELOAD_OFF"; rm -f "$PRELOAD_MARK"; sync
+    log "preload: the previous boot's preload never finished - preload DISABLED (rm $PRELOAD_OFF to re-enable)"
     return 1
   fi
   touch "$PRELOAD_MARK"; sync

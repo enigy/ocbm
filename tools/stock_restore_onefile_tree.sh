@@ -54,7 +54,7 @@
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 RUNTIME="script/ocbm_mode script/ocbm_dispatch.sh script/ocbm_trial script/ocbm_trial.log \
-script/ocbm_failover script/ocbm_failover.log script/radio_preload script/.radio_preload_inflight \
+script/ocbm_failover script/ocbm_failover.log script/radio_preload script/radio_preload_off script/.radio_preload_inflight \
 script/box_crash.log etc/carplay_ident etc/carplay_peers.bin etc/hostapd.conf.stock etc/hostapd.conf.new"
 STOCK_DIRS="etc/boa/www etc/boa/cgi-bin etc/boa/images etc/hichain"
 BT_FLAG="etc/.custom_bluetooth_name"
