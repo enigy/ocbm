@@ -140,8 +140,10 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
 
   echo "== $sh: an update on a final adapter that passes its self-test"
   d="$T/$sh-pass"; make_box "$d" final; make_pkg "$d/run/ocbm-update.tgz" dispatch
+  echo "guard: 2 unfinished in a row" > "$d/root/script/radio_preload_off"; echo 1 > "$d/root/script/.radio_preload_unfinished"
   update "$sh" "$d"; rc=$?
   check '[ $rc = 0 ] && [ -e "$d/rebooted" ] && grep -qx placed "$d/root/etc/ocbm/update_pending"' "placed, journalled, restarting"
+  check '[ ! -e "$d/root/script/radio_preload_off" ] && [ ! -e "$d/root/script/.radio_preload_unfinished" ]' "the new version starts with the boot radio preload on"
   check '[ "$(content "$d" usr/sbin/ocbmd)" = new-ocbmd ] && [ "$(content "$d" usr/sbin/ocbmd.prev)" = old-ocbmd ]' \
     "the new ocbmd in place, the old one kept as .prev"
   check '! grep -q "usr/sbin/btd" "$d/root/etc/ocbm/update_pending"' "a file that did not change is left alone"

@@ -65,6 +65,7 @@ make_box() {  # $1 backup dir, $2 box dir: what the converted adapter looks like
   echo "ocbm boot"   > "$b/script/ocbm_boot.sh"
   echo "radio hal"   > "$b/script/radio_hal.sh"
   : > "$b/script/radio_preload"; : > "$b/script/radio_preload_off"
+  : > "$b/script/.radio_preload_inflight"; echo 1 > "$b/script/.radio_preload_unfinished"
   : > "$b/script/ncm_wifi"
   echo "old copy"    > "$b/script/start_main_service.sh.pre"
   blob "$b/etc/ocbm/identity.tgz" 4000
@@ -366,6 +367,9 @@ onefile_tests() {  # $1 shell
 
   rm -rf "$T/box"; cp -pR "$T/fin" "$T/box"
   blob "$T/box/lib/firmware/nxp/added_after.bin" 300    # a radio file of the unit's, added after the archive
+  # The boot radio preload's state (radio_hal.sh do_preload): a later install must start with the preload on.
+  echo "guard: 2 unfinished in a row" > "$T/box/script/radio_preload_off"
+  : > "$T/box/script/.radio_preload_inflight"; echo 1 > "$T/box/script/.radio_preload_unfinished"
   before=$(tree_sum "$T/box")
   run_onefile "$SH1" plan "$T/box"; rc=$?
   check '[ $rc -eq 0 ] && grep -q RESTORE_PLAN_OK "$T/out" && grep -q "switch      :" "$T/out"' "plan succeeds and names the switch"
@@ -387,6 +391,8 @@ onefile_tests() {  # $1 shell
   check '[ "$(cat "$T/box/script/start_main_service.sh")" = "stock start_main_service" ]' "the stock start script is in place"
   check '[ ! -e "$T/box/usr/sbin/ocbmd" ] && [ ! -e "$T/box/etc/ocbm" ] && [ ! -e "$T/box/script/ocbm_mode" ] && [ ! -e "$T/box/script/ocbm_boot.sh" ]' "OCBM's files removed after the switch"
   check '[ ! -e "$T/box/script/radio_hal.sh" ] && [ ! -e "$T/box/script/radio_detect.sh" ] && [ ! -e "$T/box/script/radio_ap_up.sh" ]' "OCBM's radio seam goes with OCBM: stock has none"
+  check '[ ! -e "$T/box/script/radio_preload_off" ] && [ ! -e "$T/box/script/.radio_preload_inflight" ] && [ ! -e "$T/box/script/.radio_preload_unfinished" ]' \
+    "the boot radio preload's flag, marker and count go, so a later install starts with it on"
   check '[ -e "$T/box/lib/firmware/nxp/added_after.bin" ] && grep -q "1 kept by the radio guard" "$T/out"' "the radio guard still keeps the unit's own radio files"
   check '[ ! -e "$T/box/etc/carplay" ] && grep -q "/etc/carplay removed" "$T/out"' "/etc/carplay, OCBM's bond store, is removed"
   check 'grep -q "5/5 OCBM scripts and settings: [0-9]* removed, 0 kept by the radio guard" "$T/out"' \

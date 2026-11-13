@@ -242,6 +242,7 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   id1=$(cat "$r/root/etc/ocbm/install_id" 2>/dev/null)
   echo flagged > "$r/root/etc/ocbm/acc_direct_io"   # the earlier install's driver finding
   echo 2 > "$r/root/etc/ocbm/boot_attempts"
+  echo "guard: 2 unfinished in a row" > "$r/root/script/radio_preload_off"; : > "$r/root/script/.radio_preload_inflight"
   refresh "$r"; run_once "$sh" "$r"; rc=$?
   check '[ $rc = 1 ] && grep -q "OCBM_RETRY" "$r/stick/OCBM_RESULT.txt"' "an undone version is refused without OCBM_RETRY"
   touch "$r/stick/OCBM_RETRY"; refresh "$r"; run_once "$sh" "$r"; rc=$?
@@ -253,6 +254,7 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   check 'grep -q "^OCBM install: REFUSED" "$r/stick/OCBM_RESULT.prev.txt" && [ ! -e "$r/stick/OCBM_RESULT.txt" ]' \
     "the refusal's report is kept as OCBM_RESULT.prev.txt until finish.sh writes the new one"
   check '[ ! -e "$r/root/etc/ocbm/boot_attempts" ] && [ ! -e "$r/root/etc/ocbm/pending_result.txt" ]' "arming clears the earlier try's start counter and report"
+  check '[ ! -e "$r/root/script/radio_preload_off" ] && [ ! -e "$r/root/script/.radio_preload_inflight" ]' "and the boot radio preload starts on again"
   echo "== $sh: a Bluetooth name flag the install found comes back with the go-back"
   r="$T/$sh-btflag"; make_box "$r"; echo "My Car" > "$r/root/etc/.custom_bluetooth_name"; run_once "$sh" "$r" >/dev/null; mkdir -p "$r/run"
   check 'gzip -dc "$r/root/etc/ocbm/identity.tgz" | tar -tf - | grep -qx etc/.custom_bluetooth_name' "identity.tgz holds the Bluetooth name flag the install found"

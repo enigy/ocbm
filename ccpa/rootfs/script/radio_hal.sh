@@ -505,8 +505,13 @@ do_wifi_ap_off() {
 #    WLAN driver being the wedge-prone step. A failure is left to the app-driven bt_on, exactly as
 #    if this had not run.
 #  * An in-flight marker on flash. A boot that finds it knows the previous preload never finished
-#    (hung, or power lost inside it) and DISABLES the preload by writing the off flag, so a
-#    unit that wedges here costs one bad boot, not one in two.
+#    (hung, or power lost inside it) and counts it; PRELOAD_GUARD_AFTER in a row DISABLE the preload
+#    by writing the off flag with "guard" in it, so a unit that wedges here costs two bad boots, not
+#    one in two. Not one: a power cut inside the 7 s window is no wedge (the Mac's dev adapter, 13 Nov,
+#    latched off overnight), and on a truck the engine crank falls just after the ignition comes on.
+#    A preload that finishes clears the count. An owner's own flag is empty. Installs, updates and
+#    every way back to stock remove all three files, and ocbmd reports the state to Carlink (box info
+#    "preload"). ocbm_boot.sh logs a disabled preload at every boot.
 #  * A session owns the radios once a host is here. A Carlink already plugged in when the adapter
 #    boots (as after an update) can reach bt_on before this does: the preload then stands down, and
 #    it never powers off a controller it did not bring up itself (the Mac's 13 Nov review).
@@ -514,11 +519,19 @@ HOST_FLAG=/tmp/host_present
 host_here() { [ "$(cat "$HOST_FLAG" 2>/dev/null)" = 1 ]; }
 PRELOAD_OFF=/script/radio_preload_off
 PRELOAD_MARK=/script/.radio_preload_inflight
+PRELOAD_UNFINISHED=/script/.radio_preload_unfinished
+PRELOAD_GUARD_AFTER=2
 do_preload() {
   if [ -e "$PRELOAD_MARK" ]; then
-    : > "$PRELOAD_OFF"; rm -f "$PRELOAD_MARK"; sync
-    log "preload: the previous boot's preload never finished - preload DISABLED (rm $PRELOAD_OFF to re-enable)"
-    return 1
+    _pn=$(cat "$PRELOAD_UNFINISHED" 2>/dev/null); case "$_pn" in ''|*[!0-9]*) _pn=0 ;; esac
+    _pn=$((_pn + 1)); rm -f "$PRELOAD_MARK"
+    if [ "$_pn" -ge "$PRELOAD_GUARD_AFTER" ]; then
+      echo "guard: $_pn unfinished in a row" > "$PRELOAD_OFF"; rm -f "$PRELOAD_UNFINISHED"; sync
+      log "preload: $_pn boots in a row never finished it - preload DISABLED (rm $PRELOAD_OFF to re-enable)"
+      return 1
+    fi
+    echo "$_pn" > "$PRELOAD_UNFINISHED"; sync
+    log "preload: the previous boot's preload never finished ($_pn of $PRELOAD_GUARD_AFTER in a row before it is switched off)"
   fi
   if host_here; then
     log "preload: a host is here - left to its session"
@@ -531,7 +544,7 @@ do_preload() {
   # Attached by this preload: power it down to the between-sessions state. Not when it found the controller up
   # (rc 2: someone else's), and not once a host has come: its session is waiting on this lock for the radio.
   if [ "$_pr" = 0 ] && ! host_here; then do_bt_off; fi
-  rm -f "$PRELOAD_MARK"; sync
+  rm -f "$PRELOAD_MARK" "$PRELOAD_UNFINISHED"; sync
   log "preload: done rc=$_pr in $(awk "BEGIN{printf \"%.1f\", $(cut -d' ' -f1 /proc/uptime)-$_p0}") s, wlan=$(wlan_iface 2>/dev/null || echo none) bt=$(hciconfig 2>/dev/null | grep -oE 'UP RUNNING|DOWN' | head -1)"
   return $_pr
 }

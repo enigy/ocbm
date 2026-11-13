@@ -491,6 +491,9 @@ if [ "$dispatcher" = 0 ]; then   # the current start script IS stock: keep it fo
   fi
 fi
 rm -f "$EO/boot_attempts" "$EO/first_start.txt" "$EO/pending_result.txt" "$EO/acc_direct_io"   # Stage B state of an earlier try
+# The boot radio preload starts on, its guard counting afresh (radio_hal.sh do_preload): a flag from an earlier
+# install outlives a go-back to stock, and one unfinished preload there left the Mac's dev adapter off (13 Nov).
+rm -f "$ROOT/script/radio_preload_off" "$ROOT/script/.radio_preload_inflight" "$ROOT/script/.radio_preload_unfinished"
 { echo trial > "$MODE.new" && mv -f "$MODE.new" "$MODE"; } || abort "Could not write /script/ocbm_mode."
 echo "$VER" > "$EO/installed_version" || abort "Could not write /etc/ocbm/installed_version."
 # A new id for each install, which updates keep: Carlink's once-per-install records (a trial proven by

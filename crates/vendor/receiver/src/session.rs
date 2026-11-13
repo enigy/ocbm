@@ -496,7 +496,11 @@ const SHUTDOWN_POLL: Duration = Duration::from_millis(500);
 
 /// How long after the phone tears down its screen stream we wait for it to set one up again before
 /// asking for its UI ([`AvSession::nudge_screen_back`]).
-const SCREEN_NUDGE_AFTER: Duration = Duration::from_secs(3);
+///
+/// 3 s until the Mac's 13 Nov bench: the older iPhone dropped its first screen stream in 7 of 8 cold connects and 3 of
+/// 7 then paid the whole wait, the largest spread left in a connect. A phone that sets its screen up again does so
+/// within about 30 ms (bench 2026-11-02), and a requestUI it did not need is the one RECORD sends anyway.
+const SCREEN_NUDGE_AFTER: Duration = Duration::from_millis(500);
 
 /// Per-stream liveness flags keyed by `(stream type, channelID)` ([`AvSession`]'s `av_streams`).
 type StreamFlags = Mutex<HashMap<(i64, String), Arc<AtomicBool>>>;
@@ -601,15 +605,25 @@ impl AvSession {
     fn nudge_screen_back(&self) {
         let streams = self.av_streams.clone();
         let alive = self.alive.clone();
+        let torn = Instant::now();
         let spawned = thread::Builder::new().name("screen-nudge".into()).spawn(move || {
             thread::sleep(SCREEN_NUDGE_AFTER);
-            if !alive.load(Ordering::Acquire) || screen_stream_live(&streams) {
+            if !alive.load(Ordering::Acquire) {
                 return;
             }
+            if screen_stream_live(&streams) {
+                eprintln!("[session] the phone set its screen up again within {} ms — no nudge", SCREEN_NUDGE_AFTER.as_millis());
+                return;
+            }
+            // What the session had when it fired, so a bench can tell a phone that would have come back from one that
+            // needed it: the streams still live, by type.
+            let mut live: Vec<i64> = crate::plock(&streams).keys().map(|(ty, _)| *ty).collect();
+            live.sort_unstable();
+            live.dedup();
             let sent = crate::events::send_request_ui();
             eprintln!(
-                "[session] no screen stream {} s after the phone tore it down — asked for its UI again (requestUI={sent})",
-                SCREEN_NUDGE_AFTER.as_secs()
+                "[session] no screen stream {} ms after the phone tore it down (streams live: {live:?}) — asked for its UI again (requestUI={sent})",
+                torn.elapsed().as_millis()
             );
         });
         if let Err(e) = spawned {

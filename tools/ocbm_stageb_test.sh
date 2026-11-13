@@ -97,9 +97,10 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   check 'waitfor "[ -e $d/m.selftest ]" 5 && [ -e "$d/m.boot" ]' "confirmed starts OCBM and still runs the self-test"
 
   echo "== $sh: a failed self-test goes back to stock"
-  d="$T/$sh-fail"; make_box "$d" trial; touch "$d/st.fail"; boot "$sh" "$d"
+  d="$T/$sh-fail"; make_box "$d" trial; touch "$d/st.fail"; echo "guard: 2 unfinished in a row" > "$d/root/script/radio_preload_off"; boot "$sh" "$d"
   check 'waitfor "[ -e $d/rebooted ]" 5 && reverted "$d"' \
     "revert: mode removed, hostapd.conf put back, 'reverted version=' recorded, report pending, restart"
+  check '[ ! -e "$d/root/script/radio_preload_off" ]' "the go-back drops the boot radio preload's state with the install"
   check 'grep -q "self-test failed (FAILED after 30 s: ocbmd is not running)" "$d/root/etc/ocbm/last_result.txt" && grep -q "^FAILED" "$d/root/etc/ocbm/pending_result.txt"' \
     "the reason and the self-test output are in the record and the report"
   restart "$d"; boot "$sh" "$d"

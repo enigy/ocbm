@@ -1419,6 +1419,21 @@ fn install_mode(path: &str) -> &'static str {
     }
 }
 
+/// The boot radio preload's off flag (radio_hal.sh do_preload): its guard writes "guard: ..." after unfinished preloads,
+/// an owner's is empty. Reported in MGMT_INFO ("preload") so a Carlink log shows a preload the guard switched off.
+#[cfg(not(test))]
+const PRELOAD_OFF_FILE: &str = "/script/radio_preload_off";
+#[cfg(test)]
+const PRELOAD_OFF_FILE: &str = "/tmp/ocbmd_selftest_radio_preload_off";
+
+fn preload_state(path: &str) -> &'static str {
+    match std::fs::read_to_string(path) {
+        Err(_) => "on",
+        Ok(s) if s.starts_with("guard") => "off_guard",
+        Ok(_) => "off_owner",
+    }
+}
+
 /// MGMT_INSTALL_CONFIRM: `trial` -> `confirmed`, written `.new` + rename on the same filesystem, so a
 /// power cut leaves the old word or the new one, never a torn file. Ok(true) = confirmed now;
 /// Ok(false) = already `confirmed` or `final`; Err = no one-file install to confirm.
@@ -3473,9 +3488,10 @@ impl Daemon {
              \"rootfs_free_kb\":{rt_free},\"ssp\":{ssp},\"hci_up\":{hci_up},\"wlan_ap\":{ap},\
              \"transport\":\"{transport}\",\"host_present\":{host},\"phone_present\":{phone},\
              \"daemons\":{{\"ocbmd\":{d0},\"iap2d\":{d1},\"airplayd\":{d2},\"carplay_wireless\":{d3}}},\
-             \"install\":\"{install}\",\"update\":\"{update}\",\"update_result\":\"{update_result}\",\
+             \"preload\":\"{preload}\",\"install\":\"{install}\",\"update\":\"{update}\",\"update_result\":\"{update_result}\",\
              \"host_name\":\"{host_name}\",\"devices\":[{devs}]}}",
             install = install_mode(INSTALL_MODE_FILE),
+            preload = preload_state(PRELOAD_OFF_FILE),
             update = update_state(UPDATE_PENDING, UPDATE_RESULT),
             update_result = json_escape(read_trim(UPDATE_RESULT).lines().next().unwrap_or("")),
             ser = json_escape(&serial),
@@ -5142,6 +5158,18 @@ mod tests {
         );
         std::fs::remove_file(&f).unwrap();
         assert!(file_sha256(&f).is_none(), "a missing package has no hash");
+    }
+
+    #[test]
+    fn the_preload_state_tells_the_guard_from_the_owner() {
+        let p = "/tmp/ocbmd_selftest_preload_state";
+        let _ = std::fs::remove_file(p);
+        assert_eq!(preload_state(p), "on");
+        std::fs::write(p, "guard: 2 unfinished in a row\n").unwrap();
+        assert_eq!(preload_state(p), "off_guard");
+        std::fs::write(p, "").unwrap();
+        assert_eq!(preload_state(p), "off_owner");
+        let _ = std::fs::remove_file(p);
     }
 
     // One test for every verb that goes through the install's and the update's files: cargo runs tests in

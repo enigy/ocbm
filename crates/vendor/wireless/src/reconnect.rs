@@ -43,6 +43,11 @@ const FIRST_RETRY_SECS: u64 = 2;
 /// Mac's 13 Nov bench, at times a 2.56 s page-scan interval), which cost 9.7 s. 3.75 s covers that interval.
 const FIRST_ROUND_PAGE_SLOTS: u16 = 6_000;
 
+/// A round's order less the phones it had paged before the app's policy re-planned it.
+fn unpaged(order: Vec<[u8; 6]>, paged_before: &[[u8; 6]]) -> Vec<[u8; 6]> {
+    order.into_iter().filter(|p| !paged_before.contains(p)).collect()
+}
+
 /// The page timeout for a round: the short one for the first walk over more than one phone, else the default.
 fn round_page_slots(first_round: bool, phones: usize) -> u16 {
     if first_round && phones > 1 {
@@ -465,7 +470,7 @@ pub fn run(
                     log(&format!("switch hold -- paging only {}", control::fmt_addr(&held)));
                     vec![held]
                 }
-                _ => ctrl.call_order(bonds.clone()).into_iter().filter(|p| !paged_before.contains(p)).collect(),
+                _ => unpaged(ctrl.call_order(bonds.clone()), &paged_before),
             },
         };
         paged_before.clear();
@@ -548,7 +553,7 @@ pub fn run(
 
 #[cfg(test)]
 mod tests {
-    use super::{round_page_slots, FIRST_ROUND_PAGE_SLOTS};
+    use super::{round_page_slots, unpaged, FIRST_ROUND_PAGE_SLOTS};
     use super::{default_settle_secs, failure, walk, Attempt, ResetStreak, Walk, INITIAL_SETTLE_DEFAULT_SECS};
     use std::time::{Duration, Instant};
 
@@ -587,6 +592,34 @@ mod tests {
             },
         );
         (paged, walked)
+    }
+
+    /// The Mac's 13 Nov bench: btd can page before Carlink's SET_POLICY reaches it. A policy that changes while
+    /// a round pages ends the walk after the phone in hand, and the rest go in the new order, skipping that one.
+    #[test]
+    fn a_policy_that_changes_mid_round_re_plans_the_phones_not_yet_paged() {
+        const THIRD: [u8; 6] = [3, 0, 0, 0, 0, 0];
+        let ctrl = crate::control::Control::default();
+        ctrl.take_policy_changed();
+        let mut paged = Vec::new();
+        let walked = walk(
+            &[SCOTT, YODA, THIRD],
+            || ctrl.policy_changed(),
+            |_| true,
+            |peer| {
+                paged.push(peer);
+                if peer == SCOTT {
+                    // The app's order arrives while the first phone is paged.
+                    ctrl.set_policy(crate::control::Policy { auto_connect: true, order: vec![THIRD, SCOTT, YODA] });
+                }
+                Attempt::Failed
+            },
+        );
+        assert_eq!(paged, vec![SCOTT], "the walk stops after the phone in hand");
+        assert!(!walked.ran && !walked.rejected);
+        assert!(ctrl.take_policy_changed());
+        assert_eq!(unpaged(vec![THIRD, SCOTT, YODA], &paged), vec![THIRD, YODA], "the rest, in the new order");
+        assert!(!ctrl.policy_changed(), "taken once: the re-planned round is not stopped again");
     }
 
     /// The dev bench, 2 Nov: after a power cut the first-called iPhone answered and reset the link, and the

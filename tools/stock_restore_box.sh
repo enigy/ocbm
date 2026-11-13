@@ -89,7 +89,10 @@ BOOT_SET="script/custom_init.sh etc/mdev/udisk_insert.sh script/start_main_servi
 LOGIN_SET="etc/passwd etc/passwd- etc/shadow etc/shadow- etc/dropbear/dropbear_rsa_host_key etc/dropbear/dropbear_dss_host_key root/.ssh/authorized_keys"
 PROTECT="script/ncm_only script/ncm_wifi"
 CONSOLE="usr/sbin/ocbmd"                          # onefile: the program the restore's own console needs
-SEAM="script/radio_ap_up.sh script/radio_detect.sh script/radio_hal.sh"   # OCBM's radio seam, payload
+SEAM="script/radio_ap_up.sh script/radio_detect.sh script/radio_hal.sh \
+script/radio_preload script/radio_preload_off script/.radio_preload_inflight script/.radio_preload_unfinished"
+# OCBM's radio seam, payload, and its boot preload's state (radio_hal.sh do_preload): radio_* to is_radio(), so the
+# guard kept the off flag, and an install after the go-back started with the preload off (the Mac, 13 Nov).
 OCBM_STATE="etc/carplay"                          # OCBM's Bluetooth bond store, written while it runs
 BT_FLAG="etc/.custom_bluetooth_name"              # the seam's Bluetooth name flag (ocbm_bt_flag)
 

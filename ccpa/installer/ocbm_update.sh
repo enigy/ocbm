@@ -209,6 +209,8 @@ if [ "$rc" != 0 ]; then   # no "placed" in the journal: the next start undoes wh
   sync; unlock; $REBOOT; exit 1
 fi
 echo placed >> "$U" && sync
+# A new version starts with the boot radio preload on: its guard counts afresh (radio_hal.sh do_preload).
+rm -f "$S/radio_preload_off" "$S/.radio_preload_inflight" "$S/.radio_preload_unfinished"
 
 step restart
 result "trial $VER (from $have_line)"

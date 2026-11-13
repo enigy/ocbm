@@ -101,6 +101,12 @@ touch /tmp/UDiskPassThroughMode
         i=$((i + 1)); sleep 1
       done
       exec sh /script/radio_hal.sh preload' preload "${OCBM_PRELOAD_AFTER:-}" >> /tmp/box.log 2>&1 </dev/null &
+  elif [ -e /script/radio_preload_off ]; then   # every boot, so no drive log misses it
+    if grep -q "^guard" /script/radio_preload_off 2>/dev/null; then
+      echo "[ocbm-boot] radio preload DISABLED by its guard ($(head -1 /script/radio_preload_off)); rm /script/radio_preload_off to re-enable" >> /tmp/box.log
+    else
+      echo "[ocbm-boot] radio preload off (/script/radio_preload_off)" >> /tmp/box.log
+    fi
   fi
 
   # No remote login in OCBM mode (security review C1, 2026-10-21). The box's rcS starts dropbear
