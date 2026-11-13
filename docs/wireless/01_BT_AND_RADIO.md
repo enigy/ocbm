@@ -217,7 +217,8 @@ CarPlay on its old address for ~5 s, then DISCOVERed, and the session died when 
 (the Mac's LIVI bench, 10 Nov 16:58; the probe bench at 17:39 got the same address back and survived).
 BusyBox's server NAKs a REQUEST it has no lease for ("No, we don't have this IP for you"), so the phone
 takes a fresh address within a second, before CarPlay starts. Both scripts start it as
-`busybox udhcpd -f /etc/udhcpd.conf` (`radio_ap_up.sh`; the IW416 overlay without `-f`) on the same file,
+`busybox udhcpd -f -a 250 /etc/udhcpd.conf` (`radio_ap_up.sh`, whose 250 ms ARP probe replaces the default 2 s that cost
+1-1.9 s whenever a phone had no lease; the IW416 overlay without `-f` or `-a`) on the same file,
 pool (`.100`-`.200`), lease (864000 s), interface and lease file, and set `auto_time 60`. BusyBox writes
 leases on that timer and at SIGTERM, not at each ACK, and a drive ends in a power cut, so a lease
 reaches flash within a minute of its ACK. Its lease file has another format: an 8-byte timestamp, then

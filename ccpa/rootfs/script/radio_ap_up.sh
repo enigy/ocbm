@@ -250,7 +250,10 @@ if ! ps | grep -v grep | grep -q "udhcpd .*etc/udhcpd.conf"; then
   # radio_ap_dhcp.log stays a small `>`-truncated status file: this udhcpd is a setsid-backgrounded
   # foreground process, so piping its own stdout to tee would change its lifecycle. Only the readback
   # below (on failure) is universal-logged.
-  setsid busybox udhcpd -f /etc/udhcpd.conf </dev/null >/tmp/radio_ap_dhcp.log 2>&1 &
+  # -a 250: the ARP probe before each offer waits 250 ms, not the default 2 s. It cost 1-1.9 s whenever a phone had
+  # no lease (the Mac's 13 Nov brief, item 10); a short probe still catches an address in use. BusyBox 1.32.1's udhcpd
+  # takes -a (the adapter's, checked on the Mac's bench); /usr/sbin/udhcpd is the vendor's v0.9.9-pre and is not this.
+  setsid busybox udhcpd -f -a 250 /etc/udhcpd.conf </dev/null >/tmp/radio_ap_dhcp.log 2>&1 &
 fi
 
 # ---- converge ---------------------------------------------------------------------------------
