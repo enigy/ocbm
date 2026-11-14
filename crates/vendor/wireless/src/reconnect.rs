@@ -835,6 +835,11 @@ fn run_loop(env: &impl Env, ctrl: &Control) {
                     vec![held]
                 }
                 _ => {
+                    // The rest of a round whose walk a Connect from the device screen with no phone named ended: its bench
+                    // order is no longer due to land (the review of round 3).
+                    if rest && request.is_some() {
+                        drop_bench(env, &mut round_bench, "a Connect from the device screen came first");
+                    }
                     if !rest {
                         // One a session or a Connect left at the last round's end goes now, saying why.
                         let why = if request.is_some() { "a Connect from the device screen came first" } else { "a new round began" };
@@ -1380,6 +1385,28 @@ mod tests {
         assert_eq!(fake.paged(1), vec![SCOTT]);
         let logs = fake.logs.borrow();
         assert!(logs.iter().any(|l| l.ends_with("dropped: it came due with nothing left to page")), "{logs:?}");
+        assert!(!logs.iter().any(|l| l.contains("applied")), "never applied: {logs:?}");
+    }
+
+    /// The review of round 3: a bench order whose walk a Connect from the device screen (no phone named) cut short is
+    /// dropped, not applied to the re-planned rest: the rest goes in the app's order.
+    #[test]
+    fn a_connect_with_no_phone_named_drops_a_pending_bench_order() {
+        let ctrl = Control::default();
+        set_order(&ctrl, &[SCOTT, YODA, THIRD]);
+        let c = &ctrl;
+        let fake = Fake::new(&ctrl, 1, move |round, peer| {
+            if round == 0 && peer == SCOTT {
+                c.request_connect(None);
+                c.set_policy(crate::control::Policy { auto_connect: true, order: vec![YODA, THIRD, SCOTT] });
+            }
+            Attempt::Absent
+        });
+        *fake.bench.borrow_mut() = Some((0, super::BenchOrder { macs: vec![THIRD, YODA], after_ms: 1500 }));
+        run_loop(&fake, &ctrl);
+        assert_eq!(fake.paged(0), vec![SCOTT, YODA, THIRD], "the rest in the app's new order, not the bench's");
+        let logs = fake.logs.borrow();
+        assert!(logs.iter().any(|l| l.ends_with("dropped: a Connect from the device screen came first")), "{logs:?}");
         assert!(!logs.iter().any(|l| l.contains("applied")), "never applied: {logs:?}");
     }
 
