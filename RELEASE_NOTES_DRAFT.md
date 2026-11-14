@@ -25,8 +25,13 @@ Scott's scope (14 Nov): release OCBM a9392a5 first. Nothing here is released yet
 
 ## OCBM: GitHub release notes
 
-**Faster wireless connects.** On the Mac's bench of 2.0.1 with Carlink 387985e0, a cold connect took a median 12.1 s and
-a connect when the display wakes 11.3 s, against 22.5 s for a cold connect on the released 2.0.0, measured the same way.
+**Faster wireless connects.** Measured on the Mac's bench with Carlink 387985e0 and one iPhone, listed first and in range:
+
+- A cold connect after an adapter restart, from Carlink's USB OK to the CarPlay picture: a median 12.1 s over 3 runs on
+  2.0.1, against 22.5 s (1 run) on the released 2.0.0, measured the same way.
+- A connect when the display wakes, with the adapter still powered, from display on to the CarPlay picture: a median
+  11.3 s over 5 runs.
+- Bluetooth is up 1.5 s after the adapter sees the car, against 11.3 s.
 
 - The adapter readies Bluetooth and the Wi-Fi driver while the car starts (the boot preload). The first connect after
   power-up then skips the driver and firmware load.
@@ -74,7 +79,8 @@ a connect when the display wakes 11.3 s, against 22.5 s for a cold connect on th
   install first (Remove stock firmware), as for 2.0.0: the package needs about 3141 KB of flash, and a trial adapter has
   1252 KB. An adapter that ran a pre-release build (85bff31 to 9b228f8) may hold an older single-event flag; the
   update's first start clears it.
-- **Going back to stock from a finished adapter wipes its paired phones.** Pair them again afterwards.
+- **Going back to stock from a finished adapter wipes its paired phones.** Forget the adapter (CarLink-xxxx) on each phone
+  first, and pair them again afterwards.
 
 ## Carlink 3.03: commit notes
 
@@ -103,9 +109,9 @@ a connect when the display wakes 11.3 s, against 22.5 s for a cold connect on th
 - [ ] The 2.0.1 build's byte check: its installer image differs from a9392a5's only in tmp/ocbm/VERSION and SHA256SUMS
   (BUDGET the same), and its update package is built with a --from for every published version from 1.0.1 to 2.0.0
   (015598b's tool), so FROM_MIN stays 1.0.1.
-- [ ] The 2.0.1 package checked against every published version from 1.0.1 to 2.0.0: an adapter on each finds every
-  file it lacks. For 6a561dd0: the Mac checked 1.0.1, 1.0.3-1.0.5 and 2.0.0; the files it leaves out are also the
-  same in 1.0.2's and 1.0.6's published package sums (build agent, 14 Nov).
+- [x] The 2.0.1 package checked against every published version from 1.0.1 to 2.0.0: an adapter on each finds every
+  file it lacks. For 6a561dd0: the Mac checked 1.0.1, 1.0.3-1.0.5 and 2.0.0, and from git that the four scripts it
+  leaves out are identical at every tag from v1.0.2 to v2.0.0; 1.0.2's and 1.0.6's published package sums agree.
 - [ ] The Mac's bench of OCBM 2.0.1 (a9392a5 + its VERSION bump) with Carlink 387985e0:
   - on the published installer-2.0.0, finished (FINAL), first: a connect, and a display ON at the grace end and about
     2 s after it;
