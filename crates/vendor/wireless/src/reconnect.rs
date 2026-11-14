@@ -67,11 +67,6 @@ struct Rounds {
 }
 
 impl Rounds {
-    /// Whether this round (with a re-planned rest) has paged `peer` already.
-    fn has_paged(&self, peer: [u8; 6]) -> bool {
-        self.paged.contains(&peer)
-    }
-
     /// A walk starts: a new round forgets the last one's pages; the rest of a re-planned round keeps them.
     fn begin(&mut self) {
         if !self.replanning {
@@ -513,8 +508,8 @@ trait Env {
     fn pair_rejected_over(&self);
     /// The bench's phantom first phone ([`BENCH_PHANTOM_FLAG`]), when set.
     fn phantom(&self) -> Option<[u8; 6]>;
-    /// Apply a bench order `after_ms` into the walk about to start ([`Control::take_bench_order`]).
-    fn bench_order_later(&self, order: Vec<[u8; 6]>, after_ms: u64);
+    /// The bench's call order for the round about to start ([`BENCH_ORDER_FILE`]), taken once.
+    fn bench_order(&self) -> Option<BenchOrder>;
 }
 
 /// The real [`Env`].
@@ -567,16 +562,10 @@ impl Env for OnBox<'_> {
         let _ = std::fs::remove_file(bt_common::rfcomm::PAIR_REJECTED_FLAG);
     }
     fn phantom(&self) -> Option<[u8; 6]> {
-        std::path::Path::new(BENCH_PHANTOM_FLAG).exists().then_some(BENCH_PHANTOM)
+        box_common::bench_flag(BENCH_PHANTOM_FLAG).then_some(BENCH_PHANTOM)
     }
-    fn bench_order_later(&self, order: Vec<[u8; 6]>, after_ms: u64) {
-        let ctrl = Arc::clone(self.ctrl);
-        let _ = thread::Builder::new().name("bench-order".into()).spawn(move || {
-            thread::sleep(Duration::from_millis(after_ms));
-            log(&format!("[bench] call order applied {after_ms} ms into the round: {} phone(s)", order.len()));
-            let auto_connect = ctrl.policy().auto_connect;
-            ctrl.set_policy(control::Policy { auto_connect, order });
-        });
+    fn bench_order(&self) -> Option<BenchOrder> {
+        take_bench_order(BENCH_ORDER_FILE)
     }
 }
 
@@ -590,6 +579,65 @@ const BENCH_PHANTOM_FLAG: &str = "/tmp/bench_phantom_first";
 /// never counted toward a forgotten pairing.
 const BENCH_PHANTOM: [u8; 6] = [0x01, 0x00, 0x00, 0x00, 0x00, 0x02];
 
+/// The bench's call order for one round (docs/ops/02_TESTING.md): one line, "MAC,MAC[,...] [after_ms]", the MACs as
+/// AA:BB:CC:DD:EE:FF and after_ms 0 when left out. The next policy-order round takes it (reads and removes it) and,
+/// after_ms into its walk, pages the rest of the round in that order, through the re-plan path, as if the app's order
+/// had just come (the Mac's 13 Nov bench-hooks brief, item 5). In memory, for that round only: never set_policy, so
+/// nothing reaches projection_policy.json, Carlink's own SET_POLICY sync neither undoes it nor is undone by it, and
+/// the next round goes back to the app's order. Carlink's debug builds write it over CH_FILE; "off" is no order.
+const BENCH_ORDER_FILE: &str = "/tmp/bench_order";
+
+/// A bench call order ([`BENCH_ORDER_FILE`]): the phones, in mgmt byte order, and how far into the walk it lands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BenchOrder {
+    macs: Vec<[u8; 6]>,
+    after_ms: u64,
+}
+
+/// Whether the round's bench order is due: `after_ms` since the round started (`started`, `now`: [`Env::elapsed`]).
+fn bench_due(order: Option<&BenchOrder>, started: Duration, now: Duration) -> bool {
+    order.is_some_and(|b| now.saturating_sub(started) >= Duration::from_millis(b.after_ms))
+}
+
+/// "MAC,MAC[,...] [after_ms]", or why it isn't one.
+fn parse_bench_order(text: &str) -> Result<BenchOrder, String> {
+    let mut words = text.split_whitespace();
+    let list = words.next().ok_or("empty")?;
+    let after_ms = match words.next() {
+        None => 0,
+        Some(w) => w.parse::<u64>().map_err(|_| format!("after_ms {w:?} is not a number of ms"))?,
+    };
+    if words.next().is_some() {
+        return Err("more than a list and a delay".into());
+    }
+    let macs = list
+        .split(',')
+        .map(|a| control::parse_addr(a.trim()).ok_or(format!("{a:?} is not a MAC")))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(BenchOrder { macs, after_ms })
+}
+
+/// Take [`BENCH_ORDER_FILE`] at `path`: read and remove it. A malformed one is refused, logged and removed; an absent one,
+/// or "off", is no order ([`box_common::bench_text`]).
+fn take_bench_order(path: &str) -> Option<BenchOrder> {
+    let text = box_common::bench_text(path)?;
+    let _ = std::fs::remove_file(path);
+    match parse_bench_order(&text) {
+        Ok(order) => {
+            log(&format!(
+                "[bench] call order taken from {path}: {}, {} ms into this round",
+                order.macs.iter().map(control::fmt_addr).collect::<Vec<_>>().join(","),
+                order.after_ms
+            ));
+            Some(order)
+        }
+        Err(why) => {
+            log(&format!("[bench] {path} refused ({why}): want \"MAC,MAC[,...] [after_ms]\"; removed"));
+            None
+        }
+    }
+}
+
 /// [`run`]'s loop, against `env`: see [`run`].
 fn run_loop(env: &impl Env, ctrl: &Control) {
     let mut backoff = BACKOFF_START_SECS;
@@ -602,12 +650,20 @@ fn run_loop(env: &impl Env, ctrl: &Control) {
     let mut last_state: Option<bool> = None;
     let mut last_manual_log = false;
     let mut rounds = Rounds::default();
+    // The next walk is the rest of a re-planned round, not a new round.
+    let mut rest = false;
+    // Bench (docs/ops/02_TESTING.md): this round's call order from BENCH_ORDER_FILE until it lands, then the order the rest
+    // of the round pages in, in memory, and when the round started, for its after_ms.
+    let mut round_bench: Option<BenchOrder> = None;
+    let mut round_order: Option<Vec<[u8; 6]>> = None;
+    let mut round_started = Duration::ZERO;
     while !env.shutdown() {
         // Never fight an in-progress session (accept path or a prior reconnect). Advisory fast-path
         // only — the authoritative claim is the compare_exchange in attempt().
         if env.session_active() {
             streak.session();
             rounds.session();
+            (rest, round_bench, round_order) = (false, None, None);
             if !env.sleep(BACKOFF_START_SECS) {
                 break;
             }
@@ -631,6 +687,7 @@ fn run_loop(env: &impl Env, ctrl: &Control) {
         }
         if !has_bonds {
             rounds.not_walked();
+            (rest, round_bench, round_order) = (false, None, None);
             if !env.sleep(BACKOFF_MAX_SECS) {
                 break;
             }
@@ -651,6 +708,7 @@ fn run_loop(env: &impl Env, ctrl: &Control) {
                 log("autoConnect off — idle until the device screen asks for a phone");
                 last_manual_log = true;
             }
+            (rest, round_bench, round_order) = (false, None, None);
             rounds.not_walked();
             if !env.sleep_or_request(BACKOFF_START_SECS) {
                 break;
@@ -663,8 +721,10 @@ fn run_loop(env: &impl Env, ctrl: &Control) {
         // phone it holds for is paged, round after round, until it connects or the hold lapses
         // (`Control::request_switch`). Anything else walks the policy order, with a switched-to phone
         // that never reached CarPlay moved last for a while (`Control::switch_stranded`).
-        let mut policy_round = false;
-        let mut targets: Vec<[u8; 6]> = match request {
+        // The round's phones, for the re-plan's "any left" (with the bench's phantom in a policy-order round).
+        let mut round_bonds = bonds.clone();
+        let mut phantom = None;
+        let targets: Vec<[u8; 6]> = match request {
             Some(Some(addr)) => {
                 if bonds.contains(&addr) {
                     log(&format!("explicit connect request for {}", control::fmt_addr(&addr)));
@@ -685,24 +745,25 @@ fn run_loop(env: &impl Env, ctrl: &Control) {
                     vec![held]
                 }
                 _ => {
-                    policy_round = true;
-                    rounds.order(bonds.clone(), |b| ctrl.call_order(b))
+                    if !rest {
+                        round_bench = env.bench_order();
+                        round_order = None;
+                        round_started = env.elapsed();
+                    }
+                    // Bench: the phantom first phone is one of the round's phones, ahead of the bonds, so a round that
+                    // found it absent pages it last next round, as a real absent first-listed phone (the Mac's review,
+                    // BH-04).
+                    phantom = env.phantom();
+                    if phantom.is_some() && !rest {
+                        log("[bench] the phantom first phone is in this round (/tmp/bench_phantom_first)");
+                    }
+                    round_bonds = round_order.clone().unwrap_or_else(|| {
+                        phantom.into_iter().chain(bonds.iter().copied().filter(|b| Some(*b) != phantom)).collect()
+                    });
+                    rounds.order(round_bonds.clone(), |b| ctrl.call_order(b))
                 }
             },
         };
-        // Bench: the phantom first phone, once per round (not again in a re-planned rest, which skips what it paged).
-        let phantom = if policy_round { env.phantom() } else { None };
-        if let Some(p) = phantom {
-            if !rounds.has_paged(p) {
-                log("[bench] paging the phantom first phone (/tmp/bench_phantom_first)");
-                targets.insert(0, p);
-            }
-        }
-        if policy_round {
-            if let Some((order, after_ms)) = ctrl.take_bench_order() {
-                env.bench_order_later(order, after_ms);
-            }
-        }
 
         let want = round_page_slots(first_round, targets.len());
         if want != page_slots {
@@ -716,7 +777,12 @@ fn run_loop(env: &impl Env, ctrl: &Control) {
         }
         let Walk { ran, rejected } = walk(
             &targets,
-            || env.shutdown() || env.session_active() || ctrl.policy_changed(),
+            || {
+                env.shutdown()
+                    || env.session_active()
+                    || ctrl.policy_changed()
+                    || bench_due(round_bench.as_ref(), round_started, env.elapsed())
+            },
             |peer| {
                 log(&format!(
                     "{} answered and reset the link -- paging it once more in {RESET_RETRY_SECS}s before the next phone",
@@ -748,10 +814,29 @@ fn run_loop(env: &impl Env, ctrl: &Control) {
         // The app's policy came while this round paged (btd can page before Carlink's SET_POLICY reaches it): the phones
         // not yet paged go at once, in its order, and a round that has not ended keeps its first-round page.
         // R1: the round's pages and timeouts carry into the rest, and a change with nothing left to page ends it.
-        let changed = !ran && !rejected && ctrl.take_policy_changed();
-        if rounds.end(ran, changed, &bonds) {
-            log("the app's call order came mid-round -- paging the rest by it");
+        // Bench: its call order lands the same way, after_ms into the round, in memory for the rest of it only.
+        let bench_now = !ran && !rejected && bench_due(round_bench.as_ref(), round_started, env.elapsed());
+        if bench_now {
+            if let Some(b) = round_bench.take() {
+                let order = control::order_bonds(&round_bonds, &b.macs);
+                log(&format!(
+                    "[bench] call order applied {} ms into the round, for this round only (not saved): {}",
+                    env.elapsed().saturating_sub(round_started).as_millis(),
+                    order.iter().map(control::fmt_addr).collect::<Vec<_>>().join(",")
+                ));
+                round_order = Some(order);
+            }
+        }
+        let changed = !ran && !rejected && (bench_now || ctrl.take_policy_changed());
+        if rounds.end(ran, changed, &round_bonds) {
+            log(if bench_now { "[bench] paging the rest of the round by its call order" } else { "the app's call order came mid-round -- paging the rest by it" });
+            rest = true;
             continue;
+        }
+        rest = false;
+        round_order = None;
+        if let Some(b) = round_bench.take() {
+            log(&format!("[bench] the round ended before its call order was due ({} ms): dropped", b.after_ms));
         }
         if rejected {
             backoff = BACKOFF_MAX_SECS; // the phone said no; more paging only rotates codes
@@ -870,6 +955,10 @@ mod tests {
         gaps: std::cell::RefCell<Vec<u64>>,
         bond_lost: std::cell::Cell<u32>,
         base: Instant,
+        /// The rounds in which the phone's own session is live (the accept path), at the loop's top.
+        sessions: Vec<usize>,
+        /// A bench call order for a round, taken once ([`Env::bench_order`]).
+        bench: std::cell::RefCell<Option<(usize, super::BenchOrder)>>,
     }
 
     impl<'a> Fake<'a> {
@@ -885,6 +974,8 @@ mod tests {
                 gaps: Default::default(),
                 bond_lost: Default::default(),
                 base: Instant::now(),
+                sessions: Vec::new(),
+                bench: Default::default(),
             }
         }
 
@@ -909,7 +1000,7 @@ mod tests {
             self.round.get() >= self.rounds
         }
         fn session_active(&self) -> bool {
-            false
+            self.sessions.contains(&self.round.get())
         }
         fn sleep(&self, secs: u64) -> bool {
             self.sleep_or_request(secs)
@@ -939,8 +1030,13 @@ mod tests {
         fn phantom(&self) -> Option<[u8; 6]> {
             self.phantom
         }
-        fn bench_order_later(&self, order: Vec<[u8; 6]>, _after_ms: u64) {
-            set_order(self.ctrl, &order);
+        fn bench_order(&self) -> Option<super::BenchOrder> {
+            let mut b = self.bench.borrow_mut();
+            if b.as_ref().is_some_and(|(round, _)| *round == self.round.get()) {
+                b.take().map(|(_, order)| order)
+            } else {
+                None
+            }
         }
     }
 
@@ -992,26 +1088,107 @@ mod tests {
         assert_eq!(fake.paged(1), vec![THIRD, YODA, SCOTT], "all timed out: the order just set");
     }
 
-    /// The crossing rule through the loop, with the bench's phantom first phone: a reset straight after its timeout is
-    /// never counted toward a forgotten pairing, round after round; resets with nothing before them are.
+    /// BH-04 and the crossing rule, with the bench's phantom: it is one of the round's phones, ahead of the bonds, so the
+    /// round after it timed out pages it last, as a real absent first-listed phone; a reset straight after its timeout
+    /// is not counted toward a forgotten pairing.
     #[test]
-    fn the_loop_never_counts_a_crossing_reset_and_pages_the_phantom_first() {
+    fn the_phantom_goes_first_then_last_and_its_crossing_reset_is_not_counted() {
         let ctrl = Control::default();
         set_order(&ctrl, &[YODA]);
-        let mut fake = Fake::new(&ctrl, 6, |_, peer| if peer == super::BENCH_PHANTOM { Attempt::Absent } else { Attempt::Reset });
+        let mut yoda_in_round_1 = 0;
+        let mut fake = Fake::new(&ctrl, 3, move |round, peer| match (round, peer) {
+            (_, p) if p == super::BENCH_PHANTOM => Attempt::Absent,
+            (1, _) => {
+                yoda_in_round_1 += 1;
+                if yoda_in_round_1 == 1 { Attempt::Reset } else { Attempt::Failed }
+            }
+            _ => Attempt::Reset,
+        });
         fake.phantom = Some(super::BENCH_PHANTOM);
         run_loop(&fake, &ctrl);
-        for round in 0..6 {
-            assert_eq!(fake.paged(round), vec![super::BENCH_PHANTOM, YODA, YODA], "round {round}");
-        }
-        // Each round: a crossing reset (not counted), then its re-page's reset (counted): three rounds tell, once.
-        assert_eq!(fake.bond_lost.get(), 1);
+        assert_eq!(fake.paged(0), vec![super::BENCH_PHANTOM, YODA, YODA], "first, as an absent first-listed phone");
+        assert_eq!(fake.paged(1), vec![YODA, YODA, super::BENCH_PHANTOM], "timed out last round: last");
+        // Counted: round 0's re-page (1) and round 1's first page (2); round 1's failed re-page ends the run. Had round
+        // 0's crossing reset counted, round 1's first page would have been the third, and told.
+        assert_eq!(fake.bond_lost.get(), 0);
 
         let ctrl = Control::default();
         set_order(&ctrl, &[YODA]);
         let fake = Fake::new(&ctrl, 2, |_, _| Attempt::Reset);
         run_loop(&fake, &ctrl);
         assert_eq!(fake.bond_lost.get(), 1, "two resets a round, nothing before them: told in the second round");
+    }
+
+    /// R2 through the loop: a phone's own session (the accept path) clears who was absent: the round after it pages in
+    /// the policy's order again.
+    #[test]
+    fn the_loop_forgets_who_was_absent_after_a_phone_s_own_session() {
+        let ctrl = Control::default();
+        set_order(&ctrl, &[SCOTT, YODA]);
+        let mut fake = Fake::new(&ctrl, 4, |round, peer| if peer == SCOTT && round < 2 { Attempt::Absent } else { Attempt::Failed });
+        fake.sessions = vec![2];
+        run_loop(&fake, &ctrl);
+        assert_eq!(fake.paged(1), vec![YODA, SCOTT], "timed out: last");
+        assert!(fake.paged(2).is_empty(), "its own session: nothing paged");
+        assert_eq!(fake.paged(3), vec![SCOTT, YODA], "after the session, the policy's order");
+    }
+
+    /// R3 through the loop: a passed-over phone stays last, even behind a phone that timed out last round.
+    #[test]
+    fn the_loop_keeps_a_passed_over_phone_last() {
+        let ctrl = Control::default();
+        set_order(&ctrl, &[SCOTT, YODA, THIRD]);
+        ctrl.pass_over(YODA);
+        let fake = Fake::new(&ctrl, 2, |round, peer| if round == 0 && peer == SCOTT { Attempt::Absent } else { Attempt::Failed });
+        run_loop(&fake, &ctrl);
+        assert_eq!(fake.paged(0), vec![SCOTT, THIRD, YODA]);
+        assert_eq!(fake.paged(1), vec![THIRD, SCOTT, YODA], "the timed-out phone last but one: the passed-over one is last");
+    }
+
+    /// The bench's call order (BH-01/02): taken for one round, it lands after_ms into the walk through the re-plan path
+    /// and pages the rest of the round in its order; the next round is the app's order again, and nothing was saved.
+    #[test]
+    fn the_loop_pages_a_bench_order_for_one_round_in_memory() {
+        let ctrl = Control::default();
+        set_order(&ctrl, &[SCOTT, YODA, THIRD]);
+        let fake = Fake::new(&ctrl, 2, |_, _| Attempt::Absent);
+        *fake.bench.borrow_mut() = Some((0, super::BenchOrder { macs: vec![THIRD, YODA], after_ms: 1500 }));
+        run_loop(&fake, &ctrl);
+        // A timed-out page moves the fake clock 4 s: due after the first page.
+        assert_eq!(fake.paged(0), vec![SCOTT, THIRD, YODA], "the rest of the round in the bench order");
+        assert_eq!(fake.gaps.borrow()[0], FIRST_RETRY_SECS, "one round: the bench order is no round of its own");
+        assert_eq!(fake.paged(1), vec![SCOTT, YODA, THIRD], "the next round, the app's order");
+        assert_eq!(ctrl.policy().order, vec![SCOTT, YODA, THIRD], "never saved");
+        assert!(!ctrl.take_policy_changed(), "nor seen as the app's");
+
+        let ctrl = Control::default();
+        set_order(&ctrl, &[SCOTT, YODA]);
+        let fake = Fake::new(&ctrl, 1, |_, _| Attempt::Absent);
+        *fake.bench.borrow_mut() = Some((0, super::BenchOrder { macs: vec![YODA], after_ms: 0 }));
+        run_loop(&fake, &ctrl);
+        assert_eq!(fake.paged(0), vec![YODA, SCOTT], "after_ms 0: before the first page");
+    }
+
+    /// /tmp/bench_order: read and removed; "off" is no order and is left; a malformed one is refused and removed.
+    #[test]
+    fn a_bench_order_file_is_taken_once_and_a_bad_one_refused() {
+        let path = std::env::temp_dir().join(format!("btd_bench_order_{}", std::process::id()));
+        let p = path.to_str().unwrap();
+        let a = [0x01, 0xee, 0xdd, 0xcc, 0xbb, 0xaa];
+        let b = [0x02, 0xee, 0xdd, 0xcc, 0xbb, 0xaa];
+        std::fs::write(&path, "AA:BB:CC:DD:EE:01,aa:bb:cc:dd:ee:02 1500\n").unwrap();
+        assert_eq!(super::take_bench_order(p), Some(super::BenchOrder { macs: vec![a, b], after_ms: 1500 }));
+        assert!(!path.exists(), "taken once");
+        std::fs::write(&path, "AA:BB:CC:DD:EE:01").unwrap();
+        assert_eq!(super::take_bench_order(p).map(|o| o.after_ms), Some(0), "after_ms defaults to 0");
+        std::fs::write(&path, "off\n").unwrap();
+        assert_eq!(super::take_bench_order(p), None);
+        assert!(path.exists(), "off is no order, and is left");
+        for bad in ["", "AA:BB:CC:DD:EE", "AA:BB:CC:DD:EE:01 soon", "AA:BB:CC:DD:EE:01 1 2"] {
+            std::fs::write(&path, bad).unwrap();
+            assert_eq!(super::take_bench_order(p), None, "{bad:?}");
+            assert!(!path.exists(), "{bad:?}: refused and removed");
+        }
     }
 
     /// The Mac's 13 Nov bench and review (R1): the app's order arrives while the first phone is paged. The rest go at

@@ -34,14 +34,15 @@ pub fn first_frame() {
     let Ok(marks) = std::fs::read_to_string(MARKS) else { return };
     let Some(line) = summary(&marks, now) else { return };
     let at = mark_value(&marks, "boxlog_at").unwrap_or(0);
+    let head = mark_word(&marks, "boxlog_head");
     let nudges = [NUDGES[0].load(Ordering::Relaxed), NUDGES[1].load(Ordering::Relaxed)];
-    eprintln!("[startup] {line}{}", counts(&marks, nudges, psk_mismatches(at)));
+    eprintln!("[startup] {line}{}", counts(&marks, nudges, psk_mismatches(BOX_LOG, at, head)));
 }
 
 /// This session's counts, for the Mac's bench to read one line per session (its 13 Nov bench-hooks brief, item 8): btd's
 /// timed-out pages and resets (and of those, the ones cut for no SDP channel after the answer), this carplayd's nudges, and the
 /// phone's PSK-mismatch tries at the access point.
-fn counts(marks: &str, nudges: [u32; 2], psk: Option<usize>) -> String {
+fn counts(marks: &str, nudges: [u32; 2], psk: Option<Psk>) -> String {
     let tally = |what: &str| marks.lines().filter(|l| l.split_whitespace().eq(["tally", what])).count();
     format!(
         "; this session: absent pages {}, resets {} ({} cut, no SDP channel), nudges {}+{}, PSK mismatches {}",
@@ -50,21 +51,50 @@ fn counts(marks: &str, nudges: [u32; 2], psk: Option<usize>) -> String {
         tally("sdp_cut"),
         nudges[0],
         nudges[1],
-        psk.map_or_else(|| "-".to_string(), |n| n.to_string())
+        match psk {
+            None => "-".to_string(),
+            Some(Psk { count, cut: true }) => format!(">={count} (box.log cut)"),
+            Some(Psk { count, cut: false }) => count.to_string(),
+        }
     )
 }
 
-/// hostapd's AP-STA-POSSIBLE-PSK-MISMATCH lines in the box log after byte `from` (from the start when the log was cut
-/// since); None when it can't be read.
-fn psk_mismatches(from: u64) -> Option<usize> {
+/// The session's PSK-mismatch count, and whether the box log was cut since the host came: ocbmd empties it at its cap,
+/// and the lines between the host and the cut are gone, so the count is then a lower bound (the Mac's review, BH-06).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Psk {
+    count: usize,
+    cut: bool,
+}
+
+/// hostapd's AP-STA-POSSIBLE-PSK-MISMATCH lines in the box log after byte `from`, its size when the host came, or all of
+/// it when it was cut since: shorter than `from`, or its first bytes no longer `head` (btd's `boxlog_head`, hex), as when
+/// it was emptied and grew past `from` again. None when it can't be read.
+fn psk_mismatches(path: &str, from: u64, head: Option<&str>) -> Option<Psk> {
     use std::io::{Read as _, Seek as _, SeekFrom};
-    let mut f = std::fs::File::open(BOX_LOG).ok()?;
+    let mut f = std::fs::File::open(path).ok()?;
     let len = f.metadata().ok()?.len();
-    let start = if from > len { 0 } else { from.max(len.saturating_sub(SCAN_MAX)) };
+    let mut first = vec![0u8; head.map_or(0, |h| h.len() / 2)];
+    let n = f.read(&mut first).ok()?;
+    let cut = from > len || head.is_some_and(|h| hex(&first[..n]) != h);
+    let start = if cut { 0 } else { from.max(len.saturating_sub(SCAN_MAX)) };
     f.seek(SeekFrom::Start(start)).ok()?;
     let mut buf = Vec::new();
     f.take(SCAN_MAX).read_to_end(&mut buf).ok()?;
-    Some(String::from_utf8_lossy(&buf).matches("AP-STA-POSSIBLE-PSK-MISMATCH").count())
+    Some(Psk { count: String::from_utf8_lossy(&buf).matches("AP-STA-POSSIBLE-PSK-MISMATCH").count(), cut })
+}
+
+/// Lower-case hex, as btd writes `boxlog_head`.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A mark's first word after its name, as text.
+fn mark_word<'a>(marks: &'a str, stage: &str) -> Option<&'a str> {
+    marks.lines().find_map(|l| {
+        let mut w = l.split_whitespace();
+        (w.next() == Some(stage)).then(|| w.next()).flatten()
+    })
 }
 
 fn mark_value(marks: &str, stage: &str) -> Option<u64> {
@@ -143,7 +173,7 @@ mod tests {
     fn the_session_counts_read_from_the_tallies_and_this_process() {
         let marks = "host_present 1000\ntally absent\ntally reset\ntally sdp_cut\ntally absent\nhandoff 5000\n";
         assert_eq!(
-            counts(marks, [1, 0], Some(2)),
+            counts(marks, [1, 0], Some(Psk { count: 2, cut: false })),
             "; this session: absent pages 2, resets 1 (1 cut, no SDP channel), nudges 1+0, PSK mismatches 2"
         );
         assert_eq!(
@@ -151,6 +181,30 @@ mod tests {
             "; this session: absent pages 0, resets 0 (0 cut, no SDP channel), nudges 0+0, PSK mismatches -"
         );
         assert_eq!(summary(marks, 9000).as_deref().map(|l| l.contains("tally")), Some(false), "tallies are no stage");
+    }
+
+    /// BH-06: a box log ocbmd rotated since the host came (emptied at its cap) gives a lower bound, said as one; one
+    /// that only grew is counted from where it stood.
+    #[test]
+    fn a_box_log_cut_since_the_host_came_gives_a_lower_bound() {
+        let path = std::env::temp_dir().join(format!("receiver_psk_{}.log", std::process::id()));
+        let p = path.to_str().unwrap();
+        let before = "[ocbmd] up\nwlan0: AP-STA-POSSIBLE-PSK-MISMATCH 1\n";
+        let head = hex(&before.as_bytes()[..32]);
+        let from = before.len() as u64;
+        std::fs::write(&path, format!("{before}wlan0: AP-STA-POSSIBLE-PSK-MISMATCH 2\nwlan0: AP-STA-POSSIBLE-PSK-MISMATCH 3\n")).unwrap();
+        assert_eq!(psk_mismatches(p, from, Some(&head)), Some(Psk { count: 2, cut: false }), "only this session's");
+        std::fs::write(&path, "AP-STA-POSSIBLE-PSK-MISMATCH\n").unwrap();
+        assert_eq!(psk_mismatches(p, from, None), Some(Psk { count: 1, cut: true }), "shorter than it was: cut");
+        let grown = format!("[log] rotated 262144 bytes\n{}wlan0: AP-STA-POSSIBLE-PSK-MISMATCH 5\n", "x".repeat(200));
+        std::fs::write(&path, grown).unwrap();
+        assert_eq!(psk_mismatches(p, from, Some(&head)), Some(Psk { count: 1, cut: true }), "grown past it again: cut");
+        assert_eq!(
+            counts("", [0, 0], Some(Psk { count: 1, cut: true })),
+            "; this session: absent pages 0, resets 0 (0 cut, no SDP channel), nudges 0+0, PSK mismatches >=1 (box.log cut)"
+        );
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(psk_mismatches(p, 0, None), None, "no log");
     }
 
     #[test]

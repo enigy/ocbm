@@ -32,3 +32,41 @@ pub fn lever(name: &str, legacy: &str) -> Option<String> {
         Err(_) => None,
     }
 }
+
+/// A bench flag's text (docs/ops/02_TESTING.md, "Bench hooks"): the trimmed content of `path` when the flag is set,
+/// None when it is not. Set means the file exists and its content is not "off": empty and "on" are set. Carlink's debug
+/// builds write the flags over CH_FILE, which can write a file but not delete one, so they clear a flag by writing
+/// "off". Nothing in the product writes them, and /tmp clears at a reboot.
+pub fn bench_text(path: &str) -> Option<String> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => Some(s.trim().to_string()).filter(|t| t != "off"),
+        // Present but unreadable: set, as a file that exists.
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Some(String::new()),
+        Err(_) => None,
+    }
+}
+
+/// Whether the bench flag at `path` is set ([`bench_text`]).
+pub fn bench_flag(path: &str) -> bool {
+    bench_text(path).is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_bench_flag_is_set_unless_absent_or_off() {
+        let path = std::env::temp_dir().join(format!("box_common_bench_flag_{}", std::process::id()));
+        let p = path.to_str().unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(!bench_flag(p), "absent");
+        for (text, set) in [("", true), ("on\n", true), ("  off \n", false), ("off", false), ("1", true)] {
+            std::fs::write(&path, text).unwrap();
+            assert_eq!(bench_flag(p), set, "{text:?}");
+        }
+        std::fs::write(&path, " AA:BB:CC:DD:EE:01 1500\n").unwrap();
+        assert_eq!(bench_text(p).as_deref(), Some("AA:BB:CC:DD:EE:01 1500"), "the text, trimmed");
+        let _ = std::fs::remove_file(&path);
+    }
+}

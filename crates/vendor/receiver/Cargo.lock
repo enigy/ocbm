@@ -51,6 +51,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "box-common"
+version = "0.1.0"
+dependencies = [
+ "ocbm-proto",
+]
+
+[[package]]
 name = "carplay-iap2-core"
 version = "0.1.0"
 dependencies = [
@@ -380,6 +387,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ocbm-proto"
+version = "0.1.0"
+
+[[package]]
 name = "opaque-debug"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -486,6 +497,7 @@ dependencies = [
 name = "receiver"
 version = "0.0.0"
 dependencies = [
+ "box-common",
  "carplay-iap2-core",
  "chacha20poly1305",
  "ed25519-dalek",

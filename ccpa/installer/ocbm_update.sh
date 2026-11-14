@@ -145,9 +145,10 @@ have=$(first "$have_line")
 [ -n "$have" ] || refuse "The adapter does not say which OCBM it runs (/etc/ocbm/installed_version)."
 # Bench only (docs/ops/02_TESTING.md): with $RUN/bench_update_any_version (/tmp; nothing in the product writes it) a
 # package of the same or an older VERSION is placed too, as the Mac's bench builds keep 2.0.0 with new code. Every
-# other check stands.
+# other check stands. Set when the file exists and does not read "off" (Carlink clears a flag by writing "off").
+bench_flag() { [ -e "$1" ] && [ "$(tr -d ' \t\r\n' < "$1" 2>/dev/null)" != off ]; }
 if ! newer "$new" "$have"; then
-  [ -e "$RUN/bench_update_any_version" ] || refuse "The adapter already runs OCBM $have; this package is $new."
+  bench_flag "$RUN/bench_update_any_version" || refuse "The adapter already runs OCBM $have; this package is $new."
   log "[bench] placing $new over $have ($RUN/bench_update_any_version)"
 fi
 newer "$from_min" "$have" && refuse "This package updates OCBM $from_min or newer; the adapter runs $have."

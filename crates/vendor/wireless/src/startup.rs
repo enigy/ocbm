@@ -26,14 +26,30 @@ pub fn begin() {
     let states = std::fs::read_to_string(PRELOAD_STATE).unwrap_or_default();
     let preload = host_uptime.map_or_else(|| "unknown".to_string(), |at| preload_at(&states, at));
     let mut record = format!("host_present {present}\npreload {preload}\n");
-    // Where the box log stood, so carplayd counts only this session's hostapd lines (receiver::startup).
-    if let Ok(m) = std::fs::metadata("/tmp/box.log") {
-        record.push_str(&format!("boxlog_at {}\n", m.len()));
+    // Where the box log stood, so carplayd counts only this session's hostapd lines (receiver::startup), and its first
+    // bytes, so a log ocbmd rotated since (emptied at its cap) is told from one that only grew (the Mac's review, BH-06).
+    if let Ok(mut f) = std::fs::File::open("/tmp/box.log") {
+        use std::io::Read as _;
+        if let Ok(m) = f.metadata() {
+            record.push_str(&format!("boxlog_at {}\n", m.len()));
+        }
+        let mut head = [0u8; BOXLOG_HEAD];
+        if let Ok(n @ 1..) = f.read(&mut head) {
+            record.push_str(&format!("boxlog_head {}\n", hex(&head[..n])));
+        }
     }
     if let Some(u) = host_uptime {
         record.push_str(&format!("host_uptime {u}\n"));
     }
     let _ = std::fs::write(MARKS, record);
+}
+
+/// How many of the box log's first bytes `boxlog_head` keeps (receiver::startup compares them).
+pub const BOXLOG_HEAD: usize = 32;
+
+/// Lower-case hex, for the marks.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// `/proc/uptime`'s first field in ms.
