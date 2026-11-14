@@ -1,4 +1,4 @@
-# Connect speed: release notes draft (14 Nov 2026, round 3, not merged)
+# Connect speed: release notes draft (14 Nov 2026, round 3 and its review, not merged)
 
 Scott's scope (14 Nov): release OCBM a9392a5 first. Nothing here is released yet; it waits for the bench below.
 
@@ -6,15 +6,15 @@ Scott's scope (14 Nov): release OCBM a9392a5 first. Nothing here is released yet
 
 - **OCBM 2.0.1: a9392a5 plus its version bump to 2.0.1** (88afbfb on `rel-2.0.1`, VERSION only). The changes are efeb113
   to a9392a5, 8 commits on v2.0.0; the protocol is unchanged.
-- **Carlink 3.03 from `connect-speed-2` at 9146fffe**, pinning OCBM 2.0.1. It is v302 plus:
+- **Carlink 3.03 from `connect-speed-2` at 387985e0**, pinning OCBM 2.0.1. It is v302 plus:
   - the Tide water moving while driving (e165f5fe, merged to main on 12 Nov);
   - `bench-1113`: the wake connecting at once, the Phones call-order line and the engine type selector;
   - the fixes for a display off/on during a connect (the 13 Nov C1 and the 14 Nov reviews' W1-W9, with W1 on
-    elapsedRealtime);
+    elapsedRealtime, and the round 3 review's fix: only a stop that sent CT_STOP holds the next connect);
   - the cold-start log line, and tests.
   It works with OCBM 2.0.0 too.
 - **Not in this release:**
-  - the OCBM `connect-speed-2` line (8a3a8b2: one Bluetooth power cycle, the cut of a stuck SDP answer, the woken
+  - the OCBM `connect-speed-2` line (8a7e802: one Bluetooth power cycle, the cut of a stuck SDP answer, the woken
     supervisor), after its own bench;
   - the bench hooks (debug builds and /tmp files only);
   - Carlink `fuel-discounts`.
@@ -80,7 +80,7 @@ expected (an estimate, not yet measured).
 
 - [ ] The 2.0.1 build's byte check: its installer image differs from a9392a5's only in tmp/ocbm/VERSION and SHA256SUMS
   (BUDGET the same), and its update package is built --from the 1.0.1 SHA256SUMS, so FROM_MIN stays 1.0.1.
-- [ ] The Mac's bench of OCBM 2.0.1 (a9392a5 + its VERSION bump) with Carlink 9146fffe:
+- [ ] The Mac's bench of OCBM 2.0.1 (a9392a5 + its VERSION bump) with Carlink 387985e0:
   - on the published 2.0.0 first: a connect, and a display ON at the grace end and about 2 s after it;
   - the in-app update of that 2.0.0 adapter to the 2.0.1 package;
   - on 2.0.1: wakes, a cold start, display flickers in the wake's open, the grace-end ONs, and a reboot in final mode;
