@@ -25,9 +25,8 @@ Scott's scope (14 Nov): release OCBM a9392a5 first. Nothing here is released yet
 
 ## OCBM: GitHub release notes
 
-**Faster wireless connects.** On the Mac's bench of a pre-release build (9b228f8, 13 Nov), a cold connect took a median
-13.2 s from the adapter's USB link coming up to the CarPlay picture. [To replace with the medians from the Mac's bench of
-2.0.1 with Carlink 387985e0, one measure throughout: a cold start and a display wake, and 2.0.0 measured the same way.]
+**Faster wireless connects.** On the Mac's bench of 2.0.1 with Carlink 387985e0, a cold connect took a median 12.1 s and
+a connect when the display wakes 11.3 s, against 22.5 s for a cold connect on the released 2.0.0, measured the same way.
 
 - The adapter readies Bluetooth and the Wi-Fi driver while the car starts (the boot preload). The first connect after
   power-up then skips the driver and firmware load.
@@ -75,6 +74,7 @@ Scott's scope (14 Nov): release OCBM a9392a5 first. Nothing here is released yet
   install first (Remove stock firmware), as for 2.0.0: the package needs about 3141 KB of flash, and a trial adapter has
   1252 KB. An adapter that ran a pre-release build (85bff31 to 9b228f8) may hold an older single-event flag; the
   update's first start clears it.
+- **Going back to stock from a finished adapter wipes its paired phones.** Pair them again afterwards.
 
 ## Carlink 3.03: commit notes
 
@@ -97,9 +97,9 @@ Scott's scope (14 Nov): release OCBM a9392a5 first. Nothing here is released yet
 
 ## Before merging
 
-- [ ] Scott picks Carlink 3.03's base: 06c1d09e, as above, or the benched 387985e0 with those items left for later.
-- [ ] Scott picks the OCBM release set: the Mac's corrected build (image 718a00b3, package 6a561dd0, with 2.0.0's bytes for
-  the unchanged iap2d and iap_role_switch; benched byte for byte) or a rebuild.
+- [x] Scott picked Carlink 3.03's base: 06c1d09e (14 Nov). [303] also says "About 20 seconds" for Reset connection.
+- [x] Scott picked the OCBM release set (14 Nov): the Mac's corrected build (image 718a00b3, package 6a561dd0, with
+  2.0.0's bytes for the unchanged iap2d and iap_role_switch; benched byte for byte).
 - [ ] The 2.0.1 build's byte check: its installer image differs from a9392a5's only in tmp/ocbm/VERSION and SHA256SUMS
   (BUDGET the same), and its update package is built with a --from for every published version from 1.0.1 to 2.0.0
   (015598b's tool), so FROM_MIN stays 1.0.1.
