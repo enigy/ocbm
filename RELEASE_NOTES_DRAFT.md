@@ -10,12 +10,12 @@ For Scott's merge decision once the Mac's bench passes. Nothing here is released
 
 ## OCBM: GitHub release notes
 
-**Faster wireless connects.** On the Mac's bench a cold connect now takes 14-17 s from Carlink's start to the CarPlay picture, down from 33-42 s on 2.0.0. A connect when the display wakes takes about 15 s.
+**Faster wireless connects.** On the Mac's bench a cold connect now takes 14-17 s from Carlink opening the adapter to the CarPlay picture, against about 26-28 s on 2.0.0 measured the same way. That is with the first-listed phone away; with the driver's own phone listed first, about 10-11 s is expected (an estimate, not yet measured). A connect when the display wakes takes about 15 s.
 
 - The adapter readies Bluetooth and the Wi-Fi driver while the car starts (the boot preload). The first connect after power-up then skips the driver and firmware load.
 - Bluetooth and the Wi-Fi network come up side by side. The adapter tries each phone briefly first (about 4 s each), in the order set in Carlink's Phones page.
-- A phone whose page timed out is tried last in the next round. A phone that comes back within two minutes is found within 5 s.
-- A phone that answers and then drops the link is no longer read as having forgotten the pairing.
+- A phone whose page timed out is tried last in the next round. A phone that comes back within two minutes is found at the next round, at most 5 s later, plus its own page: about 5-7 s.
+- A phone that answers and then drops the link straight after another phone's page timed out is no longer read as having forgotten the pairing.
 - If the phone drops its screen stream, the adapter asks for the picture again after 0.5 s, and once more at 3 s.
 - One `[startup]` line per session times each stage. ocbmd logs every hello from Carlink with the adapter's uptime.
 
@@ -28,6 +28,7 @@ For Scott's merge decision once the Mac's bench passes. Nothing here is released
   - On a trial adapter, or a version still in its update trial, the preload waits until the start-up self-test passes. It never shares a first boot with anything new.
   - On a final adapter it starts at boot.
   - In both, a host that arrives first takes the radios: the preload steps aside, and never powers Bluetooth off under a session.
+  - A host that arrives while the preload runs waits for it (up to about 7 s), then finds Bluetooth already up.
 - **Updating from 2.0.0** needs nothing special. An adapter that ran a pre-release build (85bff31 to 9b228f8) may hold an older single-event flag; the update's first start clears it.
 
 ## Carlink 3.03: commit notes
