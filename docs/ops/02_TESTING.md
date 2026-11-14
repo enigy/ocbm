@@ -316,20 +316,24 @@ can write but not delete, so it clears one by writing `off`. From a debug build:
         [--es value <text>] [--ez on false]
 
 - `/tmp/bench_phantom_first`: btd adds `02:00:00:00:00:01`, a locally administered address no phone has, ahead
-  of the bonded phones in every policy-order round (not for an explicit connect or a switch hold). Its page times
-  out like an absent first-listed phone's, so "first-listed absent" needs no airplane mode; and like one, a round
-  that found it absent pages it last next round. It is never bonded, listed or counted toward a forgotten pairing.
+  of the bonded phones in every policy-order round (not for a switch hold, nor a Connect from the device screen,
+  named or not). Its page times out like an absent first-listed phone's, so "first-listed absent" needs no
+  airplane mode; and like one, a round that found it absent pages it last next round.
+  It is never bonded, listed or counted toward a forgotten pairing.
 - `/tmp/bench_order`: one line, `MAC,MAC[,...] [after_ms]` (the MACs as `AA:BB:CC:DD:EE:FF`, `after_ms` 0 when left
   out). The next policy-order round reads and removes it and, `after_ms` into its walk (at the next page
   boundary), pages the rest of the round in that order, through the re-plan path: the mid-round re-plan on cue.
   Bonded phones it leaves out follow it; addresses that aren't bonded are ignored. It holds for that round only,
   in memory: nothing is saved to `projection_policy.json`, Carlink's SET_POLICY neither undoes it nor is undone by
-  it, and the next round is the app's order again. A malformed file is refused with a `[bench]` line and removed;
-  `off` is no order. A round that ends before `after_ms` drops it.
+  it, and the next round is the app's order again. A malformed file (or one that lists a phone twice) is refused
+  with a `[bench]` line and removed; `off` is no order. An order dropped unused (the round ended or a phone
+  connected first, nothing was left to page, a session, a Connect or a switch hold came first) says why in a
+  `[bench]` line.
 - `/tmp/bench_skip_first_requestui`: carplayd skips the 0.5 s screen nudge's requestUI once (the file is removed
   when used) and says so, so the 3 s second nudge fires.
-- `/tmp/sdp_after_acl_ms` (whole ms): how long btd gives the SDP channel after a page is answered (the link
-  BT_CONNECTED) before it cuts the connect as a reset; 700 without it. Read at each page.
+- `/tmp/bench_sdp_after_acl_ms` (whole ms): how long btd gives the SDP channel after a page is answered (the link
+  BT_CONNECTED) before it cuts the connect; 700 without it, or with `off`. Read at each page; a window not the
+  default logs a `[bench]` line. The env lever `BT_SDP_AFTER_ACL_MS` wins over it.
 - `/tmp/bench_update_any_version`: `ocbm_update.sh` places a package whose VERSION is the same as or older than
   `installed_version` (bench builds keep 2.0.0 with new code), so the bench flashes by update instead of the stick.
   Every other check stands: the sums, product, chip, mode, FROM_MIN, room and the journal.

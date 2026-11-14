@@ -72,14 +72,21 @@ const POLL_SLICE: std::time::Duration = std::time::Duration::from_millis(25);
 /// How long the link a cut leaves may take to go after its Disconnect, before the caller pages again anyway.
 const CUT_LINK_GONE: std::time::Duration = std::time::Duration::from_millis(1500);
 
-/// [`SDP_AFTER_ACL_MS`], or the bench lever `BT_SDP_AFTER_ACL_MS` / `/tmp/sdp_after_acl_ms` (whole ms), the project's
-/// env-then-tmpfs convention: the Mac's review of 376c4ce (F4).
+/// The bench file for the SDP window (docs/ops/02_TESTING.md): whole ms, read through box_common::bench_text, so Carlink's
+/// debug builds can set it like the other bench files and "off" (or anything not a number) is the default.
+const BENCH_SDP_AFTER_ACL: &str = "/tmp/bench_sdp_after_acl_ms";
+
+/// [`SDP_AFTER_ACL_MS`], or the env lever `BT_SDP_AFTER_ACL_MS`, or [`BENCH_SDP_AFTER_ACL`]: the Mac's reviews of 376c4ce
+/// (F4) and of the 14 Nov pushes (B3). A window not the default says so, each page, as a [bench] line.
 fn sdp_after_acl() -> std::time::Duration {
     let parse = |v: &str| v.trim().parse::<u64>().ok();
     let ms = box_common::lever("BT_SDP_AFTER_ACL_MS", "CARPLAY_SDP_AFTER_ACL_MS")
         .and_then(|v| parse(&v))
-        .or_else(|| std::fs::read_to_string("/tmp/sdp_after_acl_ms").ok().and_then(|v| parse(&v)))
+        .or_else(|| box_common::bench_text(BENCH_SDP_AFTER_ACL).and_then(|v| parse(&v)))
         .unwrap_or(SDP_AFTER_ACL_MS);
+    if ms != SDP_AFTER_ACL_MS {
+        log(&format!("[bench] SDP window {ms} ms after the answer, not {SDP_AFTER_ACL_MS} ({BENCH_SDP_AFTER_ACL} or BT_SDP_AFTER_ACL_MS)"));
+    }
     std::time::Duration::from_millis(ms)
 }
 
