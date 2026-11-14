@@ -61,8 +61,9 @@ fn hex(b: &[u8]) -> String {
 
 /// How long after the page is answered (the ACL is BT_CONNECTED) the SDP channel may take to open. All 83 good answers
 /// on the Mac's benches opened it within 14-512 ms; all 10 answered-then-reset links never did, and the phone dropped
-/// the link 4-6 s later (13 Nov brief, item 3). Past this, the connect is cut and reads as a reset. A bench may set
-/// another ([`sdp_after_acl`]).
+/// the link 4-6 s later (13 Nov brief, item 3). Past this, the connect is cut: a result of its own (`is_cut`), which the
+/// reconnect loop pages once more and counts once a round, and which keeps a link that was up before the page. A bench
+/// may set another ([`sdp_after_acl`]).
 const SDP_AFTER_ACL_MS: u64 = 700;
 
 /// How often a connect in flight looks at its socket and at the link.
@@ -175,13 +176,13 @@ fn next_step(polled: Option<(i16, i32)>, answered_for: Option<std::time::Duratio
 /// the loop's shutdown. Once the page is answered ([`crate::hci::AclInfo::answered`]) the SDP channel gets
 /// [`sdp_after_acl`]; past it the connect is [`cut`]. Polled in this thread, not cut from another: a shutdown() from a
 /// watch thread left the socket without an error, so connect() returned only at its 8 s timeout (the Mac's review of
-/// 376c4ce, F2). `link_before`: a link to the phone was up before the page, which the cut then leaves alone.
+/// 376c4ce, F2). `link_before`: why a link up before the page is to be left alone by a cut ([`before_page`]).
 fn wait_connected(
     fd: std::os::fd::OwnedFd,
     peer: [u8; 6],
     start: std::time::Instant,
     timeout: std::time::Duration,
-    link_before: bool,
+    link_before: Option<&'static str>,
     watch: &Watch<'_>,
 ) -> std::io::Result<std::os::fd::OwnedFd> {
     use std::os::fd::AsRawFd;
@@ -225,13 +226,7 @@ fn wait_connected(
                 // Not a link this page brought up, or one a live session rides: close the socket and leave the link.
                 // The kernel reuses an existing ACL for this page, so the phone's own (the accept path taking its
                 // session mid-page, an SSP re-pair from Settings) would read as answered at once (the Mac's review, A2).
-                let keep = if link_before {
-                    Some("the link was up before the page")
-                } else if watch.session_active.load(Ordering::Relaxed) {
-                    Some("a session is live")
-                } else {
-                    None
-                };
+                let keep = link_before.or_else(|| watch.session_active.load(Ordering::Relaxed).then_some("a session is live"));
                 return Err(cut(fd, dev.unwrap_or(0), peer, handle, (start, at), keep));
             }
         }
@@ -261,20 +256,109 @@ fn cut(
         log(&format!("{head}; {why}: socket closed, no Disconnect"));
         return error;
     }
-    if let Err(e) = crate::hci::disconnect(dev, handle) {
-        log(&format!("Disconnect of the cut link not sent: {e}"));
-    }
+    let sent = match crate::hci::disconnect(dev, handle) {
+        Ok(()) => true,
+        Err(e) => {
+            log(&format!("Disconnect of the cut link not sent: {e}"));
+            false
+        }
+    };
     let t = std::time::Instant::now();
     while t.elapsed() < CUT_LINK_GONE && crate::hci::acl_info(dev, peer).is_some() {
         std::thread::sleep(POLL_SLICE);
     }
     let gone = crate::hci::acl_info(dev, peer).is_none();
+    note_left_link(peer, handle, !gone, sent);
     log(&format!(
         "{head}; the link {} {} ms after its Disconnect",
         if gone { "went" } else { "was still up" },
         t.elapsed().as_millis()
     ));
     error
+}
+
+/// The link a cut left behind (the Mac's review of 8a3a8b2, item 5): still up after its Disconnect, or its Disconnect
+/// never sent. The next page to that phone would ride it and take it for the phone's own; it is told apart by its
+/// handle, forgotten once a read finds no link to the phone, and its Disconnect is sent again only when it was never
+/// sent, and only by the page right after the cut (`fresh`), since handles are reused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LeftLink {
+    peer: [u8; 6],
+    handle: u16,
+    sent: bool,
+    fresh: bool,
+}
+
+static LEFT_LINK: std::sync::Mutex<Option<LeftLink>> = std::sync::Mutex::new(None);
+
+/// What a page finds up to its phone before it starts ([`link_before_page`]).
+#[derive(Debug, PartialEq, Eq)]
+enum Before {
+    Nothing,
+    /// A link btd didn't leave: the phone's own, or a session's. A cut keeps it.
+    PhonesLink,
+    /// btd's own from the last cut; `resend`: its Disconnect was never sent, and this is the page right after.
+    OwnLink { resend: bool },
+}
+
+/// The decision for the link `acl` up to `peer` before a page, given the last cut's `left` link, which it updates.
+fn link_before_page(peer: [u8; 6], acl: Option<crate::hci::AclInfo>, left: &mut Option<LeftLink>) -> Before {
+    let mine = left.filter(|l| l.peer == peer);
+    let out = match (acl, mine) {
+        (None, Some(_)) => {
+            *left = None;
+            Before::Nothing
+        }
+        (None, None) => Before::Nothing,
+        (Some(a), Some(l)) if l.handle == a.handle => Before::OwnLink { resend: !l.sent && l.fresh },
+        (Some(_), _) => Before::PhonesLink,
+    };
+    if let Some(l) = left.as_mut() {
+        l.fresh = false;
+    }
+    out
+}
+
+/// Look at the link up to `peer` just before its page: the phone's own (kept by a cut, the reason returned), btd's own
+/// from the last cut (logged as such, its Disconnect sent again when it never went out), or none.
+fn before_page(dev: u16, peer: [u8; 6]) -> Option<&'static str> {
+    let acl = crate::hci::acl_info(dev, peer);
+    let mut left = LEFT_LINK.lock().unwrap_or_else(|e| e.into_inner());
+    match (link_before_page(peer, acl, &mut left), acl) {
+        (Before::Nothing, _) | (Before::OwnLink { .. }, None) => None,
+        (Before::PhonesLink, _) => Some("the link was up before the page"),
+        (Before::OwnLink { resend }, Some(a)) => {
+            log(&format!(
+                "the link up before this page is btd's own from the last cut (handle 0x{:04x}, state {}){}",
+                a.handle,
+                a.state,
+                if resend { ": its Disconnect was never sent, sending it now" } else { "" }
+            ));
+            if resend {
+                if let Some(l) = left.as_mut() {
+                    l.sent = true;
+                }
+                if crate::hci::disconnect(dev, a.handle).is_ok() {
+                    let t = std::time::Instant::now();
+                    while t.elapsed() < CUT_LINK_GONE && crate::hci::acl_info(dev, peer).is_some() {
+                        std::thread::sleep(POLL_SLICE);
+                    }
+                }
+                if crate::hci::acl_info(dev, peer).is_none() {
+                    *left = None;
+                    return None;
+                }
+            }
+            // Still up: this page rides it, and a cut leaves it to the kernel rather than disconnect it again.
+            Some("btd's own link from the last cut is still up")
+        }
+    }
+}
+
+/// Note the link a cut leaves: up after its Disconnect (`sent`), or with none sent; or gone (`up` false).
+fn note_left_link(peer: [u8; 6], handle: u16, up: bool, sent: bool) {
+    let mut left = LEFT_LINK.lock().unwrap_or_else(|e| e.into_inner());
+    *left = up.then_some(LeftLink { peer, handle, sent, fresh: true });
 }
 
 /// L2CAP-connect to `peer`'s SDP PSM (implicitly pages the phone in BlueZ). `timeout_secs` bounds both
@@ -323,7 +407,8 @@ fn connect_sdp(peer: [u8; 6], timeout_secs: i64, watch: &Watch<'_>) -> std::io::
     };
     set_nonblocking(fd.as_raw_fd(), true)?;
     // A link to the phone already up (one it opened, or a session's): this page rides it, and a cut leaves it alone.
-    let link_before = crate::hci::dev_id(crate::HCI_DEV).ok().and_then(|dev| crate::hci::acl_info(dev, peer)).is_some();
+    // btd's own, left by its last cut, is told apart (before_page).
+    let link_before = crate::hci::dev_id(crate::HCI_DEV).ok().and_then(|dev| before_page(dev, peer));
     let start = std::time::Instant::now();
     let ret = unsafe {
         libc::connect(
@@ -525,6 +610,36 @@ pub fn query(peer: [u8; 6], timeout_secs: i64, watch: &Watch<'_>) -> std::io::Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Item 5 (the Mac's review of 8a3a8b2): btd's own link from its last cut is told from the phone's by its handle,
+    /// forgotten once there is no link, and its Disconnect is sent again only when it never went out, and only by the
+    /// page right after the cut.
+    #[test]
+    fn a_link_left_by_the_last_cut_is_told_apart() {
+        let peer = [1, 2, 3, 4, 5, 6];
+        let other = [9, 2, 3, 4, 5, 6];
+        let acl = |handle| Some(crate::hci::AclInfo { handle, state: crate::hci::BT_CONNECTED });
+        let left = |sent| Some(LeftLink { peer, handle: 0x0b, sent, fresh: true });
+
+        let mut l = left(false);
+        assert_eq!(link_before_page(peer, acl(0x0b), &mut l), Before::OwnLink { resend: true }, "never sent: resend");
+        assert_eq!(link_before_page(peer, acl(0x0b), &mut l), Before::OwnLink { resend: false }, "only right after the cut");
+
+        let mut l = left(true);
+        assert_eq!(link_before_page(peer, acl(0x0b), &mut l), Before::OwnLink { resend: false }, "sent once: not again");
+
+        let mut l = left(false);
+        assert_eq!(link_before_page(peer, acl(0x0c), &mut l), Before::PhonesLink, "another handle: not btd's");
+        assert!(l.is_some_and(|l| !l.fresh), "and no resend after");
+
+        let mut l = left(false);
+        assert_eq!(link_before_page(other, acl(0x0b), &mut l), Before::PhonesLink, "another phone's link");
+        assert_eq!(link_before_page(peer, None, &mut l), Before::Nothing);
+        assert_eq!(l, None, "no link to the phone: forgotten");
+
+        let mut l = None;
+        assert_eq!(link_before_page(peer, acl(0x0b), &mut l), Before::PhonesLink, "no cut before it: the phone's");
+    }
 
     /// wait_connected's decision (the Mac's review, A3): a page that timed out fails with EHOSTDOWN, an answer with no SDP
     /// channel past the window is a cut, and a writable socket is connected.

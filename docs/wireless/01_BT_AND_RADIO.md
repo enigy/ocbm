@@ -45,7 +45,9 @@ A `wireless_up` waits for a `wireless_down` teardown still running (`/tmp/.wl_te
 block, in flight while any lives; up to 4 s, then the main loop's re-bring timer, which the block's end wakes), so a host back within the teardown is neither skipped nor killed by it. btd's reconnect SDP
 connect is non-blocking and polled in its own thread: once the page is answered (the link BT_CONNECTED, by
 HCIGETCONNINFO; a link mid-page is BT_CONNECT, state 5 in `hcitool con`), the SDP channel gets 700 ms (bench lever
-`/tmp/sdp_after_acl_ms`); past it the socket is closed, the link disconnected, and the page counts as a reset.
+`/tmp/sdp_after_acl_ms`); past it the connect is cut, a result of its own: the socket is closed and the link
+disconnected, except a link that was up before the page or one a live session rides, which is kept. The walk pages
+the phone once more, as after a reset, and a round counts at most one cut per phone toward a forgotten pairing.
 
 #### Why "it's Linux, it should be generic" does not apply here
 

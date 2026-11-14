@@ -176,8 +176,9 @@ const EARLY_WINDOW: Duration = Duration::from_secs(120);
 /// it ended. Bring-up has already returned when this starts (SSP agent and SDP are serving), and a
 /// phone that connects IN meanwhile is still safe: `attempt()`'s compare_exchange on
 /// `session_active` refuses to run a second session over it, and a page that rides its link (the kernel reuses
-/// the ACL) is never cut with a Disconnect: `sdp_client` leaves a link that was up before the page, or that a live
-/// session rides, and only closes its socket (the Mac's review of bbd29f3, A2). 1 s kept a moment for that inbound
+/// the ACL) keeps that link: if its SDP connect is cut ([`Attempt::Cut`], paged once more and counted once a round),
+/// `sdp_client` only closes its socket, with no Disconnect for a link that was up before the page or that a live
+/// session rides (the Mac's review of bbd29f3, A2). 1 s kept a moment for that inbound
 /// connect.
 /// Override: `BT_RECONNECT_SETTLE_SECS` or `/tmp/reconnect_settle_secs` (whole seconds, `0` allowed).
 /// None when the controller was warm ([`BT_WARM`]): nothing was just attached, so paging starts at once (the Mac's
@@ -649,12 +650,12 @@ pub fn run(
                 // A reset straight after another phone's page timed out is most likely the two crossing, not a
                 // forgotten pairing: the phone was up on the next page every time (the Mac, 13 Nov). Not counted.
                 if !rounds.paged(peer, result) {
-                    log("the reset came right after another phone's page timed out -- not counted toward a forgotten pairing");
+                    log("the reset or cut came right after another phone's page timed out -- not counted toward a forgotten pairing");
                 } else if streak.note(peer, result, bonds_written(), std::time::SystemTime::now(), Instant::now())
                     && !session_active.load(Ordering::Relaxed)
                 {
                     log(&format!(
-                        "{} answered and reset the link on {} pages in a row: it has most likely forgotten the pairing",
+                        "{} answered and reset the link, or opened no SDP channel (a cut, one a round), on {} pages in a row: it has most likely forgotten the pairing",
                         control::fmt_addr(&peer),
                         ResetStreak::TELL_AT
                     ));
