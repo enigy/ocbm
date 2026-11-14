@@ -247,6 +247,7 @@ fn cut(
     let answered_ms = answered_at.duration_since(start).as_millis();
     let cut_ms = start.elapsed().as_millis();
     drop(fd);
+    crate::startup::tally("sdp_cut");
     let error = cut_error();
     let head = format!(
         "answered at +{answered_ms} ms, but no SDP channel by +{cut_ms} ms ({} ms after the answer): cut",

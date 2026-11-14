@@ -507,6 +507,10 @@ const ACCEPT_POLL: Duration = Duration::from_millis(10);
 /// within about 30 ms (bench 2026-11-02), and a requestUI it did not need is the one RECORD sends anyway.
 const SCREEN_NUDGE_AFTER: Duration = Duration::from_millis(500);
 
+/// The bench flag that swallows the first screen nudge's requestUI once (it is removed when used), so the second
+/// fires on cue (the Mac's 13 Nov bench-hooks brief, item 6). /tmp only; nothing in the product writes it.
+const BENCH_SKIP_FIRST_REQUESTUI: &str = "/tmp/bench_skip_first_requestui";
+
 /// A second requestUI this long after the teardown if the first went unanswered: the 0.5 s one is untested on the
 /// older iOS 15 phone, which answered every 3 s one (11 of 11, 13 Nov); without it the session would keep audio and no
 /// picture (the Mac's 13 Nov review, N1).
@@ -630,7 +634,14 @@ impl AvSession {
             let mut live: Vec<i64> = crate::plock(&streams).keys().map(|(ty, _)| *ty).collect();
             live.sort_unstable();
             live.dedup();
-            let sent = crate::events::send_request_ui();
+            // Bench only (docs/ops/02_TESTING.md): swallow this first requestUI once, so the second one can be checked.
+            let sent = if std::fs::remove_file(BENCH_SKIP_FIRST_REQUESTUI).is_ok() {
+                eprintln!("[bench] first screen nudge swallowed ({BENCH_SKIP_FIRST_REQUESTUI}): the second fires at 3 s");
+                false
+            } else {
+                crate::startup::nudged(false);
+                crate::events::send_request_ui()
+            };
             eprintln!(
                 "[session] no screen stream {} ms after the phone tore it down (streams live: {live:?}) — asked for its UI again (requestUI={sent})",
                 torn.elapsed().as_millis()
@@ -639,6 +650,7 @@ impl AvSession {
             if !alive.load(Ordering::Acquire) || screen_stream_live(&streams) {
                 return;
             }
+            crate::startup::nudged(true);
             let sent = crate::events::send_request_ui();
             eprintln!(
                 "[session] still no screen stream {} ms after the phone tore it down — asked for its UI a second time (requestUI={sent})",

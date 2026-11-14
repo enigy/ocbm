@@ -290,6 +290,10 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   refusal "a package that is not one" "could not be unpacked"
   d="$T/$sh-r-same"; make_box "$d" final; NEW_SAVE="$NEW"; NEW="1.0.0 ocbm again"; make_pkg "$d/run/ocbm-update.tgz" ""; NEW="$NEW_SAVE"
   refusal "a version that is not newer" "already runs OCBM 1.0.0"
+  touch "$d/run/bench_update_any_version"   # the bench flag: the same VERSION with new code is placed
+  update "$sh" "$d"; rc=$?
+  check '[ $rc = 0 ] && grep -qx placed "$d/root/etc/ocbm/update_pending" && grep -q "\[bench\] placing 1.0.0 over 1.0.0" "$d/run/box.log"' \
+    "with /tmp/bench_update_any_version the same version is placed, and says so"
   d="$T/$sh-r-older"; make_box "$d" final; make_pkg "$d/run/ocbm-update.tgz" "" 1.0.5
   refusal "an adapter older than FROM_MIN" "updates OCBM 1.0.5 or newer"
   d="$T/$sh-r-lacks"; make_box "$d" final; make_pkg "$d/run/ocbm-update.tgz" "" 1.0.0 usr/sbin/ocbmd
