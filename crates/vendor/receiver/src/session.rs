@@ -634,18 +634,22 @@ impl AvSession {
             let mut live: Vec<i64> = crate::plock(&streams).keys().map(|(ty, _)| *ty).collect();
             live.sort_unstable();
             live.dedup();
-            // Bench only (docs/ops/02_TESTING.md): swallow this first requestUI once, so the second one can be checked.
-            let sent = if std::fs::remove_file(BENCH_SKIP_FIRST_REQUESTUI).is_ok() {
-                eprintln!("[bench] first screen nudge swallowed ({BENCH_SKIP_FIRST_REQUESTUI}): the second fires at 3 s");
-                false
+            // Bench only (docs/ops/02_TESTING.md): skip this first requestUI once, so the second one can be checked. The
+            // flag is set unless absent or "off" (box_common::bench_flag), and is removed when used.
+            if box_common::bench_flag(BENCH_SKIP_FIRST_REQUESTUI) {
+                let _ = std::fs::remove_file(BENCH_SKIP_FIRST_REQUESTUI);
+                eprintln!(
+                    "[bench] no screen stream {} ms after the phone tore it down (streams live: {live:?}) — first nudge skipped by {BENCH_SKIP_FIRST_REQUESTUI}: the second comes at 3 s",
+                    torn.elapsed().as_millis()
+                );
             } else {
                 crate::startup::nudged(false);
-                crate::events::send_request_ui()
-            };
-            eprintln!(
-                "[session] no screen stream {} ms after the phone tore it down (streams live: {live:?}) — asked for its UI again (requestUI={sent})",
-                torn.elapsed().as_millis()
-            );
+                let sent = crate::events::send_request_ui();
+                eprintln!(
+                    "[session] no screen stream {} ms after the phone tore it down (streams live: {live:?}) — asked for its UI again (requestUI={sent})",
+                    torn.elapsed().as_millis()
+                );
+            }
             thread::sleep(SCREEN_NUDGE_AGAIN.saturating_sub(torn.elapsed()));
             if !alive.load(Ordering::Acquire) || screen_stream_live(&streams) {
                 return;

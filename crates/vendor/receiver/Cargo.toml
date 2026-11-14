@@ -20,6 +20,8 @@ mfi = { path = "../mfi" }
 # the bug. It now takes the same lock (bounded 10s rather than blocking); all four chip users agree on
 # the path. See its own doc comment.
 mfi-i2c-local = { path = "../mfi-i2c-local" }
+# The bench flags' one reading (box_common::bench_flag), shared with btd.
+box-common = { path = "../../box-common" }
 # Wireless iAP2-over-AirPlay metadata tunnel (docs/wireless/00_WIRELESS_CARPLAY.md gap): reuses the SAME message-id constants,
 # subscribe-body builders and NowPlaying/RouteGuidance/CallState parsers `iap2d` uses on the wired
 # physical iAP2 link, since the wire-level message catalog is transport-agnostic (only the framing

@@ -304,19 +304,30 @@ observable is the ABSENCE of a second `TX detect+SYN` line, not a dedicated warn
 ### Bench hooks (13 Nov 2026)
 
 For the Mac's unattended bench. Each is a file in `/tmp` that nothing in the product writes, so a reboot clears
-it, and each logs a `[bench]` line when it acts. Carlink's side (flash by update, display off/on, the box-log tail)
+it, and each logs a `[bench]` line when it acts: btd's in `/tmp/wl.log`, carplayd's in `/tmp/carplayd_wl.log`,
+`ocbm_update.sh`'s in `/tmp/box.log`. Carlink's side (flash by update, display off/on, the box-log tail, these files)
 is in its debug builds only.
 
-- `/tmp/bench_phantom_first`: btd pages `02:00:00:00:00:01`, a locally administered address no phone has, first in
-  every policy-order round (not for an explicit connect or a switch hold). It times out like an absent first-listed
-  phone, so "first-listed absent" needs no airplane mode. It is never bonded, listed or counted toward a forgotten
-  pairing.
-- `/tmp/bench_hooks`: turns on the control port's bench commands (127.0.0.1:9115). Today one:
-  `{"cmd":"bench_order","macs":["AA:BB:CC:DD:EE:FF",...],"after_ms":1500}` arms a call order that the next
-  policy-order round applies `after_ms` into its walk, through the same path as Carlink's SET_POLICY: the mid-round
-  re-plan on cue.
-- `/tmp/bench_skip_first_requestui`: carplayd swallows the 0.5 s screen nudge's requestUI once (the file is
-  removed when used), so the 3 s second nudge fires.
+**On and off.** A flag is set when its file exists and its content, trimmed, is not `off`: an empty file and `on`
+are set (`box_common::bench_flag`; `bench_flag` in `ocbm_update.sh`). Carlink writes the files over CH_FILE, which
+can write but not delete, so it clears one by writing `off`. From a debug build:
+
+    am broadcast -p com.enigy.carlink3 -a com.enigy.carlink3.BENCH --es do box_flag --es name <bench_name> \
+        [--es value <text>] [--ez on false]
+
+- `/tmp/bench_phantom_first`: btd adds `02:00:00:00:00:01`, a locally administered address no phone has, ahead
+  of the bonded phones in every policy-order round (not for an explicit connect or a switch hold). Its page times
+  out like an absent first-listed phone's, so "first-listed absent" needs no airplane mode; and like one, a round
+  that found it absent pages it last next round. It is never bonded, listed or counted toward a forgotten pairing.
+- `/tmp/bench_order`: one line, `MAC,MAC[,...] [after_ms]` (the MACs as `AA:BB:CC:DD:EE:FF`, `after_ms` 0 when left
+  out). The next policy-order round reads and removes it and, `after_ms` into its walk (at the next page
+  boundary), pages the rest of the round in that order, through the re-plan path: the mid-round re-plan on cue.
+  Bonded phones it leaves out follow it; addresses that aren't bonded are ignored. It holds for that round only,
+  in memory: nothing is saved to `projection_policy.json`, Carlink's SET_POLICY neither undoes it nor is undone by
+  it, and the next round is the app's order again. A malformed file is refused with a `[bench]` line and removed;
+  `off` is no order. A round that ends before `after_ms` drops it.
+- `/tmp/bench_skip_first_requestui`: carplayd skips the 0.5 s screen nudge's requestUI once (the file is removed
+  when used) and says so, so the 3 s second nudge fires.
 - `/tmp/sdp_after_acl_ms` (whole ms): how long btd gives the SDP channel after a page is answered (the link
   BT_CONNECTED) before it cuts the connect as a reset; 700 without it. Read at each page.
 - `/tmp/bench_update_any_version`: `ocbm_update.sh` places a package whose VERSION is the same as or older than
@@ -324,7 +335,9 @@ is in its debug builds only.
   Every other check stands: the sums, product, chip, mode, FROM_MIN, room and the journal.
 
 The box `[startup]` line ends with the session's counts: `; this session: absent pages N, resets N (N cut, no SDP channel),
-nudges first+second, PSK mismatches N`. The phantom's pages count as absent.
+nudges first+second, PSK mismatches N`. The phantom's pages count as absent. When ocbmd rotated `box.log` (it empties
+it at its cap) between the host's arrival and the first frame, the PSK count is a lower bound: `PSK mismatches >=N
+(box.log cut)`.
 
 ### Release gate — OCBM 1.0.5, the CarPlay-only cleanup (8 Nov 2026)
 
