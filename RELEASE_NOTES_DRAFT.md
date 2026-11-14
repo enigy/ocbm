@@ -1,16 +1,19 @@
-# Connect speed: release notes draft (14 Nov 2026, after the Mac's check of the release pair, not merged)
+# Connect speed: release notes draft (14 Nov 2026: OCBM 2.5.0 and Carlink 3.10, not merged)
 
-Scott's scope (14 Nov): release OCBM a9392a5 first. Nothing here is released yet; it waits for the bench below.
+Scott (14 Nov): release OCBM as 2.5.0 and Carlink as 3.10 (v310). There are no 2.0.1 or 3.03 releases: 2.0.1 is the
+benched set's version number only. Nothing here is released yet.
 
 ## What would ship
 
-- **OCBM 2.0.1: a9392a5 plus its version bump to 2.0.1** (88afbfb on `rel-2.0.1`, VERSION only; 015598b after it
-  changes only tools/make_ocbm_update.sh). The changes are efeb113 to a9392a5, 8 commits on v2.0.0. There is no
-  protocol change beyond a new MGMT_INFO field, "preload".
-- **Carlink 3.03: `connect-speed-2` at 06c1d09e plus the [303] commit** (version 3.03; the v2.0.1 and installer-2.0.1
-  pins). 387985e0, the benched build, is version 3.02 and pins 2.0.0; 06c1d09e adds the low items from the Mac's check
-  of the pair: every start's SUBSCRIBE clears a cut again, the CT_STOP stamp counts a written CT_STOP, and tests. It is
-  v302 plus:
+- **OCBM 2.5.0: `rel-2.0.1` at 92ab7a5** (PR #3 to main). The changes are efeb113 to a9392a5, 8 commits on v2.0.0,
+  plus the update tool's fix (015598b) and the version (88afbfb set 2.0.1 for the bench, 92ab7a5 sets 2.5.0; both
+  VERSION only). There is no protocol change beyond a new MGMT_INFO field, "preload". The release files are the Mac's
+  build from 92ab7a5 with the benched 2.0.1 set's program files (2.0.0's bytes for the unchanged iap2d and
+  iap_role_switch).
+- **Carlink 3.10 (v310): `connect-speed-2` at 06c1d09e plus the [310] commit** (version 3.10; the v2.5.0 and
+  installer-2.5.0 pins; Reset connection says "About 20 seconds"). 387985e0 is the benched build; 06c1d09e adds the low
+  items from the Mac's check of the pair: every start's SUBSCRIBE clears a cut again, the CT_STOP stamp counts a written
+  CT_STOP, and tests. It is v302 plus:
   - the Tide water moving while driving (e165f5fe, merged to main on 12 Nov);
   - `bench-1113`: the wake connecting at once, the Phones call-order line and the engine type selector;
   - the fixes for a display off/on during a connect (the 13 Nov C1 and the 14 Nov reviews' W1-W9, with W1 on
@@ -23,47 +26,28 @@ Scott's scope (14 Nov): release OCBM a9392a5 first. Nothing here is released yet
   - the bench hooks (debug builds and /tmp files only);
   - Carlink `fuel-discounts`.
 
-## OCBM: GitHub release notes
+## Release texts
 
-**Faster wireless connects.** Measured on the Mac's bench with Carlink 387985e0 and one iPhone, listed first and in range:
+For the Mac to publish once Scott OKs them:
 
-- A cold connect after an adapter restart, from Carlink's USB OK to the CarPlay picture: a median 12.1 s over 3 runs on
-  2.0.1, against 22.5 s (1 run) on the released 2.0.0, measured the same way.
-- A connect when the display wakes, with the adapter still powered, from display on to the CarPlay picture: a median
-  11.3 s over 5 runs.
-- Bluetooth is up 1.5 s after the adapter sees the car, against 11.3 s.
+- `releases/v2.5.0.md`: release v2.5.0, "OCBM 2.5.0", with ocbm-update-2.5.0.tgz, its .sha256 and
+  fdk-aac-2.0.3.tar.gz, as for 2.0.0.
+- `releases/installer-2.5.0.md`: release installer-2.5.0, "OCBM 2.5.0 installer image", with A15W_Update.img, its
+  .sha256 and fdk-aac-2.0.3.tar.gz, as for 2.0.0.
+- `releases/carlink-v310.txt`: Carlink v310's annotated tag message (`git tag -a v310 -F releases/carlink-v310.txt`).
+  Its subject is the release title and its body the notes; the workflow adds the commit list.
 
-- The adapter readies Bluetooth and the Wi-Fi driver while the car starts (the boot preload). The first connect after
-  power-up then skips the driver and firmware load.
-- Bluetooth and the Wi-Fi network come up side by side. The adapter tries each phone briefly first (about 4 s each), in
-  the order set in Carlink's Phones page.
-- A phone whose page timed out is tried last in the next round. For two minutes from when the adapter starts its radios,
-  rounds are 5 s apart, so a phone that comes back then is found within about 5-7 s, plus about 5 s for each phone listed
-  ahead of it that is still away; after that the gap grows from 10 s to 60 s.
-- A phone that answers and then drops the link straight after another phone's page timed out is no longer read as having
-  forgotten the pairing.
-- If the phone drops its screen stream, the adapter asks for the picture again after 0.5 s, and once more at 3 s.
-- One `[startup]` line per session times each stage. ocbmd logs every hello from Carlink with the adapter's uptime.
-
-**From 2.0.0, for adapters on 1.0.x** (they update straight to 2.0.1):
-
-- **Video from the iPhone, parked (route A).** The adapter offers AirPlay video inside the CarPlay session (iOS 26 and
-  later). With Carlink 3.00 or later, a video you send from the iPhone (Safari, for example) plays full screen on the
-  car's screen while the car is parked. It is fetched through the iPhone's own network, never the car's. The iPhone
-  decides what it offers; FairPlay-protected video (the TV app's) stays on the iPhone.
-- **The car's GPS and status for the iPhone**, when Carlink pushes them (Settings › Vehicle).
-- **A stuck wireless session ends by itself.** A Bluetooth session whose iPhone never reaches CarPlay ends 90 s in, and
-  the phones are called again, so CarPlay comes back once the iPhone's Wi-Fi does.
-- **One name.** The adapter's Wi-Fi has the same name as its Bluetooth, CarLink-<4 hex>.
-- Retired: the AirPlay video probe's switch file (/etc/ocbm/airplay_probe) is ignored, and protocol command 0x14 (the
-  screen borrow) is gone.
+The bench figures in them are the Mac's bench of the 2.0.1 set with Carlink 387985e0, one iPhone listed first and in
+range: cold connect after an adapter restart, Carlink's USB OK to the CarPlay picture, median 12.1 s over 3 runs,
+against 22.5 s (1 run) on the released 2.0.0; wake with the adapter powered, display on to the picture, median 11.3 s
+over 5 runs; Bluetooth up 1.5 s after the adapter sees the car, against 11.3 s.
 
 ## Upgrade notes
 
 - **The boot preload is on by default.** It loads the radio drivers and attaches Bluetooth at power-up, with nothing a
   phone can see: no Wi-Fi network, and Bluetooth powered down. To turn it off, create `/script/radio_preload_off`.
-- **Its guard.** After two unfinished preloads with none finishing between (a hang, or power lost inside its 7 s), the adapter
-  switches it off, writes `guard: 2 unfinished in a row` into that flag, and logs it at every boot. Carlink logs
+- **Its guard.** After two unfinished preloads with none finishing between (a hang, or power lost inside its 7 s), the
+  adapter switches it off, writes `guard: 2 unfinished in a row` into that flag, and logs it at every boot. Carlink logs
   `boot radio preload off_guard`. One unfinished preload doesn't count on its own: a power dip such as an engine crank
   is not a hang. To turn it back on, delete the flag.
 - **Installs, updates and the go-back to stock** clear the flag, the in-progress marker and the count. A new version
@@ -75,44 +59,22 @@ Scott's scope (14 Nov): release OCBM a9392a5 first. Nothing here is released yet
   - In both, a host that arrives first takes the radios: the preload steps aside, and never powers Bluetooth off under a
     session.
   - A host that arrives while the preload runs waits for it (up to about 10 s), then finds Bluetooth already up.
-- **Updating from 1.0.1 or later:** Carlink 3.03 offers it in the app. An adapter still in its install trial finishes its
+- **Updating from 1.0.1 or later:** Carlink 3.10 offers it in the app. An adapter still in its install trial finishes its
   install first (Remove stock firmware), as for 2.0.0: the package needs about 3141 KB of flash, and a trial adapter has
   1252 KB. An adapter that ran a pre-release build (85bff31 to 9b228f8) may hold an older single-event flag; the
   update's first start clears it.
 - **Going back to stock from a finished adapter wipes its paired phones.** Forget the adapter (CarLink-xxxx) on each phone
   first, and pair them again afterwards.
 
-## Carlink 3.03: commit notes
-
-- When the head unit's display wakes, Carlink connects at once while the adapter is still listed. It keeps the 2.5 s USB
-  settle only for an adapter that isn't listed, or an open that failed. The open at once waits 3 s for the adapter's
-  first reply instead of 20 s.
-- Offers the adapter update to OCBM 2.0.1, from 1.0.1 or later.
-- A display going off and on during a connect no longer leaves Carlink stuck in Connecting, nor ends a session that had
-  already come up. Close app and a handover stay closed.
-- Any connect within 6 s of Carlink's own stop (the display-off wait ending a session, Close app, a reset) waits for the
-  adapter to finish tearing that session down, on OCBM 2.0.0 and 2.0.1; the adapter-side fix comes with
-  `connect-speed-2`.
-- Reset connection, Close app and a handover finish even when you leave the settings page during them.
-- The Phones page explains the call order when two or more phones are listed.
-- Settings › Vehicle › Engine type: no "From the car" option. The car's own type shows selected (Gasoline, the adapter's
-  default, until the car reports one) until the driver picks one, and a pick is remembered.
-- The Tide water moves while driving too.
-- Logs: the adapter's boot preload state, a `[startup] wake:` line timing each wake, and a `[startup] carlink:` line at a
-  cold start.
-
 ## Before merging
 
-- [x] Scott picked Carlink 3.03's base: 06c1d09e (14 Nov). [303] also says "About 20 seconds" for Reset connection.
-- [x] Scott picked the OCBM release set (14 Nov): the Mac's corrected build (image 718a00b3, package 6a561dd0, with
-  2.0.0's bytes for the unchanged iap2d and iap_role_switch; benched byte for byte).
-- [ ] The 2.0.1 build's byte check: its installer image differs from a9392a5's only in tmp/ocbm/VERSION and SHA256SUMS
-  (BUDGET the same), and its update package is built with a --from for every published version from 1.0.1 to 2.0.0
-  (015598b's tool), so FROM_MIN stays 1.0.1.
-- [x] The 2.0.1 package checked against every published version from 1.0.1 to 2.0.0: an adapter on each finds every
-  file it lacks. For 6a561dd0: the Mac checked 1.0.1, 1.0.3-1.0.5 and 2.0.0, and from git that the four scripts it
-  leaves out are identical at every tag from v1.0.2 to v2.0.0; 1.0.2's and 1.0.6's published package sums agree.
-- [ ] The Mac's bench of OCBM 2.0.1 (a9392a5 + its VERSION bump) with Carlink 387985e0:
+- [x] Scott picked Carlink's base: 06c1d09e (14 Nov). [310] also says "About 20 seconds" for Reset connection.
+- [x] Scott picked the OCBM release set (14 Nov): the Mac's build with the benched program files (benched as 2.0.1:
+  image 718a00b3, package 6a561dd0), rebuilt as 2.5.0 from 92ab7a5.
+- [x] The package checked against every published version from 1.0.1 to 2.0.0: for 6a561dd0 the Mac checked 1.0.1,
+  1.0.3-1.0.5 and 2.0.0, and from git that the four scripts it leaves out are identical at every tag from v1.0.2 to
+  v2.0.0; 1.0.2's and 1.0.6's published package sums agree.
+- [ ] The Mac's bench of the 2.0.1 set with Carlink 387985e0 (figures above):
   - on the published installer-2.0.0, finished (FINAL), first: a connect, and a display ON at the grace end and about
     2 s after it;
   - an older preload flag planted on that 2.0.0 adapter, then the in-app update to the 2.0.1 package through the
@@ -120,8 +82,12 @@ Scott's scope (14 Nov): release OCBM a9392a5 first. Nothing here is released yet
   - on 2.0.1: wakes, a cold start, display flickers in the wake's open, the grace-end ONs, and a reboot in final mode;
   - Close app, Reset connection and a refused handover, each with the page left mid-way; a reopen within 6 s of
     Close app.
-- [ ] The benched package's sha256 is the one published.
-- [ ] Scott publishes 2.0.1, then the Carlink [303] commit pins it, and one connect with [303]'s minified release APK.
-- [ ] After [303]: the pin's tag, url, size and sha256 equal the published asset, fromMin is 1.0.1, needKb comes from
-  the package's ROOM, and the installer pin points at installer-2.0.1.
+- [ ] The 2.5.0 files: built from 92ab7a5 with the benched program files, they differ from the benched 2.0.1 set only
+  in VERSION and SHA256SUMS; the package carries the same 18 files, FROM_MIN 1.0.1.
+- [ ] The Mac's dev adapter updated in the app from 2.0.1 to 2.5.0.
+- [ ] [310] pins the Mac's sha256s and sizes; the Mac's gate and 20-minute check of its debug build on the dev adapter.
+- [ ] Scott OKs the release texts and gives the go. The Mac merges both PRs (OCBM #3, Carlink connect-speed-2), publishes
+  v2.5.0 and installer-2.5.0 with gh from `releases/`, and tags v310 from `releases/carlink-v310.txt`.
+- [ ] After publishing: the published assets' sha256s and sizes equal [310]'s pins, fromMin is 1.0.1, needKb comes from
+  the package's ROOM, and the installer pin points at installer-2.5.0. One connect with v310's minified release APK.
 - [ ] A truck check after the release, as with 2.0.0.

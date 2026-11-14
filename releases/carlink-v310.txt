@@ -1,0 +1,11 @@
+Carlink 3.10: faster wireless connects, with OCBM 2.5.0
+
+- Offers the adapter update to OCBM 2.5.0, from OCBM 1.0.1 or later, and installs 2.5.0 on a stock adapter. With 2.5.0 a cold connect takes about 12 s to the CarPlay picture, against about 22 s on 2.0.0.
+- When the head unit's display wakes, Carlink connects at once while the adapter is still listed. It keeps the 2.5 s USB settle only for an adapter that isn't listed, or an open that failed. The open at once waits 3 s for the adapter's first reply instead of 20 s.
+- A display going off and on during a connect no longer leaves Carlink stuck in Connecting, nor ends a session that had already come up. Close app and a handover stay closed.
+- A connect within 6 s of Carlink's own stop (the display-off wait ending a session, Close app, a reset) waits for the adapter to finish tearing that session down.
+- Reset connection, Close app and a handover finish even when you leave the settings page during them. Reset connection now says about 20 seconds without CarPlay.
+- The Phones page explains the call order when two or more phones are listed.
+- Settings › Vehicle › Engine type: no "From the car" option. The car's own type shows selected (Gasoline, the adapter's default, until the car reports one) until the driver picks one, and a pick is remembered.
+- The Tide water moves while driving too.
+- Logs: the adapter's boot preload state, a [startup] wake: line timing each wake, and a [startup] carlink: line at a cold start.
