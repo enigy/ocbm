@@ -44,6 +44,9 @@
 //!   {"cmd":"pair_window","seconds":120}    -> {"ok":true,"seconds":120}  // open the pairing window
 //!                                                            // (1..300 s; 0 closes it). Security
 //!                                                            // plan 2026-10-21 H1, ssp_agent::PairWindow
+//!   {"cmd":"bench_order","macs":["AA:BB:.."],"after_ms":1500} -> {"ok":true}  // bench only, with
+//!                                                            // /tmp/bench_hooks: that order lands
+//!                                                            // after_ms into the next round (re-plan)
 //! ```
 //!
 //! ## Address byte order — the thing that will bite
@@ -380,6 +383,8 @@ pub struct Control {
     /// The app's policy changed since the reconnect loop last looked. Carlink sends it every session, but btd can be
     /// paging before it arrives (the Mac's 13 Nov bench), so a round in progress re-plans by it ([`Self::take_policy_changed`]).
     policy_changed: AtomicBool,
+    /// A bench order and its delay into the next policy-order round ([`Self::take_bench_order`]), one-shot.
+    bench_order: Mutex<Option<(Vec<[u8; 6]>, u64)>>,
     /// The head unit's yes/no for a Numeric-Comparison pairing prompt, read by the SSP agent's mgmt
     /// loop. PROCESS-lifetime like the rest of this struct, and cloned into each session's agent
     /// thread — pairing happens on the accept path, before any session exists, so a per-session
@@ -578,6 +583,13 @@ impl Control {
     /// Whether the policy changed since the last call, clearing it.
     pub fn take_policy_changed(&self) -> bool {
         self.policy_changed.swap(false, Ordering::AcqRel)
+    }
+
+    /// The bench order armed by `bench_order` on the control port, taken once by the next policy-order round, which
+    /// applies it `after_ms` into its walk through [`Self::set_policy`], the path Carlink's SET_POLICY takes. Makes the
+    /// mid-round re-plan deterministic on the bench (the Mac's 13 Nov bench-hooks brief, item 5).
+    pub fn take_bench_order(&self) -> Option<(Vec<[u8; 6]>, u64)> {
+        self.bench_order.lock().ok().and_then(|mut b| b.take())
     }
 
     /// Take any pending connect request. Called by the reconnect loop each round.
@@ -1065,6 +1077,12 @@ fn save_policy(p: &Policy) {
 // ---- request handling -----------------------------------------------------------------------
 
 /// Build a response for one request line. Pure, so it is fully testable without a socket.
+/// The gate for the control port's bench commands (`bench_order`): a file in /tmp, never written by the product.
+#[cfg(not(test))]
+const BENCH_HOOKS_FLAG: &str = "/tmp/bench_hooks";
+#[cfg(test)]
+const BENCH_HOOKS_FLAG: &str = "/tmp/btd_selftest_bench_hooks";
+
 pub fn handle_request(ctrl: &Control, line: &str) -> String {
     let Some(cmd) = json_str(line, "cmd") else {
         return r#"{"ok":false,"error":"no cmd"}"#.to_string();
@@ -1178,6 +1196,22 @@ pub fn handle_request(ctrl: &Control, line: &str) -> String {
         // whether the agent still has one pending (it may have just timed out), and reporting an
         // error for a race the caller cannot avoid would only teach the app to ignore the field.
         // The agent drops a stray answer rather than banking it.
+        // Bench only (docs/ops/02_TESTING.md): refused unless [`BENCH_HOOKS_FLAG`] exists, which nothing in the product
+        // writes and a reboot clears.
+        "bench_order" => {
+            if !std::path::Path::new(BENCH_HOOKS_FLAG).exists() {
+                return r#"{"ok":false,"error":"bench_order: bench hooks are off"}"#.to_string();
+            }
+            let (Some(macs), Some(after_ms)) = (json_str_array(line, "macs"), json_u64(line, "after_ms")) else {
+                return r#"{"ok":false,"error":"bench_order: macs and after_ms required"}"#.to_string();
+            };
+            let order: Vec<[u8; 6]> = macs.iter().filter_map(|a| parse_addr(a)).collect();
+            log(&format!("[bench] call order armed: {} phone(s), {after_ms} ms into the next round", order.len()));
+            if let Ok(mut b) = ctrl.bench_order.lock() {
+                *b = Some((order, after_ms));
+            }
+            r#"{"ok":true}"#.to_string()
+        }
         "pair_answer" => match json_bool(line, "accept") {
             Some(accept) => {
                 ctrl.pair_answer.set(accept);

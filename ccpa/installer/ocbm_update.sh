@@ -143,7 +143,13 @@ esac
 have_line=$(head -1 "$EO/installed_version" 2>/dev/null)
 have=$(first "$have_line")
 [ -n "$have" ] || refuse "The adapter does not say which OCBM it runs (/etc/ocbm/installed_version)."
-newer "$new" "$have" || refuse "The adapter already runs OCBM $have; this package is $new."
+# Bench only (docs/ops/02_TESTING.md): with $RUN/bench_update_any_version (/tmp; nothing in the product writes it) a
+# package of the same or an older VERSION is placed too, as the Mac's bench builds keep 2.0.0 with new code. Every
+# other check stands.
+if ! newer "$new" "$have"; then
+  [ -e "$RUN/bench_update_any_version" ] || refuse "The adapter already runs OCBM $have; this package is $new."
+  log "[bench] placing $new over $have ($RUN/bench_update_any_version)"
+fi
 newer "$from_min" "$have" && refuse "This package updates OCBM $from_min or newer; the adapter runs $have."
 
 # What changes: every file of the new version that the adapter does not already have as it should.

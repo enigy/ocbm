@@ -191,6 +191,7 @@ fn cut(
         if gone { "went" } else { "was still up" },
         t.elapsed().as_millis()
     ));
+    crate::startup::tally("sdp_cut");
     std::io::Error::new(std::io::ErrorKind::ConnectionReset, "answered, no SDP channel")
 }
 

@@ -26,6 +26,10 @@ pub fn begin() {
     let states = std::fs::read_to_string(PRELOAD_STATE).unwrap_or_default();
     let preload = host_uptime.map_or_else(|| "unknown".to_string(), |at| preload_at(&states, at));
     let mut record = format!("host_present {present}\npreload {preload}\n");
+    // Where the box log stood, so carplayd counts only this session's hostapd lines (receiver::startup).
+    if let Ok(m) = std::fs::metadata("/tmp/box.log") {
+        record.push_str(&format!("boxlog_at {}\n", m.len()));
+    }
     if let Some(u) = host_uptime {
         record.push_str(&format!("host_uptime {u}\n"));
     }
@@ -61,6 +65,13 @@ pub fn mark(stage: &str) {
     }
     if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(MARKS) {
         let _ = writeln!(f, "{stage} {}", now_ms());
+    }
+}
+
+/// Count one of `what` for this session's line (absent, reset, sdp_cut): a `tally <what>` line per event.
+pub fn tally(what: &str) {
+    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(MARKS) {
+        let _ = writeln!(f, "tally {what}");
     }
 }
 

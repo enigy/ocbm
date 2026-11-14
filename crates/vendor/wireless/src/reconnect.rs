@@ -67,6 +67,11 @@ struct Rounds {
 }
 
 impl Rounds {
+    /// Whether this round (with a re-planned rest) has paged `peer` already.
+    fn has_paged(&self, peer: [u8; 6]) -> bool {
+        self.paged.contains(&peer)
+    }
+
     /// A walk starts: a new round forgets the last one's pages; the rest of a re-planned round keeps them.
     fn begin(&mut self) {
         if !self.replanning {
@@ -480,7 +485,113 @@ pub fn run(
     if !interruptible_sleep(settle, shutdown) {
         return;
     }
+    let env = OnBox { name, shutdown, session_active, ctrl, started: Instant::now() };
+    run_loop(&env, ctrl);
+    log("reconnect loop exiting");
+}
 
+/// What the loop asks of the box, so a test drives [`run_loop`] itself with a fake pager and a virtual clock (the
+/// Mac's 13 Nov bench-hooks brief, item 9). [`OnBox`] is the real one: the radio, the link-key store, the clock.
+trait Env {
+    /// The bonded phones in the policy's order ([`Control::ordered_bonds`]).
+    fn bonds(&self) -> Vec<[u8; 6]>;
+    /// One page and connect ([`attempt`]).
+    fn attempt(&self, peer: [u8; 6]) -> Attempt;
+    fn shutdown(&self) -> bool;
+    fn session_active(&self) -> bool;
+    /// Sleep `secs`, false on shutdown ([`interruptible_sleep`]).
+    fn sleep(&self, secs: u64) -> bool;
+    /// Sleep `secs`, cut short by a connect request, false on shutdown ([`sleep_or_request`]).
+    fn sleep_or_request(&self, secs: u64) -> bool;
+    /// Since the loop started (a host has just come).
+    fn elapsed(&self) -> Duration;
+    /// The monotonic and wall clocks and the link-key store's last write, for [`ResetStreak::note`].
+    fn now(&self) -> (Instant, std::time::SystemTime, Option<std::time::SystemTime>);
+    /// Write_Page_Timeout.
+    fn page_slots(&self, slots: u16) -> std::io::Result<()>;
+    fn bond_lost(&self);
+    fn pair_rejected_over(&self);
+    /// The bench's phantom first phone ([`BENCH_PHANTOM_FLAG`]), when set.
+    fn phantom(&self) -> Option<[u8; 6]>;
+    /// Apply a bench order `after_ms` into the walk about to start ([`Control::take_bench_order`]).
+    fn bench_order_later(&self, order: Vec<[u8; 6]>, after_ms: u64);
+}
+
+/// The real [`Env`].
+struct OnBox<'a> {
+    name: &'a str,
+    shutdown: &'a Arc<AtomicBool>,
+    session_active: &'a Arc<AtomicBool>,
+    ctrl: &'a Arc<Control>,
+    started: Instant,
+}
+
+impl Env for OnBox<'_> {
+    fn bonds(&self) -> Vec<[u8; 6]> {
+        self.ctrl.ordered_bonds()
+    }
+    fn attempt(&self, peer: [u8; 6]) -> Attempt {
+        let result = attempt(peer, self.name, self.shutdown, self.session_active, self.ctrl);
+        match result {
+            Attempt::Absent => crate::startup::tally("absent"),
+            Attempt::Reset => crate::startup::tally("reset"),
+            _ => {}
+        }
+        result
+    }
+    fn shutdown(&self) -> bool {
+        self.shutdown.load(Ordering::Relaxed)
+    }
+    fn session_active(&self) -> bool {
+        self.session_active.load(Ordering::Relaxed)
+    }
+    fn sleep(&self, secs: u64) -> bool {
+        interruptible_sleep(secs, self.shutdown)
+    }
+    fn sleep_or_request(&self, secs: u64) -> bool {
+        sleep_or_request(secs, self.shutdown, self.ctrl)
+    }
+    fn elapsed(&self) -> Duration {
+        self.started.elapsed()
+    }
+    fn now(&self) -> (Instant, std::time::SystemTime, Option<std::time::SystemTime>) {
+        (Instant::now(), std::time::SystemTime::now(), bonds_written())
+    }
+    fn page_slots(&self, slots: u16) -> std::io::Result<()> {
+        crate::hci::dev_id(crate::HCI_DEV).and_then(|dev| crate::hci::write_page_timeout(dev, slots))
+    }
+    fn bond_lost(&self) {
+        bt_driver::publish_bt_phase(ocbm_proto::BTP_BOND_LOST);
+    }
+    fn pair_rejected_over(&self) {
+        let _ = std::fs::remove_file(bt_common::rfcomm::PAIR_REJECTED_FLAG);
+    }
+    fn phantom(&self) -> Option<[u8; 6]> {
+        std::path::Path::new(BENCH_PHANTOM_FLAG).exists().then_some(BENCH_PHANTOM)
+    }
+    fn bench_order_later(&self, order: Vec<[u8; 6]>, after_ms: u64) {
+        let ctrl = Arc::clone(self.ctrl);
+        let _ = thread::Builder::new().name("bench-order".into()).spawn(move || {
+            thread::sleep(Duration::from_millis(after_ms));
+            log(&format!("[bench] call order applied {after_ms} ms into the round: {} phone(s)", order.len()));
+            let auto_connect = ctrl.policy().auto_connect;
+            ctrl.set_policy(control::Policy { auto_connect, order });
+        });
+    }
+}
+
+/// The bench flag that pages [`BENCH_PHANTOM`] first in every policy-order round, as an absent first-listed phone:
+/// no airplane mode, no Bluetooth toggling (the Mac's 13 Nov bench-hooks brief, item 4). Bench only; /tmp, so a reboot
+/// clears it; nothing in the product writes it (docs/ops/02_TESTING.md).
+const BENCH_PHANTOM_FLAG: &str = "/tmp/bench_phantom_first";
+
+/// 02:00:00:00:00:01 in mgmt byte order: a locally administered address no phone has, so its page times out
+/// ("Host is down") like an absent phone's. Never bonded, never offered for pairing, never listed on the control port,
+/// never counted toward a forgotten pairing.
+const BENCH_PHANTOM: [u8; 6] = [0x01, 0x00, 0x00, 0x00, 0x00, 0x02];
+
+/// [`run`]'s loop, against `env`: see [`run`].
+fn run_loop(env: &impl Env, ctrl: &Control) {
     let mut backoff = BACKOFF_START_SECS;
     let mut streak = ResetStreak::default();
     let mut first_round = true;
@@ -491,14 +602,13 @@ pub fn run(
     let mut last_state: Option<bool> = None;
     let mut last_manual_log = false;
     let mut rounds = Rounds::default();
-    let started = Instant::now();
-    while !shutdown.load(Ordering::Relaxed) {
+    while !env.shutdown() {
         // Never fight an in-progress session (accept path or a prior reconnect). Advisory fast-path
         // only — the authoritative claim is the compare_exchange in attempt().
-        if session_active.load(Ordering::Relaxed) {
+        if env.session_active() {
             streak.session();
             rounds.session();
-            if !interruptible_sleep(BACKOFF_START_SECS, shutdown) {
+            if !env.sleep(BACKOFF_START_SECS) {
                 break;
             }
             backoff = BACKOFF_START_SECS; // a live session means the phone is here; retry promptly after it
@@ -509,7 +619,7 @@ pub fn run(
         // once and returned early when the set was empty, so a box that booted unpaired never drove
         // reconnect for a later-paired phone. This just reads the persisted link-key file — cheap, no
         // paging, no side effects — now ordered by the app's policy.
-        let bonds = ctrl.ordered_bonds();
+        let bonds = env.bonds();
         let has_bonds = !bonds.is_empty();
         if last_state != Some(has_bonds) {
             if has_bonds {
@@ -521,7 +631,7 @@ pub fn run(
         }
         if !has_bonds {
             rounds.not_walked();
-            if !interruptible_sleep(BACKOFF_MAX_SECS, shutdown) {
+            if !env.sleep(BACKOFF_MAX_SECS) {
                 break;
             }
             continue;
@@ -542,7 +652,7 @@ pub fn run(
                 last_manual_log = true;
             }
             rounds.not_walked();
-            if !sleep_or_request(BACKOFF_START_SECS, shutdown, ctrl) {
+            if !env.sleep_or_request(BACKOFF_START_SECS) {
                 break;
             }
             continue;
@@ -553,7 +663,8 @@ pub fn run(
         // phone it holds for is paged, round after round, until it connects or the hold lapses
         // (`Control::request_switch`). Anything else walks the policy order, with a switched-to phone
         // that never reached CarPlay moved last for a while (`Control::switch_stranded`).
-        let targets: Vec<[u8; 6]> = match request {
+        let mut policy_round = false;
+        let mut targets: Vec<[u8; 6]> = match request {
             Some(Some(addr)) => {
                 if bonds.contains(&addr) {
                     log(&format!("explicit connect request for {}", control::fmt_addr(&addr)));
@@ -573,13 +684,29 @@ pub fn run(
                     log(&format!("switch hold -- paging only {}", control::fmt_addr(&held)));
                     vec![held]
                 }
-                _ => rounds.order(bonds.clone(), |b| ctrl.call_order(b)),
+                _ => {
+                    policy_round = true;
+                    rounds.order(bonds.clone(), |b| ctrl.call_order(b))
+                }
             },
         };
+        // Bench: the phantom first phone, once per round (not again in a re-planned rest, which skips what it paged).
+        let phantom = if policy_round { env.phantom() } else { None };
+        if let Some(p) = phantom {
+            if !rounds.has_paged(p) {
+                log("[bench] paging the phantom first phone (/tmp/bench_phantom_first)");
+                targets.insert(0, p);
+            }
+        }
+        if policy_round {
+            if let Some((order, after_ms)) = ctrl.take_bench_order() {
+                env.bench_order_later(order, after_ms);
+            }
+        }
 
         let want = round_page_slots(first_round, targets.len());
         if want != page_slots {
-            match crate::hci::dev_id(crate::HCI_DEV).and_then(|dev| crate::hci::write_page_timeout(dev, want)) {
+            match env.page_slots(want) {
                 Ok(()) => {
                     log(&format!("paging {} ms per phone this round", u64::from(want) * 5 / 8));
                     page_slots = want;
@@ -589,31 +716,31 @@ pub fn run(
         }
         let Walk { ran, rejected } = walk(
             &targets,
-            || shutdown.load(Ordering::Relaxed) || session_active.load(Ordering::Relaxed) || ctrl.policy_changed(),
+            || env.shutdown() || env.session_active() || ctrl.policy_changed(),
             |peer| {
                 log(&format!(
                     "{} answered and reset the link -- paging it once more in {RESET_RETRY_SECS}s before the next phone",
                     control::fmt_addr(&peer)
                 ));
-                sleep_or_request(RESET_RETRY_SECS, shutdown, ctrl)
-                    && !ctrl.has_request()
-                    && !session_active.load(Ordering::Relaxed)
+                env.sleep_or_request(RESET_RETRY_SECS) && !ctrl.has_request() && !env.session_active()
             },
             |peer| {
-                let result = attempt(peer, name, shutdown, session_active, ctrl);
+                let result = env.attempt(peer);
+                let (mono, wall, bonds_at) = env.now();
                 // A reset straight after another phone's page timed out is most likely the two crossing, not a
                 // forgotten pairing: the phone was up on the next page every time (the Mac, 13 Nov). Not counted.
                 if !rounds.paged(peer, result) {
                     log("the reset came right after another phone's page timed out -- not counted toward a forgotten pairing");
-                } else if streak.note(peer, result, bonds_written(), std::time::SystemTime::now(), Instant::now())
-                    && !session_active.load(Ordering::Relaxed)
+                } else if Some(peer) != phantom
+                    && streak.note(peer, result, bonds_at, wall, mono)
+                    && !env.session_active()
                 {
                     log(&format!(
                         "{} answered and reset the link on {} pages in a row: it has most likely forgotten the pairing",
                         control::fmt_addr(&peer),
                         ResetStreak::TELL_AT
                     ));
-                    bt_driver::publish_bt_phase(ocbm_proto::BTP_BOND_LOST);
+                    env.bond_lost();
                 }
                 result
             },
@@ -643,24 +770,23 @@ pub fn run(
         if quick {
             log(&format!("first page round failed -- one quick retry in {FIRST_RETRY_SECS}s"));
         }
-        let early = !rejected && started.elapsed() < EARLY_WINDOW;
-        if !sleep_or_request(round_gap(quick, early, backoff), shutdown, ctrl) {
+        let early = !rejected && env.elapsed() < EARLY_WINDOW;
+        if !env.sleep_or_request(round_gap(quick, early, backoff)) {
             break;
         }
         if rejected {
             // The hold-off is over: drop the flag so the next attempt is judged on its own.
-            let _ = std::fs::remove_file(bt_common::rfcomm::PAIR_REJECTED_FLAG);
+            env.pair_rejected_over();
         } else if !ran && !quick && !early {
             // Not in the early window: it would double under the 5 s gaps and jump to 60 s at its end (the Mac, 13 Nov).
             backoff = (backoff * 2).min(BACKOFF_MAX_SECS);
         }
     }
-    log("reconnect loop exiting");
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{absent_last, round_gap, round_page_slots, Rounds, FIRST_ROUND_PAGE_SLOTS};
+    use super::{absent_last, round_gap, round_page_slots, run_loop, Env, Rounds, FIRST_ROUND_PAGE_SLOTS};
     use super::{BACKOFF_START_SECS, EARLY_GAP_SECS, FIRST_RETRY_SECS};
     use crate::control::Control;
     use super::{default_settle_secs, failure, walk, Attempt, ResetStreak, Walk, INITIAL_SETTLE_DEFAULT_SECS};
@@ -726,6 +852,166 @@ mod tests {
         let changed = !walked.ran && !walked.rejected && ctrl.take_policy_changed();
         let replan = r.end(walked.ran, changed, &bonds);
         (paged, counted, replan)
+    }
+
+
+    // ---- run_loop itself, with a fake box (the Mac's 13 Nov bench-hooks brief, item 9) ----------------------------
+
+    /// A fake box: the bonds are the policy's order, each page answers as `answer(round, peer)` says, and a virtual
+    /// clock moves 4 s for a timed-out page, 1 s for any other, and by every gap. Stops after `rounds` rounds.
+    struct Fake<'a> {
+        ctrl: &'a Control,
+        answer: std::cell::RefCell<Box<dyn FnMut(usize, [u8; 6]) -> Attempt + 'a>>,
+        rounds: usize,
+        phantom: Option<[u8; 6]>,
+        round: std::cell::Cell<usize>,
+        clock: std::cell::Cell<u64>,
+        pages: std::cell::RefCell<Vec<(usize, [u8; 6])>>,
+        gaps: std::cell::RefCell<Vec<u64>>,
+        bond_lost: std::cell::Cell<u32>,
+        base: Instant,
+    }
+
+    impl<'a> Fake<'a> {
+        fn new(ctrl: &'a Control, rounds: usize, answer: impl FnMut(usize, [u8; 6]) -> Attempt + 'a) -> Self {
+            Fake {
+                ctrl,
+                answer: std::cell::RefCell::new(Box::new(answer)),
+                rounds,
+                phantom: None,
+                round: Default::default(),
+                clock: Default::default(),
+                pages: Default::default(),
+                gaps: Default::default(),
+                bond_lost: Default::default(),
+                base: Instant::now(),
+            }
+        }
+
+        /// The phones paged in `round`, in order.
+        fn paged(&self, round: usize) -> Vec<[u8; 6]> {
+            self.pages.borrow().iter().filter(|(r, _)| *r == round).map(|(_, p)| *p).collect()
+        }
+    }
+
+    impl Env for Fake<'_> {
+        fn bonds(&self) -> Vec<[u8; 6]> {
+            self.ctrl.policy().order
+        }
+        fn attempt(&self, peer: [u8; 6]) -> Attempt {
+            let round = self.round.get();
+            self.pages.borrow_mut().push((round, peer));
+            let a = (self.answer.borrow_mut())(round, peer);
+            self.clock.set(self.clock.get() + if a == Attempt::Absent { 4 } else { 1 });
+            a
+        }
+        fn shutdown(&self) -> bool {
+            self.round.get() >= self.rounds
+        }
+        fn session_active(&self) -> bool {
+            false
+        }
+        fn sleep(&self, secs: u64) -> bool {
+            self.sleep_or_request(secs)
+        }
+        fn sleep_or_request(&self, secs: u64) -> bool {
+            if secs > 0 {
+                self.gaps.borrow_mut().push(secs);
+                self.clock.set(self.clock.get() + secs);
+                self.round.set(self.round.get() + 1);
+            }
+            !self.shutdown()
+        }
+        fn elapsed(&self) -> Duration {
+            Duration::from_secs(self.clock.get())
+        }
+        fn now(&self) -> (Instant, std::time::SystemTime, Option<std::time::SystemTime>) {
+            let wall = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000 + self.clock.get());
+            (self.base + self.elapsed(), wall, Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(900_000)))
+        }
+        fn page_slots(&self, _slots: u16) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn bond_lost(&self) {
+            self.bond_lost.set(self.bond_lost.get() + 1);
+        }
+        fn pair_rejected_over(&self) {}
+        fn phantom(&self) -> Option<[u8; 6]> {
+            self.phantom
+        }
+        fn bench_order_later(&self, order: Vec<[u8; 6]>, _after_ms: u64) {
+            set_order(self.ctrl, &order);
+        }
+    }
+
+    /// Rounds 2 s, then 5 s apart for the first two minutes, then 10, 20, 40, 60: the backoff starts at its window's end.
+    #[test]
+    fn the_loop_waits_5_s_early_then_backs_off_from_the_start() {
+        let ctrl = Control::default();
+        set_order(&ctrl, &[SCOTT]);
+        let fake = Fake::new(&ctrl, 30, |_, _| Attempt::Absent);
+        run_loop(&fake, &ctrl);
+        let gaps = fake.gaps.borrow().clone();
+        assert_eq!(gaps[0], FIRST_RETRY_SECS, "one quick retry after a failed first round");
+        let early = gaps[1..].iter().take_while(|g| **g == EARLY_GAP_SECS).count();
+        assert!(early >= 10, "5 s apart while early: {gaps:?}");
+        assert_eq!(&gaps[1 + early..1 + early + 5], &[10, 20, 40, 60, 60], "{gaps:?}");
+    }
+
+    /// R2 and R3 through the loop: only the timed-out phone goes last next round; a lost claim moves nobody.
+    #[test]
+    fn the_loop_pages_a_timed_out_phone_last_and_nobody_else() {
+        let ctrl = Control::default();
+        set_order(&ctrl, &[SCOTT, YODA]);
+        let fake = Fake::new(&ctrl, 3, |round, peer| match (round, peer) {
+            (0, SCOTT) => Attempt::Absent,
+            _ => Attempt::Failed,
+        });
+        run_loop(&fake, &ctrl);
+        assert_eq!(fake.paged(0), vec![SCOTT, YODA]);
+        assert_eq!(fake.paged(1), vec![YODA, SCOTT], "the timed-out phone last");
+        assert_eq!(fake.paged(2), vec![SCOTT, YODA], "a failure that wasn't a timeout moves nobody");
+    }
+
+    /// R1 through the loop: the app's order lands during the first page; the rest go at once by it, and the next round
+    /// keeps it, with every phone that timed out last.
+    #[test]
+    fn the_loop_re_plans_by_an_order_that_lands_mid_round() {
+        let ctrl = Control::default();
+        set_order(&ctrl, &[SCOTT, YODA, THIRD]);
+        let c = &ctrl;
+        let fake = Fake::new(&ctrl, 2, move |round, peer| {
+            if round == 0 && peer == SCOTT {
+                set_order(c, &[THIRD, YODA, SCOTT]);
+            }
+            Attempt::Absent
+        });
+        run_loop(&fake, &ctrl);
+        assert_eq!(fake.paged(0), vec![SCOTT, THIRD, YODA], "the rest in the new order, at once");
+        assert_eq!(fake.gaps.borrow()[0], FIRST_RETRY_SECS, "one round: the re-plan is not a round of its own");
+        assert_eq!(fake.paged(1), vec![THIRD, YODA, SCOTT], "all timed out: the order just set");
+    }
+
+    /// The crossing rule through the loop, with the bench's phantom first phone: a reset straight after its timeout is
+    /// never counted toward a forgotten pairing, round after round; resets with nothing before them are.
+    #[test]
+    fn the_loop_never_counts_a_crossing_reset_and_pages_the_phantom_first() {
+        let ctrl = Control::default();
+        set_order(&ctrl, &[YODA]);
+        let mut fake = Fake::new(&ctrl, 6, |_, peer| if peer == super::BENCH_PHANTOM { Attempt::Absent } else { Attempt::Reset });
+        fake.phantom = Some(super::BENCH_PHANTOM);
+        run_loop(&fake, &ctrl);
+        for round in 0..6 {
+            assert_eq!(fake.paged(round), vec![super::BENCH_PHANTOM, YODA, YODA], "round {round}");
+        }
+        // Each round: a crossing reset (not counted), then its re-page's reset (counted): three rounds tell, once.
+        assert_eq!(fake.bond_lost.get(), 1);
+
+        let ctrl = Control::default();
+        set_order(&ctrl, &[YODA]);
+        let fake = Fake::new(&ctrl, 2, |_, _| Attempt::Reset);
+        run_loop(&fake, &ctrl);
+        assert_eq!(fake.bond_lost.get(), 1, "two resets a round, nothing before them: told in the second round");
     }
 
     /// The Mac's 13 Nov bench and review (R1): the app's order arrives while the first phone is paged. The rest go at
