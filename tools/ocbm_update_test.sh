@@ -403,7 +403,7 @@ for f in ocbm_dispatch ocbm_selftest ocbm_revert ocbm_finish ocbm_update ocbm_re
 cp "$INST/retired.list" "$b/inst/retired.list"
 echo 1.0.0 > "$b/inst/VERSION"
 printf 'final_kb=3900\ntrial_kb=1252\n' > "$b/inst/update_budget"
-export BIN_DIR="$b/bin" IRS_BIN="$b/irs" INSTALLER_DIR="$b/inst"
+export BIN_DIR="$b/bin" IRS_BIN="$b/irs" INSTALLER_DIR="$b/inst" PUBLISHED=""   # no published versions but those named below
 src_sums() {  # the payload's SHA256SUMS as the installer image would carry it
   local s="$b/stage"; rm -rf "$s"; mkdir -p "$s"
   "$REPO/tools/make_ocbm_installer.sh" --sources | while IFS='|' read -r src dst; do mkdir -p "$s/$(dirname "$dst")"; cp "$src" "$s/$dst"; done
@@ -431,6 +431,19 @@ check '[ $rc = 0 ] && grep -qx "trial=no" "$b/x/ROOM" && echo "$out" | grep -q "
   "over the trial budget: built, marked trial=no"
 printf 'final_kb=200\ntrial_kb=100\n' > "$b/inst/update_budget"
 check '! "$REPO/tools/make_ocbm_update.sh" --from "$b/from/SHA256SUMS" "$b/out" >/dev/null 2>&1' "over the final budget: no package (no adapter could take it)"
+# Two published versions whose builds differ (the Mac, 14 Nov): 1.0.5 and 2.0.0 shipped another toolchain's
+# iap_role_switch than 1.0.1, so a package built from 1.0.1's sums alone left it out, and their updaters refused it.
+printf 'final_kb=3900\ntrial_kb=1252\n' > "$b/inst/update_budget"
+mkdir -p "$b/from2"; echo "1.0.5 ocbm other" > "$b/from2/VERSION"
+awk -v z="$(printf "%064d" 0)" '$2 ~ /iap_role_switch$/ {$1 = z} {print $1 "  " $2}' "$b/from/SHA256SUMS" > "$b/from2/SHA256SUMS"
+check 'PUBLISHED="1.0.0 1.0.5" "$REPO/tools/make_ocbm_update.sh" --from "$b/from/SHA256SUMS" "$b/out" 2>&1 >/dev/null | grep -q "no --from for published OCBM 1.0.5"' \
+  "refuses without the sums of every published version from FROM_MIN up"
+out=$(PUBLISHED="1.0.0 1.0.5" "$REPO/tools/make_ocbm_update.sh" --from "$b/from2/SHA256SUMS" --from "$b/from/SHA256SUMS" "$b/out" 2>&1); rc=$?
+rm -rf "$b/x"; mkdir -p "$b/x" && (cd "$b/x" && gzip -dc "$pk" | tar -xf -)
+check '[ $rc = 0 ] && [ "$(cd "$b/x/files" && find . -type f | sed "s|^\./||" | LC_ALL=C sort | tr "\n" " ")" = "usr/bin/iap_role_switch usr/sbin/ocbmd " ]' \
+  "files/ holds a file that differs from any one published version (iap_role_switch, 1.0.5 only)"
+check '[ "$(cat "$b/x/FROM_MIN")" = 1.0.0 ] && echo "$out" | grep -q "iap_role_switch (differs from 1.0.5)" && echo "$out" | grep -q "checked against 1.0.5 1.0.0"' \
+  "FROM_MIN is the oldest given, and the build names the versions it checked"
 
 echo
 [ "$fails" = 0 ] && { echo "ocbm_update_test: all passed"; exit 0; }
