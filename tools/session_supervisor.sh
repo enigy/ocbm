@@ -604,14 +604,24 @@ radio_off() { [ -f /tmp/radio_off ]; }
 hot_handover_enabled() { grep -qiE '^[[:space:]]*hot_handover:[[:space:]]*true' "$WIRELESS_CFG" 2>/dev/null; }
 wireless_running() { pgrep -f /usr/sbin/btd >/dev/null 2>&1; }
 # A wireless_down teardown still running (its detached block): /tmp/.wl_teardown holds its start uptime, written here
-# before the block starts and removed by the block as it ends. 15 s on, a marker is stale (a block killed mid-way).
+# before the block starts; the block adds its pid as its first act and removes the marker as it ends, if it is still
+# its own. In flight while that pid lives: a block can wait up to 30 s on each radio_hal.sh lock, so no fixed age
+# would do (the Mac's review of bbd29f3). 90 s caps it against a reused pid; before the pid is written, 15 s does.
 # wireless_up waits on it, so a host that comes back within the teardown neither finds the SIGTERMed btd and skips
 # its bring-up, nor starts a btd the teardown then kills with -9 (the Mac's review of 376c4ce, SUP-TEARDOWN-RACE).
 WL_TEARDOWN_MARK=/tmp/.wl_teardown
 teardown_in_flight() {
-  _ti=$(cat "$WL_TEARDOWN_MARK" 2>/dev/null)
-  case "$_ti" in ''|*[!0-9.]*) return 1 ;; esac
-  [ $(( $(now) - ${_ti%%.*} )) -lt 15 ]
+  _ti=$(cat "$WL_TEARDOWN_MARK" 2>/dev/null) || return 1
+  _ts=${_ti%% *}
+  case "$_ts" in ''|*[!0-9.]*) return 1 ;; esac
+  _tage=$(( $(now) - ${_ts%%.*} ))
+  if [ "$_ti" = "$_ts" ]; then
+    [ "$_tage" -lt 15 ]   # the block has not written its pid yet
+  else
+    _tp=${_ti#* }
+    case "$_tp" in ''|*[!0-9]*) return 1 ;; esac
+    [ -d "/proc/$_tp" ] && [ "$_tage" -lt 90 ]
+  fi
 }
 teardown_mark() { _td=$(cut -d" " -f1 /proc/uptime); echo "$_td" > "$WL_TEARDOWN_MARK"; }
 # Is ANY part of the wireless stack still drawing power? The advertiser can be dead while hostapd is
@@ -688,7 +698,7 @@ wireless_up() {
   while teardown_in_flight && [ "$_tw" -lt 20 ]; do _tw=$((_tw + 1)); sleep 0.2; done
   if teardown_in_flight; then
     echo "[sup] wireless_up: the teardown is still running after 4 s -- bring-up deferred"
-    wireless_rebring_at=$(( $(now) + 1 ))
+    wireless_rebring_at=$(( $(now) + 2 ))
     return
   fi
   [ "$_tw" -gt 0 ] && echo "[sup] wireless_up waited $((_tw * 200)) ms for the teardown in flight"
@@ -830,6 +840,8 @@ wireless_down() {
     # a pattern's plain word anywhere in the block.
     teardown_mark
     env WL_TEARDOWN="$_td" setsid sh -c '
+      # Its pid in the marker, while the marker is still its own: wireless_up waits while this block lives.
+      [ "$(cut -d" " -f1 /tmp/.wl_teardown 2>/dev/null)" = "$WL_TEARDOWN" ] && echo "$WL_TEARDOWN $$" > /tmp/.wl_teardown
       pkill -f "[/]usr/sbin/btd" 2>/dev/null
       pkill -f "[c]arplayd" 2>/dev/null
       pkill -f "[b]tmon" 2>/dev/null   # the 2026-09-03 HCI-capture bench lever, harmless if never armed
@@ -855,7 +867,7 @@ wireless_down() {
       # controller; it also hardcoded hci0 instead of the discovered device.
       sh /script/radio_hal.sh bt_off >/tmp/bt_off.log 2>&1
       # This teardown is over: wireless_up may go on (teardown_in_flight). Only its own marker, by its start uptime.
-      [ "$(cat /tmp/.wl_teardown 2>/dev/null)" = "$WL_TEARDOWN" ] && rm -f /tmp/.wl_teardown
+      [ "$(cut -d" " -f1 /tmp/.wl_teardown 2>/dev/null)" = "$WL_TEARDOWN" ] && rm -f /tmp/.wl_teardown
     ' </dev/null >/dev/null 2>&1 &
     # docs/wireless/00_WIRELESS_CARPLAY.md #1.2/#1.3: this is OUR session ending — clear the health state we own and the transport
     # flag ourselves (value-scoped, so it never fires against a wired session's "wired"/absent value),
@@ -873,6 +885,8 @@ wireless_down() {
     # (see the COMPLETE-teardown branch above for the full rationale).
     teardown_mark
     env WL_TEARDOWN="$_td" setsid sh -c '
+      # Its pid in the marker, while the marker is still its own: wireless_up waits while this block lives.
+      [ "$(cut -d" " -f1 /tmp/.wl_teardown 2>/dev/null)" = "$WL_TEARDOWN" ] && echo "$WL_TEARDOWN $$" > /tmp/.wl_teardown
       pkill -f "[/]usr/sbin/btd" 2>/dev/null
       pkill -f "[b]tmon" 2>/dev/null   # the 2026-09-03 HCI-capture bench lever, harmless if never armed
       sleep 1
@@ -883,7 +897,7 @@ wireless_down() {
       # verb (see the COMPLETE-teardown branch rationale).
       sh /script/radio_hal.sh bt_off >/tmp/bt_off.log 2>&1
       # This teardown is over: wireless_up may go on (teardown_in_flight). Only its own marker, by its start uptime.
-      [ "$(cat /tmp/.wl_teardown 2>/dev/null)" = "$WL_TEARDOWN" ] && rm -f /tmp/.wl_teardown
+      [ "$(cut -d" " -f1 /tmp/.wl_teardown 2>/dev/null)" = "$WL_TEARDOWN" ] && rm -f /tmp/.wl_teardown
     ' </dev/null >/dev/null 2>&1 &
   fi
 }
@@ -967,7 +981,9 @@ while :; do
   fi
   if [ -n "$wireless_rebring_at" ] && [ "$(now)" -ge "$wireless_rebring_at" ]; then
     wireless_rebring_at=""
-    [ "${last_p:-0}" = 1 ] && wireless_up
+    # This tick's read, not last_p: on a host edge last_p is still the old value until the edge block below, and a
+    # deferral that came due this same tick was dropped (the Mac's review of bbd29f3).
+    [ "${p:-${last_p:-0}}" = 1 ] && wireless_up
   fi
 
   # App-commanded radio inhibit edges (CT_RADIO -> /tmp/radio_off, docs/carplay/04_CAPABILITIES_AND_CONFIG.md radio gating). Flag
@@ -1245,6 +1261,8 @@ while :; do
   # that came while this tick worked skips the wait.
   if [ "$woken" != 1 ]; then
     sleep 1 & _tick_sleep=$!
+    # A USR1 between the test above and the fork set woken but found no wait to cut: cut the sleep now.
+    [ "$woken" = 1 ] && kill "$_tick_sleep" 2>/dev/null
     wait "$_tick_sleep" 2>/dev/null || kill "$_tick_sleep" 2>/dev/null
   fi
 done

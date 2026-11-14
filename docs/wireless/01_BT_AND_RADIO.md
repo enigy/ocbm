@@ -41,8 +41,8 @@ per-caller temporary file. `caps()` detects once per boot and reuses a descripto
 ocbmd logs each HELLO and a host's first frames after 5 s of silence with the uptime, to place a stalled open. They
 are written before Carlink arms its log stream, so a drive log carries them only as thinned `[backfill]` replay: read
 them from Save Logs' box log or `/tmp/box.log` over the console, before a reboot (tmpfs) loses them.
-A `wireless_up` waits for a `wireless_down` teardown still running (`/tmp/.wl_teardown`, up to 4 s, then the main
-loop's re-bring timer), so a host back within the teardown is neither skipped nor killed by it. btd's reconnect SDP
+A `wireless_up` waits for a `wireless_down` teardown still running (`/tmp/.wl_teardown`, in flight while its block
+lives; up to 4 s, then the main loop's re-bring timer), so a host back within the teardown is neither skipped nor killed by it. btd's reconnect SDP
 connect is non-blocking and polled in its own thread: once the page is answered (the link BT_CONNECTED, by
 HCIGETCONNINFO; a link mid-page is BT_CONNECT, state 5 in `hcitool con`), the SDP channel gets 700 ms (bench lever
 `/tmp/sdp_after_acl_ms`); past it the socket is closed, the link disconnected, and the page counts as a reset.
