@@ -40,7 +40,7 @@ For the Mac to publish once Scott OKs them:
 The bench figures in them are the Mac's bench of the 2.0.1 set with Carlink 387985e0, one iPhone listed first and in
 range: cold connect after an adapter restart, Carlink's USB OK to the CarPlay picture, median 12.1 s over 3 runs,
 against 22.5 s (1 run) on the released 2.0.0; wake with the adapter powered, display on to the picture, median 11.3 s
-over 5 runs; Bluetooth up 1.5 s after the adapter sees the car, against 11.3 s.
+over 5 runs; Bluetooth up 1.5 s after the adapter sees the car, against 11.3 s on 2.0.0.
 
 ## Upgrade notes
 
@@ -60,7 +60,7 @@ over 5 runs; Bluetooth up 1.5 s after the adapter sees the car, against 11.3 s.
     session.
   - A host that arrives while the preload runs waits for it (up to about 10 s), then finds Bluetooth already up.
 - **Updating from 1.0.1 or later:** Carlink 3.10 offers it in the app. An adapter still in its install trial finishes its
-  install first (Remove stock firmware), as for 2.0.0: the package needs about 3141 KB of flash, and a trial adapter has
+  install first (Settings › Adapter and about › Remove stock CarPlay), as for 2.0.0: the package needs about 3141 KB of flash, and a trial adapter has
   1252 KB. An adapter that ran a pre-release build (85bff31 to 9b228f8) may hold an older single-event flag; the
   update's first start clears it.
 - **Going back to stock from a finished adapter wipes its paired phones.** Forget the adapter (CarLink-xxxx) on each phone
@@ -82,8 +82,10 @@ over 5 runs; Bluetooth up 1.5 s after the adapter sees the car, against 11.3 s.
   - on 2.0.1: wakes, a cold start, display flickers in the wake's open, the grace-end ONs, and a reboot in final mode;
   - Close app, Reset connection and a refused handover, each with the page left mid-way; a reopen within 6 s of
     Close app.
-- [ ] The 2.5.0 files: built from 92ab7a5 with the benched program files, they differ from the benched 2.0.1 set only
-  in VERSION and SHA256SUMS; the package carries the same 18 files, FROM_MIN 1.0.1.
+- [x] The 2.5.0 files (the Mac, 14 Nov): built from 92ab7a5 with the benched program files, they differ from the benched
+  2.0.1 set only in VERSION and SHA256SUMS ("2.5.0 ocbm 92ab7a5"). Package b511432f (2,096,750 B): the same 18 files,
+  FROM_MIN 1.0.1, needKb 3141, and the updater's file check passes from all seven published versions. Image 83c791aa
+  (2,112,256 B).
 - [ ] The Mac's dev adapter updated in the app from 2.0.1 to 2.5.0.
 - [ ] [310] pins the Mac's sha256s and sizes; the Mac's gate and 20-minute check of its debug build on the dev adapter.
 - [ ] Scott OKs the release texts and gives the go. The Mac merges both PRs (OCBM #3, Carlink connect-speed-2), publishes

@@ -14,7 +14,7 @@ Carlink can also write this image to a stick in the adapter for you. Stock firmw
 
 Going back to stock from a finished adapter (stock firmware removed) wipes its paired phones: forget the adapter (CarLink-xxxx) on each phone first, and pair them again afterwards.
 
-The image also updates an adapter already on OCBM 1.0.1 to 2.0.0, if it has room. More: MIGRATING.md and docs/ops/01_RECOVERY.md.
+The image also updates an adapter already on any OCBM from 1.0.1 to 2.0.0, if it has room. More: MIGRATING.md and docs/ops/01_RECOVERY.md.
 
 No install is guaranteed to succeed. Until you remove the stock firmware, the adapter goes back to it by itself if OCBM fails its start-up self-test.
 
