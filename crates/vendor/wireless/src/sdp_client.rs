@@ -108,21 +108,91 @@ fn set_nonblocking(fd: libc::c_int, on: bool) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Wait for the non-blocking connect on `fd`, polled here in [`POLL_SLICE`]s, until `timeout` from `start` (the page).
-/// Once the page is answered ([`crate::hci::AclInfo::answered`]) the SDP channel gets [`sdp_after_acl`]; past it the
-/// connect is [`cut`]. Polled in this thread, not cut from another: a shutdown() from a watch thread left the socket
-/// without an error, so connect() returned only at its 8 s timeout (the Mac's review of 376c4ce, F2).
+/// What the reconnect loop lends a connect in flight: its shutdown, and whether a session is live (the accept path's,
+/// or one the phone opened) whose link a cut must not drop.
+pub struct Watch<'a> {
+    pub shutdown: &'a std::sync::atomic::AtomicBool,
+    pub session_active: &'a std::sync::atomic::AtomicBool,
+}
+
+/// The error of a [`cut`]: a reset, of its own kind, so the reconnect loop can count it apart from a phone that resets
+/// the link itself ([`is_cut`]; the Mac's review of bbd29f3, A1).
+#[derive(Debug)]
+struct SdpCut;
+
+impl std::fmt::Display for SdpCut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("answered, no SDP channel")
+    }
+}
+
+impl std::error::Error for SdpCut {}
+
+/// The error a [`cut`] returns.
+pub(crate) fn cut_error() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::ConnectionReset, SdpCut)
+}
+
+/// Whether `e` came from a [`cut`].
+pub fn is_cut(e: &std::io::Error) -> bool {
+    e.get_ref().is_some_and(|inner| inner.is::<SdpCut>())
+}
+
+/// What a connect in flight does next, from one look ([`wait_connected`]).
+#[derive(Debug, PartialEq, Eq)]
+enum Next {
+    Wait,
+    Connected,
+    /// The connect failed with this errno: EHOSTDOWN for a page that timed out, ECONNRESET for a reset.
+    Failed(i32),
+    /// Closed with no error given.
+    Closed,
+    /// Answered, and no SDP channel within the window: [`cut`].
+    Cut,
+}
+
+/// The decision of one look: `polled` is poll's revents and the socket's SO_ERROR when poll said something,
+/// `answered_for` how long since the page was answered (None: not yet), `after_acl` the SDP channel's window.
+fn next_step(polled: Option<(i16, i32)>, answered_for: Option<std::time::Duration>, after_acl: std::time::Duration) -> Next {
+    if let Some((revents, err)) = polled {
+        if err != 0 {
+            return Next::Failed(err);
+        }
+        if revents & (libc::POLLERR | libc::POLLHUP) != 0 {
+            return Next::Closed;
+        }
+        if revents & libc::POLLOUT != 0 {
+            return Next::Connected;
+        }
+    }
+    match answered_for {
+        Some(d) if d >= after_acl => Next::Cut,
+        _ => Next::Wait,
+    }
+}
+
+/// Wait for the non-blocking connect on `fd`, polled here in [`POLL_SLICE`]s, until `timeout` from `start` (the page) or
+/// the loop's shutdown. Once the page is answered ([`crate::hci::AclInfo::answered`]) the SDP channel gets
+/// [`sdp_after_acl`]; past it the connect is [`cut`]. Polled in this thread, not cut from another: a shutdown() from a
+/// watch thread left the socket without an error, so connect() returned only at its 8 s timeout (the Mac's review of
+/// 376c4ce, F2). `link_before`: a link to the phone was up before the page, which the cut then leaves alone.
 fn wait_connected(
     fd: std::os::fd::OwnedFd,
     peer: [u8; 6],
     start: std::time::Instant,
     timeout: std::time::Duration,
+    link_before: bool,
+    watch: &Watch<'_>,
 ) -> std::io::Result<std::os::fd::OwnedFd> {
     use std::os::fd::AsRawFd;
+    use std::sync::atomic::Ordering;
     let dev = crate::hci::dev_id(crate::HCI_DEV).ok();
     let after_acl = sdp_after_acl();
     let mut answered: Option<(std::time::Instant, u16)> = None;
     loop {
+        if watch.shutdown.load(Ordering::Relaxed) {
+            return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "shutting down"));
+        }
         let left = timeout.saturating_sub(start.elapsed());
         if left.is_zero() {
             return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "the SDP connect timed out"));
@@ -137,45 +207,60 @@ fn wait_connected(
             }
             return Err(e);
         }
-        if r > 0 {
-            // A failed connect leaves its error here: EHOSTDOWN for a page that timed out, ECONNRESET for a reset.
-            let err = so_error(fd.as_raw_fd())?;
-            if err != 0 {
-                return Err(std::io::Error::from_raw_os_error(err));
-            }
-            if pfd.revents & (libc::POLLERR | libc::POLLHUP) != 0 {
-                return Err(std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "the SDP channel closed while connecting"));
-            }
-            if pfd.revents & libc::POLLOUT != 0 {
-                return Ok(fd);
+        let polled = if r > 0 { Some((pfd.revents, so_error(fd.as_raw_fd())?)) } else { None };
+        if let (None, None, Some(dev)) = (polled, answered, dev) {
+            if let Some(acl) = crate::hci::acl_info(dev, peer).filter(|a| a.answered()) {
+                answered = Some((std::time::Instant::now(), acl.handle));
             }
         }
-        let Some(dev) = dev else { continue };
-        match answered {
-            None => {
-                if let Some(acl) = crate::hci::acl_info(dev, peer).filter(|a| a.answered()) {
-                    answered = Some((std::time::Instant::now(), acl.handle));
-                }
+        match next_step(polled, answered.map(|(at, _)| at.elapsed()), after_acl) {
+            Next::Wait => {}
+            Next::Connected => return Ok(fd),
+            Next::Failed(err) => return Err(std::io::Error::from_raw_os_error(err)),
+            Next::Closed => {
+                return Err(std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "the SDP channel closed while connecting"));
             }
-            Some((at, handle)) if at.elapsed() >= after_acl => return Err(cut(fd, dev, peer, handle, start, at)),
-            Some(_) => {}
+            Next::Cut => {
+                let (at, handle) = answered.expect("a cut follows an answer");
+                // Not a link this page brought up, or one a live session rides: close the socket and leave the link.
+                // The kernel reuses an existing ACL for this page, so the phone's own (the accept path taking its
+                // session mid-page, an SSP re-pair from Settings) would read as answered at once (the Mac's review, A2).
+                let keep = if link_before {
+                    Some("the link was up before the page")
+                } else if watch.session_active.load(Ordering::Relaxed) {
+                    Some("a session is live")
+                } else {
+                    None
+                };
+                return Err(cut(fd, dev.unwrap_or(0), peer, handle, (start, at), keep));
+            }
         }
     }
 }
 
 /// A page answered, and no SDP channel in [`sdp_after_acl`]: close the socket here, disconnect the link it leaves and
-/// wait (up to [`CUT_LINK_GONE`]) for it to go, so the caller's next page doesn't ride the same stuck link. A reset.
+/// wait (up to [`CUT_LINK_GONE`]) for it to go, so the caller's next page doesn't ride the same stuck link. With `keep`
+/// (why), the link isn't this page's to drop: the socket is closed and nothing else. Its own kind of reset ([`is_cut`]).
 fn cut(
     fd: std::os::fd::OwnedFd,
     dev: u16,
     peer: [u8; 6],
     handle: u16,
-    start: std::time::Instant,
-    answered_at: std::time::Instant,
+    (start, answered_at): (std::time::Instant, std::time::Instant),
+    keep: Option<&str>,
 ) -> std::io::Error {
     let answered_ms = answered_at.duration_since(start).as_millis();
     let cut_ms = start.elapsed().as_millis();
     drop(fd);
+    let error = cut_error();
+    let head = format!(
+        "answered at +{answered_ms} ms, but no SDP channel by +{cut_ms} ms ({} ms after the answer): cut",
+        cut_ms.saturating_sub(answered_ms)
+    );
+    if let Some(why) = keep {
+        log(&format!("{head}; {why}: socket closed, no Disconnect"));
+        return error;
+    }
     if let Err(e) = crate::hci::disconnect(dev, handle) {
         log(&format!("Disconnect of the cut link not sent: {e}"));
     }
@@ -185,19 +270,17 @@ fn cut(
     }
     let gone = crate::hci::acl_info(dev, peer).is_none();
     log(&format!(
-        "answered at +{answered_ms} ms, but no SDP channel by +{cut_ms} ms ({} ms after the answer): cut, as a reset; \
-         the link {} {} ms after its Disconnect",
-        cut_ms.saturating_sub(answered_ms),
+        "{head}; the link {} {} ms after its Disconnect",
         if gone { "went" } else { "was still up" },
         t.elapsed().as_millis()
     ));
-    std::io::Error::new(std::io::ErrorKind::ConnectionReset, "answered, no SDP channel")
+    error
 }
 
 /// L2CAP-connect to `peer`'s SDP PSM (implicitly pages the phone in BlueZ). `timeout_secs` bounds both
 /// the connect and each subsequent read so a quiet phone can't wedge the reconnect thread. The connect itself is
 /// non-blocking, watched by [`wait_connected`].
-fn connect_sdp(peer: [u8; 6], timeout_secs: i64) -> std::io::Result<std::fs::File> {
+fn connect_sdp(peer: [u8; 6], timeout_secs: i64, watch: &Watch<'_>) -> std::io::Result<std::fs::File> {
     use std::os::fd::AsRawFd;
     let raw = unsafe {
         libc::socket(
@@ -239,6 +322,8 @@ fn connect_sdp(peer: [u8; 6], timeout_secs: i64) -> std::io::Result<std::fs::Fil
         l2_bdaddr_type: 0,
     };
     set_nonblocking(fd.as_raw_fd(), true)?;
+    // A link to the phone already up (one it opened, or a session's): this page rides it, and a cut leaves it alone.
+    let link_before = crate::hci::dev_id(crate::HCI_DEV).ok().and_then(|dev| crate::hci::acl_info(dev, peer)).is_some();
     let start = std::time::Instant::now();
     let ret = unsafe {
         libc::connect(
@@ -254,7 +339,7 @@ fn connect_sdp(peer: [u8; 6], timeout_secs: i64) -> std::io::Result<std::fs::Fil
         if e.raw_os_error() != Some(libc::EINPROGRESS) {
             return Err(e);
         }
-        wait_connected(fd, peer, start, std::time::Duration::from_secs(timeout_secs.max(1) as u64))?
+        wait_connected(fd, peer, start, std::time::Duration::from_secs(timeout_secs.max(1) as u64), link_before, watch)?
     };
     // Blocking again, for the SDP exchange and its SO_RCVTIMEO-bounded reads.
     set_nonblocking(fd.as_raw_fd(), false)?;
@@ -396,12 +481,12 @@ pub struct Services {
 /// only on connect/transport failure — a peer without one yields `Services::default()` with its raw
 /// catalog logged.
 /// Handles SDP continuation by re-requesting with the cookie.
-pub fn query(peer: [u8; 6], timeout_secs: i64) -> std::io::Result<Services> {
+pub fn query(peer: [u8; 6], timeout_secs: i64, watch: &Watch<'_>) -> std::io::Result<Services> {
     let mut disp = peer;
     disp.reverse(); // human-readable bdaddr for the log only
     let human = disp.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(":");
     log(&format!("querying SDP on {human} (PSM 0x{SDP_PSM:04x})"));
-    let mut sock = connect_sdp(peer, timeout_secs)?;
+    let mut sock = connect_sdp(peer, timeout_secs, watch)?;
     log("L2CAP SDP channel up (phone paged)");
 
     // (1) Targeted: the accessory-side iAP2 UUID. If iOS exposes an iAP2 RFCOMM service by this UUID,
@@ -440,6 +525,23 @@ pub fn query(peer: [u8; 6], timeout_secs: i64) -> std::io::Result<Services> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// wait_connected's decision (the Mac's review, A3): a page that timed out fails with EHOSTDOWN, an answer with no SDP
+    /// channel past the window is a cut, and a writable socket is connected.
+    #[test]
+    fn a_connect_in_flight_fails_cuts_or_connects() {
+        let w = std::time::Duration::from_millis(700);
+        let ms = std::time::Duration::from_millis;
+        assert_eq!(next_step(Some((libc::POLLERR | libc::POLLHUP, libc::EHOSTDOWN)), None, w), Next::Failed(libc::EHOSTDOWN));
+        assert_eq!(next_step(Some((libc::POLLERR, libc::ECONNRESET)), Some(ms(300)), w), Next::Failed(libc::ECONNRESET));
+        assert_eq!(next_step(Some((libc::POLLOUT, 0)), Some(ms(900)), w), Next::Connected, "connected beats a late cut");
+        assert_eq!(next_step(Some((libc::POLLHUP, 0)), None, w), Next::Closed);
+        assert_eq!(next_step(None, None, w), Next::Wait, "still paging");
+        assert_eq!(next_step(None, Some(ms(699)), w), Next::Wait, "answered, inside the window");
+        assert_eq!(next_step(None, Some(ms(700)), w), Next::Cut);
+        assert!(is_cut(&cut_error()), "a cut is told from a reset");
+        assert!(!is_cut(&std::io::Error::from_raw_os_error(libc::ECONNRESET)));
+    }
 
     #[test]
     fn ssa_request_has_iap2_uuid_and_range() {

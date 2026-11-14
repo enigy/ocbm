@@ -67,13 +67,16 @@ struct Rounds {
 }
 
 impl Rounds {
-    /// A walk starts: a new round forgets the last one's pages; the rest of a re-planned round keeps them.
-    fn begin(&mut self) {
-        if !self.replanning {
-            self.absent_now.clear();
-            self.paged.clear();
-            self.prev_absent = false;
+    /// A walk starts: a new round forgets the last one's pages; the rest of a re-planned round keeps them. True for a
+    /// new round.
+    fn begin(&mut self) -> bool {
+        if self.replanning {
+            return false;
         }
+        self.absent_now.clear();
+        self.paged.clear();
+        self.prev_absent = false;
+        true
     }
 
     /// The order to page in: the phones absent last round moved last BEFORE `call_order` (the pass-over), so a
@@ -86,7 +89,7 @@ impl Rounds {
     /// two most likely crossed, and it is not counted toward a forgotten pairing (the Mac, 13 Nov).
     fn paged(&mut self, peer: [u8; 6], result: Attempt) -> bool {
         self.paged.push(peer);
-        let crossing = result == Attempt::Reset && self.prev_absent;
+        let crossing = matches!(result, Attempt::Reset | Attempt::Cut) && self.prev_absent;
         self.prev_absent = result == Attempt::Absent;
         if self.prev_absent && !self.absent_now.contains(&peer) {
             self.absent_now.push(peer);
@@ -151,6 +154,15 @@ fn round_page_slots(first_round: bool, phones: usize) -> u16 {
 /// None since the Mac's 13 Nov brief (item 11): the re-page 2 s later connected about 1 s in, every time, and a reset
 /// is now caught 0.7 s after the answer (`sdp_client`'s watch), so the re-page goes at once.
 const RESET_RETRY_SECS: u64 = 0;
+/// What the walk's pause says of a page it repeats: a reset, or a cut.
+fn retry_words(result: Attempt) -> &'static str {
+    if result == Attempt::Cut {
+        "answered and opened no SDP channel"
+    } else {
+        "answered and reset the link"
+    }
+}
+
 /// For the first [`EARLY_WINDOW`] after btd starts (a host has just come), rounds are this far apart, not the doubling
 /// backoff: a phone that comes back (a driver who walks up after the display is on) waited 10, 20, then 40 s for
 /// the next page (the Mac, 13 Nov). A phone that said no still gets [`BACKOFF_MAX_SECS`].
@@ -163,7 +175,10 @@ const EARLY_WINDOW: Duration = Duration::from_secs(120);
 /// host's SUBSCRIBE to the first video frame, with the bonded phone answering the page 0.75 s after
 /// it ended. Bring-up has already returned when this starts (SSP agent and SDP are serving), and a
 /// phone that connects IN meanwhile is still safe: `attempt()`'s compare_exchange on
-/// `session_active` refuses to page over it. 1 s keeps a moment for that inbound connect.
+/// `session_active` refuses to run a second session over it, and a page that rides its link (the kernel reuses
+/// the ACL) is never cut with a Disconnect: `sdp_client` leaves a link that was up before the page, or that a live
+/// session rides, and only closes its socket (the Mac's review of bbd29f3, A2). 1 s kept a moment for that inbound
+/// connect.
 /// Override: `BT_RECONNECT_SETTLE_SECS` or `/tmp/reconnect_settle_secs` (whole seconds, `0` allowed).
 /// None when the controller was warm ([`BT_WARM`]): nothing was just attached, so paging starts at once (the Mac's
 /// 13 Nov connect-time brief). None after a fresh attach either since its 13 Nov brief (item 6): an adapter still
@@ -256,16 +271,24 @@ enum Attempt {
     /// there but not ready, as an iPhone still letting go of a session a power cut ended. Paged once more
     /// before the next phone ([`walk`]).
     Reset,
+    /// The phone answered the page and opened no SDP channel within the window (`sdp_client`'s cut): it is there but
+    /// not ready, as a phone a power cut left mid-session. Paged once more like a reset, but a round counts at most one
+    /// toward a forgotten pairing ([`ResetStreak`]): the re-page is at once, so a not-ready phone could otherwise run up
+    /// three cuts in 5-8 s and Carlink would ask to re-pair a paired phone (the Mac's review of bbd29f3, A1).
+    Cut,
     /// The phone rejected the SSP re-pair (`rfcomm::connect_to` → `PermissionDenied`):
     /// paging it again just produces another prompt it cannot accept. Hold off for the maximum
     /// backoff and let the operator re-pair from the iPhone.
     PairRejected,
 }
 
-/// [`Attempt::Reset`] when the phone reset the link, [`Attempt::Absent`] when the page timed out, else
+/// [`Attempt::Cut`] for `sdp_client`'s cut, [`Attempt::Reset`] when the phone reset the link, [`Attempt::Absent`] when the
+/// page timed out, else
 /// [`Attempt::Failed`].
 fn failure(e: &std::io::Error) -> Attempt {
-    if e.kind() == std::io::ErrorKind::ConnectionReset {
+    if sdp_client::is_cut(e) {
+        Attempt::Cut
+    } else if e.kind() == std::io::ErrorKind::ConnectionReset {
         Attempt::Reset
     } else if e.raw_os_error() == Some(libc::EHOSTDOWN) {
         Attempt::Absent
@@ -298,12 +321,16 @@ struct ResetStreak {
     bonds: Option<std::time::SystemTime>,
     /// When btd first saw that write, on the monotonic clock: the hold's start when the write's age is unknown.
     seen: Option<Instant>,
+    /// The reconnect round, for one counted cut per phone per round ([`Self::new_round`]).
+    round: u64,
 }
 
 #[derive(Debug, Default)]
 struct Run {
     count: u32,
     told: bool,
+    /// The round of this run's last counted cut: a round counts one.
+    cut_round: Option<u64>,
 }
 
 impl ResetStreak {
@@ -330,6 +357,15 @@ impl ResetStreak {
         }
         match result {
             Attempt::Reset => {}
+            // A cut counts once a round: not none, since a cut at 0.7 s now comes before a phone that really forgot the
+            // pairing would reset the link itself, so ignoring cuts could keep its BOND_LOST from ever coming.
+            Attempt::Cut => {
+                let run = self.runs.entry(peer).or_default();
+                if run.cut_round == Some(self.round) {
+                    return false;
+                }
+                run.cut_round = Some(self.round);
+            }
             Attempt::Ran => {
                 self.runs.clear();
                 return false;
@@ -357,6 +393,11 @@ impl ResetStreak {
     fn session(&mut self) {
         self.runs.clear();
     }
+
+    /// A new round of the reconnect loop (not the re-planned rest of one): each phone may count one more cut.
+    fn new_round(&mut self) {
+        self.round += 1;
+    }
 }
 
 /// When the link-key store was last written: a new bond rewrites it.
@@ -365,11 +406,12 @@ fn bonds_written() -> Option<std::time::SystemTime> {
 }
 
 /// Page `targets` in order until `stop` says not to go on. A phone that answers and resets the link
-/// ([`Attempt::Reset`]) is paged once more, after `pause` (false: go no further), before the next one.
+/// ([`Attempt::Reset`]) or is cut ([`Attempt::Cut`]) is paged once more, after `pause` (false: go no further), before
+/// the next one.
 fn walk(
     targets: &[[u8; 6]],
     mut stop: impl FnMut() -> bool,
-    mut pause: impl FnMut([u8; 6]) -> bool,
+    mut pause: impl FnMut([u8; 6], Attempt) -> bool,
     mut page: impl FnMut([u8; 6]) -> Attempt,
 ) -> Walk {
     let mut out = Walk::default();
@@ -378,15 +420,15 @@ fn walk(
             break;
         }
         let mut result = page(peer);
-        if result == Attempt::Reset {
-            if !pause(peer) {
+        if matches!(result, Attempt::Reset | Attempt::Cut) {
+            if !pause(peer, result) {
                 break;
             }
             result = page(peer);
         }
         match result {
             Attempt::Ran => out.ran = true,
-            Attempt::Failed | Attempt::Absent | Attempt::Reset => {}
+            Attempt::Failed | Attempt::Absent | Attempt::Reset | Attempt::Cut => {}
             Attempt::PairRejected => {
                 out.rejected = true;
                 break; // do not page the next phone into the same rejection storm
@@ -403,7 +445,7 @@ fn attempt(
     session_active: &AtomicBool,
     ctrl: &Control,
 ) -> Attempt {
-    let services = match sdp_client::query(peer, CONNECT_TIMEOUT_SECS) {
+    let services = match sdp_client::query(peer, CONNECT_TIMEOUT_SECS, &sdp_client::Watch { shutdown, session_active }) {
         Ok(s) => s,
         Err(e) => {
             log(&format!("SDP query failed: {e}"));
@@ -529,7 +571,9 @@ pub fn run(
 
         // This round plans by the policy as it is now: only a change while it pages re-plans it.
         ctrl.take_policy_changed();
-        rounds.begin();
+        if rounds.begin() {
+            streak.new_round();
+        }
         // An explicit request from the device screen. Consumed here, so it fires exactly once.
         let request = ctrl.take_request();
         let auto = ctrl.policy().auto_connect;
@@ -590,11 +634,12 @@ pub fn run(
         let Walk { ran, rejected } = walk(
             &targets,
             || shutdown.load(Ordering::Relaxed) || session_active.load(Ordering::Relaxed) || ctrl.policy_changed(),
-            |peer| {
-                log(&format!(
-                    "{} answered and reset the link -- paging it once more in {RESET_RETRY_SECS}s before the next phone",
-                    control::fmt_addr(&peer)
-                ));
+            |peer, result| {
+                // A request or a session first: no line that pages once more when it won't (the Mac's review, A6).
+                if ctrl.has_request() || session_active.load(Ordering::Relaxed) {
+                    return false;
+                }
+                log(&format!("{} {} -- paging it once more before the next phone", control::fmt_addr(&peer), retry_words(result)));
                 sleep_or_request(RESET_RETRY_SECS, shutdown, ctrl)
                     && !ctrl.has_request()
                     && !session_active.load(Ordering::Relaxed)
@@ -691,7 +736,7 @@ mod tests {
         let walked = walk(
             &[SCOTT, YODA],
             || false,
-            |_| true,
+            |_, _| true,
             |peer| {
                 paged.push(peer);
                 match queue.iter().position(|(p, _)| *p == peer) {
@@ -717,7 +762,7 @@ mod tests {
         let bonds = ctrl.policy().order;
         let targets = r.order(bonds.clone(), |b| ctrl.call_order(b));
         let (mut paged, mut counted) = (Vec::new(), Vec::new());
-        let walked = walk(&targets, || ctrl.policy_changed(), |_| true, |peer| {
+        let walked = walk(&targets, || ctrl.policy_changed(), |_, _| true, |peer| {
             let result = answer(peer);
             paged.push(peer);
             counted.push(r.paged(peer, result));
@@ -859,6 +904,31 @@ mod tests {
         assert!(s.note(SCOTT, Attempt::Reset, old, t, m));
     }
 
+    /// A1: a cut counts once a round toward a forgotten pairing. A not-ready phone cut on every page of two rounds
+    /// (the re-page is at once) is not told; cut on every page of three rounds, it is, once. A reset still counts each.
+    #[test]
+    fn a_cut_counts_once_a_round_toward_a_forgotten_pairing() {
+        let m = Instant::now();
+        let t = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let old = Some(t - Duration::from_secs(3600));
+        let mut s = ResetStreak::default();
+        for _ in 0..2 {
+            s.new_round();
+            assert!(!s.note(SCOTT, Attempt::Cut, old, t, m));
+            assert!(!s.note(SCOTT, Attempt::Cut, old, t, m), "the round's second cut is not counted");
+        }
+        s.new_round();
+        assert!(s.note(SCOTT, Attempt::Cut, old, t, m), "the third round's cut tells");
+        assert!(!s.note(SCOTT, Attempt::Cut, old, t, m), "once");
+
+        let mut s = ResetStreak::default();
+        s.new_round();
+        assert!(!s.note(SCOTT, Attempt::Cut, old, t, m));
+        assert!(!s.note(SCOTT, Attempt::Reset, old, t, m));
+        assert!(s.note(SCOTT, Attempt::Reset, old, t, m), "a cut and two resets in one round: three");
+        assert_eq!(failure(&crate::sdp_client::cut_error()), Attempt::Cut);
+    }
+
     /// The 1.0.4 bench, 5 Nov: re-paired, CarPlay mis-tapped on the iPhone, which then answered-and-reset two pages
     /// within a minute. A new bond starts the count over and holds the news back while it is new.
     #[test]
@@ -903,7 +973,7 @@ mod tests {
             let mut s = ResetStreak::default();
             let mut told = Vec::new();
             for round in 1..=3 {
-                walk(&order, || false, |_| true, |peer| {
+                walk(&order, || false, |_, _| true, |peer| {
                     let result = if peer == SCOTT { Attempt::Reset } else { Attempt::Failed };
                     if s.note(peer, result, old, t, m) {
                         told.push((round, peer));
@@ -942,7 +1012,7 @@ mod tests {
     #[test]
     fn a_request_or_a_session_during_the_pause_ends_the_walk() {
         let mut paged = Vec::new();
-        let walked = walk(&[SCOTT, YODA], || false, |_| false, |peer| {
+        let walked = walk(&[SCOTT, YODA], || false, |_, _| false, |peer| {
             paged.push(peer);
             Attempt::Reset
         });

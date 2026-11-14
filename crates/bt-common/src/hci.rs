@@ -174,7 +174,8 @@ impl HciSocket {
     }
 
     /// [`HciSocket::cmd`], then wait up to `wait` for the controller's answer to `opcode`: Ok on status 0, an error on
-    /// any other status or on no answer. Needs [`HciSocket::receive_command_events`] first.
+    /// any other status or on no answer. Needs [`HciSocket::receive_command_events`] first. Matched by opcode alone: a Complete
+    /// for the same opcode the kernel had queued could end the wait early, which only skips this check for that write.
     fn cmd_waited(&self, opcode: u16, params: &[u8], wait: std::time::Duration) -> io::Result<()> {
         self.cmd(opcode, params)?;
         let until = std::time::Instant::now() + wait;
@@ -243,6 +244,9 @@ const ACL_LINK: u8 = 0x01;
 /// `struct hci_conn_info_req` (bdaddr, type, then one `struct hci_conn_info` at offset 8, 4-aligned) as the kernel
 /// writes it back: handle @8, bdaddr @10, type @16, out @17, state @18, link_mode @20.
 const CONN_INFO_LEN: usize = 24;
+/// Where the parser reads the handle and the state in that reply (tested against the structs, mirrored as `#[repr(C)]`).
+const HANDLE_AT: usize = 8;
+const STATE_AT: usize = 18;
 
 /// The kernel's `BT_CONNECTED`: the page was answered and the link is set up (remote features read).
 pub const BT_CONNECTED: u16 = 1;
@@ -269,8 +273,8 @@ impl AclInfo {
 /// The handle and state in a HCIGETCONNINFO reply buffer.
 fn parse_conn_info(reply: &[u8; CONN_INFO_LEN]) -> AclInfo {
     AclInfo {
-        handle: u16::from_ne_bytes([reply[8], reply[9]]),
-        state: u16::from_ne_bytes([reply[18], reply[19]]),
+        handle: u16::from_ne_bytes([reply[HANDLE_AT], reply[HANDLE_AT + 1]]),
+        state: u16::from_ne_bytes([reply[STATE_AT], reply[STATE_AT + 1]]),
     }
 }
 
@@ -427,6 +431,40 @@ mod tests {
         assert_eq!(command_status(&[0x04, 0x05, 0x04, 0x00, 0x0c, 0x00, 0x13], OP_WRITE_EIR), None, "another event");
         assert_eq!(command_status(&[0x04, 0x0E, 0x04, 0x01, op[0]], OP_WRITE_LOCAL_NAME), None, "short");
         assert_eq!(command_status(&[], OP_WRITE_LOCAL_NAME), None);
+    }
+
+
+    /// The Mac's review of bbd29f3 (A3): the parser's offsets against the kernel's structs, mirrored as `#[repr(C)]`
+    /// (bdaddr_t as a packed `[u8; 6]`): `struct hci_conn_info_req { bdaddr_t; u8 type; struct hci_conn_info[]; }` and
+    /// `struct hci_conn_info { u16 handle; bdaddr_t; u8 type; u8 out; u16 state; u32 link_mode; }`.
+    #[test]
+    fn the_conn_info_offsets_are_the_kernel_s() {
+        #[allow(dead_code)]
+        #[derive(Default)]
+        #[repr(C)]
+        struct HciConnInfo {
+            handle: u16,
+            bdaddr: [u8; 6],
+            kind: u8,
+            out: u8,
+            state: u16,
+            link_mode: u32,
+        }
+        #[allow(dead_code)]
+        #[derive(Default)]
+        #[repr(C)]
+        struct HciConnInfoReq {
+            bdaddr: [u8; 6],
+            kind: u8,
+            conn_info: HciConnInfo,
+        }
+        let r = HciConnInfoReq::default();
+        let base = &r as *const HciConnInfoReq as usize;
+        assert_eq!(&r.conn_info as *const HciConnInfo as usize - base, 8, "conn_info");
+        assert_eq!(&r.conn_info.handle as *const u16 as usize - base, HANDLE_AT);
+        assert_eq!(&r.conn_info.out as *const u8 as usize - base, 17, "out");
+        assert_eq!(&r.conn_info.state as *const u16 as usize - base, STATE_AT);
+        assert_eq!(std::mem::size_of::<HciConnInfoReq>(), CONN_INFO_LEN);
     }
 
     #[test]

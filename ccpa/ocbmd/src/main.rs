@@ -2138,6 +2138,10 @@ impl Daemon {
                 // Mirror `present`, do NOT hardcode true: the flag is a view of daemon state, and a
                 // deadline that outlived its session (see go_idle) must not be able to invent one.
                 write_flag_atomic(HOST_PRESENT_FLAG, self.present);
+                // The supervisor then sees the host this tick, not on its next 1 s one (the Mac's review of bbd29f3, A7).
+                if self.present {
+                    wake_supervisor(SUPERVISOR_PID_FILE);
+                }
                 eprintln!(
                     "[ocbmd] session: presence flag restored to {} — supervisor should be re-ARMing",
                     self.present
