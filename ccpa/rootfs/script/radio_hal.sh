@@ -552,7 +552,9 @@ do_preload() {
   # (rc 2: someone else's), and not once a host has come: its session is waiting on this lock for the radio.
   if [ "$_pr" = 0 ] && ! host_here; then do_bt_off; fi
   rm -f "$PRELOAD_MARK" "$PRELOAD_UNFINISHED"; sync
-  preload_state done
+  # "done" only when Bluetooth came up (rc 0, or 2: already up); a failed attach says so, e.g. done_rc1, so the
+  # [startup] line never reads "preload done" after one (the Mac's review, PRELOAD-DONE-ANY-RC).
+  case "$_pr" in 0|2) preload_state done ;; *) preload_state "done_rc$_pr" ;; esac
   log "preload: done rc=$_pr in $(awk "BEGIN{printf \"%.1f\", $(cut -d' ' -f1 /proc/uptime)-$_p0}") s, wlan=$(wlan_iface 2>/dev/null || echo none) bt=$(hciconfig 2>/dev/null | grep -oE 'UP RUNNING|DOWN' | head -1)"
   return $_pr
 }

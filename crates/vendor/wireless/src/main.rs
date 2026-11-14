@@ -102,10 +102,20 @@ fn rfcomm_accept(
 
 /// Whether radio_hal.sh's bt_on opened the controller from DOWN just before this btd started ("opened" in
 /// `/tmp/.radio_bt_warm`), true for this process's first bring-up only: a later one follows a session that used it.
+/// Taken once: the word is cleared as it is read, the file kept (its presence still says warm, for the reconnect
+/// settle), so a later btd never skips its DOWN/UP on a stale word over a controller that is down (the Mac's review,
+/// BT-4).
 fn just_opened() -> bool {
+    const WARM: &str = "/tmp/.radio_bt_warm";
     static FIRST: AtomicBool = AtomicBool::new(true);
-    FIRST.swap(false, Ordering::Relaxed)
-        && std::fs::read_to_string("/tmp/.radio_bt_warm").is_ok_and(|s| s.trim() == "opened")
+    if !FIRST.swap(false, Ordering::Relaxed) {
+        return false;
+    }
+    let opened = std::fs::read_to_string(WARM).is_ok_and(|s| s.trim() == "opened");
+    if opened {
+        let _ = std::fs::write(WARM, "");
+    }
+    opened
 }
 
 /// Run one active wireless session: bring Bluetooth up discoverable, serve SSP + SDP + RFCOMM/iAP2,

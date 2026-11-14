@@ -115,17 +115,25 @@ _known_psk "$PSK" && PSK=""
 if [ "${#PSK}" -lt 8 ]; then
   # OCBM's own from before a go-back to stock first (it puts stock's 12345678 back): each phone knows it, and a new one
   # cost each phone about 6 s of PSK-MISMATCH retries at its first connect after the reinstall (the Mac, 13 Nov).
+  # Which source it came from is logged, never the passphrase (the Mac's review, PSK-SOURCE-UNLOGGED).
+  _psk_src="the one OCBM kept (/etc/ocbm/wifi_psk)"
   PSK=$(cat /etc/ocbm/wifi_psk 2>/dev/null | tr -cd '[:print:]' | head -c 63)
   _known_psk "$PSK" && PSK=""
-  [ "${#PSK}" -lt 8 ] && PSK=$(cat /etc/wifi_password 2>/dev/null | tr -cd '[:print:]' | head -c 63)
-  _known_psk "$PSK" && PSK=""
-  [ "${#PSK}" -lt 8 ] && PSK=$(head -c 64 /dev/urandom | md5sum | cut -c1-20)
+  if [ "${#PSK}" -lt 8 ]; then
+    _psk_src="/etc/wifi_password"
+    PSK=$(cat /etc/wifi_password 2>/dev/null | tr -cd '[:print:]' | head -c 63)
+    _known_psk "$PSK" && PSK=""
+  fi
+  if [ "${#PSK}" -lt 8 ]; then
+    _psk_src="a new random one"
+    PSK=$(head -c 64 /dev/urandom | md5sum | cut -c1-20)
+  fi
   if grep -q '^wpa_passphrase=' /etc/hostapd.conf; then
     sed -i "s/^wpa_passphrase=.*/wpa_passphrase=$PSK/" /etc/hostapd.conf
   else
     echo "wpa_passphrase=$PSK" >> /etc/hostapd.conf
   fi
-  echo "$L wpa_passphrase was absent, too short or a known default - set one (kept or random)"
+  echo "$L wpa_passphrase was absent, too short or a known default - set $_psk_src"
 fi
 # Kept where a go-back leaves it (/etc/ocbm stays on flash; ocbm_revert.sh), for the install after it. Not logged.
 if [ -d /etc/ocbm ] && [ "$(cat /etc/ocbm/wifi_psk 2>/dev/null)" != "$PSK" ]; then

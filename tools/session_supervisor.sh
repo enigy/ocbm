@@ -44,8 +44,11 @@ while ! mkdir "$_sup_lock" 2>/dev/null; do
   exit 0
 done
 # ocbmd sends SIGUSR1 when a host arrives, to cut the 1 s tick short (the main loop's wait). Set before the pid is
-# published, so the signal never finds the default action (which would end this process).
-trap ':' USR1
+# published, so the signal never finds the default action (which would end this process). It records the wake too:
+# one that lands while the tick is still working, outside its closing wait, skips that wait instead of being lost
+# (the Mac's review of 376c4ce, SUP-WAKE-LOST).
+woken=0
+trap 'woken=1' USR1
 echo $$ > "$_sup_lock/pid" 2>/dev/null
 trap 'rm -rf "$_sup_lock" 2>/dev/null' EXIT
 trap 'rm -rf "$_sup_lock" 2>/dev/null; trap - EXIT; exit 143' INT TERM HUP
@@ -600,6 +603,17 @@ radio_off() { [ -f /tmp/radio_off ]; }
 # standard "keep wireless on plug" behavior. See docs/ops/05_AUDITS.md and the transport-selection research 2026-08-01.
 hot_handover_enabled() { grep -qiE '^[[:space:]]*hot_handover:[[:space:]]*true' "$WIRELESS_CFG" 2>/dev/null; }
 wireless_running() { pgrep -f /usr/sbin/btd >/dev/null 2>&1; }
+# A wireless_down teardown still running (its detached block): /tmp/.wl_teardown holds its start uptime, written here
+# before the block starts and removed by the block as it ends. 15 s on, a marker is stale (a block killed mid-way).
+# wireless_up waits on it, so a host that comes back within the teardown neither finds the SIGTERMed btd and skips
+# its bring-up, nor starts a btd the teardown then kills with -9 (the Mac's review of 376c4ce, SUP-TEARDOWN-RACE).
+WL_TEARDOWN_MARK=/tmp/.wl_teardown
+teardown_in_flight() {
+  _ti=$(cat "$WL_TEARDOWN_MARK" 2>/dev/null)
+  case "$_ti" in ''|*[!0-9.]*) return 1 ;; esac
+  [ $(( $(now) - ${_ti%%.*} )) -lt 15 ]
+}
+teardown_mark() { _td=$(cut -d" " -f1 /proc/uptime); echo "$_td" > "$WL_TEARDOWN_MARK"; }
 # Is ANY part of the wireless stack still drawing power? The advertiser can be dead while hostapd is
 # still beaconing and hci0 is still UP — which is exactly the state that made a wired session crawl
 # (owner report 2026-08-11), so all three are checked, not just the daemon.
@@ -668,6 +682,16 @@ wireless_up() {
     echo "[sup] wireless_up SUPPRESSED — a WIRED session owns the box (Hot-Handover off)"
     return
   fi
+  # A teardown still running goes first (teardown_in_flight): up to 4 s here, then the bring-up is deferred to the
+  # main loop's re-bring timer rather than started under it.
+  _tw=0
+  while teardown_in_flight && [ "$_tw" -lt 20 ]; do _tw=$((_tw + 1)); sleep 0.2; done
+  if teardown_in_flight; then
+    echo "[sup] wireless_up: the teardown is still running after 4 s -- bring-up deferred"
+    wireless_rebring_at=$(( $(now) + 1 ))
+    return
+  fi
+  [ "$_tw" -gt 0 ] && echo "[sup] wireless_up waited $((_tw * 200)) ms for the teardown in flight"
   wireless_running && return   # idempotent guard (checked HERE, before the wrapper exists)
   # Clean slate before a fresh bring-up: reap any orphaned A/V children left by a prior session so the
   # new stack can NEVER latch onto / collide with a stale carplayd (the observed
@@ -804,7 +828,8 @@ wireless_down() {
     # line made that pkill SIGTERM this subshell right after btd/carplayd, so wlan_off and bt_off
     # never ran - hostapd kept beaconing and hci0 stayed up after every app disconnect. Never write
     # a pattern's plain word anywhere in the block.
-    setsid sh -c '
+    teardown_mark
+    env WL_TEARDOWN="$_td" setsid sh -c '
       pkill -f "[/]usr/sbin/btd" 2>/dev/null
       pkill -f "[c]arplayd" 2>/dev/null
       pkill -f "[b]tmon" 2>/dev/null   # the 2026-09-03 HCI-capture bench lever, harmless if never armed
@@ -829,6 +854,8 @@ wireless_down() {
       # land between a concurrent bt_on attach and its readback and present as a wedged
       # controller; it also hardcoded hci0 instead of the discovered device.
       sh /script/radio_hal.sh bt_off >/tmp/bt_off.log 2>&1
+      # This teardown is over: wireless_up may go on (teardown_in_flight). Only its own marker, by its start uptime.
+      [ "$(cat /tmp/.wl_teardown 2>/dev/null)" = "$WL_TEARDOWN" ] && rm -f /tmp/.wl_teardown
     ' </dev/null >/dev/null 2>&1 &
     # docs/wireless/00_WIRELESS_CARPLAY.md #1.2/#1.3: this is OUR session ending — clear the health state we own and the transport
     # flag ourselves (value-scoped, so it never fires against a wired session's "wired"/absent value),
@@ -844,7 +871,8 @@ wireless_down() {
     echo "[sup] $_wd_why -> tearing down wireless advertiser + radios only (carplayd are wired-owned, left running)"
     # SELF-MATCH FIX 2026-08-01: `[/]usr/...` so this `sh -c` block doesn't SIGKILL itself before wlan_off
     # (see the COMPLETE-teardown branch above for the full rationale).
-    setsid sh -c '
+    teardown_mark
+    env WL_TEARDOWN="$_td" setsid sh -c '
       pkill -f "[/]usr/sbin/btd" 2>/dev/null
       pkill -f "[b]tmon" 2>/dev/null   # the 2026-09-03 HCI-capture bench lever, harmless if never armed
       sleep 1
@@ -854,6 +882,8 @@ wireless_down() {
       # docs/carplay/04_CAPABILITIES_AND_CONFIG.md radio gating: power BT off here too, through the locked seam bt_off
       # verb (see the COMPLETE-teardown branch rationale).
       sh /script/radio_hal.sh bt_off >/tmp/bt_off.log 2>&1
+      # This teardown is over: wireless_up may go on (teardown_in_flight). Only its own marker, by its start uptime.
+      [ "$(cat /tmp/.wl_teardown 2>/dev/null)" = "$WL_TEARDOWN" ] && rm -f /tmp/.wl_teardown
     ' </dev/null >/dev/null 2>&1 &
   fi
 }
@@ -879,6 +909,7 @@ fi
 while :; do
   # Read presence, acting only on a DEFINITE 0/1 — an empty/partial read (or missing file) keeps the
   # last state rather than flapping. (ocbmd writes the flag atomically, so this is defensive.)
+  woken=0
   p=$(cat "$FLAG" 2>/dev/null)
   # A host just came: bring wireless up FIRST, before the rest of this tick's checks, each a fork on this CPU. They
   # put about 1.3 s between the host and radio_hal.sh's first line (the Mac's 13 Nov brief, item 1).
@@ -1210,7 +1241,10 @@ while :; do
 
   tick=$((tick + 1))
   [ $((tick % 30)) -eq 0 ] && bound_logs
-  # 1 s, cut short by ocbmd's SIGUSR1 when a host arrives (the trap above): wait returns on a trapped signal.
-  sleep 1 & _tick_sleep=$!
-  wait "$_tick_sleep" 2>/dev/null || kill "$_tick_sleep" 2>/dev/null
+  # 1 s, cut short by ocbmd's SIGUSR1 when a host arrives (the trap above): wait returns on a trapped signal, and one
+  # that came while this tick worked skips the wait.
+  if [ "$woken" != 1 ]; then
+    sleep 1 & _tick_sleep=$!
+    wait "$_tick_sleep" 2>/dev/null || kill "$_tick_sleep" 2>/dev/null
+  fi
 done

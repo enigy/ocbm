@@ -104,9 +104,19 @@ impl Rounds {
         self.replanning
     }
 
-    /// A session the phone started itself: nobody is absent.
+    /// A session the phone started itself: nobody is absent, and a re-planned rest is moot.
     fn session(&mut self) {
         self.absent_before.clear();
+        self.replanning = false;
+    }
+
+    /// The loop went round without a walk (no bonds, or autoConnect off and nothing asked): a re-planned rest that never
+    /// ran ends its round here, so a later round, maybe much later, pages every phone again (the Mac's review, F5).
+    fn not_walked(&mut self) {
+        if self.replanning {
+            self.replanning = false;
+            self.absent_before = std::mem::take(&mut self.absent_now);
+        }
     }
 }
 
@@ -510,6 +520,7 @@ pub fn run(
             last_state = Some(has_bonds);
         }
         if !has_bonds {
+            rounds.not_walked();
             if !interruptible_sleep(BACKOFF_MAX_SECS, shutdown) {
                 break;
             }
@@ -530,6 +541,7 @@ pub fn run(
                 log("autoConnect off — idle until the device screen asks for a phone");
                 last_manual_log = true;
             }
+            rounds.not_walked();
             if !sleep_or_request(BACKOFF_START_SECS, shutdown, ctrl) {
                 break;
             }
@@ -773,6 +785,27 @@ mod tests {
         assert_eq!(round(&mut r, &ctrl, &mut |_| Attempt::Failed).0, vec![SCOTT, YODA], "a session: nobody is absent");
         round(&mut r, &ctrl, &mut |peer| if peer == SCOTT { Attempt::Absent } else { Attempt::Ran });
         assert_eq!(round(&mut r, &ctrl, &mut |_| Attempt::Failed).0, vec![SCOTT, YODA], "a round that ran clears it");
+    }
+
+    /// F5: a re-plan whose rest never walks (autoConnect off, no bonds, a session) ends its round, so a later round pages
+    /// every phone again, the timed-out one last.
+    #[test]
+    fn a_re_plan_whose_rest_never_walks_ends_its_round() {
+        let mut r = Rounds::default();
+        r.begin();
+        r.paged(SCOTT, Attempt::Absent);
+        assert!(r.end(false, true, &[SCOTT, YODA]), "the app's order came mid-round: a re-plan");
+        r.not_walked();
+        r.begin();
+        assert_eq!(r.order(vec![SCOTT, YODA], |b| b), vec![YODA, SCOTT], "every phone, the timed-out one last");
+
+        let mut r = Rounds::default();
+        r.begin();
+        r.paged(SCOTT, Attempt::Absent);
+        assert!(r.end(false, true, &[SCOTT, YODA]));
+        r.session();
+        r.begin();
+        assert_eq!(r.order(vec![SCOTT, YODA], |b| b), vec![SCOTT, YODA], "after a session nobody is absent");
     }
 
     /// R3: the demotion comes before the pass-over, so a passed-over phone stays last.

@@ -59,59 +59,158 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join("")
 }
 
-/// How long after the page is answered (the ACL is up) the SDP channel may take to open. All 83 good answers on the
-/// Mac's benches opened it within 14-512 ms; all 10 answered-then-reset links never did, and the phone dropped the
-/// link 4-6 s later (13 Nov brief, item 3). Past this, the connect is cut and reads as a reset.
-const SDP_AFTER_ACL: std::time::Duration = std::time::Duration::from_millis(700);
+/// How long after the page is answered (the ACL is BT_CONNECTED) the SDP channel may take to open. All 83 good answers
+/// on the Mac's benches opened it within 14-512 ms; all 10 answered-then-reset links never did, and the phone dropped
+/// the link 4-6 s later (13 Nov brief, item 3). Past this, the connect is cut and reads as a reset. A bench may set
+/// another ([`sdp_after_acl`]).
+const SDP_AFTER_ACL_MS: u64 = 700;
 
-/// Watch an SDP connect in flight: once the ACL to `peer` is up, give the channel [`SDP_AFTER_ACL`], then shut the
-/// socket down so the blocked connect returns. `done` (true once the connect returned) is held while shutting down,
-/// so the fd is never touched after the caller closes it. True in `stalled` when it cut the connect.
-fn watch_connect(
-    fd: libc::c_int,
+/// How often a connect in flight looks at its socket and at the link.
+const POLL_SLICE: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// How long the link a cut leaves may take to go after its Disconnect, before the caller pages again anyway.
+const CUT_LINK_GONE: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// [`SDP_AFTER_ACL_MS`], or the bench lever `BT_SDP_AFTER_ACL_MS` / `/tmp/sdp_after_acl_ms` (whole ms), the project's
+/// env-then-tmpfs convention: the Mac's review of 376c4ce (F4).
+fn sdp_after_acl() -> std::time::Duration {
+    let parse = |v: &str| v.trim().parse::<u64>().ok();
+    let ms = box_common::lever("BT_SDP_AFTER_ACL_MS", "CARPLAY_SDP_AFTER_ACL_MS")
+        .and_then(|v| parse(&v))
+        .or_else(|| std::fs::read_to_string("/tmp/sdp_after_acl_ms").ok().and_then(|v| parse(&v)))
+        .unwrap_or(SDP_AFTER_ACL_MS);
+    std::time::Duration::from_millis(ms)
+}
+
+/// The pending error on a socket (SO_ERROR), which reading clears; 0 for none.
+fn so_error(fd: libc::c_int) -> std::io::Result<libc::c_int> {
+    let mut err: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: an int and its length, for a descriptor this module owns.
+    let rc = unsafe { libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_ERROR, &mut err as *mut libc::c_int as *mut libc::c_void, &mut len) };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(err)
+}
+
+/// O_NONBLOCK on or off.
+fn set_nonblocking(fd: libc::c_int, on: bool) -> std::io::Result<()> {
+    // SAFETY: plain fcntl flag reads and writes on a descriptor this module owns.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let want = if on { flags | libc::O_NONBLOCK } else { flags & !libc::O_NONBLOCK };
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, want) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Wait for the non-blocking connect on `fd`, polled here in [`POLL_SLICE`]s, until `timeout` from `start` (the page).
+/// Once the page is answered ([`crate::hci::AclInfo::answered`]) the SDP channel gets [`sdp_after_acl`]; past it the
+/// connect is [`cut`]. Polled in this thread, not cut from another: a shutdown() from a watch thread left the socket
+/// without an error, so connect() returned only at its 8 s timeout (the Mac's review of 376c4ce, F2).
+fn wait_connected(
+    fd: std::os::fd::OwnedFd,
     peer: [u8; 6],
-    done: std::sync::Arc<std::sync::Mutex<bool>>,
-    stalled: std::sync::Arc<std::sync::atomic::AtomicBool>,
-) {
-    let Ok(dev) = crate::hci::dev_id(crate::HCI_DEV) else { return };
-    let _ = std::thread::Builder::new().name("sdp-watch".into()).spawn(move || {
-        let mut acl_at: Option<std::time::Instant> = None;
-        loop {
-            std::thread::sleep(std::time::Duration::from_millis(25));
-            let finished = done.lock().map(|g| *g).unwrap_or(true);
-            if finished {
-                return;
+    start: std::time::Instant,
+    timeout: std::time::Duration,
+) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::AsRawFd;
+    let dev = crate::hci::dev_id(crate::HCI_DEV).ok();
+    let after_acl = sdp_after_acl();
+    let mut answered: Option<(std::time::Instant, u16)> = None;
+    loop {
+        let left = timeout.saturating_sub(start.elapsed());
+        if left.is_zero() {
+            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "the SDP connect timed out"));
+        }
+        let mut pfd = libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLOUT, revents: 0 };
+        // SAFETY: one pollfd for this socket.
+        let r = unsafe { libc::poll(&mut pfd, 1, left.min(POLL_SLICE).as_millis().max(1) as libc::c_int) };
+        if r < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
             }
-            match acl_at {
-                None if crate::hci::acl_up(dev, peer) => acl_at = Some(std::time::Instant::now()),
-                Some(t) if t.elapsed() >= SDP_AFTER_ACL => {
-                    let g = done.lock();
-                    if g.as_deref().is_ok_and(|d| !*d) {
-                        stalled.store(true, std::sync::atomic::Ordering::Release);
-                        // SAFETY: the connect has not returned (checked under `done`), so `fd` is still its socket.
-                        unsafe { libc::shutdown(fd, libc::SHUT_RDWR) };
-                    }
-                    return;
-                }
-                _ => {}
+            return Err(e);
+        }
+        if r > 0 {
+            // A failed connect leaves its error here: EHOSTDOWN for a page that timed out, ECONNRESET for a reset.
+            let err = so_error(fd.as_raw_fd())?;
+            if err != 0 {
+                return Err(std::io::Error::from_raw_os_error(err));
+            }
+            if pfd.revents & (libc::POLLERR | libc::POLLHUP) != 0 {
+                return Err(std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "the SDP channel closed while connecting"));
+            }
+            if pfd.revents & libc::POLLOUT != 0 {
+                return Ok(fd);
             }
         }
-    });
+        let Some(dev) = dev else { continue };
+        match answered {
+            None => {
+                if let Some(acl) = crate::hci::acl_info(dev, peer).filter(|a| a.answered()) {
+                    answered = Some((std::time::Instant::now(), acl.handle));
+                }
+            }
+            Some((at, handle)) if at.elapsed() >= after_acl => return Err(cut(fd, dev, peer, handle, start, at)),
+            Some(_) => {}
+        }
+    }
+}
+
+/// A page answered, and no SDP channel in [`sdp_after_acl`]: close the socket here, disconnect the link it leaves and
+/// wait (up to [`CUT_LINK_GONE`]) for it to go, so the caller's next page doesn't ride the same stuck link. A reset.
+fn cut(
+    fd: std::os::fd::OwnedFd,
+    dev: u16,
+    peer: [u8; 6],
+    handle: u16,
+    start: std::time::Instant,
+    answered_at: std::time::Instant,
+) -> std::io::Error {
+    let answered_ms = answered_at.duration_since(start).as_millis();
+    let cut_ms = start.elapsed().as_millis();
+    drop(fd);
+    if let Err(e) = crate::hci::disconnect(dev, handle) {
+        log(&format!("Disconnect of the cut link not sent: {e}"));
+    }
+    let t = std::time::Instant::now();
+    while t.elapsed() < CUT_LINK_GONE && crate::hci::acl_info(dev, peer).is_some() {
+        std::thread::sleep(POLL_SLICE);
+    }
+    let gone = crate::hci::acl_info(dev, peer).is_none();
+    log(&format!(
+        "answered at +{answered_ms} ms, but no SDP channel by +{cut_ms} ms ({} ms after the answer): cut, as a reset; \
+         the link {} {} ms after its Disconnect",
+        cut_ms.saturating_sub(answered_ms),
+        if gone { "went" } else { "was still up" },
+        t.elapsed().as_millis()
+    ));
+    std::io::Error::new(std::io::ErrorKind::ConnectionReset, "answered, no SDP channel")
 }
 
 /// L2CAP-connect to `peer`'s SDP PSM (implicitly pages the phone in BlueZ). `timeout_secs` bounds both
-/// the connect and each subsequent read so a quiet phone can't wedge the reconnect thread.
+/// the connect and each subsequent read so a quiet phone can't wedge the reconnect thread. The connect itself is
+/// non-blocking, watched by [`wait_connected`].
 fn connect_sdp(peer: [u8; 6], timeout_secs: i64) -> std::io::Result<std::fs::File> {
-    let fd = unsafe {
+    use std::os::fd::AsRawFd;
+    let raw = unsafe {
         libc::socket(
             AF_BLUETOOTH as libc::c_int,
             libc::SOCK_SEQPACKET | crate::cloexec::SOCK_CLOEXEC,
             BTPROTO_L2CAP,
         )
     };
-    if fd < 0 {
+    if raw < 0 {
         return Err(std::io::Error::last_os_error());
     }
+    // SAFETY: a fresh descriptor, owned from here: every early return closes it.
+    let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
     // tv_sec's width is target-dependent (i32 on armv7-musl, i64 on the dev host); `as _` infers the
     // field type from the struct literal so both targets build without naming the deprecated time_t alias.
     // zeroed()+assign, not a struct literal: under `musl32_time64` (riscv32) these
@@ -121,7 +220,7 @@ fn connect_sdp(peer: [u8; 6], timeout_secs: i64) -> std::io::Result<std::fs::Fil
     for opt in [libc::SO_SNDTIMEO, libc::SO_RCVTIMEO] {
         let ret = unsafe {
             libc::setsockopt(
-                fd,
+                fd.as_raw_fd(),
                 libc::SOL_SOCKET,
                 opt,
                 &tv as *const libc::timeval as *const libc::c_void,
@@ -129,9 +228,7 @@ fn connect_sdp(peer: [u8; 6], timeout_secs: i64) -> std::io::Result<std::fs::Fil
             )
         };
         if ret < 0 {
-            let e = std::io::Error::last_os_error();
-            unsafe { libc::close(fd) };
-            return Err(e);
+            return Err(std::io::Error::last_os_error());
         }
     }
     let addr = SockaddrL2 {
@@ -141,31 +238,27 @@ fn connect_sdp(peer: [u8; 6], timeout_secs: i64) -> std::io::Result<std::fs::Fil
         l2_cid: 0,
         l2_bdaddr_type: 0,
     };
-    let done = std::sync::Arc::new(std::sync::Mutex::new(false));
-    let stalled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    watch_connect(fd, peer, done.clone(), stalled.clone());
+    set_nonblocking(fd.as_raw_fd(), true)?;
+    let start = std::time::Instant::now();
     let ret = unsafe {
         libc::connect(
-            fd,
+            fd.as_raw_fd(),
             &addr as *const SockaddrL2 as *const libc::sockaddr,
             std::mem::size_of::<SockaddrL2>() as libc::socklen_t,
         )
     };
-    let os_err = std::io::Error::last_os_error();
-    if let Ok(mut d) = done.lock() {
-        *d = true;
-    }
-    if stalled.load(std::sync::atomic::Ordering::Acquire) {
-        unsafe { libc::close(fd) };
-        log(&format!("answered, but no SDP channel {} ms after -- a reset, re-paging at once", SDP_AFTER_ACL.as_millis()));
-        return Err(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "answered, no SDP channel"));
-    }
-    if ret < 0 {
-        unsafe { libc::close(fd) };
-        return Err(os_err);
-    }
-    // SAFETY: fd is a freshly opened, connected, exclusively-owned socket descriptor.
-    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+    let fd = if ret == 0 {
+        fd
+    } else {
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() != Some(libc::EINPROGRESS) {
+            return Err(e);
+        }
+        wait_connected(fd, peer, start, std::time::Duration::from_secs(timeout_secs.max(1) as u64))?
+    };
+    // Blocking again, for the SDP exchange and its SO_RCVTIMEO-bounded reads.
+    set_nonblocking(fd.as_raw_fd(), false)?;
+    Ok(std::fs::File::from(fd))
 }
 
 /// The iAP2 UUID128 search pattern: `DES { UUID128 iAP2 }`.
