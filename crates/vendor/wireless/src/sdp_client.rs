@@ -287,6 +287,25 @@ struct LeftLink {
     handle: u16,
     sent: bool,
     fresh: bool,
+    /// When the cut left it: a resend is for the page right after, within [`LEFT_LINK_RESEND`], never a later session's.
+    at: std::time::Instant,
+}
+
+/// How long after its cut a left link's Disconnect may be sent again, twice [`CUT_LINK_GONE`] (the Mac's review of round
+/// 3): the page right after a cut comes within this; a link with that handle later is a new one.
+const LEFT_LINK_RESEND: std::time::Duration = std::time::Duration::from_millis(3000);
+
+/// Forget the left link: btd's bring-up resets the controller, so no handle from before it is valid. At the start of
+/// the reconnect loop.
+pub(crate) fn forget_left_link() {
+    *LEFT_LINK.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// Forget the left link for `peer` when a read finds no link to it (`acl`).
+fn forget_gone(left: &mut Option<LeftLink>, peer: [u8; 6], acl: Option<crate::hci::AclInfo>) {
+    if acl.is_none() && left.is_some_and(|l| l.peer == peer) {
+        *left = None;
+    }
 }
 
 static LEFT_LINK: std::sync::Mutex<Option<LeftLink>> = std::sync::Mutex::new(None);
@@ -301,8 +320,14 @@ enum Before {
     OwnLink { resend: bool },
 }
 
-/// The decision for the link `acl` up to `peer` before a page, given the last cut's `left` link, which it updates.
-fn link_before_page(peer: [u8; 6], acl: Option<crate::hci::AclInfo>, left: &mut Option<LeftLink>) -> Before {
+/// The decision for the link `acl` up to `peer` before a page at `now`, given the last cut's `left` link, which it
+/// updates: a record for this phone whose link is gone, or has another handle, is forgotten.
+fn link_before_page(
+    peer: [u8; 6],
+    acl: Option<crate::hci::AclInfo>,
+    left: &mut Option<LeftLink>,
+    now: std::time::Instant,
+) -> Before {
     let mine = left.filter(|l| l.peer == peer);
     let out = match (acl, mine) {
         (None, Some(_)) => {
@@ -310,8 +335,14 @@ fn link_before_page(peer: [u8; 6], acl: Option<crate::hci::AclInfo>, left: &mut 
             Before::Nothing
         }
         (None, None) => Before::Nothing,
-        (Some(a), Some(l)) if l.handle == a.handle => Before::OwnLink { resend: !l.sent && l.fresh },
-        (Some(_), _) => Before::PhonesLink,
+        (Some(a), Some(l)) if l.handle == a.handle => Before::OwnLink {
+            resend: !l.sent && l.fresh && now.saturating_duration_since(l.at) < LEFT_LINK_RESEND,
+        },
+        (Some(_), Some(_)) => {
+            *left = None;
+            Before::PhonesLink
+        }
+        (Some(_), None) => Before::PhonesLink,
     };
     if let Some(l) = left.as_mut() {
         l.fresh = false;
@@ -321,13 +352,15 @@ fn link_before_page(peer: [u8; 6], acl: Option<crate::hci::AclInfo>, left: &mut 
 
 /// Look at the link up to `peer` just before its page: the phone's own (kept by a cut, the reason returned), btd's own
 /// from the last cut (logged as such, its Disconnect sent again when it never went out), or none.
-fn before_page(dev: u16, peer: [u8; 6]) -> Option<&'static str> {
+fn before_page(dev: u16, peer: [u8; 6], session_live: bool) -> Option<&'static str> {
     let acl = crate::hci::acl_info(dev, peer);
     let mut left = LEFT_LINK.lock().unwrap_or_else(|e| e.into_inner());
-    match (link_before_page(peer, acl, &mut left), acl) {
+    match (link_before_page(peer, acl, &mut left, std::time::Instant::now()), acl) {
         (Before::Nothing, _) | (Before::OwnLink { .. }, None) => None,
         (Before::PhonesLink, _) => Some("the link was up before the page"),
         (Before::OwnLink { resend }, Some(a)) => {
+            // A session is live: its link may be this one, so nothing is sent (the Mac's review of round 3).
+            let resend = resend && !session_live;
             log(&format!(
                 "the link up before this page is btd's own from the last cut (handle 0x{:04x}, state {}){}",
                 a.handle,
@@ -358,7 +391,7 @@ fn before_page(dev: u16, peer: [u8; 6]) -> Option<&'static str> {
 /// Note the link a cut leaves: up after its Disconnect (`sent`), or with none sent; or gone (`up` false).
 fn note_left_link(peer: [u8; 6], handle: u16, up: bool, sent: bool) {
     let mut left = LEFT_LINK.lock().unwrap_or_else(|e| e.into_inner());
-    *left = up.then_some(LeftLink { peer, handle, sent, fresh: true });
+    *left = up.then_some(LeftLink { peer, handle, sent, fresh: true, at: std::time::Instant::now() });
 }
 
 /// L2CAP-connect to `peer`'s SDP PSM (implicitly pages the phone in BlueZ). `timeout_secs` bounds both
@@ -408,7 +441,9 @@ fn connect_sdp(peer: [u8; 6], timeout_secs: i64, watch: &Watch<'_>) -> std::io::
     set_nonblocking(fd.as_raw_fd(), true)?;
     // A link to the phone already up (one it opened, or a session's): this page rides it, and a cut leaves it alone.
     // btd's own, left by its last cut, is told apart (before_page).
-    let link_before = crate::hci::dev_id(crate::HCI_DEV).ok().and_then(|dev| before_page(dev, peer));
+    let link_before = crate::hci::dev_id(crate::HCI_DEV)
+        .ok()
+        .and_then(|dev| before_page(dev, peer, watch.session_active.load(std::sync::atomic::Ordering::Relaxed)));
     let start = std::time::Instant::now();
     let ret = unsafe {
         libc::connect(
@@ -424,7 +459,20 @@ fn connect_sdp(peer: [u8; 6], timeout_secs: i64, watch: &Watch<'_>) -> std::io::
         if e.raw_os_error() != Some(libc::EINPROGRESS) {
             return Err(e);
         }
-        wait_connected(fd, peer, start, std::time::Duration::from_secs(timeout_secs.max(1) as u64), link_before, watch)?
+        match wait_connected(fd, peer, start, std::time::Duration::from_secs(timeout_secs.max(1) as u64), link_before, watch) {
+            Ok(fd) => fd,
+            Err(e) => {
+                // A page that failed some other way: a left link to this phone that is gone now is forgotten, so the
+                // phone's own link later is not taken for it (the Mac's review of round 3).
+                if !is_cut(&e) {
+                    if let Ok(dev) = crate::hci::dev_id(crate::HCI_DEV) {
+                        let acl = crate::hci::acl_info(dev, peer);
+                        forget_gone(&mut LEFT_LINK.lock().unwrap_or_else(|p| p.into_inner()), peer, acl);
+                    }
+                }
+                return Err(e);
+            }
+        }
     };
     // Blocking again, for the SDP exchange and its SO_RCVTIMEO-bounded reads.
     set_nonblocking(fd.as_raw_fd(), false)?;
@@ -618,27 +666,43 @@ mod tests {
     fn a_link_left_by_the_last_cut_is_told_apart() {
         let peer = [1, 2, 3, 4, 5, 6];
         let other = [9, 2, 3, 4, 5, 6];
+        let now = std::time::Instant::now();
         let acl = |handle| Some(crate::hci::AclInfo { handle, state: crate::hci::BT_CONNECTED });
-        let left = |sent| Some(LeftLink { peer, handle: 0x0b, sent, fresh: true });
+        let left = |sent| Some(LeftLink { peer, handle: 0x0b, sent, fresh: true, at: now });
 
         let mut l = left(false);
-        assert_eq!(link_before_page(peer, acl(0x0b), &mut l), Before::OwnLink { resend: true }, "never sent: resend");
-        assert_eq!(link_before_page(peer, acl(0x0b), &mut l), Before::OwnLink { resend: false }, "only right after the cut");
+        assert_eq!(link_before_page(peer, acl(0x0b), &mut l, now), Before::OwnLink { resend: true }, "never sent: resend");
+        assert_eq!(link_before_page(peer, acl(0x0b), &mut l, now), Before::OwnLink { resend: false }, "only right after the cut");
 
         let mut l = left(true);
-        assert_eq!(link_before_page(peer, acl(0x0b), &mut l), Before::OwnLink { resend: false }, "sent once: not again");
+        assert_eq!(link_before_page(peer, acl(0x0b), &mut l, now), Before::OwnLink { resend: false }, "sent once: not again");
+
+        // Round 3's review: the resend is time-bound, so a later session's link with that handle never gets it.
+        let mut l = left(false);
+        let later = now + LEFT_LINK_RESEND;
+        assert_eq!(link_before_page(peer, acl(0x0b), &mut l, later), Before::OwnLink { resend: false }, "too late: no resend");
 
         let mut l = left(false);
-        assert_eq!(link_before_page(peer, acl(0x0c), &mut l), Before::PhonesLink, "another handle: not btd's");
-        assert!(l.is_some_and(|l| !l.fresh), "and no resend after");
+        assert_eq!(link_before_page(peer, acl(0x0c), &mut l, now), Before::PhonesLink, "another handle: the phone's own");
+        assert_eq!(l, None, "and the record is forgotten");
 
         let mut l = left(false);
-        assert_eq!(link_before_page(other, acl(0x0b), &mut l), Before::PhonesLink, "another phone's link");
-        assert_eq!(link_before_page(peer, None, &mut l), Before::Nothing);
+        assert_eq!(link_before_page(other, acl(0x0b), &mut l, now), Before::PhonesLink, "another phone's link");
+        assert!(l.is_some(), "kept: it is this phone's record");
+        assert_eq!(link_before_page(peer, None, &mut l, now), Before::Nothing);
         assert_eq!(l, None, "no link to the phone: forgotten");
 
         let mut l = None;
-        assert_eq!(link_before_page(peer, acl(0x0b), &mut l), Before::PhonesLink, "no cut before it: the phone's");
+        assert_eq!(link_before_page(peer, acl(0x0b), &mut l, now), Before::PhonesLink, "no cut before it: the phone's");
+
+        // A page that failed otherwise: a record whose link is gone is forgotten; one still up, or another phone's, kept.
+        let mut l = left(true);
+        forget_gone(&mut l, peer, acl(0x0b));
+        assert!(l.is_some());
+        forget_gone(&mut l, other, None);
+        assert!(l.is_some());
+        forget_gone(&mut l, peer, None);
+        assert_eq!(l, None);
     }
 
     /// wait_connected's decision (the Mac's review, A3): a page that timed out fails with EHOSTDOWN, an answer with no SDP

@@ -517,6 +517,8 @@ pub fn run(
     session_active: &Arc<AtomicBool>,
     ctrl: &Arc<Control>,
 ) {
+    // The bring-up just reset the controller: no link a cut left before it is valid now.
+    sdp_client::forget_left_link();
     // Settle before the first probe (bring-up/SSP/SDP, and give the phone a chance to connect IN first).
     let settle = initial_settle_secs();
     log(&format!("settling {settle}s before paging bonded phones"));
