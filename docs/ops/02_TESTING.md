@@ -308,6 +308,11 @@ it, and each logs a `[bench]` line when it acts: btd's in `/tmp/wl.log`, carplay
 `ocbm_update.sh`'s in `/tmp/box.log`. Carlink's side (flash by update, display off/on, the box-log tail, these files)
 is in its debug builds only.
 
+Carlink's `display_off`, `display_on` and `flicker` call its display handlers as the display watcher does, but the
+display stays on: `PowerManager.isInteractive()` doesn't change and the activity's onStop/onStart (the video pause and
+resume) don't run. They test Carlink's session lifecycle. Time to video, and the rule that no reconnect is scheduled
+while the display is off, need a real display power cycle (the Mac's 14 Nov review, D1).
+
 **On and off.** A flag is set when its file exists and its content, trimmed, is not `off`: an empty file and `on`
 are set (`box_common::bench_flag`; `bench_flag` in `ocbm_update.sh`). Carlink writes the files over CH_FILE, which
 can write but not delete, so it clears one by writing `off`. From a debug build:
