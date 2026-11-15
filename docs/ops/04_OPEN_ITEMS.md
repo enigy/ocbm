@@ -258,7 +258,7 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
      screen SETUP than the good ones. **Bench 15 Nov (the Mac), two iPhones: 84 s lost.** A phone that
      knows the AP joins it ~1.5 s after its Bluetooth link, before its 0x5703 names it, so `carplayd`
      refused its record for the last phone's and nothing looked again until the browser re-queried.
-     Fixed for 2.6.0, NOT yet benched: `btd` names a bonded phone as its Bluetooth session starts, while
+     Fixed for 2.6.0, benched 15 Nov (the Mac, two iPhones: a change of phone 4.6-5.7 s from AP join to video, 44-91 s before; the switched-from phone not dialled back): `btd` names a bonded phone as its Bluetooth session starts, while
      no CarPlay session is up and btd is not going quiet (`av::name_at_session_start`), and puts the
      earlier name back when that session ends without a 0x5703, unless the phone's own CarPlay is live,
      `carplayd` holds a control connection, or btd is going quiet (`av::put_back`). `discovery` reads the
