@@ -5144,12 +5144,12 @@ mod tests {
     fn the_adapter_name_is_btds_from_the_first_request() {
         // The app reads MGMT_INFO at SUBSCRIBE, before wlan0 exists: the live address alone gave the serial's
         // suffix (CarLink-0264) while btd named Bluetooth from wlan0 (CarLink-fd6c, the dev adapter, 31 Oct).
-        let saved = "wlan0=00:e0:4c:99:fd:6c\nhci0=38:ba:b0:1d:0c:64\n";
-        let serial = "2025.10.15.11270264";
+        let saved = "wlan0=02:00:00:00:fd:6c\nhci0=02:00:00:00:0c:64\n";
+        let serial = "2000.01.01.00000264";
         assert_eq!(bt_name_from(&name_wifi_mac("", saved), serial), "CarLink-fd6c", "radios down: the installer's record");
-        assert_eq!(bt_name_from(&name_wifi_mac("00:e0:4c:99:aa:bb", saved), serial), "CarLink-aabb", "radios up: wlan0 itself");
+        assert_eq!(bt_name_from(&name_wifi_mac("02:00:00:00:aa:bb", saved), serial), "CarLink-aabb", "radios up: wlan0 itself");
         assert_eq!(
-            bt_name_from(&name_wifi_mac("", "wlan0=\nhci0=38:ba:b0:1d:0c:64\n"), serial),
+            bt_name_from(&name_wifi_mac("", "wlan0=\nhci0=02:00:00:00:0c:64\n"), serial),
             "CarLink-0264",
             "no Wi-Fi address saved: the serial, as btd falls back"
         );

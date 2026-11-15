@@ -882,7 +882,7 @@ impl AvSession {
         // videoPlayback: route A (probe.rs), always offered. The SETUP-response half of
         // offering video in the CarPlay session; the /info half is `videoPlaybackInfo` +
         // `playbackCapabilities` (info.rs). Echoed only when the phone proposed it
-        // (Scott's iPhone does, iOS 27.2, 10 Nov), so a plain session's echo is unchanged.
+        // (the owner's iPhone does, iOS 27.2, 10 Nov), so a plain session's echo is unchanged.
         if echo_video {
             feats.push(Value::String("videoPlayback".into()));
             crate::probe::line(format_args!("SETUP phase1: echoing videoPlayback, which the phone proposed"));

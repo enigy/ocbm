@@ -694,7 +694,7 @@ mod tests {
         assert!(!s.contains("Private") && !s.contains("s3cret") && !s.contains("master") && !s.contains("pw"));
         // `type` shows only when it reads as a name.
         let mut d = Dictionary::new();
-        d.insert("type".into(), Value::String("Scott's iPhone".into()));
+        d.insert("type".into(), Value::String("Alice's iPhone".into()));
         assert_eq!(shape(&Value::Dictionary(d)), "{type: string(14)}");
     }
 
@@ -744,7 +744,7 @@ mod tests {
         let hs = vec![
             ("CSeq".to_string(), "3".to_string()),
             ("User-Agent".to_string(), "AirPlay/890.79.5".to_string()),
-            ("X-Apple-Client-Name".to_string(), "Scott's iPhone".to_string()),
+            ("X-Apple-Client-Name".to_string(), "Alice's iPhone".to_string()),
             ("X-Apple-Device-ID".to_string(), "0xA1B2C3D4E5F6".to_string()),
         ];
         assert_eq!(

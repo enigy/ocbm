@@ -93,7 +93,7 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
   saved, the session ran), but `answer_watch` sent the working trial back at 121 s: the host's answer
   went to the restarted `ocbmd`, which had not seen the HELLO. **Retry, 21:17-21:36: PASS.** The revert
   had kept the flag, so `ocbmd` was single-threaded from its first start: HELLO_ACK in 8 ms, heard and
-  answered both written, Scott's iPhone paired, HEVC 8 s after Bluetooth; after a power cycle, HELLO_ACK
+  answered both written, the owner's iPhone paired, HEVC 8 s after Bluetooth; after a power cycle, HELLO_ACK
   in 4 ms and video 22 s after Carlink connected, `dropped=av:0`. The restart case is fixed in
   `924f497` (a restarted `ocbmd` starts from the heard/answered files; `ocbm-host` sends nothing
   without a HELLO_ACK). **Truck bench, 22:10-22:24: PASS**, a real fresh install: a full
@@ -468,7 +468,7 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
   Playback DataStream, client type `A6B27562-B43A-4F2D-B75F-82391E250194` (iOS:
   `kFigEndpointRemoteControlSessionClientTypeUUIDKey_MatchPoint`) [E for the UUID's name and the
   borrow ID; I for the CarPlay keys and for the stream on CarPlay, seen on macOS's receiver].
-  **Benched 2026-11-10** (the Mac, dev adapter on `b84a58b`): at SETUP phase 1 Scott's iPhone on iOS
+  **Benched 2026-11-10** (the Mac, dev adapter on `b84a58b`): at SETUP phase 1 the owner's iPhone on iOS
   27.2 proposes 14 words, CarKit's list in its order, with `"videoPlayback"` among them (no
   `fileTransfer` or `uiSync`: no gauge cluster), and the box echoes `hevc`, `viewAreas`, `iAPChannel`
   and `sessionManagement`. So the phone side is on. What iOS then wants from the head unit is still
@@ -484,7 +484,7 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
   advertises "Carlink Video", an ordinary `_airplay._tcp` service with the Apple TV TXT record from
   nto's and openairplay's public specifications, on port 7000; its listener logs each connection's
   first requests and answers 501. Each line is tagged `[probe]` and gives keys, types and sizes only.
-  **Benched 2026-11-10** (the Mac, Scott's iPhone on iOS 27.2): route A works on the phone side. The
+  **Benched 2026-11-10** (the Mac, the owner's iPhone on iOS 27.2): route A works on the phone side. The
   phone opened SenderSettingsData, sent `setVideoPlaybackParameters` and `setProxyParameters`, put the
   Apple TV app in CarPlay's grid (its UI ran on the car screen), and YouTube listed "CarPlay" as an
   AirPlay receiver. A video opened the Playback stream (`A6B27562`, no dedicated socket), whose messages
