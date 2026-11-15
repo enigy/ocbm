@@ -1,7 +1,7 @@
-# Connect speed: release notes draft (14 Nov 2026: OCBM 2.5.0 and Carlink 3.10, not merged)
+# Connect speed: release notes (released 14 Nov 2026 as OCBM 2.5.0 and Carlink 3.10)
 
 Scott (14 Nov): release OCBM as 2.5.0 and Carlink as 3.10 (v310). There are no 2.0.1 or 3.03 releases: 2.0.1 is the
-benched set's version number only. Nothing here is released yet.
+benched set's version number only. Released 14 Nov: v2.5.0 and installer-2.5.0 at 92ab7a5, Carlink v310 at e17947b0.
 
 ## What would ship
 
