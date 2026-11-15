@@ -253,9 +253,10 @@ pub fn try_cert() -> Result<Vec<u8>, MfiError> {
     Ok(c)
 }
 
-/// Forget the cached certificate, so the next session reads it from the chip: a phone failed the authentication.
-pub fn forget_cert() {
-    let _ = std::fs::remove_file(CERT_CACHE);
+/// Forget the cached certificate, so the next session reads it from the chip: a phone failed the authentication. True
+/// when one was cached, and is gone.
+pub fn forget_cert() -> bool {
+    std::fs::remove_file(CERT_CACHE).is_ok()
 }
 
 /// Whether `c` is one DER SEQUENCE with a two-byte length, as the chip's certificate is (`30 82 hi lo`, 945 bytes on
@@ -376,7 +377,7 @@ fn sign_locked(chal: &[u8]) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_der_sequence, read_cert_cache, write_cert_cache};
+    use super::{forget_cert, is_der_sequence, read_cert_cache, write_cert_cache, CERT_CACHE};
 
     /// A certificate's shape: `30 82` and a length that is the rest of it.
     fn der(body: usize) -> Vec<u8> {
@@ -420,5 +421,14 @@ mod tests {
         assert_eq!(read_cert_cache(p), None, "a cache that isn't one is not served");
         assert!(!path.exists(), "and is removed, so the next read goes to the chip");
         assert_eq!(read_cert_cache(p), None, "none cached");
+    }
+
+    /// R1-3 (the Mac's round 2): forgetting says whether there was a cached certificate to forget.
+    #[test]
+    fn forgetting_says_whether_one_was_cached() {
+        write_cert_cache(CERT_CACHE, &der(941));
+        assert!(forget_cert(), "one was cached");
+        assert!(!std::path::Path::new(CERT_CACHE).exists());
+        assert!(!forget_cert(), "none left to forget");
     }
 }

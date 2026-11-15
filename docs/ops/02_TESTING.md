@@ -346,9 +346,10 @@ can write but not delete, so it clears one by writing `off`. From a debug build:
 
 The box `[startup]` line ends with counts: `; since the host came: absent pages N, resets N (N cut, no SDP channel), PSK
 mismatches N; this session: nudges first+second`. btd's counts and the PSK count run from the host's arrival, over every
-phone session under it, so a second session's line counts the first's too; the nudges are that session's carplayd's.
-The phantom's pages count as absent. When ocbmd rotated `box.log` (it empties it at its cap) between the host's arrival
-and the first frame, the PSK count is a lower bound: `PSK mismatches >=N (box.log cut)`.
+phone session under it (btd carries them into each session it starts under the same host: a phone switch, a session
+that never reached CarPlay, a wired preempt), so a second session's line counts the first's too; the nudges are that
+session's carplayd's. The phantom's pages count as absent. When ocbmd rotated `box.log` (it empties it at its cap) between
+the host's arrival and the first frame, the PSK count is a lower bound: `PSK mismatches >=N (box.log cut)`.
 
 ### Release gate — OCBM 1.0.5, the CarPlay-only cleanup (8 Nov 2026)
 

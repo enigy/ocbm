@@ -639,8 +639,10 @@ fn mfi_cert() -> Option<Vec<u8>> {
 /// The phone failed the tunnel's authentication (0xAA04): the certificate it was sent may be bad bytes from the boot's
 /// cache, so the next session reads it from the chip again (the Mac's 2.6.0 review, CS-3).
 fn authentication_failed() {
-    mfi_i2c_local::forget_cert();
-    log("RX 0xAA04 AuthenticationFailed: the cached MFi certificate is forgotten; the next session reads the chip");
+    // Said only when there was one to forget (the Mac's round 2, R1-3).
+    if mfi_i2c_local::forget_cert() {
+        log("RX 0xAA04 AuthenticationFailed: the cached MFi certificate is forgotten; the next session reads the chip");
+    }
 }
 
 /// `create_signature` over a 20-byte SHA-1 digest, from the same chip as [`mfi_cert`].
