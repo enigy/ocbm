@@ -259,11 +259,15 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
      knows the AP joins it ~1.5 s after its Bluetooth link, before its 0x5703 names it, so `carplayd`
      refused its record for the last phone's and nothing looked again until the browser re-queried.
      Fixed for 2.6.0, NOT yet benched: `btd` names a bonded phone as its Bluetooth session starts, while
-     no CarPlay session is up (`av::name_at_session_start`), and puts the earlier name back when that
-     session ends without a 0x5703, unless the phone's own CarPlay is live (`av::put_back`); discovery
-     reads the name once a second and, when it changes, dials the records it held for that phone and
-     browses `_carplay-ctrl` afresh; the gate keeps a live session across a name change, so a name put
-     back never dials it again.
+     no CarPlay session is up and btd is not going quiet (`av::name_at_session_start`), and puts the
+     earlier name back when that session ends without a 0x5703, unless the phone's own CarPlay is live,
+     `carplayd` holds a control connection, or btd is going quiet (`av::put_back`). `discovery` reads the
+     name once a second; when it changes it forgets the newly named phone's dialled addresses, stops and
+     starts the `_carplay-ctrl` browse (even when the stop is refused), dials what the new browse replays
+     from mdns-sd's cache for two rounds at most, then a record it held for that phone that the cache did
+     not replay; a browse that ends is started again. The gate keeps a live session across a name change,
+     so a name put back never dials it again. btd's "wireless" claim at a handoff no longer overwrites the
+     flag `carplayd` holds for a phone's connection.
   3. **"Phone drop on host re-SUBSCRIBE" (`PROJ_MODE NONE` then `SESSION_EVENT PHONE_ABSENT` after
      an app relaunch) — NOT reproduced, 2026-09-25.** Three timelines, all wired, the phone never
      left the bus in any: (a) kill-without-STOP relaunch (`adb install -r`): SUBSCRIBE → stale

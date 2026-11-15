@@ -436,7 +436,7 @@ struct CarPlayWatch {
 }
 
 /// When `/tmp/carplay_transport` was last written, while it says a wireless carplayd is live. `None` = none is.
-fn read_carplayd() -> Option<SystemTime> {
+pub(crate) fn read_carplayd() -> Option<SystemTime> {
     let written = std::fs::metadata(CARPLAY_TRANSPORT_FILE).and_then(|m| m.modified()).ok()?;
     let token = std::fs::read_to_string(CARPLAY_TRANSPORT_FILE).ok()?;
     (token.trim() == "wireless").then_some(written)
@@ -459,10 +459,16 @@ fn read_ident() -> Ident {
 }
 
 /// Whether a wireless CarPlay session is up or coming up in carplayd: it has published a phone's identity
-/// (from that phone's SETUP to its session's end), or holds a phone's control connection (the transport flag
-/// in its own hand, not btd's claim). btd names a phone early only while neither (`av::name_at_session_start`).
+/// (from that phone's SETUP to its session's end), or holds a phone's control connection
+/// ([`carplayd_connected`]). btd names a phone early only while neither (`av::name_at_session_start`).
 pub(crate) fn carplay_session_up() -> bool {
-    read_ident().is_some() || carplayd_live(read_carplayd(), SystemTime::UNIX_EPOCH, crate::av::claimed_at())
+    read_ident().is_some() || carplayd_connected()
+}
+
+/// Whether carplayd holds a phone's control connection: the transport flag in its own hand, not btd's claim
+/// (`av::claimed_at`). carplayd writes it at each connection and removes it when the session ends.
+pub(crate) fn carplayd_connected() -> bool {
+    carplayd_live(read_carplayd(), SystemTime::UNIX_EPOCH, crate::av::claimed_at())
 }
 
 /// The phone whose CarPlay session is live, by carplayd's identity; `None` = none, or it names no phone.

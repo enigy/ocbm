@@ -199,7 +199,7 @@ impl PhoneGate {
 
 /// A BR/EDR address in any usual spelling (`AA:BB:..`, `aa-bb-..`, bare hex) as 12 lower-case hex
 /// digits; `None` for anything else.
-fn normalize(s: &str) -> Option<String> {
+pub(crate) fn normalize(s: &str) -> Option<String> {
     let hex: String = s.trim().chars().filter(|c| !matches!(c, ':' | '-')).collect();
     (hex.len() == 12 && hex.bytes().all(|b| b.is_ascii_hexdigit())).then(|| hex.to_ascii_lowercase())
 }

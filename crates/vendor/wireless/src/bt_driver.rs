@@ -162,11 +162,13 @@ pub fn run(sock: File, name: &str, shutdown: &AtomicBool, peer: Option<[u8; 6]>)
     *SESSION_PEER.lock().unwrap_or_else(|e| e.into_inner()) = peer;
     HANDED_OFF.store(false, Ordering::Relaxed);
     // Name the phone for carplayd now, not only at its 0x5703: a phone that knows the AP is on it before
-    // then (the Mac's 15 Nov bench). The name goes back if the session ends without one.
-    let early = crate::av::name_at_session_start(peer, wifi_config_allowed(peer));
+    // then (the Mac's 15 Nov bench). The name goes back if the session ends without one. Neither while btd
+    // goes quiet (`shutdown`): its teardown removes the name.
+    let quiet = shutdown.load(Ordering::Relaxed);
+    let early = crate::av::name_at_session_start(peer, !quiet && wifi_config_allowed(peer), quiet);
     session(sock, name, shutdown);
     *SESSION_PEER.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    crate::av::put_back(early, HANDED_OFF.load(Ordering::Relaxed));
+    crate::av::put_back(early, HANDED_OFF.load(Ordering::Relaxed), shutdown.load(Ordering::Relaxed));
     // Un-latch the phase mirror (audit 3.3). `/tmp/bt_phase` is last-write-wins with no unlink, so
     // without this the deepest phase reached since boot stays readable forever and `ocbmd` re-emits
     // it to every fresh subscriber -- the host sees a phantom "phone detected" long after the phone
