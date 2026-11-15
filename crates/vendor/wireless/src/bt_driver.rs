@@ -37,6 +37,10 @@ const BT_PHASE_FILE: &str = "/tmp/bt_phase";
 /// session runs at a time (`control::SessionClaim`), so one slot is enough.
 static SESSION_PEER: std::sync::Mutex<Option<[u8; 6]>> = std::sync::Mutex::new(None);
 
+/// Whether this session sent its phone the 0x5703 and named it there (`av::expect_phone`); read as it ends,
+/// to know whether a name written at its start goes back (`av::put_back`). One slot, as [`SESSION_PEER`].
+static HANDED_OFF: AtomicBool = AtomicBool::new(false);
+
 /// Whether `peer` may be told the AP's SSID and passphrase: only a phone this box is bonded with
 /// (security plan 2026-10-21 H1). New bonds happen only inside the pairing window the app opens, so
 /// "bonded" is the allowlist. iAP2 authenticates the accessory to the phone, never the phone to us,
@@ -46,7 +50,7 @@ pub(crate) fn wifi_config_allowed(peer: Option<[u8; 6]>) -> bool {
 }
 
 /// Last two octets of a mgmt little-endian bdaddr, for log lines (never the whole address).
-fn peer_tail(peer: Option<[u8; 6]>) -> String {
+pub(crate) fn peer_tail(peer: Option<[u8; 6]>) -> String {
     peer.map_or_else(|| "unknown".to_string(), |p| format!("..{:02X}:{:02X}", p[1], p[0]))
 }
 
@@ -156,8 +160,15 @@ const MAX_REASSEMBLY: usize = 8192;
 /// and reconnect do — and decides whether the Wi-Fi details may be handed over ([`wifi_config_allowed`]).
 pub fn run(sock: File, name: &str, shutdown: &AtomicBool, peer: Option<[u8; 6]>) {
     *SESSION_PEER.lock().unwrap_or_else(|e| e.into_inner()) = peer;
+    HANDED_OFF.store(false, Ordering::Relaxed);
+    // Name the phone for carplayd now, not only at its 0x5703: a phone that knows the AP is on it before
+    // then (the Mac's 15 Nov bench). The name goes back if the session ends without one. Neither while btd
+    // goes quiet (`shutdown`): its teardown removes the name.
+    let quiet = shutdown.load(Ordering::Relaxed);
+    let early = crate::av::name_at_session_start(peer, !quiet && wifi_config_allowed(peer), quiet);
     session(sock, name, shutdown);
     *SESSION_PEER.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    crate::av::put_back(early, HANDED_OFF.load(Ordering::Relaxed), shutdown.load(Ordering::Relaxed));
     // Un-latch the phase mirror (audit 3.3). `/tmp/bt_phase` is last-write-wins with no unlink, so
     // without this the deepest phase reached since boot stays readable forever and `ocbmd` re-emits
     // it to every fresh subscriber -- the host sees a phantom "phone detected" long after the phone
@@ -494,6 +505,7 @@ fn process_one(
             // Name this phone first: carplayd serves only the phone btd hands off (its phone gate), so
             // a phone a switch dropped, still on the AP, cannot take the session back.
             crate::av::expect_phone(*SESSION_PEER.lock().unwrap_or_else(|e| e.into_inner()));
+            HANDED_OFF.store(true, Ordering::Relaxed);
             crate::av::ensure_av_layer();
         }
         return !sent;

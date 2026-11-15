@@ -88,10 +88,7 @@ pub const EXPECT_PHONE_FILE: &str = "/tmp/carplay_expect_phone";
 pub fn expect_phone(peer: Option<[u8; 6]>) {
     match peer {
         Some(a) => {
-            let tmp = format!("{EXPECT_PHONE_FILE}.tmp");
-            let named = std::fs::write(&tmp, crate::control::fmt_addr(&a))
-                .and_then(|_| std::fs::rename(&tmp, EXPECT_PHONE_FILE));
-            if let Err(e) = named {
+            if let Err(e) = write_name(&a) {
                 println!("[av] could not name the phone for carplayd ({e}); it serves any phone");
                 let _ = std::fs::remove_file(EXPECT_PHONE_FILE);
             }
@@ -100,6 +97,186 @@ pub fn expect_phone(peer: Option<[u8; 6]>) {
             let _ = std::fs::remove_file(EXPECT_PHONE_FILE);
         }
     }
+}
+
+fn write_name(a: &[u8; 6]) -> std::io::Result<()> {
+    let tmp = format!("{EXPECT_PHONE_FILE}.tmp");
+    std::fs::write(&tmp, crate::control::fmt_addr(a)).and_then(|_| std::fs::rename(&tmp, EXPECT_PHONE_FILE))
+}
+
+/// The phone the file names now; `None` = none.
+fn named_now() -> Option<[u8; 6]> {
+    std::fs::read_to_string(EXPECT_PHONE_FILE).ok().and_then(|s| crate::control::parse_addr(s.trim()))
+}
+
+fn tail(a: [u8; 6]) -> String {
+    crate::bt_driver::peer_tail(Some(a))
+}
+
+/// `@<unix_ms> [av] …`, as btd's other lines are stamped (docs/carplay/01_OCBM_PROTOCOL.md CH_LOG).
+fn log(m: &str) {
+    let ms = SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+    println!("@{ms} [av] {m}");
+}
+
+/// A name btd wrote as a Bluetooth session started, and the name it replaced ([`name_at_session_start`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EarlyName {
+    phone: [u8; 6],
+    before: Option<[u8; 6]>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AtStart {
+    Name(EarlyName),
+    /// A CarPlay session is up here: its 0x5703 names this phone, as before.
+    SessionUp,
+    /// No peer, not bonded, it is named already, or btd is going quiet.
+    Leave,
+}
+
+/// The Mac's 15 Nov bench: btd named a phone only after its 0x5703, and a phone that knows the AP is on it
+/// within ~1.5 s of its Bluetooth link, before that. carplayd refused its record for the last phone's, and
+/// nothing looked again until the browser re-queried, 84 s later. So the phone is named as its session
+/// starts, by the 0x5703's own rule: only a phone this box is bonded with (`bonded`, `wifi_config_allowed`,
+/// R3). And only while no CarPlay session is up here (`session_up`): a session can outlive its phone's
+/// Bluetooth link, and naming another phone would let that phone take it before it had handed off (R2).
+/// Not while btd is going quiet (`quiet`): its teardown removes the name anyway.
+fn at_session_start(
+    peer: Option<[u8; 6]>,
+    bonded: bool,
+    named: Option<[u8; 6]>,
+    session_up: bool,
+    quiet: bool,
+) -> AtStart {
+    match peer {
+        Some(p) if bonded && named != Some(p) && !quiet => {
+            if session_up {
+                AtStart::SessionUp
+            } else {
+                AtStart::Name(EarlyName { phone: p, before: named })
+            }
+        }
+        _ => AtStart::Leave,
+    }
+}
+
+/// What carplayd shows of a session when the Bluetooth one that named its phone early ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct Seen {
+    /// The phone the name file names now.
+    named: Option<[u8; 6]>,
+    /// The phone whose CarPlay is live (`/tmp/phone_identity`).
+    carplay: Option<[u8; 6]>,
+    /// carplayd holds a control connection (the transport flag in its hand, not btd's claim).
+    connected: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AtEnd {
+    /// Write the earlier name back; `None` removes the file (see [`at_session_end`]).
+    PutBack(Option<[u8; 6]>),
+    /// The phone's CarPlay is live: it is the phone served now, as after a 0x5703.
+    CarPlayLive,
+    /// carplayd holds a control connection: the named phone's own, coming up.
+    Connected,
+    /// btd is going quiet: its teardown removes the name, and a put-back would only have the old phone
+    /// dialled to be killed.
+    Quiet,
+    /// A 0x5703 named it for good, or the file was written since.
+    Leave,
+}
+
+/// R4: a session that named its phone early and ended without a 0x5703 (`handed_off`) must not leave carplayd
+/// serving a phone that is not coming while the phone served before may still be on Wi-Fi: the earlier name
+/// goes back. Never over a name written since (`seen.named`); not while that phone's own CarPlay is live
+/// (`seen.carplay`, carplayd's identity), as a CarPlay session can outlive its Bluetooth link and the other
+/// phone would take it; and not while carplayd holds a control connection (`seen.connected`), which during
+/// an early name is the named phone's own, before its SETUP publishes it. No earlier name puts back no file:
+/// carplayd is spawned only at a 0x5703, which names its phone first, so none was running for this one, or
+/// the one running already served any phone.
+fn at_session_end(early: EarlyName, handed_off: bool, seen: Seen, quiet: bool) -> AtEnd {
+    if handed_off || seen.named != Some(early.phone) {
+        AtEnd::Leave
+    } else if quiet {
+        AtEnd::Quiet
+    } else if seen.carplay == Some(early.phone) {
+        AtEnd::CarPlayLive
+    } else if seen.connected {
+        AtEnd::Connected
+    } else {
+        AtEnd::PutBack(early.before)
+    }
+}
+
+/// Name a bonded `peer` for carplayd as its Bluetooth session starts ([`at_session_start`]); `quiet` = btd is
+/// going quiet already. Returns what to hand [`put_back`] when the session ends.
+pub fn name_at_session_start(peer: Option<[u8; 6]>, bonded: bool, quiet: bool) -> Option<EarlyName> {
+    let p = peer.filter(|_| bonded && !quiet)?;
+    match at_session_start(peer, bonded, named_now(), crate::control::carplay_session_up(), quiet) {
+        AtStart::Name(early) => match write_name(&p) {
+            Ok(()) => {
+                log(&format!("named {} for carplayd at its session start", tail(p)));
+                Some(early)
+            }
+            Err(e) => {
+                log(&format!("could not name {} at its session start ({e}); its 0x5703 names it", tail(p)));
+                None
+            }
+        },
+        AtStart::SessionUp => {
+            log(&format!("not naming {} at its session start: a CarPlay session is up; its 0x5703 names it", tail(p)));
+            None
+        }
+        AtStart::Leave => None,
+    }
+}
+
+/// The session that named its phone early ended; `handed_off` when it sent a 0x5703, `quiet` when btd is going
+/// quiet ([`at_session_end`]). Its thread is the only writer while it lasts: one Bluetooth session runs at a
+/// time (`SessionClaim`, held until `bt_driver::run` returns), and `teardown_av_layer` runs only after that
+/// thread is joined.
+pub fn put_back(early: Option<EarlyName>, handed_off: bool, quiet: bool) {
+    let Some(early) = early else { return };
+    let seen = Seen {
+        named: named_now(),
+        carplay: crate::control::carplay_phone(),
+        connected: crate::control::carplayd_connected(),
+    };
+    let left = |why: &str| {
+        log(&format!("left {} named: the session ended without a handoff, but {why}", tail(early.phone)))
+    };
+    match at_session_end(early, handed_off, seen, quiet) {
+        AtEnd::PutBack(before) => {
+            expect_phone(before);
+            let to = before.map_or_else(|| "none".to_string(), tail);
+            log(&format!("put back {to}: the session ended without a handoff"));
+        }
+        AtEnd::CarPlayLive => left("its CarPlay is live"),
+        AtEnd::Connected => left("carplayd has its control connection"),
+        AtEnd::Quiet => left("btd is going quiet, and its teardown removes it"),
+        AtEnd::Leave => {}
+    }
+}
+
+/// Whether btd writes its "wireless" claim at a handoff: not over a flag carplayd wrote for a phone's control
+/// connection (`wireless`, written at another time than btd's last claim, `claimed`). Rewritten at a 0x5702
+/// retry mid-connection, that flag read as btd's own claim from then on, and carplayd's connection as none
+/// (`control::carplayd_connected`, `Control::carplay_never_reached`; the Mac's review of 2769b69).
+fn claim_due(wireless: Option<SystemTime>, claimed: Option<SystemTime>) -> bool {
+    !wireless.is_some_and(|w| Some(w) != claimed)
+}
+
+/// Write btd's "wireless" claim whole, through a rename (the pid keeps it off carplayd's temp name), and
+/// remember its write time ([`CLAIMED_AT`]).
+fn claim_transport() {
+    let flag = box_common::flags::CARPLAY_TRANSPORT;
+    let tmp = format!("{flag}.tmp.{}", std::process::id());
+    if std::fs::write(&tmp, "wireless").and_then(|_| std::fs::rename(&tmp, flag)).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    let claimed = std::fs::metadata(flag).and_then(|m| m.modified()).ok();
+    *CLAIMED_AT.lock().unwrap_or_else(|e| e.into_inner()) = claimed;
 }
 const WLAN_IFACE: &str = "wlan0";
 /// The AP gateway hostapd/udhcpd serve on `wlan0` — the address the iPhone reaches carplayd at, and
@@ -334,10 +511,11 @@ fn ensure_av_layer_timed() {
     // itself). The gap between those two points was a real race: the wired supervisor's `arm()` guard
     // checks this same flag, and with nothing written yet it could kill/replace a correctly-configured
     // wireless carplayd mid-handoff. Reaching this function at all means a 0x5703 handoff just
-    // succeeded, so wireless legitimately owns the session from this point on.
-    let _ = std::fs::write("/tmp/carplay_transport", "wireless");
-    let claimed = std::fs::metadata("/tmp/carplay_transport").and_then(|m| m.modified()).ok();
-    *CLAIMED_AT.lock().unwrap_or_else(|e| e.into_inner()) = claimed;
+    // succeeded, so wireless legitimately owns the session from this point on. A flag carplayd already
+    // holds for a phone's connection is left as it is ([`claim_due`]).
+    if claim_due(crate::control::read_carplayd(), claimed_at()) {
+        claim_transport();
+    }
 
     let carplayd = env_or("AIRPLAYD_BIN", AIRPLAYD_BIN_DEFAULT);
 
@@ -530,5 +708,75 @@ mod tests {
             "Command::status() must still work after spawn_detached (no SIGCHLD=SIG_IGN)"
         );
         assert!(st.unwrap().success());
+    }
+
+    // The Mac's 15 Nov bench: phone A had handed off; phone B came back on Bluetooth.
+    const A: [u8; 6] = [0x0A, 0x00, 0x00, 0x00, 0x00, 0x02];
+    const B: [u8; 6] = [0x0B, 0x00, 0x00, 0x00, 0x00, 0x02];
+
+    #[test]
+    fn a_bonded_phone_is_named_at_its_session_start_while_no_carplay_is_up() {
+        let named = AtStart::Name(EarlyName { phone: B, before: Some(A) });
+        assert_eq!(at_session_start(Some(B), true, Some(A), false, false), named, "10:54:23.4, B back on Bluetooth");
+        assert_eq!(
+            at_session_start(Some(B), true, None, false, false),
+            AtStart::Name(EarlyName { phone: B, before: None }),
+            "the first phone after btd starts"
+        );
+        assert_eq!(at_session_start(Some(B), false, Some(A), false, false), AtStart::Leave, "R3: not bonded");
+        assert_eq!(at_session_start(None, true, Some(A), false, false), AtStart::Leave, "no peer, nothing to name");
+        assert_eq!(at_session_start(Some(A), true, Some(A), false, false), AtStart::Leave, "the same phone back");
+        assert_eq!(
+            at_session_start(Some(B), true, Some(A), true, false),
+            AtStart::SessionUp,
+            "R2: A's CarPlay outlives its Bluetooth link; B is named at its 0x5703, as before"
+        );
+        assert_eq!(at_session_start(Some(B), true, Some(A), false, true), AtStart::Leave, "P5: btd going quiet");
+    }
+
+    #[test]
+    fn an_early_name_goes_back_only_when_the_session_ends_without_a_handoff() {
+        let early = EarlyName { phone: B, before: Some(A) };
+        let seen = |named, carplay| Seen { named, carplay, connected: false };
+        let ended = |s| at_session_end(early, false, s, false);
+        assert_eq!(ended(seen(Some(B), None)), AtEnd::PutBack(Some(A)), "R4: A is named again");
+        assert_eq!(at_session_end(early, true, seen(Some(B), None), false), AtEnd::Leave, "after its 0x5703 it stays");
+        assert_eq!(ended(seen(Some(A), None)), AtEnd::Leave, "a name written since is not clobbered");
+        assert_eq!(ended(seen(None, None)), AtEnd::Leave, "nor a removed one");
+        assert_eq!(ended(seen(Some(B), Some(B))), AtEnd::CarPlayLive, "B's CarPlay outlives its link");
+        assert_eq!(ended(seen(Some(B), Some(A))), AtEnd::PutBack(Some(A)), "A's CarPlay is live: back to it");
+        let first = EarlyName { phone: B, before: None };
+        assert_eq!(at_session_end(first, false, seen(Some(B), None), false), AtEnd::PutBack(None), "none: no file");
+    }
+
+    #[test]
+    fn the_name_stays_while_carplayd_holds_the_named_phones_connection() {
+        // P7: B was dialled and connected, and its Bluetooth session ended before its SETUP published it.
+        let early = EarlyName { phone: B, before: Some(A) };
+        let seen = Seen { named: Some(B), carplay: None, connected: true };
+        assert_eq!(at_session_end(early, false, seen, false), AtEnd::Connected);
+        assert_eq!(at_session_end(early, true, seen, false), AtEnd::Leave, "a handoff leaves it as ever");
+    }
+
+    #[test]
+    fn going_quiet_neither_names_nor_puts_back() {
+        // P5: go-quiet always ends in teardown_av_layer, which removes the name; a put-back seconds before it
+        // would have carplayd dial the old phone only to be killed.
+        let early = EarlyName { phone: B, before: Some(A) };
+        let seen = Seen { named: Some(B), carplay: None, connected: false };
+        assert_eq!(at_session_end(early, false, seen, true), AtEnd::Quiet);
+        assert_eq!(at_session_start(Some(B), true, Some(A), false, true), AtStart::Leave);
+    }
+
+    #[test]
+    fn the_claim_is_not_written_over_a_flag_carplayd_holds() {
+        // P8: a 0x5702 retry mid-connection rewrote carplayd's "wireless", and its connection then read as none.
+        let t0 = std::time::UNIX_EPOCH + Duration::from_secs(1_000);
+        let t1 = t0 + Duration::from_millis(1_500);
+        assert!(claim_due(None, None), "no flag: claim it");
+        assert!(claim_due(None, Some(t0)), "carplayd cleared it at its session's end: claim it again");
+        assert!(claim_due(Some(t0), Some(t0)), "btd's own claim: written again, as before");
+        assert!(!claim_due(Some(t1), Some(t0)), "carplayd's, for a phone's connection: left alone");
+        assert!(!claim_due(Some(t1), None), "carplayd's, before btd ever claimed: left alone");
     }
 }

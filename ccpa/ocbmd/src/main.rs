@@ -787,6 +787,26 @@ const ANSWERED_FILE: &str = "/tmp/ocbmd_answered";
 #[cfg(test)]
 const ANSWERED_FILE: &str = "/tmp/ocbmd_selftest_answered";
 
+/// The session supervisor's pid (its singleton lock). `cfg(test)`: nothing to signal.
+#[cfg(not(test))]
+const SUPERVISOR_PID_FILE: &str = "/tmp/.sup_lock/pid";
+#[cfg(test)]
+const SUPERVISOR_PID_FILE: &str = "/tmp/ocbmd_selftest_no_such_sup_pid";
+
+/// Cut the supervisor's 1 s tick short when a host arrives (SIGUSR1, which it traps): about 0.5 s of every connect on
+/// average (the Mac's 13 Nov brief, item 1). Only a process whose command line names session_supervisor gets it: a
+/// recycled pid must never take a signal whose default action ends it.
+fn wake_supervisor(pid_file: &str) {
+    let Some(pid) = std::fs::read_to_string(pid_file).ok().and_then(|s| s.trim().parse::<libc::pid_t>().ok()) else {
+        return;
+    };
+    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+    if pid > 0 && String::from_utf8_lossy(&cmdline).contains("session_supervisor") {
+        // SAFETY: a signal to the supervisor just identified; it traps USR1.
+        unsafe { libc::kill(pid, libc::SIGUSR1) };
+    }
+}
+
 /// A host silent this long, then speaking again, gets a log line ([`Daemon::handle`]).
 const HOST_SILENCE: Duration = Duration::from_secs(5);
 
@@ -1959,6 +1979,9 @@ impl Daemon {
         }
         self.present = present;
         write_flag_atomic(HOST_PRESENT_FLAG, present);
+        if present {
+            wake_supervisor(SUPERVISOR_PID_FILE);
+        }
         if !present {
             self.present_cleared_at = Some(std::time::Instant::now());
         }
@@ -2115,6 +2138,10 @@ impl Daemon {
                 // Mirror `present`, do NOT hardcode true: the flag is a view of daemon state, and a
                 // deadline that outlived its session (see go_idle) must not be able to invent one.
                 write_flag_atomic(HOST_PRESENT_FLAG, self.present);
+                // The supervisor then sees the host this tick, not on its next 1 s one (the Mac's review of bbd29f3, A7).
+                if self.present {
+                    wake_supervisor(SUPERVISOR_PID_FILE);
+                }
                 eprintln!(
                     "[ocbmd] session: presence flag restored to {} — supervisor should be re-ARMing",
                     self.present
@@ -4888,7 +4915,7 @@ mod tests {
         // then connected, the unchanged text sent nothing and the app never learned it was live.
         let t0 = std::time::UNIX_EPOCH + Duration::from_secs(1_000);
         let t1 = t0 + Duration::from_secs(17);
-        let id = r#"{"name":"iPhone","deviceID":"68:A7:29:00:25:10"}"#;
+        let id = r#"{"name":"iPhone","deviceID":"02:00:00:00:00:0A"}"#;
         assert!(phone_ident_due(id, Some(t0), None, None), "a fresh host is told");
         assert!(!phone_ident_due(id, Some(t0), Some(id), Some(t0)), "nothing new");
         assert!(phone_ident_due(id, Some(t1), Some(id), Some(t0)), "the same phone, a new session");
@@ -4900,8 +4927,8 @@ mod tests {
     fn forgetting_the_idle_phone_leaves_the_live_one_alone() {
         // 2026-11-01 bench: Forget on the idle phone restarted btd and ended the live phone's session.
         let live = |mac: &str| Some((true, mac.to_string()));
-        assert_eq!(forget_way(live("68:A7:29:00:25:10"), "AA:BB:CC:00:6A:DE"), ForgetWay::KeepLive);
-        assert_eq!(forget_way(live("68:A7:29:00:25:10"), "68:a7:29:00:25:10"), ForgetWay::Now, "the live phone itself");
+        assert_eq!(forget_way(live("02:00:00:00:00:0A"), "AA:BB:CC:00:6A:DE"), ForgetWay::KeepLive);
+        assert_eq!(forget_way(live("02:00:00:00:00:0A"), "02:00:00:00:00:0a"), ForgetWay::Now, "the live phone itself");
         assert_eq!(forget_way(live(""), "AA:BB:CC:00:6A:DE"), ForgetWay::Now, "a session btd can't name");
         assert_eq!(forget_way(Some((false, String::new())), "AA:BB:CC:00:6A:DE"), ForgetWay::Now);
         assert_eq!(forget_way(None, "AA:BB:CC:00:6A:DE"), ForgetWay::Now, "btd not answering");
@@ -5117,12 +5144,12 @@ mod tests {
     fn the_adapter_name_is_btds_from_the_first_request() {
         // The app reads MGMT_INFO at SUBSCRIBE, before wlan0 exists: the live address alone gave the serial's
         // suffix (CarLink-0264) while btd named Bluetooth from wlan0 (CarLink-fd6c, the dev adapter, 31 Oct).
-        let saved = "wlan0=00:e0:4c:99:fd:6c\nhci0=38:ba:b0:1d:0c:64\n";
-        let serial = "2025.10.15.11270264";
+        let saved = "wlan0=02:00:00:00:fd:6c\nhci0=02:00:00:00:0c:64\n";
+        let serial = "2000.01.01.00000264";
         assert_eq!(bt_name_from(&name_wifi_mac("", saved), serial), "CarLink-fd6c", "radios down: the installer's record");
-        assert_eq!(bt_name_from(&name_wifi_mac("00:e0:4c:99:aa:bb", saved), serial), "CarLink-aabb", "radios up: wlan0 itself");
+        assert_eq!(bt_name_from(&name_wifi_mac("02:00:00:00:aa:bb", saved), serial), "CarLink-aabb", "radios up: wlan0 itself");
         assert_eq!(
-            bt_name_from(&name_wifi_mac("", "wlan0=\nhci0=38:ba:b0:1d:0c:64\n"), serial),
+            bt_name_from(&name_wifi_mac("", "wlan0=\nhci0=02:00:00:00:0c:64\n"), serial),
             "CarLink-0264",
             "no Wi-Fi address saved: the serial, as btd falls back"
         );

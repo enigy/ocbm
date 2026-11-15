@@ -230,10 +230,67 @@ pub enum MfiError {
 }
 
 /// [`cert`] with the failure reason. `cert` is kept as the `Option` shim for existing callers.
+///
+/// Read from the chip once per boot, then from [`CERT_CACHE`]: the certificate is the chip's public one, the same on
+/// every read and sent as-is to every phone (the private key never leaves the chip, and signing still goes to it
+/// every time). The tunnel's first read of a session failed with a chip NAK and cost a retry in 23 of 23 sessions
+/// (the Mac's 13 Nov brief, item 2).
+///
+/// Only one DER SEQUENCE is cached or served from the cache ([`is_der_sequence`]): one read that completed with bad
+/// bytes would otherwise go to every phone for the rest of the boot. A read that isn't one still goes to this phone,
+/// as before the cache, and the next session reads the chip again (the Mac's 2.6.0 review, CS-3).
 pub fn try_cert() -> Result<Vec<u8>, MfiError> {
+    if let Some(c) = read_cert_cache(CERT_CACHE) {
+        return Ok(c);
+    }
     let _lock = MfiLock::acquire()?;
-    cert_locked().ok_or(MfiError::Chip)
+    let c = cert_locked().ok_or(MfiError::Chip)?;
+    if is_der_sequence(&c) {
+        write_cert_cache(CERT_CACHE, &c);
+    } else {
+        eprintln!("[mfi-i2c-local] the certificate read ({} B) is not one DER SEQUENCE: sent, not cached", c.len());
+    }
+    Ok(c)
 }
+
+/// Forget the cached certificate, so the next session reads it from the chip: a phone failed the authentication. True
+/// when one was cached, and is gone.
+pub fn forget_cert() -> bool {
+    std::fs::remove_file(CERT_CACHE).is_ok()
+}
+
+/// Whether `c` is one DER SEQUENCE with a two-byte length, as the chip's certificate is (`30 82 hi lo`, 945 bytes on
+/// this unit's 2.0C: docs/ops/captures/README.md), its length the rest of the bytes exactly, within the chip's 2048.
+fn is_der_sequence(c: &[u8]) -> bool {
+    match c {
+        [0x30, 0x82, hi, lo, ..] => c.len() <= 2048 && usize::from(u16::from_be_bytes([*hi, *lo])) + 4 == c.len(),
+        _ => false,
+    }
+}
+
+/// The certificate cached at `path`, when it is one DER SEQUENCE; one that isn't is removed.
+fn read_cert_cache(path: &str) -> Option<Vec<u8>> {
+    let c = std::fs::read(path).ok()?;
+    if is_der_sequence(&c) {
+        return Some(c);
+    }
+    let _ = std::fs::remove_file(path);
+    None
+}
+
+/// Cache `c` at `path`: written aside and renamed, so a reader never sees half of it.
+fn write_cert_cache(path: &str, c: &[u8]) {
+    let tmp = format!("{path}.{}", std::process::id());
+    if std::fs::write(&tmp, c).and_then(|_| std::fs::rename(&tmp, path)).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// The certificate as last read from the chip this boot (tmpfs). `cfg(test)`: a path of its own.
+#[cfg(not(test))]
+const CERT_CACHE: &str = "/tmp/carplay_mfi_cert.der";
+#[cfg(test)]
+const CERT_CACHE: &str = "/tmp/mfi_i2c_local_selftest_cert.der";
 
 /// [`sign`] with the failure reason.
 pub fn try_sign(chal: &[u8]) -> Result<Vec<u8>, MfiError> {
@@ -316,4 +373,62 @@ fn sign_locked(chal: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     Some(sig)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{forget_cert, is_der_sequence, read_cert_cache, write_cert_cache, CERT_CACHE};
+
+    /// A certificate's shape: `30 82` and a length that is the rest of it.
+    fn der(body: usize) -> Vec<u8> {
+        let mut c = vec![0x30, 0x82, (body >> 8) as u8, body as u8];
+        c.extend(std::iter::repeat(0xa5).take(body));
+        c
+    }
+
+    /// The Mac's 2.6.0 review, CS-3: only one whole DER SEQUENCE with a two-byte length passes.
+    #[test]
+    fn only_one_whole_der_sequence_is_a_certificate() {
+        assert!(is_der_sequence(&der(941)), "the 2.0C's 945 bytes, 30 82 03 ad");
+        assert!(is_der_sequence(&der(2044)), "the chip's 2048 at most");
+        assert!(!is_der_sequence(&der(2045)), "past the chip's 2048");
+        let mut c = der(941);
+        c.push(0);
+        assert!(!is_der_sequence(&c), "a byte past its length");
+        assert!(!is_der_sequence(&c[..900]), "cut short");
+        c = der(941);
+        c[0] = 0x31;
+        assert!(!is_der_sequence(&c), "not a SEQUENCE");
+        c = der(941);
+        c[1] = 0x81;
+        assert!(!is_der_sequence(&c), "not a two-byte length");
+        assert!(!is_der_sequence(&[0u8; 945]), "a read of zeros");
+        assert!(!is_der_sequence(&[0xffu8; 945]), "a read of ones");
+        assert!(!is_der_sequence(&[0x30u8, 0x82, 0x00]), "shorter than its header");
+        assert!(!is_der_sequence(&[]), "empty");
+    }
+
+    /// The cache holds and serves only a certificate; one that isn't is removed when read.
+    #[test]
+    fn the_cache_serves_only_a_certificate() {
+        let path = std::env::temp_dir().join(format!("mfi_i2c_local_cache_{}.der", std::process::id()));
+        let p = path.to_str().unwrap();
+        write_cert_cache(p, &der(941));
+        assert_eq!(read_cert_cache(p), Some(der(941)));
+        let mut bad = der(941);
+        bad.truncate(600);
+        std::fs::write(&path, &bad).unwrap();
+        assert_eq!(read_cert_cache(p), None, "a cache that isn't one is not served");
+        assert!(!path.exists(), "and is removed, so the next read goes to the chip");
+        assert_eq!(read_cert_cache(p), None, "none cached");
+    }
+
+    /// R1-3 (the Mac's round 2): forgetting says whether there was a cached certificate to forget.
+    #[test]
+    fn forgetting_says_whether_one_was_cached() {
+        write_cert_cache(CERT_CACHE, &der(941));
+        assert!(forget_cert(), "one was cached");
+        assert!(!std::path::Path::new(CERT_CACHE).exists());
+        assert!(!forget_cert(), "none left to forget");
+    }
 }

@@ -226,7 +226,7 @@ fn device_suffix() -> Option<String> {
 }
 
 /// Pure suffix extractor (testable): the last 4 hex digits of `raw`, lowercased. A Wi-Fi MAC
-/// `"00:e0:4c:91:b0:df"` → `"b0df"`; a serial `"…AB12CD34"` → `"cd34"`. `None` if fewer than 4 hex chars.
+/// `"02:00:00:00:b0:df"` → `"b0df"`; a serial `"…AB12CD34"` → `"cd34"`. `None` if fewer than 4 hex chars.
 fn suffix_from(raw: &str) -> Option<String> {
     let hex: String = raw.chars().filter(|c| c.is_ascii_hexdigit()).collect();
     (hex.len() >= 4).then(|| hex[hex.len() - 4..].to_ascii_lowercase())
@@ -1166,8 +1166,8 @@ mod tests {
     #[test]
     fn device_suffix_extraction() {
         // Wi-Fi MAC -> last 2 octets, lowercase, colons stripped (the SSID CarLink-b0df too).
-        assert_eq!(suffix_from("00:e0:4c:91:b0:df").as_deref(), Some("b0df"));
-        assert_eq!(suffix_from("00:E0:4C:91:B0:DF\n").as_deref(), Some("b0df")); // upper + trailing NL
+        assert_eq!(suffix_from("02:00:00:00:b0:df").as_deref(), Some("b0df"));
+        assert_eq!(suffix_from("02:00:00:00:B0:DF\n").as_deref(), Some("b0df")); // upper + trailing NL
                                                                                  // SoC serial -> last 4 hex.
         assert_eq!(suffix_from("0a1b2c3dAB12CD34").as_deref(), Some("cd34"));
         // Too few hex chars -> None (caller falls through to the next source / bare base name).
@@ -1283,7 +1283,7 @@ mod tests {
     fn ident_info_wireless_transport_matches_captured_param24_bytes() {
         // Byte-exact against carlink_linux's real BT capture fixture (docs/carplay/04_CAPABILITIES_AND_CONFIG.md): componentIdentifier=2,
         // name "IAP2-Wireless", then the two "none" presence flags at sub-ids 2 and 4.
-        let mac = [0x38, 0xba, 0xb0, 0x7d, 0xd3, 0x8d];
+        let mac = [0x02, 0x00, 0x00, 0x00, 0xd3, 0x8d];
         let body = build_ident_info(
             "CarLink",
             TransportComponent::Wireless { bt_mac: mac },
@@ -1329,7 +1329,7 @@ mod tests {
         // captured raw reject payload). This test is back to pinning the pre-5.1/5.2 / Phase-5.0-only
         // reference lists — considered the stable baseline going forward; params-6/7 growth is now a
         // closed dead end as a class, not just for these two specific id pairs.
-        let mac = [0x38, 0xba, 0xb0, 0x7d, 0xd3, 0x8d];
+        let mac = [0x02, 0x00, 0x00, 0x00, 0xd3, 0x8d];
         let body = build_ident_info(
             "CarLink",
             TransportComponent::Wireless { bt_mac: mac },
@@ -1517,7 +1517,7 @@ mod tests {
         // deliberate one: a `0x1D03` reject on this transport is UNRECOVERABLE (params 6/7 are in
         // `REQUIRED_IDENT_PARAMS`, so the retry is byte-identical, the second reject aborts, and the
         // tunnel session is cleared with no auth, no identify and no subscribes).
-        let mac = [0x38, 0xba, 0xb0, 0x7d, 0xd3, 0x8d];
+        let mac = [0x02, 0x00, 0x00, 0x00, 0xd3, 0x8d];
         let body = proven_ident_body("CarLink", TransportComponent::AirPlayTunnel { bt_mac: mac });
         // Built with the proven policy pinned (the compiled default), hermetic vs /tmp: the body must
         // carry exactly the 2026-07-25 device-accepted lists.
@@ -1600,7 +1600,7 @@ mod tests {
         // — this pins that so a future revert-back-to-wired-only-gate (see the ROLLBACK comment above
         // the param-30 block) would be caught by a failing test, not silently reintroduced. If Phase
         // 5.0 is ever rolled back, this test should be deleted/inverted alongside it.
-        let mac = [0x38, 0xba, 0xb0, 0x7d, 0xd3, 0x8d];
+        let mac = [0x02, 0x00, 0x00, 0x00, 0xd3, 0x8d];
         let body = build_ident_info(
             "CarLink",
             TransportComponent::Wireless { bt_mac: mac },
@@ -1632,7 +1632,7 @@ mod tests {
         // Device-confirmed 2026-07-07 (docs/carplay/04_CAPABILITIES_AND_CONFIG.md): param 24 without this companion param 17
         // (bluetoothTransportComponent) gets an 0x1D03 reject from a real iPhone instead of
         // 0x1D02 IdentifyAccept. Byte-exact against the reference's own captured fixture.
-        let mac = [0x38, 0xba, 0xb0, 0x7d, 0xd3, 0x8d];
+        let mac = [0x02, 0x00, 0x00, 0x00, 0xd3, 0x8d];
         let body = build_ident_info(
             "CarLink",
             TransportComponent::Wireless { bt_mac: mac },
@@ -2304,7 +2304,7 @@ mod tests {
             TransportComponent::Usb { cp_iface: 1 },
             TransportComponent::Usb { cp_iface: 7 },
             TransportComponent::Wireless {
-                bt_mac: [0x38, 0xba, 0xb0, 0x7d, 0xd3, 0x8d],
+                bt_mac: [0x02, 0x00, 0x00, 0x00, 0xd3, 0x8d],
             },
         ] {
             for declare_wired in [false, true] {

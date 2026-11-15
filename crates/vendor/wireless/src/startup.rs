@@ -8,14 +8,95 @@ use std::io::Write as _;
 /// The stages as written; read back by carplayd (`receiver::startup::MARKS`).
 pub const MARKS: &str = "/tmp/startup_marks";
 
-/// Start this session's record, from the host's arrival: the mtime of `/tmp/host_present`, else now.
+/// The boot radio preload's states this boot, one `<word> <uptime s>` line each as ocbm_boot.sh and radio_hal.sh enter
+/// them: waiting (for the self-test), running, done, stood_down (a host came first), skipped, off_guard or off_owner.
+pub const PRELOAD_STATE: &str = "/tmp/radio_preload_state";
+
+/// Start this session's record, from the host's arrival: the mtime of `/tmp/host_present`, else now. With it, the
+/// adapter's uptime then and the preload's state now, so a truck's cold start shows whether its head unit beat the
+/// preload (the Mac's 13 Nov brief, item 5). Under the same host, the counts so far carry over ([`carry_over`]).
 pub fn begin() {
     let present = std::fs::metadata("/tmp/host_present")
         .and_then(|m| m.modified())
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map_or_else(now_ms, |d| d.as_millis() as u64);
-    let _ = std::fs::write(MARKS, format!("host_present {present}\n"));
+    let uptime = std::fs::read_to_string("/proc/uptime").ok().and_then(|u| uptime_ms(&u));
+    let host_uptime = uptime.map(|u| u.saturating_sub(now_ms().saturating_sub(present)));
+    let states = std::fs::read_to_string(PRELOAD_STATE).unwrap_or_default();
+    let preload = host_uptime.map_or_else(|| "unknown".to_string(), |at| preload_at(&states, at));
+    let mut record = format!("host_present {present}\npreload {preload}\n");
+    // Where the box log stood, so carplayd counts the hostapd lines since the host came (receiver::startup; kept across
+    // btd's sessions under one host by carry_over, the Mac's round 3, C-2), and its first
+    // bytes, so a log ocbmd rotated since (emptied at its cap) is told from one that only grew (the Mac's review, BH-06).
+    if let Ok(mut f) = std::fs::File::open("/tmp/box.log") {
+        use std::io::Read as _;
+        if let Ok(m) = f.metadata() {
+            record.push_str(&format!("boxlog_at {}\n", m.len()));
+        }
+        let mut head = [0u8; BOXLOG_HEAD];
+        if let Ok(n @ 1..) = f.read(&mut head) {
+            record.push_str(&format!("boxlog_head {}\n", hex(&head[..n])));
+        }
+    }
+    if let Some(u) = host_uptime {
+        record.push_str(&format!("host_uptime {u}\n"));
+    }
+    let prev = std::fs::read_to_string(MARKS).unwrap_or_default();
+    let _ = std::fs::write(MARKS, carry_over(&prev, present, &record));
+}
+
+/// The record a session starts with: `fresh`, and when `prev` is the same host's (its host_present is `present`), its
+/// tallies and box log marks, so the [startup] line's counts run from the host's arrival over every session btd starts
+/// under it: a phone switch, a session that never reached CarPlay, a wired preempt (the Mac's round 2, R2-1). The
+/// stages are always the new session's.
+fn carry_over(prev: &str, present: u64, fresh: &str) -> String {
+    fn word(l: &str) -> &str {
+        l.split_whitespace().next().unwrap_or("")
+    }
+    let same_host = prev.lines().find_map(|l| l.strip_prefix("host_present ")).and_then(|v| v.trim().parse::<u64>().ok())
+        == Some(present);
+    if !same_host {
+        return fresh.to_string();
+    }
+    let boxlog = |l: &&str| matches!(word(*l), "boxlog_at" | "boxlog_head");
+    // The box log's marks from when the host came, when the first session had them; else this one's.
+    let from_prev = prev.lines().any(|l| word(l) == "boxlog_at");
+    fresh
+        .lines()
+        .filter(|l| !(from_prev && boxlog(l)))
+        .chain(prev.lines().filter(|l| (from_prev && boxlog(l)) || word(*l) == "tally"))
+        .map(|l| format!("{l}\n"))
+        .collect()
+}
+
+/// How many of the box log's first bytes `boxlog_head` keeps (receiver::startup compares them).
+pub const BOXLOG_HEAD: usize = 32;
+
+/// Lower-case hex, for the marks.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// `/proc/uptime`'s first field in ms.
+fn uptime_ms(text: &str) -> Option<u64> {
+    let secs: f64 = text.split_whitespace().next()?.parse().ok()?;
+    Some((secs * 1000.0) as u64)
+}
+
+/// The preload's state at `at_ms` of uptime: the last one entered by then; "none" when none was (no preload this boot,
+/// or not started yet).
+fn preload_at(states: &str, at_ms: u64) -> String {
+    states
+        .lines()
+        .filter_map(|l| {
+            let mut w = l.split_whitespace();
+            let word = w.next()?;
+            let ms = uptime_ms(w.next()?)?;
+            (ms <= at_ms).then(|| word.to_string())
+        })
+        .last()
+        .unwrap_or_else(|| "none".to_string())
 }
 
 /// Note `stage` now, once per session: a stage already noted keeps its first time.
@@ -26,6 +107,13 @@ pub fn mark(stage: &str) {
     }
     if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(MARKS) {
         let _ = writeln!(f, "{stage} {}", now_ms());
+    }
+}
+
+/// Count one of `what` for this session's line (absent, reset, sdp_cut): a `tally <what>` line per event.
+pub fn tally(what: &str) {
+    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(MARKS) {
+        let _ = writeln!(f, "tally {what}");
     }
 }
 
@@ -51,5 +139,39 @@ mod tests {
         assert!(noted(marks, "bt_up"));
         assert!(!noted(marks, "phone"));
         assert!(!noted(marks, "bt"), "a whole word, not a prefix");
+    }
+
+    #[test]
+    fn the_uptime_and_the_preload_state_read_as_written() {
+        assert_eq!(uptime_ms("4.27 3.90\n"), Some(4270));
+        assert_eq!(uptime_ms(""), None);
+        let states = "waiting 2.10\nrunning 3.60\ndone 10.40\n";
+        assert_eq!(preload_at(states, 4_200), "running", "the truck's head unit beat the preload");
+        assert_eq!(preload_at(states, 12_000), "done");
+        assert_eq!(preload_at(states, 1_000), "none", "before the boot got to it");
+        assert_eq!(preload_at("", 5_000), "none");
+    }
+
+    /// R2-1 (the Mac's round 2): a session btd starts under the same host keeps the counts since the host came and where
+    /// the box log stood then; its stages are its own. Another host starts afresh.
+    #[test]
+    fn a_session_under_the_same_host_carries_the_counts_over() {
+        let prev = "host_present 1000\npreload done\nboxlog_at 500\nboxlog_head 5b6f\nhost_uptime 4270\nbt_up 1200\n\
+                    tally absent\ntally reset\ntally sdp_cut\nphone 3000\nhandoff 3500\ntally absent\n";
+        let fresh = "host_present 1000\npreload done\nboxlog_at 900\nboxlog_head 5b6f\nhost_uptime 4270\n";
+        let rec = carry_over(prev, 1000, fresh);
+        assert_eq!(
+            rec,
+            "host_present 1000\npreload done\nhost_uptime 4270\nboxlog_at 500\nboxlog_head 5b6f\n\
+             tally absent\ntally reset\ntally sdp_cut\ntally absent\n"
+        );
+        assert!(!noted(&rec, "bt_up") && !noted(&rec, "phone") && !noted(&rec, "handoff"), "the stages are the new session's");
+
+        let no_log = "host_present 1000\npreload done\ntally reset\n";
+        assert_eq!(carry_over(no_log, 1000, fresh), format!("{fresh}tally reset\n"), "no box log then: this session's marks");
+
+        let other = fresh.replace("1000", "2000");
+        assert_eq!(carry_over(prev, 2000, &other), other, "another host: afresh");
+        assert_eq!(carry_over("", 1000, fresh), fresh, "the first session");
     }
 }

@@ -255,7 +255,7 @@ endpoint, stand its A/V consumers up, show progress UI) had nothing to trigger o
 | `0x05` | `BTP_IDENTIFIED` | `0x1D02` accepted — the phone has the accessory |
 | `0x06` | `BTP_WIFI_HANDOFF` | `0x5703` sent: the phone now has the hotspot credentials |
 | `0x07` | `BTP_PAIR_REJECTED` | the phone rejected 3 re-pair confirmations without a new link key (`ssp_agent`) |
-| `0x08` | `BTP_BOND_LOST` | a bonded phone most likely forgot the pairing: it refused the stored link key (`AUTH_FAILED` 0x05/0x06, `ssp_agent`), or answered and reset the link on 3 or more reconnect pages in a row (`reconnect`; a still-paired phone can hang up once after a power cut). The app may ask the driver to forget the adapter on the iPhone and pair again (5 Nov bench) |
+| `0x08` | `BTP_BOND_LOST` | a bonded phone most likely forgot the pairing: it refused the stored link key (`AUTH_FAILED` 0x05/0x06, `ssp_agent`), or answered and then reset the link, or opened no SDP channel (a cut, counted once a round), on 3 or more reconnect pages in a row (`reconnect`; a still-paired phone can hang up once after a power cut, and a reset or cut straight after another phone's page timed out is not counted). The app may ask the driver to forget the adapter on the iPhone and pair again (5 Nov bench) |
 
 **Transport.** `wireless::bt_driver::publish_bt_phase` writes the value to `/tmp/bt_phase`; `ocbmd`'s
 `bt_phase_tick` mirrors it to the host on change. This is deliberately the **same mechanism as

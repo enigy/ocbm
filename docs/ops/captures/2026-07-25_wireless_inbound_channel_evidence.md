@@ -4,7 +4,7 @@ Archived because `docs/carplay/03_SDK_GROUND_TRUTH.md` §1's central claim rests
 unverifiable while it existed only in `/tmp/airplayd_wl.log` on the box (tmpfs — lost on reboot).
 
 **Session:** the first successful wireless CarPlay session after the BT pairing fix (docs/wireless/01_BT_AND_RADIO.md). Box
-`CarLink-b0df`, iPhone `64:31:35:8C:29:69`, HEVC video + audio streaming normally throughout
+`CarLink-b0df`, iPhone `..29:69`, HEVC video + audio streaming normally throughout
 (`video ok=3964 fail=0, audio ok=5526 fail=0` at time of capture).
 
 **Deployed binaries at capture time:** `airplayd 3ce47fbde4b0a1baadeb3fa36bad71a0`,

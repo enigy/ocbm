@@ -30,6 +30,13 @@ run "iap2d"      cargo test -p iap2d --quiet
 # binaries, and `carplay-metadata`, a direct dependency of iap2-core.
 run "metadata"   cargo test --manifest-path crates/vendor/metadata/Cargo.toml --quiet
 run "wireless"   cargo test -p btd --quiet
+# carplayd's own tests (its phone gate and discovery) ran nowhere until 15 Nov. Linux only: carplayd uses
+# libc::TCP_KEEPIDLE (above). Without the AAC-ELD feature, whose libfdk-aac a host checkout lacks.
+if [ "$(uname -s)" = Linux ]; then
+  run "carplayd"   cargo test -p carplayd --no-default-features --quiet
+else
+  echo "=== carplayd: skipped, Linux only (TCP_KEEPIDLE)"
+fi
 # bt-common holds the Bluetooth primitives extracted from btd on 2026-09-01. Its
 # 29 tests used to run under the "wireless" line above; without this one they would silently
 # stop running, which is the failure mode an extraction is most likely to cause.
@@ -39,6 +46,8 @@ run "box-common" cargo test -p box-common --quiet
 run "pairing"    cargo test --manifest-path crates/vendor/pairing/Cargo.toml --quiet
 run "rtsp"       cargo test --manifest-path crates/vendor/rtsp/Cargo.toml --quiet
 run "mfi"        cargo test --manifest-path crates/vendor/mfi/Cargo.toml --quiet
+# The tunnel's chip access: its certificate cache's DER check (the Mac's 2.6.0 review, CS-3), its first tests.
+run "mfi-i2c-local" cargo test --manifest-path crates/vendor/mfi-i2c-local/Cargo.toml --quiet
 run "ocbm-host"  cargo test -p ocbm-host --quiet
 # The back-to-stock restore payload (busybox sh), against synthetic trees: no adapter, no backup.
 run "stock-restore" sh tools/stock_restore_test.sh
@@ -59,6 +68,8 @@ run "ocbm-stageb" bash tools/ocbm_stageb_test.sh
 run "ocbm-update" bash tools/ocbm_update_test.sh
 # The radio seam's detection against synthetic units (Carlinkit's and lvalen's dispatcher texts).
 run "radio-detect" bash tools/radio_detect_test.sh
+# radio_ap_up.sh's passphrase, read and written against scratch adapters (the Mac's round 2, R1-1).
+run "radio-ap-up" bash tools/radio_ap_up_test.sh
 # The box scripts' suites again under BusyBox's sh and awk, the adapter's (v1.32.1); skipped without it.
 run "busybox (the adapter's sh and awk)" sh tools/busybox_suites.sh
 

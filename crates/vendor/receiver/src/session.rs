@@ -494,6 +494,11 @@ fn rcs_channels_named(entry: &Dictionary, channels: &HashMap<String, RcsChannel>
 /// How often stream threads wake from a blocking socket read to check the session-liveness flag.
 const SHUTDOWN_POLL: Duration = Duration::from_millis(500);
 
+/// How often a waiting accept looks again. The screen's used [`SHUTDOWN_POLL`], so the phone's screen connection
+/// waited up to 0.5 s to be taken, and the event channel's 0.1 s (the Mac's 13 Nov brief, item 2). A few dozen
+/// wake-ups until the phone connects, typically under a second.
+const ACCEPT_POLL: Duration = Duration::from_millis(10);
+
 /// How long after the phone tears down its screen stream we wait for it to set one up again before
 /// asking for its UI ([`AvSession::nudge_screen_back`]).
 ///
@@ -501,6 +506,10 @@ const SHUTDOWN_POLL: Duration = Duration::from_millis(500);
 /// 7 then paid the whole wait, the largest spread left in a connect. A phone that sets its screen up again does so
 /// within about 30 ms (bench 2026-11-02), and a requestUI it did not need is the one RECORD sends anyway.
 const SCREEN_NUDGE_AFTER: Duration = Duration::from_millis(500);
+
+/// The bench flag that swallows the first screen nudge's requestUI once (it is removed when used), so the second
+/// fires on cue (the Mac's 13 Nov bench-hooks brief, item 6). /tmp only; nothing in the product writes it.
+const BENCH_SKIP_FIRST_REQUESTUI: &str = "/tmp/bench_skip_first_requestui";
 
 /// A second requestUI this long after the teardown if the first went unanswered: the 0.5 s one is untested on the
 /// older iOS 15 phone, which answered every 3 s one (11 of 11, 13 Nov); without it the session would keep audio and no
@@ -625,15 +634,27 @@ impl AvSession {
             let mut live: Vec<i64> = crate::plock(&streams).keys().map(|(ty, _)| *ty).collect();
             live.sort_unstable();
             live.dedup();
-            let sent = crate::events::send_request_ui();
-            eprintln!(
-                "[session] no screen stream {} ms after the phone tore it down (streams live: {live:?}) — asked for its UI again (requestUI={sent})",
-                torn.elapsed().as_millis()
-            );
+            // Bench only (docs/ops/02_TESTING.md): skip this first requestUI once, so the second one can be checked. The
+            // flag is set unless absent or "off" (box_common::bench_flag), and is removed when used.
+            if box_common::bench_flag(BENCH_SKIP_FIRST_REQUESTUI) {
+                let _ = std::fs::remove_file(BENCH_SKIP_FIRST_REQUESTUI);
+                eprintln!(
+                    "[bench] no screen stream {} ms after the phone tore it down (streams live: {live:?}) — first nudge skipped by {BENCH_SKIP_FIRST_REQUESTUI}: the second comes at 3 s",
+                    torn.elapsed().as_millis()
+                );
+            } else {
+                crate::startup::nudged(false);
+                let sent = crate::events::send_request_ui();
+                eprintln!(
+                    "[session] no screen stream {} ms after the phone tore it down (streams live: {live:?}) — asked for its UI again (requestUI={sent})",
+                    torn.elapsed().as_millis()
+                );
+            }
             thread::sleep(SCREEN_NUDGE_AGAIN.saturating_sub(torn.elapsed()));
             if !alive.load(Ordering::Acquire) || screen_stream_live(&streams) {
                 return;
             }
+            crate::startup::nudged(true);
             let sent = crate::events::send_request_ui();
             eprintln!(
                 "[session] still no screen stream {} ms after the phone tore it down — asked for its UI a second time (requestUI={sent})",
@@ -861,7 +882,7 @@ impl AvSession {
         // videoPlayback: route A (probe.rs), always offered. The SETUP-response half of
         // offering video in the CarPlay session; the /info half is `videoPlaybackInfo` +
         // `playbackCapabilities` (info.rs). Echoed only when the phone proposed it
-        // (Scott's iPhone does, iOS 27.2, 10 Nov), so a plain session's echo is unchanged.
+        // (the owner's iPhone does, iOS 27.2, 10 Nov), so a plain session's echo is unchanged.
         if echo_video {
             feats.push(Value::String("videoPlayback".into()));
             crate::probe::line(format_args!("SETUP phase1: echoing videoPlayback, which the phone proposed"));
@@ -2092,7 +2113,9 @@ impl SessionDelegate for AvSession {
         if let Some(listener) = self.event_listener.take() {
             listener.set_nonblocking(true).ok();
             let mut accepted = false;
-            for _ in 0..50 {
+            // 5 s by the clock, as 50 x 100 ms was, now that each wait is [`ACCEPT_POLL`].
+            let accept_until = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < accept_until {
                 match listener.accept() {
                     Ok((stream, peer)) => {
                         eprintln!("[session] RECORD: event channel accepted from {peer}");
@@ -2137,7 +2160,7 @@ impl SessionDelegate for AvSession {
                         break;
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(std::time::Duration::from_millis(100));
+                        thread::sleep(ACCEPT_POLL);
                     }
                     Err(e) => {
                         eprintln!("[session] RECORD: event accept error: {e}");
@@ -2512,7 +2535,7 @@ fn spawn_screen(
                     if !alive.load(Ordering::Acquire) {
                         return;
                     }
-                    thread::sleep(SHUTDOWN_POLL);
+                    thread::sleep(ACCEPT_POLL);
                 }
                 Err(e) => {
                     eprintln!("[screen] accept failed: {e}");

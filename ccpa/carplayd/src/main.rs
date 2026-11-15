@@ -1602,8 +1602,9 @@ fn run_pairing_server() -> io::Result<()> {
     // listening. It is handed the identity rather than re-deriving it: the advertised deviceid/pi
     // must equal the ones `Identity` above verifies with, and two processes reading the same env
     // vars was the only thing that ever kept them in step.
-    // The one phone this carplayd serves (`phone_gate`): btd names it at each Wi-Fi handoff. Discovery
-    // leaves alone a phone refused at SETUP; the accept thread drops its connections, and does not let
+    // The one phone this carplayd serves (`phone_gate`): btd names it at each Wi-Fi handoff, and as a bonded
+    // phone's Bluetooth session starts while no CarPlay session is up. Discovery dials it when the name
+    // changes, and leaves alone a phone refused at SETUP; the accept thread drops its connections, and does not let
     // another address preempt the named phone's session.
     let gate = std::sync::Arc::new(phone_gate::PhoneGate::from_env());
     if gate.armed() {

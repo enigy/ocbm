@@ -436,7 +436,7 @@ struct CarPlayWatch {
 }
 
 /// When `/tmp/carplay_transport` was last written, while it says a wireless carplayd is live. `None` = none is.
-fn read_carplayd() -> Option<SystemTime> {
+pub(crate) fn read_carplayd() -> Option<SystemTime> {
     let written = std::fs::metadata(CARPLAY_TRANSPORT_FILE).and_then(|m| m.modified()).ok()?;
     let token = std::fs::read_to_string(CARPLAY_TRANSPORT_FILE).ok()?;
     (token.trim() == "wireless").then_some(written)
@@ -456,6 +456,24 @@ fn read_ident() -> Ident {
     let written = std::fs::metadata(PHONE_IDENT_FILE).and_then(|m| m.modified()).ok()?;
     let named = std::fs::read_to_string(PHONE_IDENT_FILE).ok().and_then(|s| ident_device(&s));
     Some((written, named))
+}
+
+/// Whether a wireless CarPlay session is up or coming up in carplayd: it has published a phone's identity
+/// (from that phone's SETUP to its session's end), or holds a phone's control connection
+/// ([`carplayd_connected`]). btd names a phone early only while neither (`av::name_at_session_start`).
+pub(crate) fn carplay_session_up() -> bool {
+    read_ident().is_some() || carplayd_connected()
+}
+
+/// Whether carplayd holds a phone's control connection: the transport flag in its own hand, not btd's claim
+/// (`av::claimed_at`). carplayd writes it at each connection and removes it when the session ends.
+pub(crate) fn carplayd_connected() -> bool {
+    carplayd_live(read_carplayd(), SystemTime::UNIX_EPOCH, crate::av::claimed_at())
+}
+
+/// The phone whose CarPlay session is live, by carplayd's identity; `None` = none, or it names no phone.
+pub(crate) fn carplay_phone() -> Option<[u8; 6]> {
+    read_ident().and_then(|(_, phone)| phone)
 }
 
 /// Whether carplayd took a SETUP from `w`'s phone since its session started: the identity file was
@@ -755,6 +773,14 @@ impl Control {
             *p = Some((watch.addr, now + PASS_OVER));
         }
         true
+    }
+
+    /// Test only: `addr` passed over for [`PASS_OVER`], as [`Control::switch_stranded`] leaves a stranded phone.
+    #[cfg(test)]
+    pub(crate) fn pass_over(&self, addr: [u8; 6]) {
+        if let Ok(mut p) = self.passed_over.lock() {
+            *p = Some((addr, Instant::now() + PASS_OVER));
+        }
     }
 
     /// The phone [`Control::switch_stranded`] ended, while it is passed over.
@@ -1434,7 +1460,7 @@ mod tests {
         assert_eq!(c.take_request(), Some(Some([0x11, 0x22, 0x33, 0x44, 0x55, 0x66])));
     }
 
-    const PHONE_A: [u8; 6] = [0x10, 0x25, 0x00, 0x29, 0xA7, 0x68];
+    const PHONE_A: [u8; 6] = [0x0A, 0x00, 0x00, 0x00, 0x00, 0x02];
     const PHONE_B: [u8; 6] = [0xDE, 0x6A, 0x00, 0x00, 0x00, 0x00];
 
     /// A Control with `peer`'s session live, as `SessionClaim` leaves it.
@@ -1770,7 +1796,7 @@ mod tests {
         assert_eq!(parse_hold(&line, 50_000), None, "lapsed at its deadline");
         assert_eq!(parse_hold(&line, 60_000), None);
         assert_eq!(parse_hold(&hold_line(&PHONE_A, 46_001), 1_000), None, "more than a whole hold is not ours");
-        assert_eq!(parse_hold("68:A7:29:00:25:10", 0), None, "no deadline");
+        assert_eq!(parse_hold("02:00:00:00:00:0A", 0), None, "no deadline");
         assert_eq!(parse_hold("not-an-address 5000", 0), None);
         assert_eq!(parse_hold("", 0), None);
 
@@ -1784,7 +1810,7 @@ mod tests {
 
     #[test]
     fn the_identity_document_names_its_phone() {
-        let json = r#"{"name":"Owner\"s iPhone","deviceID":"68:A7:29:00:25:10","model":"iPhone17,1","osName":"iPhone OS","osVersion":"27.1"}"#;
+        let json = r#"{"name":"Owner\"s iPhone","deviceID":"02:00:00:00:00:0A","model":"iPhone17,1","osName":"iPhone OS","osVersion":"27.1"}"#;
         assert_eq!(ident_device(json), Some(PHONE_A));
         assert_eq!(ident_device(r#"{"name":"x","deviceID":"","model":""}"#), None);
         assert_eq!(ident_device("{}"), None);
@@ -1810,7 +1836,7 @@ mod tests {
         assert!(!c.restart_requested());
         assert_eq!(c.take_request(), None);
         // Over the socket: no link keys in a test run, so any address is unbonded.
-        assert!(handle_request(&c, r#"{"cmd":"switch","address":"68:A7:29:00:25:10"}"#).contains("not bonded"));
+        assert!(handle_request(&c, r#"{"cmd":"switch","address":"02:00:00:00:00:0A"}"#).contains("not bonded"));
         assert!(handle_request(&c, r#"{"cmd":"switch","address":"nope"}"#).contains("bad address"));
         assert!(handle_request(&c, r#"{"cmd":"switch"}"#).contains("\"ok\":false"));
         assert!(!c.restart_requested());

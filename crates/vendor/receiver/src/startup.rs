@@ -3,7 +3,7 @@
 //! each as +ms from the host's arrival. A drive log then carries the truck's own connect time (the Mac's 13 Nov
 //! brief). Nothing is printed for a session btd didn't note (a wired one), or for a record from an older session.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 /// btd's record of this session's stages (`wireless::startup::MARKS`).
 pub const MARKS: &str = "/tmp/startup_marks";
@@ -12,6 +12,18 @@ pub const MARKS: &str = "/tmp/startup_marks";
 const STALE_MS: u64 = 10 * 60 * 1000;
 
 static PRINTED: AtomicBool = AtomicBool::new(false);
+/// This carplayd's screen nudges (`session.rs` nudge_screen_back): the 0.5 s one and the 3 s one.
+static NUDGES: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
+
+/// The box log, scanned from where it stood when the host came (btd's `boxlog_at` mark) for the
+/// PSK-mismatch lines since then (C-2). Bounded: at most [`SCAN_MAX`] bytes are read.
+const BOX_LOG: &str = "/tmp/box.log";
+const SCAN_MAX: u64 = 512 * 1024;
+
+/// A screen nudge sent: the first (0.5 s) or the second (3 s).
+pub fn nudged(second: bool) {
+    NUDGES[usize::from(second)].fetch_add(1, Ordering::Relaxed);
+}
 
 /// The first video frame went to the host: print the line, once per carplayd (one per session).
 pub fn first_frame() {
@@ -19,9 +31,79 @@ pub fn first_frame() {
         return;
     }
     let now = now_ms();
-    if let Some(line) = std::fs::read_to_string(MARKS).ok().and_then(|m| summary(&m, now)) {
-        eprintln!("[startup] {line}");
-    }
+    let Ok(marks) = std::fs::read_to_string(MARKS) else { return };
+    let Some(line) = summary(&marks, now) else { return };
+    let at = mark_value(&marks, "boxlog_at").unwrap_or(0);
+    let head = mark_word(&marks, "boxlog_head");
+    let nudges = [NUDGES[0].load(Ordering::Relaxed), NUDGES[1].load(Ordering::Relaxed)];
+    eprintln!("[startup] {line}{}", counts(&marks, nudges, psk_mismatches(BOX_LOG, at, head)));
+}
+
+/// The counts, for the Mac's bench to read one line per session (its 13 Nov bench-hooks brief, item 8): since the host came,
+/// btd's timed-out pages and resets (and of those, the ones cut for no SDP channel after the answer) and the phone's
+/// PSK-mismatch tries at the access point; this session's, this carplayd's nudges. btd's record runs from the host's
+/// arrival, over every phone session under it, so a later session's line counts the earlier ones' too (the Mac's 2.6.0 review,
+/// BH-1).
+fn counts(marks: &str, nudges: [u32; 2], psk: Option<Psk>) -> String {
+    let tally = |what: &str| marks.lines().filter(|l| l.split_whitespace().eq(["tally", what])).count();
+    format!(
+        "; since the host came: absent pages {}, resets {} ({} cut, no SDP channel), PSK mismatches {}; this session: nudges {}+{}",
+        tally("absent"),
+        tally("reset"),
+        tally("sdp_cut"),
+        match psk {
+            None => "-".to_string(),
+            Some(Psk { count, cut: true }) => format!(">={count} (box.log cut)"),
+            Some(Psk { count, cut: false }) => count.to_string(),
+        },
+        nudges[0],
+        nudges[1],
+    )
+}
+
+/// The PSK-mismatch count since the host came, and whether the box log was cut since the host came: ocbmd empties it at its cap,
+/// and the lines between the host and the cut are gone, so the count is then a lower bound (the Mac's review, BH-06).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Psk {
+    count: usize,
+    cut: bool,
+}
+
+/// hostapd's AP-STA-POSSIBLE-PSK-MISMATCH lines in the box log after byte `from`, its size when the host came, or all of
+/// it when it was cut since: shorter than `from`, or its first bytes no longer `head` (btd's `boxlog_head`, hex), as when
+/// it was emptied and grew past `from` again. None when it can't be read.
+fn psk_mismatches(path: &str, from: u64, head: Option<&str>) -> Option<Psk> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    let mut first = vec![0u8; head.map_or(0, |h| h.len() / 2)];
+    let n = f.read(&mut first).ok()?;
+    let cut = from > len || head.is_some_and(|h| hex(&first[..n]) != h);
+    let start = if cut { 0 } else { from.max(len.saturating_sub(SCAN_MAX)) };
+    f.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = Vec::new();
+    f.take(SCAN_MAX).read_to_end(&mut buf).ok()?;
+    Some(Psk { count: String::from_utf8_lossy(&buf).matches("AP-STA-POSSIBLE-PSK-MISMATCH").count(), cut })
+}
+
+/// Lower-case hex, as btd writes `boxlog_head`.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A mark's first word after its name, as text.
+fn mark_word<'a>(marks: &'a str, stage: &str) -> Option<&'a str> {
+    marks.lines().find_map(|l| {
+        let mut w = l.split_whitespace();
+        (w.next() == Some(stage)).then(|| w.next()).flatten()
+    })
+}
+
+fn mark_value(marks: &str, stage: &str) -> Option<u64> {
+    marks.lines().find_map(|l| {
+        let mut w = l.split_whitespace();
+        (w.next() == Some(stage)).then(|| w.next().and_then(|v| v.parse::<u64>().ok())).flatten()
+    })
 }
 
 /// The line for `marks` with the first frame at `frame_ms`, or None without a recent host arrival and a handoff.
@@ -38,8 +120,20 @@ fn summary(marks: &str, frame_ms: u64) -> Option<String> {
         return None;
     }
     let off = |stage: &str| at(stage).map_or_else(|| "-".to_string(), |t| format!("+{} ms", t.saturating_sub(start)));
+    // The adapter's uptime when the host came and the boot preload's state then: whether the head unit beat it.
+    let word = |stage: &str| {
+        marks.lines().find_map(|l| {
+            let mut w = l.split_whitespace();
+            (w.next() == Some(stage)).then(|| w.next().map(str::to_string)).flatten()
+        })
+    };
+    let boot = match (at("host_uptime"), word("preload")) {
+        (Some(u), Some(p)) => format!(" (adapter up {}.{} s, preload {p})", u / 1000, u % 1000 / 100),
+        (None, Some(p)) => format!(" (preload {p})"),
+        _ => String::new(),
+    };
     Some(format!(
-        "host present +0 ms, Bluetooth up {}, phone connected {}, Wi-Fi handoff {}, first frame +{} ms",
+        "host present +0 ms{boot}, Bluetooth up {}, phone connected {}, Wi-Fi handoff {}, first frame +{} ms",
         off("bt_up"),
         off("phone"),
         off("handoff"),
@@ -66,6 +160,53 @@ mod tests {
             summary(marks, 27100).as_deref(),
             Some("host present +0 ms, Bluetooth up +10900 ms, phone connected +19200 ms, Wi-Fi handoff +21800 ms, first frame +26100 ms")
         );
+    }
+
+    #[test]
+    fn the_line_says_when_the_adapter_came_up_and_where_the_preload_was() {
+        let marks = "host_present 1000\npreload running\nhost_uptime 4270\nhandoff 5000\n";
+        assert_eq!(
+            summary(marks, 9000).as_deref(),
+            Some("host present +0 ms (adapter up 4.2 s, preload running), Bluetooth up -, phone connected -, Wi-Fi handoff +4000 ms, first frame +8000 ms")
+        );
+    }
+
+    #[test]
+    fn the_session_counts_read_from_the_tallies_and_this_process() {
+        let marks = "host_present 1000\ntally absent\ntally reset\ntally sdp_cut\ntally absent\nhandoff 5000\n";
+        assert_eq!(
+            counts(marks, [1, 0], Some(Psk { count: 2, cut: false })),
+            "; since the host came: absent pages 2, resets 1 (1 cut, no SDP channel), PSK mismatches 2; this session: nudges 1+0"
+        );
+        assert_eq!(
+            counts("host_present 1\n", [0, 0], None),
+            "; since the host came: absent pages 0, resets 0 (0 cut, no SDP channel), PSK mismatches -; this session: nudges 0+0"
+        );
+        assert_eq!(summary(marks, 9000).as_deref().map(|l| l.contains("tally")), Some(false), "tallies are no stage");
+    }
+
+    /// BH-06: a box log ocbmd rotated since the host came (emptied at its cap) gives a lower bound, said as one; one
+    /// that only grew is counted from where it stood.
+    #[test]
+    fn a_box_log_cut_since_the_host_came_gives_a_lower_bound() {
+        let path = std::env::temp_dir().join(format!("receiver_psk_{}.log", std::process::id()));
+        let p = path.to_str().unwrap();
+        let before = "[ocbmd] up\nwlan0: AP-STA-POSSIBLE-PSK-MISMATCH 1\n";
+        let head = hex(&before.as_bytes()[..32]);
+        let from = before.len() as u64;
+        std::fs::write(&path, format!("{before}wlan0: AP-STA-POSSIBLE-PSK-MISMATCH 2\nwlan0: AP-STA-POSSIBLE-PSK-MISMATCH 3\n")).unwrap();
+        assert_eq!(psk_mismatches(p, from, Some(&head)), Some(Psk { count: 2, cut: false }), "only this session's");
+        std::fs::write(&path, "AP-STA-POSSIBLE-PSK-MISMATCH\n").unwrap();
+        assert_eq!(psk_mismatches(p, from, None), Some(Psk { count: 1, cut: true }), "shorter than it was: cut");
+        let grown = format!("[log] rotated 262144 bytes\n{}wlan0: AP-STA-POSSIBLE-PSK-MISMATCH 5\n", "x".repeat(200));
+        std::fs::write(&path, grown).unwrap();
+        assert_eq!(psk_mismatches(p, from, Some(&head)), Some(Psk { count: 1, cut: true }), "grown past it again: cut");
+        assert_eq!(
+            counts("", [0, 0], Some(Psk { count: 1, cut: true })),
+            "; since the host came: absent pages 0, resets 0 (0 cut, no SDP channel), PSK mismatches >=1 (box.log cut); this session: nudges 0+0"
+        );
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(psk_mismatches(p, 0, None), None, "no log");
     }
 
     #[test]

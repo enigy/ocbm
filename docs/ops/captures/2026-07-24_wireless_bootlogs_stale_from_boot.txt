@@ -16,7 +16,7 @@ File downloaded:        0:  160900File downloaded:       16:  160900File downloa
 Download Complete
 time:2559
 CTS is low
-	BD Address: 38:BA:B0:7D:D3:8D ACL MTU: 1021:7 SCO MTU: 120:6
+	BD Address: 02:00:00:00:D3:8D ACL MTU: 1021:7 SCO MTU: 120:6
 < HCI Command: ogf 0x3f, ocf 0x001d, plen 1
   00 
 > HCI Event: 0x0e plen 4
@@ -28,7 +28,7 @@ CTS is low
 < HCI Command: ogf 0x03, ocf 0x0003, plen 0
 > HCI Event: 0x0e plen 4
   01 03 0C 00 
-[attach_bluetooth] hci0 up: 38:ba:b0:7d:d3:8d
+[attach_bluetooth] hci0 up: 02:00:00:00:d3:8d
 X check_hciattach_done_ms 2800!
 process 614: Attempt to remove filter function 0x17add user data 0x160c748, but no such filter has been added
   D-Bus not built with -rdynamic so unable to print a backtrace
@@ -59,7 +59,7 @@ killall: sdpd: no process killed
 [ssp-agent] pairing mode: NUMERIC COMPARISON (DisplayYesNo) — a 6-digit code will be shown to match
 [ssp-agent] auto-accept pairing agent running
 [wlan_on] insmod mlan/moal
-Setting Wi-Fi MAC address: 00:E0:4C:91:B0:DF
+Setting Wi-Fi MAC address: 02:00:00:00:B0:DF
 Configuration file: /etc/hostapd.conf
 rfkill: Cannot open RFKILL control device
 wlan0: interface state UNINITIALIZED->COUNTRY_UPDATE
@@ -72,7 +72,7 @@ wlan0: interface state UNINITIALIZED->COUNTRY_UPDATE
 2020-01-02 02:12:33.515: error, Unable to open /var/lib/udhcpd.leases for reading
 2020-01-02 02:12:33.516: info, wlan0 (our ip) = 192.168.43.1
 2020-01-02 02:12:33.516: info, adapter index 4
-2020-01-02 02:12:33.516: info, adapter hardware address 00:e0:4c:91:b0:df
+2020-01-02 02:12:33.516: info, adapter hardware address 02:00:00:00:b0:df
 2020-01-02 02:12:33.520: info, Opening listen socket on 0x00000000:67 wlan0
 [start_bluetooth_wifi] AP up: ssid=ccpa-b0df ip=192.168.43.1 ch=36 hostapd=1 udhcpd=1
 [wlan_on] SSID=ccpa-b0df inet addr:192.168.43.1  hostapd=1
