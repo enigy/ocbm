@@ -39,23 +39,25 @@ pub fn first_frame() {
     eprintln!("[startup] {line}{}", counts(&marks, nudges, psk_mismatches(BOX_LOG, at, head)));
 }
 
-/// This session's counts, for the Mac's bench to read one line per session (its 13 Nov bench-hooks brief, item 8): btd's
-/// timed-out pages and resets (and of those, the ones cut for no SDP channel after the answer), this carplayd's nudges, and the
-/// phone's PSK-mismatch tries at the access point.
+/// The counts, for the Mac's bench to read one line per session (its 13 Nov bench-hooks brief, item 8): since the host came,
+/// btd's timed-out pages and resets (and of those, the ones cut for no SDP channel after the answer) and the phone's
+/// PSK-mismatch tries at the access point; this session's, this carplayd's nudges. btd's record runs from the host's
+/// arrival, over every phone session under it, so a later session's line counts the earlier ones' too (the Mac's 2.6.0 review,
+/// BH-1).
 fn counts(marks: &str, nudges: [u32; 2], psk: Option<Psk>) -> String {
     let tally = |what: &str| marks.lines().filter(|l| l.split_whitespace().eq(["tally", what])).count();
     format!(
-        "; this session: absent pages {}, resets {} ({} cut, no SDP channel), nudges {}+{}, PSK mismatches {}",
+        "; since the host came: absent pages {}, resets {} ({} cut, no SDP channel), PSK mismatches {}; this session: nudges {}+{}",
         tally("absent"),
         tally("reset"),
         tally("sdp_cut"),
-        nudges[0],
-        nudges[1],
         match psk {
             None => "-".to_string(),
             Some(Psk { count, cut: true }) => format!(">={count} (box.log cut)"),
             Some(Psk { count, cut: false }) => count.to_string(),
-        }
+        },
+        nudges[0],
+        nudges[1],
     )
 }
 
@@ -174,11 +176,11 @@ mod tests {
         let marks = "host_present 1000\ntally absent\ntally reset\ntally sdp_cut\ntally absent\nhandoff 5000\n";
         assert_eq!(
             counts(marks, [1, 0], Some(Psk { count: 2, cut: false })),
-            "; this session: absent pages 2, resets 1 (1 cut, no SDP channel), nudges 1+0, PSK mismatches 2"
+            "; since the host came: absent pages 2, resets 1 (1 cut, no SDP channel), PSK mismatches 2; this session: nudges 1+0"
         );
         assert_eq!(
             counts("host_present 1\n", [0, 0], None),
-            "; this session: absent pages 0, resets 0 (0 cut, no SDP channel), nudges 0+0, PSK mismatches -"
+            "; since the host came: absent pages 0, resets 0 (0 cut, no SDP channel), PSK mismatches -; this session: nudges 0+0"
         );
         assert_eq!(summary(marks, 9000).as_deref().map(|l| l.contains("tally")), Some(false), "tallies are no stage");
     }
@@ -201,7 +203,7 @@ mod tests {
         assert_eq!(psk_mismatches(p, from, Some(&head)), Some(Psk { count: 1, cut: true }), "grown past it again: cut");
         assert_eq!(
             counts("", [0, 0], Some(Psk { count: 1, cut: true })),
-            "; this session: absent pages 0, resets 0 (0 cut, no SDP channel), nudges 0+0, PSK mismatches >=1 (box.log cut)"
+            "; since the host came: absent pages 0, resets 0 (0 cut, no SDP channel), PSK mismatches >=1 (box.log cut); this session: nudges 0+0"
         );
         let _ = std::fs::remove_file(&path);
         assert_eq!(psk_mismatches(p, 0, None), None, "no log");

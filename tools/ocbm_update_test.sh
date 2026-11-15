@@ -296,6 +296,21 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   update "$sh" "$d"; rc=$?
   check '[ $rc = 0 ] && grep -qx placed "$d/root/etc/ocbm/update_pending" && grep -q "\[bench\] placing 1.0.0 over 1.0.0" "$d/run/box.log"' \
     "with /tmp/bench_update_any_version the same version is placed, and says so"
+  # The Mac's 2.6.0 review, BH-3: the flag passes the version check only; a later refusal leaves no "placing" line.
+  d="$T/$sh-r-bench-room"; make_box "$d" final; NEW_SAVE="$NEW"; NEW="1.0.0 ocbm again"; make_pkg "$d/run/ocbm-update.tgz" ""; NEW="$NEW_SAVE"
+  : > "$d/run/bench_update_any_version"
+  refusal "the bench flag, then too little flash: refused" "Not enough flash" FAKE_FREE_KB=300
+  check '! grep -q "\[bench\] placing" "$d/run/box.log"' "and no [bench] placing line for it"
+  d="$T/$sh-r-bench-from"; make_box "$d" final; NEW_SAVE="$NEW"; NEW="1.0.0 ocbm again"; make_pkg "$d/run/ocbm-update.tgz" "" 1.0.5; NEW="$NEW_SAVE"
+  : > "$d/run/bench_update_any_version"
+  refusal "the bench flag, then an adapter older than FROM_MIN: refused" "updates OCBM 1.0.5 or newer"
+  check '! grep -q "\[bench\] placing" "$d/run/box.log"' "and no [bench] placing line for it"
+  d="$T/$sh-bench-older"; make_box "$d" final; NEW_SAVE="$NEW"; NEW="0.9.0 ocbm older"; make_pkg "$d/run/ocbm-update.tgz" "" 0.9.0; NEW="$NEW_SAVE"
+  refusal "an older VERSION, no flag: refused" "already runs OCBM 1.0.0; this package is 0.9.0"
+  : > "$d/run/bench_update_any_version"
+  update "$sh" "$d"; rc=$?
+  check '[ $rc = 0 ] && grep -qx placed "$d/root/etc/ocbm/update_pending" && grep -q "\[bench\] placing 0.9.0 over 1.0.0" "$d/run/box.log"' \
+    "with the flag an older VERSION is placed, and says so"
   d="$T/$sh-r-older"; make_box "$d" final; make_pkg "$d/run/ocbm-update.tgz" "" 1.0.5
   refusal "an adapter older than FROM_MIN" "updates OCBM 1.0.5 or newer"
   d="$T/$sh-r-lacks"; make_box "$d" final; make_pkg "$d/run/ocbm-update.tgz" "" 1.0.0 usr/sbin/ocbmd

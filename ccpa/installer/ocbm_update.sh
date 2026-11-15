@@ -144,12 +144,14 @@ have_line=$(head -1 "$EO/installed_version" 2>/dev/null)
 have=$(first "$have_line")
 [ -n "$have" ] || refuse "The adapter does not say which OCBM it runs (/etc/ocbm/installed_version)."
 # Bench only (docs/ops/02_TESTING.md): with $RUN/bench_update_any_version (/tmp; nothing in the product writes it) a
-# package of the same or an older VERSION is placed too, as the Mac's bench builds keep 2.0.0 with new code. Every
-# other check stands. Set when the file exists and does not read "off" (Carlink clears a flag by writing "off").
+# package of the same or an older VERSION is placed too, as the Mac's bench builds keep the last published version with
+# new code. Every other check stands, and its "[bench] placing" line is logged only once they have all passed (the
+# Mac's 2.6.0 review, BH-3). Set when the file exists and does not read "off" (Carlink clears a flag by writing "off").
 bench_flag() { [ -e "$1" ] && [ "$(tr -d ' \t\r\n' < "$1" 2>/dev/null)" != off ]; }
+bench_over=""
 if ! newer "$new" "$have"; then
   bench_flag "$RUN/bench_update_any_version" || refuse "The adapter already runs OCBM $have; this package is $new."
-  log "[bench] placing $new over $have ($RUN/bench_update_any_version)"
+  bench_over="[bench] placing $new over $have ($RUN/bench_update_any_version)"
 fi
 newer "$from_min" "$have" && refuse "This package updates OCBM $from_min or newer; the adapter runs $have."
 
@@ -167,6 +169,7 @@ done < "$WORK/SHA256SUMS"
 if [ ! -s "$list" ]; then   # a new version number with no new files
   { echo "$VER" > "$EO/installed_version.new" && mv -f "$EO/installed_version.new" "$EO/installed_version"; } \
     || refuse "Could not write /etc/ocbm/installed_version."
+  [ -z "$bench_over" ] || log "$bench_over"
   result "committed $VER (from $have_line): no files changed"
   log "nothing to place: the adapter's files already match $VER"
   rm -f "$S/radio_preload_off" "$S/.radio_preload_inflight" "$S/.radio_preload_unfinished"   # a new version starts it on
@@ -180,6 +183,7 @@ free=${FAKE_FREE_KB:-$(free_kb "$ROOT/")}
 log "updating $have_line to $VER: $(wc -l < "$list") files, ~$need_kb KB on flash; $free KB free, $RESERVE_KB KB kept spare"
 [ "$free" -ge $((need_kb + RESERVE_KB)) ] \
   || refuse "Not enough flash: $free KB free, and the update needs about $need_kb KB plus $RESERVE_KB KB spare. The files it replaces stay until it passes its self-test, so it can always be undone."
+[ -z "$bench_over" ] || log "$bench_over"
 
 step place
 while read -r want rel; do

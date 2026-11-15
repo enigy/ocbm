@@ -340,13 +340,15 @@ can write but not delete, so it clears one by writing `off`. From a debug build:
   BT_CONNECTED) before it cuts the connect; 700 without it, or with `off`. Read at each page; a window not the
   default logs a `[bench]` line. The env lever `BT_SDP_AFTER_ACL_MS` wins over it.
 - `/tmp/bench_update_any_version`: `ocbm_update.sh` places a package whose VERSION is the same as or older than
-  `installed_version` (bench builds keep 2.0.0 with new code), so the bench flashes by update instead of the stick.
-  Every other check stands: the sums, product, chip, mode, FROM_MIN, room and the journal.
+  `installed_version` (bench builds keep the last published version with new code), so the bench flashes by update
+  instead of the stick. Every other check stands: the sums, product, chip, mode, FROM_MIN, room and the journal; a
+  package one of them refuses logs no `[bench] placing` line.
 
-The box `[startup]` line ends with the session's counts: `; this session: absent pages N, resets N (N cut, no SDP channel),
-nudges first+second, PSK mismatches N`. The phantom's pages count as absent. When ocbmd rotated `box.log` (it empties
-it at its cap) between the host's arrival and the first frame, the PSK count is a lower bound: `PSK mismatches >=N
-(box.log cut)`.
+The box `[startup]` line ends with counts: `; since the host came: absent pages N, resets N (N cut, no SDP channel), PSK
+mismatches N; this session: nudges first+second`. btd's counts and the PSK count run from the host's arrival, over every
+phone session under it, so a second session's line counts the first's too; the nudges are that session's carplayd's.
+The phantom's pages count as absent. When ocbmd rotated `box.log` (it empties it at its cap) between the host's arrival
+and the first frame, the PSK count is a lower bound: `PSK mismatches >=N (box.log cut)`.
 
 ### Release gate — OCBM 1.0.5, the CarPlay-only cleanup (8 Nov 2026)
 

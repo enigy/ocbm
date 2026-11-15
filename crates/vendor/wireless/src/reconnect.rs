@@ -861,9 +861,12 @@ fn run_loop(env: &impl Env, ctrl: &Control) {
                     if phantom.is_some() && !rest {
                         log("[bench] the phantom first phone is in this round (/tmp/bench_phantom_first)");
                     }
-                    round_bonds = round_order.clone().unwrap_or_else(|| {
-                        phantom.into_iter().chain(bonds.iter().copied().filter(|b| Some(*b) != phantom)).collect()
-                    });
+                    round_bonds = match round_order.clone() {
+                        // An applied order holds the phantom of the pass it was built in: a pass without it (a Connect
+                        // from the device screen, or the flag gone) pages only its bonds (the Mac's 2.6.0 review, BH-4).
+                        Some(order) => order.into_iter().filter(|b| bonds.contains(b) || Some(*b) == phantom).collect(),
+                        None => phantom.into_iter().chain(bonds.iter().copied().filter(|b| Some(*b) != phantom)).collect(),
+                    };
                     rounds.order(round_bonds.clone(), |b| ctrl.call_order(b))
                 }
             },
@@ -1430,6 +1433,29 @@ mod tests {
         let logs = fake.logs.borrow();
         assert!(logs.iter().any(|l| l.ends_with("dropped: a Connect from the device screen came first")), "{logs:?}");
         assert!(!logs.iter().any(|l| l.contains("applied")), "never applied: {logs:?}");
+    }
+
+    /// The Mac's 2.6.0 review, BH-4: an order applied in a round with the phantom holds it; a Connect from the device screen
+    /// that comes with a policy change during the rest's walk re-plans the rest again, and that pass pages no phantom.
+    #[test]
+    fn a_connect_after_an_applied_order_never_pages_the_phantom() {
+        let ctrl = Control::default();
+        set_order(&ctrl, &[SCOTT, YODA, THIRD]);
+        let c = &ctrl;
+        let mut fake = Fake::new(&ctrl, 1, move |round, peer| {
+            if round == 0 && peer == THIRD {
+                c.request_connect(None);
+                c.set_policy(crate::control::Policy { auto_connect: true, order: vec![YODA, SCOTT, THIRD] });
+            }
+            Attempt::Absent
+        });
+        fake.phantom = Some(super::BENCH_PHANTOM);
+        *fake.bench.borrow_mut() = Some((0, super::BenchOrder { macs: vec![THIRD], after_ms: 0 }));
+        run_loop(&fake, &ctrl);
+        let phantom = crate::control::fmt_addr(&super::BENCH_PHANTOM);
+        let logs = fake.logs.borrow();
+        assert!(logs.iter().any(|l| l.contains("call order applied") && l.contains(&phantom)), "applied with the phantom: {logs:?}");
+        assert_eq!(fake.paged(0), vec![THIRD, SCOTT, YODA], "the order applied before any page, then the Connect's rest: no phantom");
     }
 
     /// /tmp/bench_order: read and removed; "off" is no order and is left; a malformed one is refused and removed.
