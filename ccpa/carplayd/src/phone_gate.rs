@@ -172,9 +172,9 @@ impl PhoneGate {
     }
 
     /// Whether discovery should dial a phone whose `_carplay-ctrl` TXT `id` is `txt_id`. The phone puts
-    /// its BR/EDR address there (bench 2026-11-01: `id=68:a7:29:00:25:10`), the same address btd names,
-    /// so another phone is left alone before anything is dialled (fix 1b). No gate, or no readable id:
-    /// dial, and the SETUP check still applies.
+    /// its BR/EDR address there (bench 2026-11-01: `id=`, lower case with colons), the same address btd
+    /// names, so another phone is left alone before anything is dialled (fix 1b). No gate, or no readable
+    /// id: dial, and the SETUP check still applies.
     pub fn wants(&self, txt_id: Option<&str>) -> bool {
         let mut st = self.lock();
         match (self.expected_now(&mut st), txt_id.and_then(normalize)) {
@@ -277,7 +277,7 @@ impl SessionDelegate for GatedSession {
 mod tests {
     use super::*;
 
-    const OWNER: &str = "68:A7:29:00:25:10";
+    const OWNER: &str = "02:00:00:00:00:0A";
     const OTHER: &str = "AA:BB:CC:00:6A:DE";
 
     fn gate_naming(phone: Option<&str>) -> (PhoneGate, PathBuf) {
@@ -309,7 +309,7 @@ mod tests {
         assert!(gate.is_refused(ip(100)), "discovery leaves it alone");
         assert_eq!(gate.on_connection(ip(100)), Admit::Refused, "and its reconnects are dropped");
         assert_eq!(gate.on_connection(ip(101)), Admit::Accept);
-        assert!(gate.on_setup(2, ip(101), Some("68-a7-29-00-25-10")), "the named phone, in any spelling");
+        assert!(gate.on_setup(2, ip(101), Some("02-00-00-00-00-0a")), "the named phone, in any spelling");
         let _ = std::fs::remove_file(path);
     }
 
@@ -352,9 +352,9 @@ mod tests {
 
     #[test]
     fn discovery_dials_only_the_named_phone_by_its_txt_id() {
-        // 2026-11-01 bench: "_carplay-ctrl TXT: id=68:a7:29:00:25:10 srcvers=1005.13.1".
+        // 2026-11-01 bench: "_carplay-ctrl TXT: id=<its address, lower case> srcvers=1005.13.1".
         let (gate, path) = gate_naming(Some(OWNER));
-        assert!(gate.wants(Some("68:a7:29:00:25:10")), "the TXT spells it in lower case");
+        assert!(gate.wants(Some("02:00:00:00:00:0a")), "the TXT spells it in lower case");
         assert!(!gate.wants(Some(OTHER)), "another phone is never dialled");
         assert!(gate.wants(None), "no id: dial, and the SETUP check decides");
         assert!(gate.wants(Some("not a mac")));
@@ -370,7 +370,7 @@ mod tests {
         let (gate, path) = gate_naming(Some(OWNER));
         assert!(!gate.serving(Some(OWNER)), "no session yet: dial it");
         assert!(gate.on_setup(3, ip(101), Some(OWNER)));
-        assert!(gate.serving(Some("68:a7:29:00:25:10")), "its session is live: leave it alone");
+        assert!(gate.serving(Some("02:00:00:00:00:0a")), "its session is live: leave it alone");
         assert!(!gate.serving(Some(OTHER)), "says nothing about another phone");
         assert!(!gate.serving(None), "nor about a TXT without an id");
         gate.session_ended(3);
@@ -389,7 +389,7 @@ mod tests {
         assert!(gate.serving(Some(OWNER)), "the owner's session is still live: never dialled again");
         assert_eq!(gate.on_connection(ip(102)), Admit::Accept, "with another phone named it does not hold, as before");
         std::fs::write(&path, OWNER).unwrap();
-        assert_eq!(gate.named().as_deref(), Some("68a729002510"));
+        assert_eq!(gate.named().as_deref(), Some("02000000000a"));
         assert!(gate.serving(Some(OWNER)), "named again: still not dialled again");
         assert_eq!(gate.on_connection(ip(102)), Admit::Holding(ip(101)), "and it holds again");
         gate.session_ended(4);
@@ -409,9 +409,9 @@ mod tests {
 
     #[test]
     fn addresses_normalize_however_they_are_spelled() {
-        assert_eq!(normalize(" 68:A7:29:00:25:10\n").as_deref(), Some("68a729002510"));
-        assert_eq!(normalize("68a729002510").as_deref(), Some("68a729002510"));
-        assert_eq!(normalize("68:A7:29:00:25"), None);
-        assert_eq!(normalize("ZZ:A7:29:00:25:10"), None);
+        assert_eq!(normalize(" 02:00:00:00:00:0A\n").as_deref(), Some("02000000000a"));
+        assert_eq!(normalize("02000000000A").as_deref(), Some("02000000000a"));
+        assert_eq!(normalize("02:00:00:00:00"), None);
+        assert_eq!(normalize("ZZ:00:00:00:00:0A"), None);
     }
 }

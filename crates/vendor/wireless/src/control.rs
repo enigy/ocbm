@@ -1454,7 +1454,7 @@ mod tests {
         assert_eq!(c.take_request(), Some(Some([0x11, 0x22, 0x33, 0x44, 0x55, 0x66])));
     }
 
-    const PHONE_A: [u8; 6] = [0x10, 0x25, 0x00, 0x29, 0xA7, 0x68];
+    const PHONE_A: [u8; 6] = [0x0A, 0x00, 0x00, 0x00, 0x00, 0x02];
     const PHONE_B: [u8; 6] = [0xDE, 0x6A, 0x00, 0x00, 0x00, 0x00];
 
     /// A Control with `peer`'s session live, as `SessionClaim` leaves it.
@@ -1790,7 +1790,7 @@ mod tests {
         assert_eq!(parse_hold(&line, 50_000), None, "lapsed at its deadline");
         assert_eq!(parse_hold(&line, 60_000), None);
         assert_eq!(parse_hold(&hold_line(&PHONE_A, 46_001), 1_000), None, "more than a whole hold is not ours");
-        assert_eq!(parse_hold("68:A7:29:00:25:10", 0), None, "no deadline");
+        assert_eq!(parse_hold("02:00:00:00:00:0A", 0), None, "no deadline");
         assert_eq!(parse_hold("not-an-address 5000", 0), None);
         assert_eq!(parse_hold("", 0), None);
 
@@ -1804,7 +1804,7 @@ mod tests {
 
     #[test]
     fn the_identity_document_names_its_phone() {
-        let json = r#"{"name":"Owner\"s iPhone","deviceID":"68:A7:29:00:25:10","model":"iPhone17,1","osName":"iPhone OS","osVersion":"27.1"}"#;
+        let json = r#"{"name":"Owner\"s iPhone","deviceID":"02:00:00:00:00:0A","model":"iPhone17,1","osName":"iPhone OS","osVersion":"27.1"}"#;
         assert_eq!(ident_device(json), Some(PHONE_A));
         assert_eq!(ident_device(r#"{"name":"x","deviceID":"","model":""}"#), None);
         assert_eq!(ident_device("{}"), None);
@@ -1830,7 +1830,7 @@ mod tests {
         assert!(!c.restart_requested());
         assert_eq!(c.take_request(), None);
         // Over the socket: no link keys in a test run, so any address is unbonded.
-        assert!(handle_request(&c, r#"{"cmd":"switch","address":"68:A7:29:00:25:10"}"#).contains("not bonded"));
+        assert!(handle_request(&c, r#"{"cmd":"switch","address":"02:00:00:00:00:0A"}"#).contains("not bonded"));
         assert!(handle_request(&c, r#"{"cmd":"switch","address":"nope"}"#).contains("bad address"));
         assert!(handle_request(&c, r#"{"cmd":"switch"}"#).contains("\"ok\":false"));
         assert!(!c.restart_requested());

@@ -571,7 +571,7 @@ mod tests {
     }
 
     // The Mac's 15 Nov bench: phone A was named, phone B had handed off before.
-    const PHONE_A: &str = "68:a7:29:00:25:10";
+    const PHONE_A: &str = "02:00:00:00:00:0a";
     const PHONE_B: &str = "aa:bb:cc:00:6a:de";
 
     fn gate_naming(phone: &str) -> (PhoneGate, std::path::PathBuf) {

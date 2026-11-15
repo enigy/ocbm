@@ -4915,7 +4915,7 @@ mod tests {
         // then connected, the unchanged text sent nothing and the app never learned it was live.
         let t0 = std::time::UNIX_EPOCH + Duration::from_secs(1_000);
         let t1 = t0 + Duration::from_secs(17);
-        let id = r#"{"name":"iPhone","deviceID":"68:A7:29:00:25:10"}"#;
+        let id = r#"{"name":"iPhone","deviceID":"02:00:00:00:00:0A"}"#;
         assert!(phone_ident_due(id, Some(t0), None, None), "a fresh host is told");
         assert!(!phone_ident_due(id, Some(t0), Some(id), Some(t0)), "nothing new");
         assert!(phone_ident_due(id, Some(t1), Some(id), Some(t0)), "the same phone, a new session");
@@ -4927,8 +4927,8 @@ mod tests {
     fn forgetting_the_idle_phone_leaves_the_live_one_alone() {
         // 2026-11-01 bench: Forget on the idle phone restarted btd and ended the live phone's session.
         let live = |mac: &str| Some((true, mac.to_string()));
-        assert_eq!(forget_way(live("68:A7:29:00:25:10"), "AA:BB:CC:00:6A:DE"), ForgetWay::KeepLive);
-        assert_eq!(forget_way(live("68:A7:29:00:25:10"), "68:a7:29:00:25:10"), ForgetWay::Now, "the live phone itself");
+        assert_eq!(forget_way(live("02:00:00:00:00:0A"), "AA:BB:CC:00:6A:DE"), ForgetWay::KeepLive);
+        assert_eq!(forget_way(live("02:00:00:00:00:0A"), "02:00:00:00:00:0a"), ForgetWay::Now, "the live phone itself");
         assert_eq!(forget_way(live(""), "AA:BB:CC:00:6A:DE"), ForgetWay::Now, "a session btd can't name");
         assert_eq!(forget_way(Some((false, String::new())), "AA:BB:CC:00:6A:DE"), ForgetWay::Now);
         assert_eq!(forget_way(None, "AA:BB:CC:00:6A:DE"), ForgetWay::Now, "btd not answering");
