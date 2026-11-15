@@ -4,14 +4,16 @@
 # pushes it to /tmp/ocbm-update.tgz and sends MGMT_UPDATE, and ccpa/installer/ocbm_update.sh installs
 # it as a trial that falls back to the version it replaced.
 #
-#   tools/make_ocbm_update.sh --from SUMS [OUT_DIR]   # default ~/.cache/carlink-artifacts/ocbm_update
+#   tools/make_ocbm_update.sh --from SUMS [--from SUMS ...] [OUT_DIR]   # default ~/.cache/carlink-artifacts/ocbm_update
 #
-# SUMS is the SHA256SUMS of the version the package updates from (an installer image's tmp/ocbm/
-# SHA256SUMS, or an earlier package's), with that version's VERSION file beside it. The package holds
-# this version's sums for every payload file (SHA256SUMS), but only the files that differ from SUMS
-# (files/), and FROM_MIN names the version SUMS came from: an adapter on it, or on anything between it
-# and this version, takes the package; ocbm_update.sh refuses an older one rather than leave it half
-# updated.
+# One --from for every published version the package updates: the oldest it takes and each one after
+# it. SUMS is that version's SHA256SUMS (an installer image's tmp/ocbm/SHA256SUMS, or its package's),
+# with its VERSION file beside it. The package holds this version's sums for every payload file
+# (SHA256SUMS), but only the files that differ from any of them (files/): builds of an unchanged source
+# differ between toolchains (1.0.5 and 2.0.0 shipped an iap_role_switch that 1.0.1's sums don't name),
+# and an adapter on any of these versions must find in files/ whatever it lacks. FROM_MIN names the
+# oldest given; ocbm_update.sh refuses an older adapter rather than leave it half updated. The build
+# refuses when a published version (a v* or installer-* tag here) from FROM_MIN up has no --from.
 #
 # Room: the files that change, at JFFS2's ~0.7 of their size, plus the 384 KB spare, must fit
 # final_kb in ccpa/installer/update_budget, or the build fails: no adapter could take the package.
@@ -19,7 +21,8 @@
 # trial adapters by finishing their install first (Remove stock firmware), which frees the room.
 #
 # Build the box binaries first (build.sh), as for tools/make_ocbm_installer.sh, whose payload list
-# this uses (--sources). Test hooks (tools/ocbm_update_test.sh): BIN_DIR IRS_BIN INSTALLER_DIR BUDGET.
+# this uses (--sources). Test hooks (tools/ocbm_update_test.sh): BIN_DIR IRS_BIN INSTALLER_DIR BUDGET
+# PUBLISHED (the published versions, in place of the tags).
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INSTALLER_DIR="${INSTALLER_DIR:-$REPO/ccpa/installer}"
@@ -30,19 +33,48 @@ export INSTALLER_DIR
 die() { printf 'make_ocbm_update: %s\n' "$*" >&2; exit 1; }
 sha() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$@"; else shasum -a 256 "$@"; fi; }
 kb_on_flash() { local s; s=$(du -k "$1" | cut -f1); echo $(( (s * 7 + 9) / 10 )); }   # as ocbm_update.sh counts
+vkey() { echo "$1" | awk -F. '{printf "%05d%05d%05d\n", $1, $2, $3}'; }   # X.Y.Z, comparable as text
+older() { [ "$(vkey "$1")" \< "$(vkey "$2")" ]; }
+ver_of() { head -1 "$(dirname "$1")/VERSION" 2>/dev/null | awk '{print $1}'; }
 
-from=""
+froms=()
 OUT="$HOME/.cache/carlink-artifacts/ocbm_update"
 while [ $# -gt 0 ]; do
   case "$1" in
-    --from) from="${2:-}"; shift 2 ;;
+    --from) froms+=("${2:-}"); shift 2 ;;
     -*) die "unknown option $1" ;;
     *) OUT="$1"; shift ;;
   esac
 done
-[ -s "$from" ] || die "usage: make_ocbm_update.sh --from SUMS [OUT_DIR] (SUMS: the SHA256SUMS of the version it updates from)"
-from_ver=$(head -1 "$(dirname "$from")/VERSION" 2>/dev/null | awk '{print $1}')
-[ -n "$from_ver" ] || die "no VERSION beside $from: it names the version the package updates from"
+[ "${#froms[@]}" -gt 0 ] \
+  || die "usage: make_ocbm_update.sh --from SUMS [--from SUMS ...] [OUT_DIR] (SUMS: the SHA256SUMS of each version it updates from)"
+ver=$(head -1 "$INSTALLER_DIR/VERSION" 2>/dev/null)
+[ -n "$ver" ] || die "no $INSTALLER_DIR/VERSION"
+from_vers=" "
+from_ver=""
+for f in "${froms[@]}"; do
+  [ -s "$f" ] || die "no SHA256SUMS at '$f'"
+  v=$(ver_of "$f")
+  [ -n "$v" ] || die "no VERSION beside $f: it names the version those sums are"
+  case "$from_vers" in *" $v "*) die "two --from for OCBM $v" ;; esac
+  older "$v" "$ver" || die "this tree is OCBM $ver, not newer than $v, a version it would update from: bump $INSTALLER_DIR/VERSION"
+  from_vers="$from_vers$v "
+  if [ -z "$from_ver" ] || older "$v" "$from_ver"; then from_ver=$v; fi
+done
+if [ -n "${PUBLISHED+set}" ]; then
+  published=$PUBLISHED
+else
+  published=$(git -C "$REPO" tag -l 'v[0-9]*' 'installer-[0-9]*' 2>/dev/null | sed 's/^v//; s/^installer-//' | sort -u)
+  [ -n "$published" ] || die "no release tags in this checkout (git fetch --tags): they name the published versions"
+fi
+lacking=""
+for p in $published; do
+  older "$p" "$from_ver" && continue
+  older "$p" "$ver" || continue
+  case "$from_vers" in *" $p "*) ;; *) lacking="$lacking $p" ;; esac
+done
+[ -z "$lacking" ] \
+  || die "no --from for published OCBM$lacking: an adapter on it could lack a file the package leaves out (--from each version from $from_ver up)"
 final_kb=$(sed -n 's/^final_kb=//p' "$BUDGET" 2>/dev/null)
 trial_kb=$(sed -n 's/^trial_kb=//p' "$BUDGET" 2>/dev/null)
 [ -n "$final_kb" ] && [ -n "$trial_kb" ] || die "no final_kb and trial_kb in $BUDGET"
@@ -64,20 +96,20 @@ done <<< "$sources"
 changed=0
 need_kb=$RESERVE_KB
 while read -r sum rel; do
-  old=$(awk -v r="$rel" '$2 == r {print $1}' "$from")
-  [ "$old" = "$sum" ] && continue
+  differs=""
+  for f in "${froms[@]}"; do
+    [ "$(awk -v r="$rel" '$2 == r {print $1}' "$f")" = "$sum" ] || differs="$differs $(ver_of "$f")"
+  done
+  [ -n "$differs" ] || continue
   mkdir -p "$stage/pkg/files/$(dirname "$rel")"
   cp -p "$stage/all/$rel" "$stage/pkg/files/$rel"
   need_kb=$((need_kb + $(kb_on_flash "$stage/all/$rel")))
   changed=$((changed + 1))
-  echo "  changed: $rel"
+  echo "  changed: $rel (differs from$differs)"
 done < "$stage/pkg/SHA256SUMS"
 
 rev="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 git -C "$REPO" diff --quiet HEAD 2>/dev/null || rev="$rev-dirty"
-ver=$(head -1 "$INSTALLER_DIR/VERSION" 2>/dev/null)
-[ -n "$ver" ] || die "no $INSTALLER_DIR/VERSION"
-[ "$ver" != "$from_ver" ] || die "this tree is OCBM $ver, the version it would update from: bump $INSTALLER_DIR/VERSION"
 echo "$ver ocbm $rev" > "$stage/pkg/VERSION"
 echo "$from_ver" > "$stage/pkg/FROM_MIN"
 
@@ -104,5 +136,5 @@ stray=$(gzip -dc "$pkg" | tar -tf - | grep -Ev '^(VERSION|FROM_MIN|SHA256SUMS|RO
 stray="$stray$(gzip -dc "$pkg" | tar -tf - | grep -E '(^|/)\._' || true)"
 [ -z "$stray" ] || { rm -f "$pkg"; die "the package holds entries it should not:"$'\n'"$stray"; }
 ( cd "$OUT" && sha "$(basename "$pkg")" > "$(basename "$pkg").sha256" )
-printf 'make_ocbm_update: %s (from %s): %s files changed, about %s KB on flash, trial=%s\n  %s\n  %s\n' \
-  "$ver ocbm $rev" "$from_ver" "$changed" "$need_kb" "$trial" "$pkg" "$(cut -d' ' -f1 "$pkg.sha256")"
+printf 'make_ocbm_update: %s (from %s; checked against%s): %s files changed, about %s KB on flash, trial=%s\n  %s\n  %s\n' \
+  "$ver ocbm $rev" "$from_ver" "${from_vers% }" "$changed" "$need_kb" "$trial" "$pkg" "$(cut -d' ' -f1 "$pkg.sha256")"
