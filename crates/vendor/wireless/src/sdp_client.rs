@@ -287,8 +287,8 @@ fn cut(
 
 /// The link a cut left behind (the Mac's review of 8a3a8b2, item 5): still up after its Disconnect, or its Disconnect
 /// never sent. The next page to that phone would ride it and take it for the phone's own; it is told apart by its
-/// handle, forgotten once a read finds no link to the phone, and its Disconnect is sent again only when it was never
-/// sent, and only by the page right after the cut (`fresh`), since handles are reused.
+/// handle, forgotten once a read finds no link to the phone or a page to it connects, and its Disconnect is sent again
+/// only when it was never sent, and only by the page right after the cut (`fresh`), since handles are reused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LeftLink {
     peer: [u8; 6],
@@ -311,8 +311,37 @@ pub(crate) fn forget_left_link() {
 
 /// Forget the left link for `peer` when a read finds no link to it (`acl`).
 fn forget_gone(left: &mut Option<LeftLink>, peer: [u8; 6], acl: Option<crate::hci::AclInfo>) {
-    if acl.is_none() && left.is_some_and(|l| l.peer == peer) {
+    if acl.is_none() {
+        forget_peer(left, peer);
+    }
+}
+
+/// Forget the left link if it is `peer`'s: one record serves every phone, and another phone's is not this one's to drop.
+fn forget_peer(left: &mut Option<LeftLink>, peer: [u8; 6]) {
+    if left.is_some_and(|l| l.peer == peer) {
         *left = None;
+    }
+}
+
+/// How a page ended, for the left link's record ([`page_ended`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PageEnd {
+    /// The SDP channel came up.
+    Connected,
+    /// Answered, and no SDP channel: [`cut`] noted what it left.
+    Cut,
+    /// Any other failure.
+    Failed,
+}
+
+/// The left link's record after a page to `peer` ended (`end`), `acl` reading the link to it now. A page that connected
+/// rode or brought up the phone's link, so this phone's record goes (the Mac's 2.6.0 review, CS-1); one that failed
+/// otherwise forgets it when no link is left, so the phone's own link later isn't taken for btd's (the review of round 3).
+fn page_ended(left: &mut Option<LeftLink>, peer: [u8; 6], end: PageEnd, acl: impl FnOnce() -> Option<crate::hci::AclInfo>) {
+    match end {
+        PageEnd::Connected => forget_peer(left, peer),
+        PageEnd::Cut => {}
+        PageEnd::Failed => forget_gone(left, peer, acl()),
     }
 }
 
@@ -329,12 +358,14 @@ enum Before {
 }
 
 /// The decision for the link `acl` up to `peer` before a page at `now`, given the last cut's `left` link, which it
-/// updates: a record for this phone whose link is gone, or has another handle, is forgotten.
+/// updates: a record for this phone whose link is gone, or has another handle, is forgotten. Never a resend while a
+/// session is live (`session_live`): its link may be this one (the Mac's review of round 3).
 fn link_before_page(
     peer: [u8; 6],
     acl: Option<crate::hci::AclInfo>,
     left: &mut Option<LeftLink>,
     now: std::time::Instant,
+    session_live: bool,
 ) -> Before {
     let mine = left.filter(|l| l.peer == peer);
     let out = match (acl, mine) {
@@ -344,7 +375,7 @@ fn link_before_page(
         }
         (None, None) => Before::Nothing,
         (Some(a), Some(l)) if l.handle == a.handle => Before::OwnLink {
-            resend: !l.sent && l.fresh && now.saturating_duration_since(l.at) < LEFT_LINK_RESEND,
+            resend: !l.sent && l.fresh && now.saturating_duration_since(l.at) < LEFT_LINK_RESEND && !session_live,
         },
         (Some(_), Some(_)) => {
             *left = None;
@@ -363,12 +394,10 @@ fn link_before_page(
 fn before_page(dev: u16, peer: [u8; 6], session_live: bool) -> Option<&'static str> {
     let acl = crate::hci::acl_info(dev, peer);
     let mut left = LEFT_LINK.lock().unwrap_or_else(|e| e.into_inner());
-    match (link_before_page(peer, acl, &mut left, std::time::Instant::now()), acl) {
+    match (link_before_page(peer, acl, &mut left, std::time::Instant::now(), session_live), acl) {
         (Before::Nothing, _) | (Before::OwnLink { .. }, None) => None,
         (Before::PhonesLink, _) => Some("the link was up before the page"),
         (Before::OwnLink { resend }, Some(a)) => {
-            // A session is live: its link may be this one, so nothing is sent (the Mac's review of round 3).
-            let resend = resend && !session_live;
             log(&format!(
                 "the link up before this page is btd's own from the last cut (handle 0x{:04x}, state {}){}",
                 a.handle,
@@ -399,7 +428,17 @@ fn before_page(dev: u16, peer: [u8; 6], session_live: bool) -> Option<&'static s
 /// Note the link a cut leaves: up after its Disconnect (`sent`), or with none sent; or gone (`up` false).
 fn note_left_link(peer: [u8; 6], handle: u16, up: bool, sent: bool) {
     let mut left = LEFT_LINK.lock().unwrap_or_else(|e| e.into_inner());
-    *left = up.then_some(LeftLink { peer, handle, sent, fresh: true, at: std::time::Instant::now() });
+    note_left(&mut left, peer, handle, up, sent, std::time::Instant::now());
+}
+
+/// [`note_left_link`] on `left`, at `at`: a link still up replaces the record; one that went forgets only this phone's,
+/// so another phone's cut never wipes a record still up for the first (the Mac's 2.6.0 review, CS-1).
+fn note_left(left: &mut Option<LeftLink>, peer: [u8; 6], handle: u16, up: bool, sent: bool, at: std::time::Instant) {
+    if up {
+        *left = Some(LeftLink { peer, handle, sent, fresh: true, at });
+    } else {
+        forget_peer(left, peer);
+    }
 }
 
 /// L2CAP-connect to `peer`'s SDP PSM (implicitly pages the phone in BlueZ). `timeout_secs` bounds both
@@ -460,28 +499,25 @@ fn connect_sdp(peer: [u8; 6], timeout_secs: i64, watch: &Watch<'_>) -> std::io::
             std::mem::size_of::<SockaddrL2>() as libc::socklen_t,
         )
     };
-    let fd = if ret == 0 {
-        fd
+    let connected = if ret == 0 {
+        Ok(fd)
     } else {
         let e = std::io::Error::last_os_error();
-        if e.raw_os_error() != Some(libc::EINPROGRESS) {
-            return Err(e);
-        }
-        match wait_connected(fd, peer, start, std::time::Duration::from_secs(timeout_secs.max(1) as u64), link_before, watch) {
-            Ok(fd) => fd,
-            Err(e) => {
-                // A page that failed some other way: a left link to this phone that is gone now is forgotten, so the
-                // phone's own link later is not taken for it (the Mac's review of round 3).
-                if !is_cut(&e) {
-                    if let Ok(dev) = crate::hci::dev_id(crate::HCI_DEV) {
-                        let acl = crate::hci::acl_info(dev, peer);
-                        forget_gone(&mut LEFT_LINK.lock().unwrap_or_else(|p| p.into_inner()), peer, acl);
-                    }
-                }
-                return Err(e);
-            }
+        if e.raw_os_error() == Some(libc::EINPROGRESS) {
+            wait_connected(fd, peer, start, std::time::Duration::from_secs(timeout_secs.max(1) as u64), link_before, watch)
+        } else {
+            Err(e)
         }
     };
+    // The left link's record for this phone after the page (page_ended).
+    let end = match &connected {
+        Ok(_) => PageEnd::Connected,
+        Err(e) if is_cut(e) => PageEnd::Cut,
+        Err(_) => PageEnd::Failed,
+    };
+    let acl = || crate::hci::dev_id(crate::HCI_DEV).ok().and_then(|dev| crate::hci::acl_info(dev, peer));
+    page_ended(&mut LEFT_LINK.lock().unwrap_or_else(|p| p.into_inner()), peer, end, acl);
+    let fd = connected?;
     // Blocking again, for the SDP exchange and its SO_RCVTIMEO-bounded reads.
     set_nonblocking(fd.as_raw_fd(), false)?;
     Ok(std::fs::File::from(fd))
@@ -679,38 +715,72 @@ mod tests {
         let left = |sent| Some(LeftLink { peer, handle: 0x0b, sent, fresh: true, at: now });
 
         let mut l = left(false);
-        assert_eq!(link_before_page(peer, acl(0x0b), &mut l, now), Before::OwnLink { resend: true }, "never sent: resend");
-        assert_eq!(link_before_page(peer, acl(0x0b), &mut l, now), Before::OwnLink { resend: false }, "only right after the cut");
+        assert_eq!(link_before_page(peer, acl(0x0b), &mut l, now, false), Before::OwnLink { resend: true }, "never sent: resend");
+        assert_eq!(link_before_page(peer, acl(0x0b), &mut l, now, false), Before::OwnLink { resend: false }, "only right after the cut");
 
         let mut l = left(true);
-        assert_eq!(link_before_page(peer, acl(0x0b), &mut l, now), Before::OwnLink { resend: false }, "sent once: not again");
+        assert_eq!(link_before_page(peer, acl(0x0b), &mut l, now, false), Before::OwnLink { resend: false }, "sent once: not again");
+
+        // The Mac's 2.6.0 review, CS-2: never while a session is live, whose link it may be.
+        let mut l = left(false);
+        assert_eq!(link_before_page(peer, acl(0x0b), &mut l, now, true), Before::OwnLink { resend: false }, "a session is live");
 
         // Round 3's review: the resend is time-bound, so a later session's link with that handle never gets it.
         let mut l = left(false);
         let later = now + LEFT_LINK_RESEND;
-        assert_eq!(link_before_page(peer, acl(0x0b), &mut l, later), Before::OwnLink { resend: false }, "too late: no resend");
+        assert_eq!(link_before_page(peer, acl(0x0b), &mut l, later, false), Before::OwnLink { resend: false }, "too late: no resend");
 
         let mut l = left(false);
-        assert_eq!(link_before_page(peer, acl(0x0c), &mut l, now), Before::PhonesLink, "another handle: the phone's own");
+        assert_eq!(link_before_page(peer, acl(0x0c), &mut l, now, false), Before::PhonesLink, "another handle: the phone's own");
         assert_eq!(l, None, "and the record is forgotten");
 
         let mut l = left(false);
-        assert_eq!(link_before_page(other, acl(0x0b), &mut l, now), Before::PhonesLink, "another phone's link");
+        assert_eq!(link_before_page(other, acl(0x0b), &mut l, now, false), Before::PhonesLink, "another phone's link");
         assert!(l.is_some(), "kept: it is this phone's record");
-        assert_eq!(link_before_page(peer, None, &mut l, now), Before::Nothing);
+        assert_eq!(link_before_page(peer, None, &mut l, now, false), Before::Nothing);
         assert_eq!(l, None, "no link to the phone: forgotten");
 
         let mut l = None;
-        assert_eq!(link_before_page(peer, acl(0x0b), &mut l, now), Before::PhonesLink, "no cut before it: the phone's");
+        assert_eq!(link_before_page(peer, acl(0x0b), &mut l, now, false), Before::PhonesLink, "no cut before it: the phone's");
 
         // A page that failed otherwise: a record whose link is gone is forgotten; one still up, or another phone's, kept.
+        // A cut's stands: the cut noted it (the Mac's 2.6.0 review, CS-2: as connect_sdp ends a page).
         let mut l = left(true);
-        forget_gone(&mut l, peer, acl(0x0b));
-        assert!(l.is_some());
-        forget_gone(&mut l, other, None);
-        assert!(l.is_some());
-        forget_gone(&mut l, peer, None);
-        assert_eq!(l, None);
+        page_ended(&mut l, peer, PageEnd::Failed, || acl(0x0b));
+        assert!(l.is_some(), "the link still up");
+        page_ended(&mut l, other, PageEnd::Failed, || None);
+        assert!(l.is_some(), "another phone's page");
+        page_ended(&mut l, peer, PageEnd::Cut, || None);
+        assert!(l.is_some(), "a cut");
+        page_ended(&mut l, peer, PageEnd::Failed, || None);
+        assert_eq!(l, None, "failed, and no link left: forgotten");
+    }
+
+    /// The Mac's 2.6.0 review, CS-1: one record serves every phone, so another phone's cut whose link went leaves a record
+    /// still up for the first, and a page that connects (riding the left link, or not) forgets its phone's record.
+    #[test]
+    fn the_left_link_is_one_phone_s_until_that_phone_connects() {
+        let peer = [1, 2, 3, 4, 5, 6];
+        let other = [9, 2, 3, 4, 5, 6];
+        let now = std::time::Instant::now();
+        let whose = |l: Option<LeftLink>| l.map(|l| (l.peer, l.handle));
+
+        let mut l = None;
+        note_left(&mut l, peer, 0x0b, true, false, now);
+        assert_eq!(whose(l), Some((peer, 0x0b)), "a cut whose link stayed up: noted");
+        note_left(&mut l, other, 0x0c, false, true, now);
+        assert_eq!(whose(l), Some((peer, 0x0b)), "another phone's cut whose link went: the first phone's stands");
+        page_ended(&mut l, other, PageEnd::Connected, || None);
+        assert_eq!(whose(l), Some((peer, 0x0b)), "another phone's page connected");
+        page_ended(&mut l, peer, PageEnd::Connected, || None);
+        assert_eq!(l, None, "this phone's page connected: forgotten");
+
+        note_left(&mut l, peer, 0x0b, true, false, now);
+        note_left(&mut l, peer, 0x0b, false, true, now);
+        assert_eq!(l, None, "its own next cut, whose link went: forgotten");
+        note_left(&mut l, peer, 0x0b, true, false, now);
+        note_left(&mut l, other, 0x0c, true, true, now);
+        assert_eq!(whose(l), Some((other, 0x0c)), "another phone's cut whose link stayed up: the newer record");
     }
 
     /// wait_connected's decision (the Mac's review, A3): a page that timed out fails with EHOSTDOWN, an answer with no SDP

@@ -128,16 +128,25 @@ if [ "${#PSK}" -lt 8 ]; then
     _psk_src="a new random one"
     PSK=$(head -c 64 /dev/urandom | md5sum | cut -c1-20)
   fi
-  if grep -q '^wpa_passphrase=' /etc/hostapd.conf; then
-    sed -i "s/^wpa_passphrase=.*/wpa_passphrase=$PSK/" /etc/hostapd.conf
+  # The key reaches awk through its environment, never sed's replacement or awk -v, which take '\' (and sed '/' and
+  # '&'): any printable passphrase, a kept one or /etc/wifi_password's, is written as it is. Read back; a line that
+  # doesn't hold it is logged as a failure, without the key (the Mac's 2.6.0 review, CS-4).
+  cp -p /etc/hostapd.conf /etc/hostapd.conf.new 2>/dev/null   # its mode, as sed -i kept it
+  OCBM_PSK="$PSK" awk '/^wpa_passphrase=/ { print "wpa_passphrase=" ENVIRON["OCBM_PSK"]; seen = 1; next }
+    { print }
+    END { if (!seen) print "wpa_passphrase=" ENVIRON["OCBM_PSK"] }' /etc/hostapd.conf > /etc/hostapd.conf.new \
+    && mv -f /etc/hostapd.conf.new /etc/hostapd.conf
+  rm -f /etc/hostapd.conf.new
+  if [ "$(sed -n 's/^wpa_passphrase=//p' /etc/hostapd.conf | head -1)" = "$PSK" ]; then
+    echo "$L wpa_passphrase was absent, too short or a known default - set $_psk_src"
   else
-    echo "wpa_passphrase=$PSK" >> /etc/hostapd.conf
+    echo "$L wpa_passphrase was absent, too short or a known default - FAILED to set $_psk_src: hostapd.conf does not hold it"
   fi
-  echo "$L wpa_passphrase was absent, too short or a known default - set $_psk_src"
 fi
 # Kept where a go-back leaves it (/etc/ocbm stays on flash; ocbm_revert.sh), for the install after it. Not logged.
+# printf, not echo: an echo may take a '\' in it as an escape.
 if [ -d /etc/ocbm ] && [ "$(cat /etc/ocbm/wifi_psk 2>/dev/null)" != "$PSK" ]; then
-  ( umask 077; echo "$PSK" > /etc/ocbm/wifi_psk.new && mv -f /etc/ocbm/wifi_psk.new /etc/ocbm/wifi_psk ) 2>/dev/null
+  ( umask 077; printf '%s\n' "$PSK" > /etc/ocbm/wifi_psk.new && mv -f /etc/ocbm/wifi_psk.new /etc/ocbm/wifi_psk ) 2>/dev/null
 fi
 
 # ---- channel + band ---------------------------------------------------------------------------

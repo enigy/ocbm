@@ -995,8 +995,18 @@ while :; do
     wireless_down
     wireless_rebring_at=$(( $(now) + 4 ))
   fi
-  if [ -n "$wireless_rebring_at" ] && { [ "$(now)" -ge "$wireless_rebring_at" ] \
-       || { [ "$rebring_after_teardown" = 1 ] && ! teardown_in_flight; }; }; then
+  # Deferred behind a teardown, it goes once none runs, never on its timer meanwhile: each firing blocked the tick ~4 s in
+  # wireless_up and armed it again, so a long teardown left the loop asleep ~4 s of every 6, host edges and a wired
+  # takeover late by as much (the Mac's 2.6.0 review, CS-5). The teardown's block wakes the loop (USR1) as it ends.
+  rebring_due=0
+  if [ -n "$wireless_rebring_at" ]; then
+    if [ "$rebring_after_teardown" = 1 ]; then
+      teardown_in_flight || rebring_due=1
+    elif [ "$(now)" -ge "$wireless_rebring_at" ]; then
+      rebring_due=1
+    fi
+  fi
+  if [ "$rebring_due" = 1 ]; then
     wireless_rebring_at=""; rebring_after_teardown=0
     # This tick's read, not last_p: on a host edge last_p is still the old value until the edge block below, and a
     # deferral that came due this same tick was dropped (the Mac's review of bbd29f3).

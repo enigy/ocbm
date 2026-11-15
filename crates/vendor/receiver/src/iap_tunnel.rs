@@ -472,6 +472,7 @@ fn handle_established(sess: &mut Session, data: &[u8]) {
     if let Some(msg_id) = link::parse_msg_id(&rx.payload) {
         if msg_id == spec::MSG_AUTHENTICATION_FAILED {
             log("RX 0xAA04 AuthenticationFailed on the established tunnel — aborting session");
+            authentication_failed();
             reset();
             return;
         }
@@ -598,6 +599,9 @@ fn handle_one(sess: &mut Session, data: &[u8]) -> bool {
             iap2_core::message::describe_reject(&rx.payload[6..])
         ));
     }
+    if msg_id == spec::MSG_AUTHENTICATION_FAILED {
+        authentication_failed();
+    }
     let (next, action) = state::on_message(sess.state, msg_id, &rx.payload);
     match execute(action, &mut sess.link) {
         ExecOutcome::Commit => {
@@ -630,6 +634,13 @@ enum ExecOutcome {
 /// `copy_certificate` from the box's own chip (`/dev/i2c-1`, behind `/tmp/carplay_mfi.lock`).
 fn mfi_cert() -> Option<Vec<u8>> {
     mfi_retry("cert", mfi_i2c_local::try_cert)
+}
+
+/// The phone failed the tunnel's authentication (0xAA04): the certificate it was sent may be bad bytes from the boot's
+/// cache, so the next session reads it from the chip again (the Mac's 2.6.0 review, CS-3).
+fn authentication_failed() {
+    mfi_i2c_local::forget_cert();
+    log("RX 0xAA04 AuthenticationFailed: the cached MFi certificate is forgotten; the next session reads the chip");
 }
 
 /// `create_signature` over a 20-byte SHA-1 digest, from the same chip as [`mfi_cert`].

@@ -522,8 +522,6 @@ pub fn run(
     session_active: &Arc<AtomicBool>,
     ctrl: &Arc<Control>,
 ) {
-    // The bring-up just reset the controller: no link a cut left before it is valid now.
-    sdp_client::forget_left_link();
     // Settle before the first probe (bring-up/SSP/SDP, and give the phone a chance to connect IN first).
     let settle = initial_settle_secs();
     log(&format!("settling {settle}s before paging bonded phones"));
@@ -562,6 +560,8 @@ trait Env {
     fn bench_order(&self) -> Option<BenchOrder>;
     /// A [bench] line about the call order: btd's log on the box, kept by a test's fake.
     fn bench(&self, line: &str);
+    /// Forget the link a cut left ([`sdp_client::forget_left_link`]): btd's bring-up just reset the controller.
+    fn forget_left_link(&self);
 }
 
 /// The real [`Env`].
@@ -622,6 +622,9 @@ impl Env for OnBox<'_> {
     }
     fn bench(&self, line: &str) {
         log(line);
+    }
+    fn forget_left_link(&self) {
+        sdp_client::forget_left_link();
     }
 }
 
@@ -735,6 +738,8 @@ fn run_loop(env: &impl Env, ctrl: &Control) {
     let mut round_started = Duration::ZERO;
     // Whether the rest of the round walked by the applied order (abandon_order).
     let mut order_walked = false;
+    // The bring-up just reset the controller: no link a cut left before it is valid now. Before the first page.
+    env.forget_left_link();
     while !env.shutdown() {
         // Never fight an in-progress session (accept path or a prior reconnect). Advisory fast-path
         // only — the authoritative claim is the compare_exchange in attempt().
@@ -1081,6 +1086,8 @@ mod tests {
         policy_at: Vec<(usize, bool, Vec<[u8; 6]>)>,
         /// The [bench] lines about the call order ([`Env::bench`]).
         logs: std::cell::RefCell<Vec<String>>,
+        /// How many pages had gone at each [`Env::forget_left_link`].
+        forgot_left: std::cell::RefCell<Vec<usize>>,
     }
 
     impl<'a> Fake<'a> {
@@ -1100,6 +1107,7 @@ mod tests {
                 bench: Default::default(),
                 policy_at: Vec::new(),
                 logs: Default::default(),
+                forgot_left: Default::default(),
             }
         }
 
@@ -1170,6 +1178,9 @@ mod tests {
         fn bench(&self, line: &str) {
             self.logs.borrow_mut().push(line.to_string());
         }
+        fn forget_left_link(&self) {
+            self.forgot_left.borrow_mut().push(self.pages.borrow().len());
+        }
     }
 
     /// Rounds 2 s, then 5 s apart for the first two minutes, then 10, 20, 40, 60: the backoff starts at its window's end.
@@ -1184,6 +1195,17 @@ mod tests {
         let early = gaps[1..].iter().take_while(|g| **g == EARLY_GAP_SECS).count();
         assert!(early >= 10, "5 s apart while early: {gaps:?}");
         assert_eq!(&gaps[1 + early..1 + early + 5], &[10, 20, 40, 60, 60], "{gaps:?}");
+    }
+
+    /// The Mac's 2.6.0 review, CS-2: the loop forgets the link a cut left before the bring-up, once, before its first page.
+    #[test]
+    fn the_loop_forgets_the_left_link_before_its_first_page() {
+        let ctrl = Control::default();
+        set_order(&ctrl, &[SCOTT]);
+        let fake = Fake::new(&ctrl, 2, |_, _| Attempt::Absent);
+        run_loop(&fake, &ctrl);
+        assert_eq!(fake.paged(0), vec![SCOTT]);
+        assert_eq!(*fake.forgot_left.borrow(), vec![0], "once, with no page gone");
     }
 
     /// R2 and R3 through the loop: only the timed-out phone goes last next round; a lost claim moves nobody.

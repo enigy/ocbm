@@ -39,6 +39,8 @@ run "box-common" cargo test -p box-common --quiet
 run "pairing"    cargo test --manifest-path crates/vendor/pairing/Cargo.toml --quiet
 run "rtsp"       cargo test --manifest-path crates/vendor/rtsp/Cargo.toml --quiet
 run "mfi"        cargo test --manifest-path crates/vendor/mfi/Cargo.toml --quiet
+# The tunnel's chip access: its certificate cache's DER check (the Mac's 2.6.0 review, CS-3), its first tests.
+run "mfi-i2c-local" cargo test --manifest-path crates/vendor/mfi-i2c-local/Cargo.toml --quiet
 run "ocbm-host"  cargo test -p ocbm-host --quiet
 # The back-to-stock restore payload (busybox sh), against synthetic trees: no adapter, no backup.
 run "stock-restore" sh tools/stock_restore_test.sh
