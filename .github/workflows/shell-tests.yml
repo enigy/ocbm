@@ -5,7 +5,7 @@ name: Shell suites
 # side of all of this is macOS — Scott's Mac — and the Rust workflow runs on Linux, where the image
 # packer cannot build (it needs macOS tools) so three of these suites never ran in CI at all. Both
 # 28 Oct restore bugs showed up only on the Mac: macOS tar's ._ AppleDouble side files, and two pack
-# checks. This job runs the six shell suites on macOS, as tools/run_tests.sh does, under /bin/sh
+# checks. This job runs the seven shell suites on macOS, as tools/run_tests.sh does, under /bin/sh
 # (bash 3.2) and Homebrew dash, and the flash-dump decoder's Python suite, which the stock_restore
 # suite also uses to build its dump images. Keep the list in step with tools/run_tests.sh.
 

@@ -441,7 +441,8 @@ pub fn handle_inbound(data: &[u8]) -> bool {
         // the branch above and is dispatched instead of being logged and dropped.
     }
     if aborted {
-        log("tunnel session aborted (second IdentificationRejected) — clearing; next start() rebuilds fresh");
+        // state::on_message aborts on 0xAA04 AuthenticationFailed and on a second IdentificationRejected (C-1).
+        log("tunnel session aborted (AuthenticationFailed or a second IdentificationRejected) — clearing; next start() rebuilds fresh");
         *guard = None;
     }
     true
@@ -639,9 +640,11 @@ fn mfi_cert() -> Option<Vec<u8>> {
 /// The phone failed the tunnel's authentication (0xAA04): the certificate it was sent may be bad bytes from the boot's
 /// cache, so the next session reads it from the chip again (the Mac's 2.6.0 review, CS-3).
 fn authentication_failed() {
-    // Said only when there was one to forget (the Mac's round 2, R1-3).
+    // Logged every time; the forget named only when there was one (the Mac's round 2, R1-3, and round 3, C-1).
     if mfi_i2c_local::forget_cert() {
         log("RX 0xAA04 AuthenticationFailed: the cached MFi certificate is forgotten; the next session reads the chip");
+    } else {
+        log("RX 0xAA04 AuthenticationFailed: no MFi certificate was cached");
     }
 }
 

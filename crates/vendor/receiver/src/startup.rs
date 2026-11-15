@@ -15,8 +15,8 @@ static PRINTED: AtomicBool = AtomicBool::new(false);
 /// This carplayd's screen nudges (`session.rs` nudge_screen_back): the 0.5 s one and the 3 s one.
 static NUDGES: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
 
-/// The box log, scanned from where it stood when the host came (btd's `boxlog_at` mark) for the session's
-/// PSK-mismatch lines. Bounded: at most [`SCAN_MAX`] bytes are read.
+/// The box log, scanned from where it stood when the host came (btd's `boxlog_at` mark) for the
+/// PSK-mismatch lines since then (C-2). Bounded: at most [`SCAN_MAX`] bytes are read.
 const BOX_LOG: &str = "/tmp/box.log";
 const SCAN_MAX: u64 = 512 * 1024;
 
@@ -61,7 +61,7 @@ fn counts(marks: &str, nudges: [u32; 2], psk: Option<Psk>) -> String {
     )
 }
 
-/// The session's PSK-mismatch count, and whether the box log was cut since the host came: ocbmd empties it at its cap,
+/// The PSK-mismatch count since the host came, and whether the box log was cut since the host came: ocbmd empties it at its cap,
 /// and the lines between the host and the cut are gone, so the count is then a lower bound (the Mac's review, BH-06).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Psk {

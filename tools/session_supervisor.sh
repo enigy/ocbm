@@ -479,7 +479,7 @@ restart_ocbmd_daemon() {
 # CONFIGURED means ocbmd is wedged, not merely idle.
 #
 # Staleness check: BusyBox `find` on this box has no `-newermt`/fractional support (confirmed by
-# the ONLY other stale-marker idiom in this repo, radio_hal.sh:92 / radio_ap_up.sh's lock, both of
+# the ONLY other stale-marker idiom in this repo, radio_hal.sh's lock_take() / radio_ap_up.sh's AP lock, both of
 # which use integer `-mmin`). There is therefore no portable way to hit the 15s target precisely;
 # `-mmin +0` (>=1 full minute stale) is the finest granularity available and is used here — this
 # under-reacts by up to ~45s versus the 15s contract, traded for portability. Absent

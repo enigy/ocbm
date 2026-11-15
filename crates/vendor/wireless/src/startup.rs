@@ -26,7 +26,8 @@ pub fn begin() {
     let states = std::fs::read_to_string(PRELOAD_STATE).unwrap_or_default();
     let preload = host_uptime.map_or_else(|| "unknown".to_string(), |at| preload_at(&states, at));
     let mut record = format!("host_present {present}\npreload {preload}\n");
-    // Where the box log stood, so carplayd counts only this session's hostapd lines (receiver::startup), and its first
+    // Where the box log stood, so carplayd counts the hostapd lines since the host came (receiver::startup; kept across
+    // btd's sessions under one host by carry_over, the Mac's round 3, C-2), and its first
     // bytes, so a log ocbmd rotated since (emptied at its cap) is told from one that only grew (the Mac's review, BH-06).
     if let Ok(mut f) = std::fs::File::open("/tmp/box.log") {
         use std::io::Read as _;
