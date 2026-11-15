@@ -1017,16 +1017,16 @@ mod tests {
         assert_eq!(round_page_slots(true, 1), crate::hci::PAGE_TIMEOUT_DEFAULT, "one phone: nothing to hand on to");
     }
 
-    const SCOTT: [u8; 6] = [1, 0, 0, 0, 0, 0];
-    const YODA: [u8; 6] = [2, 0, 0, 0, 0, 0];
+    const PHONE_A: [u8; 6] = [1, 0, 0, 0, 0, 0];
+    const PHONE_B: [u8; 6] = [2, 0, 0, 0, 0, 0];
 
-    /// Walk `[SCOTT, YODA]` with each phone's answers in turn (Failed once they run out), never stopping and
+    /// Walk `[PHONE_A, PHONE_B]` with each phone's answers in turn (Failed once they run out), never stopping and
     /// always ready to retry: which phones were paged, in order, and what the walk did.
     fn walk_with(answers: &[(&[u8; 6], Attempt)]) -> (Vec<[u8; 6]>, Walk) {
         let mut queue: Vec<_> = answers.iter().map(|(p, a)| (**p, *a)).collect();
         let mut paged = Vec::new();
         let walked = walk(
-            &[SCOTT, YODA],
+            &[PHONE_A, PHONE_B],
             || false,
             |_, _| true,
             |peer| {
@@ -1190,7 +1190,7 @@ mod tests {
     #[test]
     fn the_loop_waits_5_s_early_then_backs_off_from_the_start() {
         let ctrl = Control::default();
-        set_order(&ctrl, &[SCOTT]);
+        set_order(&ctrl, &[PHONE_A]);
         let fake = Fake::new(&ctrl, 30, |_, _| Attempt::Absent);
         run_loop(&fake, &ctrl);
         let gaps = fake.gaps.borrow().clone();
@@ -1204,10 +1204,10 @@ mod tests {
     #[test]
     fn the_loop_forgets_the_left_link_before_its_first_page() {
         let ctrl = Control::default();
-        set_order(&ctrl, &[SCOTT]);
+        set_order(&ctrl, &[PHONE_A]);
         let fake = Fake::new(&ctrl, 2, |_, _| Attempt::Absent);
         run_loop(&fake, &ctrl);
-        assert_eq!(fake.paged(0), vec![SCOTT]);
+        assert_eq!(fake.paged(0), vec![PHONE_A]);
         assert_eq!(*fake.forgot_left.borrow(), vec![0], "once, with no page gone");
     }
 
@@ -1215,15 +1215,15 @@ mod tests {
     #[test]
     fn the_loop_pages_a_timed_out_phone_last_and_nobody_else() {
         let ctrl = Control::default();
-        set_order(&ctrl, &[SCOTT, YODA]);
+        set_order(&ctrl, &[PHONE_A, PHONE_B]);
         let fake = Fake::new(&ctrl, 3, |round, peer| match (round, peer) {
-            (0, SCOTT) => Attempt::Absent,
+            (0, PHONE_A) => Attempt::Absent,
             _ => Attempt::Failed,
         });
         run_loop(&fake, &ctrl);
-        assert_eq!(fake.paged(0), vec![SCOTT, YODA]);
-        assert_eq!(fake.paged(1), vec![YODA, SCOTT], "the timed-out phone last");
-        assert_eq!(fake.paged(2), vec![SCOTT, YODA], "a failure that wasn't a timeout moves nobody");
+        assert_eq!(fake.paged(0), vec![PHONE_A, PHONE_B]);
+        assert_eq!(fake.paged(1), vec![PHONE_B, PHONE_A], "the timed-out phone last");
+        assert_eq!(fake.paged(2), vec![PHONE_A, PHONE_B], "a failure that wasn't a timeout moves nobody");
     }
 
     /// R1 through the loop: the app's order lands during the first page; the rest go at once by it, and the next round
@@ -1231,18 +1231,18 @@ mod tests {
     #[test]
     fn the_loop_re_plans_by_an_order_that_lands_mid_round() {
         let ctrl = Control::default();
-        set_order(&ctrl, &[SCOTT, YODA, THIRD]);
+        set_order(&ctrl, &[PHONE_A, PHONE_B, THIRD]);
         let c = &ctrl;
         let fake = Fake::new(&ctrl, 2, move |round, peer| {
-            if round == 0 && peer == SCOTT {
-                set_order(c, &[THIRD, YODA, SCOTT]);
+            if round == 0 && peer == PHONE_A {
+                set_order(c, &[THIRD, PHONE_B, PHONE_A]);
             }
             Attempt::Absent
         });
         run_loop(&fake, &ctrl);
-        assert_eq!(fake.paged(0), vec![SCOTT, THIRD, YODA], "the rest in the new order, at once");
+        assert_eq!(fake.paged(0), vec![PHONE_A, THIRD, PHONE_B], "the rest in the new order, at once");
         assert_eq!(fake.gaps.borrow()[0], FIRST_RETRY_SECS, "one round: the re-plan is not a round of its own");
-        assert_eq!(fake.paged(1), vec![THIRD, YODA, SCOTT], "all timed out: the order just set");
+        assert_eq!(fake.paged(1), vec![THIRD, PHONE_B, PHONE_A], "all timed out: the order just set");
     }
 
     /// BH-04 and the crossing rule, with the bench's phantom: it is one of the round's phones, ahead of the bonds, so the
@@ -1251,26 +1251,26 @@ mod tests {
     #[test]
     fn the_phantom_goes_first_then_last_and_its_crossing_reset_is_not_counted() {
         let ctrl = Control::default();
-        set_order(&ctrl, &[YODA]);
-        let mut yoda_in_round_1 = 0;
+        set_order(&ctrl, &[PHONE_B]);
+        let mut phone_b_in_round_1 = 0;
         let mut fake = Fake::new(&ctrl, 3, move |round, peer| match (round, peer) {
             (_, p) if p == super::BENCH_PHANTOM => Attempt::Absent,
             (1, _) => {
-                yoda_in_round_1 += 1;
-                if yoda_in_round_1 == 1 { Attempt::Reset } else { Attempt::Failed }
+                phone_b_in_round_1 += 1;
+                if phone_b_in_round_1 == 1 { Attempt::Reset } else { Attempt::Failed }
             }
             _ => Attempt::Reset,
         });
         fake.phantom = Some(super::BENCH_PHANTOM);
         run_loop(&fake, &ctrl);
-        assert_eq!(fake.paged(0), vec![super::BENCH_PHANTOM, YODA, YODA], "first, as an absent first-listed phone");
-        assert_eq!(fake.paged(1), vec![YODA, YODA, super::BENCH_PHANTOM], "timed out last round: last");
+        assert_eq!(fake.paged(0), vec![super::BENCH_PHANTOM, PHONE_B, PHONE_B], "first, as an absent first-listed phone");
+        assert_eq!(fake.paged(1), vec![PHONE_B, PHONE_B, super::BENCH_PHANTOM], "timed out last round: last");
         // Counted: round 0's re-page (1) and round 1's first page (2); round 1's failed re-page ends the run. Had round
         // 0's crossing reset counted, round 1's first page would have been the third, and told.
         assert_eq!(fake.bond_lost.get(), 0);
 
         let ctrl = Control::default();
-        set_order(&ctrl, &[YODA]);
+        set_order(&ctrl, &[PHONE_B]);
         let fake = Fake::new(&ctrl, 2, |_, _| Attempt::Reset);
         run_loop(&fake, &ctrl);
         assert_eq!(fake.bond_lost.get(), 1, "two resets a round, nothing before them: told in the second round");
@@ -1281,25 +1281,25 @@ mod tests {
     #[test]
     fn the_loop_forgets_who_was_absent_after_a_phone_s_own_session() {
         let ctrl = Control::default();
-        set_order(&ctrl, &[SCOTT, YODA]);
-        let mut fake = Fake::new(&ctrl, 4, |round, peer| if peer == SCOTT && round < 2 { Attempt::Absent } else { Attempt::Failed });
+        set_order(&ctrl, &[PHONE_A, PHONE_B]);
+        let mut fake = Fake::new(&ctrl, 4, |round, peer| if peer == PHONE_A && round < 2 { Attempt::Absent } else { Attempt::Failed });
         fake.sessions = vec![2];
         run_loop(&fake, &ctrl);
-        assert_eq!(fake.paged(1), vec![YODA, SCOTT], "timed out: last");
+        assert_eq!(fake.paged(1), vec![PHONE_B, PHONE_A], "timed out: last");
         assert!(fake.paged(2).is_empty(), "its own session: nothing paged");
-        assert_eq!(fake.paged(3), vec![SCOTT, YODA], "after the session, the policy's order");
+        assert_eq!(fake.paged(3), vec![PHONE_A, PHONE_B], "after the session, the policy's order");
     }
 
     /// R3 through the loop: a passed-over phone stays last, even behind a phone that timed out last round.
     #[test]
     fn the_loop_keeps_a_passed_over_phone_last() {
         let ctrl = Control::default();
-        set_order(&ctrl, &[SCOTT, YODA, THIRD]);
-        ctrl.pass_over(YODA);
-        let fake = Fake::new(&ctrl, 2, |round, peer| if round == 0 && peer == SCOTT { Attempt::Absent } else { Attempt::Failed });
+        set_order(&ctrl, &[PHONE_A, PHONE_B, THIRD]);
+        ctrl.pass_over(PHONE_B);
+        let fake = Fake::new(&ctrl, 2, |round, peer| if round == 0 && peer == PHONE_A { Attempt::Absent } else { Attempt::Failed });
         run_loop(&fake, &ctrl);
-        assert_eq!(fake.paged(0), vec![SCOTT, THIRD, YODA]);
-        assert_eq!(fake.paged(1), vec![THIRD, SCOTT, YODA], "the timed-out phone last but one: the passed-over one is last");
+        assert_eq!(fake.paged(0), vec![PHONE_A, THIRD, PHONE_B]);
+        assert_eq!(fake.paged(1), vec![THIRD, PHONE_A, PHONE_B], "the timed-out phone last but one: the passed-over one is last");
     }
 
     /// The bench's call order (BH-01/02): taken for one round, it lands after_ms into the walk through the re-plan path
@@ -1307,23 +1307,23 @@ mod tests {
     #[test]
     fn the_loop_pages_a_bench_order_for_one_round_in_memory() {
         let ctrl = Control::default();
-        set_order(&ctrl, &[SCOTT, YODA, THIRD]);
+        set_order(&ctrl, &[PHONE_A, PHONE_B, THIRD]);
         let fake = Fake::new(&ctrl, 2, |_, _| Attempt::Absent);
-        *fake.bench.borrow_mut() = Some((0, super::BenchOrder { macs: vec![THIRD, YODA], after_ms: 1500 }));
+        *fake.bench.borrow_mut() = Some((0, super::BenchOrder { macs: vec![THIRD, PHONE_B], after_ms: 1500 }));
         run_loop(&fake, &ctrl);
         // A timed-out page moves the fake clock 4 s: due after the first page.
-        assert_eq!(fake.paged(0), vec![SCOTT, THIRD, YODA], "the rest of the round in the bench order");
+        assert_eq!(fake.paged(0), vec![PHONE_A, THIRD, PHONE_B], "the rest of the round in the bench order");
         assert_eq!(fake.gaps.borrow()[0], FIRST_RETRY_SECS, "one round: the bench order is no round of its own");
-        assert_eq!(fake.paged(1), vec![SCOTT, YODA, THIRD], "the next round, the app's order");
-        assert_eq!(ctrl.policy().order, vec![SCOTT, YODA, THIRD], "never saved");
+        assert_eq!(fake.paged(1), vec![PHONE_A, PHONE_B, THIRD], "the next round, the app's order");
+        assert_eq!(ctrl.policy().order, vec![PHONE_A, PHONE_B, THIRD], "never saved");
         assert!(!ctrl.take_policy_changed(), "nor seen as the app's");
 
         let ctrl = Control::default();
-        set_order(&ctrl, &[SCOTT, YODA]);
+        set_order(&ctrl, &[PHONE_A, PHONE_B]);
         let fake = Fake::new(&ctrl, 1, |_, _| Attempt::Absent);
-        *fake.bench.borrow_mut() = Some((0, super::BenchOrder { macs: vec![YODA], after_ms: 0 }));
+        *fake.bench.borrow_mut() = Some((0, super::BenchOrder { macs: vec![PHONE_B], after_ms: 0 }));
         run_loop(&fake, &ctrl);
-        assert_eq!(fake.paged(0), vec![YODA, SCOTT], "after_ms 0: before the first page");
+        assert_eq!(fake.paged(0), vec![PHONE_B, PHONE_A], "after_ms 0: before the first page");
     }
 
     /// A1 through the loop: a phone a power cut left not ready, cut on both pages of one round and the first of the
@@ -1332,19 +1332,19 @@ mod tests {
     #[test]
     fn the_loop_counts_one_cut_a_round_toward_a_forgotten_pairing() {
         let ctrl = Control::default();
-        set_order(&ctrl, &[SCOTT]);
+        set_order(&ctrl, &[PHONE_A]);
         let mut pages = 0;
         let fake = Fake::new(&ctrl, 3, move |_, _| {
             pages += 1;
             if pages <= 3 { Attempt::Cut } else { Attempt::Ran }
         });
         run_loop(&fake, &ctrl);
-        assert_eq!(fake.paged(0), vec![SCOTT, SCOTT], "a cut is paged once more");
-        assert_eq!(fake.paged(1), vec![SCOTT, SCOTT]);
+        assert_eq!(fake.paged(0), vec![PHONE_A, PHONE_A], "a cut is paged once more");
+        assert_eq!(fake.paged(1), vec![PHONE_A, PHONE_A]);
         assert_eq!(fake.bond_lost.get(), 0, "three cuts in one not-ready episode: two rounds, two counted");
 
         let ctrl = Control::default();
-        set_order(&ctrl, &[SCOTT]);
+        set_order(&ctrl, &[PHONE_A]);
         let fake = Fake::new(&ctrl, 5, |_, _| Attempt::Cut);
         run_loop(&fake, &ctrl);
         assert_eq!(fake.bond_lost.get(), 1, "cut on every page of three rounds and more: told once");
@@ -1355,45 +1355,45 @@ mod tests {
     #[test]
     fn the_loop_ends_a_re_planned_round_that_goes_idle() {
         let ctrl = Control::default();
-        set_order(&ctrl, &[SCOTT, YODA]);
+        set_order(&ctrl, &[PHONE_A, PHONE_B]);
         let c = &ctrl;
         let mut fake = Fake::new(&ctrl, 3, move |round, peer| {
-            if round == 0 && peer == SCOTT {
-                c.set_policy(crate::control::Policy { auto_connect: false, order: vec![YODA, SCOTT] });
+            if round == 0 && peer == PHONE_A {
+                c.set_policy(crate::control::Policy { auto_connect: false, order: vec![PHONE_B, PHONE_A] });
             }
             Attempt::Absent
         });
-        fake.policy_at = vec![(2, true, vec![YODA, SCOTT])];
+        fake.policy_at = vec![(2, true, vec![PHONE_B, PHONE_A])];
         run_loop(&fake, &ctrl);
-        assert_eq!(fake.paged(0), vec![SCOTT], "the order came mid-round, with autoConnect off: no rest");
+        assert_eq!(fake.paged(0), vec![PHONE_A], "the order came mid-round, with autoConnect off: no rest");
         assert!(fake.paged(1).is_empty(), "idle");
-        assert_eq!(fake.paged(2), vec![YODA, SCOTT], "a new round: every phone, the timed-out one last");
+        assert_eq!(fake.paged(2), vec![PHONE_B, PHONE_A], "a new round: every phone, the timed-out one last");
 
         // And a re-plan whose next pass finds no bond (the order emptied mid-round) ends its round the same way.
         let ctrl = Control::default();
-        set_order(&ctrl, &[SCOTT, YODA]);
+        set_order(&ctrl, &[PHONE_A, PHONE_B]);
         let c = &ctrl;
         let mut fake = Fake::new(&ctrl, 2, move |round, peer| {
-            if round == 0 && peer == SCOTT {
+            if round == 0 && peer == PHONE_A {
                 c.set_policy(crate::control::Policy { auto_connect: true, order: Vec::new() });
             }
             Attempt::Absent
         });
-        fake.policy_at = vec![(1, true, vec![YODA, SCOTT])];
+        fake.policy_at = vec![(1, true, vec![PHONE_B, PHONE_A])];
         run_loop(&fake, &ctrl);
-        assert_eq!(fake.paged(0), vec![SCOTT], "the order came mid-round: re-planned, then no bonds");
-        assert_eq!(fake.paged(1), vec![YODA, SCOTT], "a new round: every phone, the timed-out one last");
+        assert_eq!(fake.paged(0), vec![PHONE_A], "the order came mid-round: re-planned, then no bonds");
+        assert_eq!(fake.paged(1), vec![PHONE_B, PHONE_A], "a new round: every phone, the timed-out one last");
     }
 
     /// B2: the phantom is never counted toward a forgotten pairing, whatever it answers.
     #[test]
     fn the_phantom_s_resets_are_never_counted() {
         let ctrl = Control::default();
-        set_order(&ctrl, &[YODA]);
+        set_order(&ctrl, &[PHONE_B]);
         let mut fake = Fake::new(&ctrl, 3, |_, peer| if peer == super::BENCH_PHANTOM { Attempt::Reset } else { Attempt::Failed });
         fake.phantom = Some(super::BENCH_PHANTOM);
         run_loop(&fake, &ctrl);
-        assert_eq!(fake.paged(0), vec![super::BENCH_PHANTOM, super::BENCH_PHANTOM, YODA]);
+        assert_eq!(fake.paged(0), vec![super::BENCH_PHANTOM, super::BENCH_PHANTOM, PHONE_B]);
         assert_eq!(fake.bond_lost.get(), 0, "six phantom resets in three rounds");
     }
 
@@ -1401,13 +1401,13 @@ mod tests {
     #[test]
     fn a_bench_order_due_with_nothing_left_is_dropped() {
         let ctrl = Control::default();
-        set_order(&ctrl, &[SCOTT]);
+        set_order(&ctrl, &[PHONE_A]);
         let fake = Fake::new(&ctrl, 2, |_, _| Attempt::Absent);
-        *fake.bench.borrow_mut() = Some((0, super::BenchOrder { macs: vec![SCOTT], after_ms: 3000 }));
+        *fake.bench.borrow_mut() = Some((0, super::BenchOrder { macs: vec![PHONE_A], after_ms: 3000 }));
         run_loop(&fake, &ctrl);
-        assert_eq!(fake.paged(0), vec![SCOTT], "paged once, no rest");
+        assert_eq!(fake.paged(0), vec![PHONE_A], "paged once, no rest");
         assert_eq!(fake.gaps.borrow()[0], FIRST_RETRY_SECS, "the round ended there");
-        assert_eq!(fake.paged(1), vec![SCOTT]);
+        assert_eq!(fake.paged(1), vec![PHONE_A]);
         let logs = fake.logs.borrow();
         assert!(logs.iter().any(|l| l.ends_with("dropped: it came due with nothing left to page")), "{logs:?}");
         assert!(!logs.iter().any(|l| l.contains("applied")), "never applied: {logs:?}");
@@ -1418,18 +1418,18 @@ mod tests {
     #[test]
     fn a_connect_with_no_phone_named_drops_a_pending_bench_order() {
         let ctrl = Control::default();
-        set_order(&ctrl, &[SCOTT, YODA, THIRD]);
+        set_order(&ctrl, &[PHONE_A, PHONE_B, THIRD]);
         let c = &ctrl;
         let fake = Fake::new(&ctrl, 1, move |round, peer| {
-            if round == 0 && peer == SCOTT {
+            if round == 0 && peer == PHONE_A {
                 c.request_connect(None);
-                c.set_policy(crate::control::Policy { auto_connect: true, order: vec![YODA, THIRD, SCOTT] });
+                c.set_policy(crate::control::Policy { auto_connect: true, order: vec![PHONE_B, THIRD, PHONE_A] });
             }
             Attempt::Absent
         });
-        *fake.bench.borrow_mut() = Some((0, super::BenchOrder { macs: vec![THIRD, YODA], after_ms: 1500 }));
+        *fake.bench.borrow_mut() = Some((0, super::BenchOrder { macs: vec![THIRD, PHONE_B], after_ms: 1500 }));
         run_loop(&fake, &ctrl);
-        assert_eq!(fake.paged(0), vec![SCOTT, YODA, THIRD], "the rest in the app's new order, not the bench's");
+        assert_eq!(fake.paged(0), vec![PHONE_A, PHONE_B, THIRD], "the rest in the app's new order, not the bench's");
         let logs = fake.logs.borrow();
         assert!(logs.iter().any(|l| l.ends_with("dropped: a Connect from the device screen came first")), "{logs:?}");
         assert!(!logs.iter().any(|l| l.contains("applied")), "never applied: {logs:?}");
@@ -1440,12 +1440,12 @@ mod tests {
     #[test]
     fn a_connect_after_an_applied_order_never_pages_the_phantom() {
         let ctrl = Control::default();
-        set_order(&ctrl, &[SCOTT, YODA, THIRD]);
+        set_order(&ctrl, &[PHONE_A, PHONE_B, THIRD]);
         let c = &ctrl;
         let mut fake = Fake::new(&ctrl, 1, move |round, peer| {
             if round == 0 && peer == THIRD {
                 c.request_connect(None);
-                c.set_policy(crate::control::Policy { auto_connect: true, order: vec![YODA, SCOTT, THIRD] });
+                c.set_policy(crate::control::Policy { auto_connect: true, order: vec![PHONE_B, PHONE_A, THIRD] });
             }
             Attempt::Absent
         });
@@ -1455,7 +1455,7 @@ mod tests {
         let phantom = crate::control::fmt_addr(&super::BENCH_PHANTOM);
         let logs = fake.logs.borrow();
         assert!(logs.iter().any(|l| l.contains("call order applied") && l.contains(&phantom)), "applied with the phantom: {logs:?}");
-        assert_eq!(fake.paged(0), vec![THIRD, SCOTT, YODA], "the order applied before any page, then the Connect's rest: no phantom");
+        assert_eq!(fake.paged(0), vec![THIRD, PHONE_A, PHONE_B], "the order applied before any page, then the Connect's rest: no phantom");
     }
 
     /// /tmp/bench_order: read and removed; "off" is no order and is left; a malformed one is refused and removed.
@@ -1486,57 +1486,57 @@ mod tests {
     #[test]
     fn a_re_planned_round_keeps_what_it_learned() {
         let ctrl = Control::default();
-        set_order(&ctrl, &[SCOTT, YODA, THIRD]);
+        set_order(&ctrl, &[PHONE_A, PHONE_B, THIRD]);
         let mut r = Rounds::default();
         let (paged, _, replan) = round(&mut r, &ctrl, &mut |peer| {
-            if peer == SCOTT {
-                set_order(&ctrl, &[THIRD, SCOTT, YODA]);
+            if peer == PHONE_A {
+                set_order(&ctrl, &[THIRD, PHONE_A, PHONE_B]);
             }
             Attempt::Absent
         });
-        assert_eq!((paged, replan), (vec![SCOTT], true), "the walk stops after the phone in hand");
+        assert_eq!((paged, replan), (vec![PHONE_A], true), "the walk stops after the phone in hand");
         let (paged, counted, replan) =
             round(&mut r, &ctrl, &mut |peer| if peer == THIRD { Attempt::Reset } else { Attempt::Absent });
-        assert_eq!(paged, vec![THIRD, THIRD, YODA], "the rest, in the new order, skipping the phone paged");
+        assert_eq!(paged, vec![THIRD, THIRD, PHONE_B], "the rest, in the new order, skipping the phone paged");
         assert_eq!(counted, vec![false, true, true], "the reset straight after the timeout is a crossing");
         assert!(!replan);
         let (paged, _, _) = round(&mut r, &ctrl, &mut |_| Attempt::Absent);
-        assert_eq!(paged, vec![THIRD, SCOTT, YODA], "all absent last round: the order just set");
+        assert_eq!(paged, vec![THIRD, PHONE_A, PHONE_B], "all absent last round: the order just set");
     }
 
     /// R1: a change that lands during the last phone's page leaves nothing to re-plan, and the round's timeouts stand.
     #[test]
     fn a_change_with_nothing_left_to_page_ends_the_round() {
         let ctrl = Control::default();
-        set_order(&ctrl, &[SCOTT, YODA]);
+        set_order(&ctrl, &[PHONE_A, PHONE_B]);
         let mut r = Rounds::default();
         let (paged, _, replan) = round(&mut r, &ctrl, &mut |peer| {
-            if peer == YODA {
-                set_order(&ctrl, &[YODA, SCOTT]);
+            if peer == PHONE_B {
+                set_order(&ctrl, &[PHONE_B, PHONE_A]);
             }
-            if peer == SCOTT { Attempt::Absent } else { Attempt::Failed }
+            if peer == PHONE_A { Attempt::Absent } else { Attempt::Failed }
         });
-        assert_eq!((paged, replan), (vec![SCOTT, YODA], false));
+        assert_eq!((paged, replan), (vec![PHONE_A, PHONE_B], false));
         let (paged, _, _) = round(&mut r, &ctrl, &mut |_| Attempt::Failed);
-        assert_eq!(paged, vec![YODA, SCOTT], "the new order; the absent phone last, where it is anyway");
+        assert_eq!(paged, vec![PHONE_B, PHONE_A], "the new order; the absent phone last, where it is anyway");
     }
 
     /// R2: only a timed-out page demotes, and a session clears it. The Mac, 13 Nov: a crossing reset is not counted.
     #[test]
     fn only_a_page_timeout_demotes_and_a_session_clears_it() {
         let ctrl = Control::default();
-        set_order(&ctrl, &[SCOTT, YODA]);
+        set_order(&ctrl, &[PHONE_A, PHONE_B]);
         let mut r = Rounds::default();
         let (_, counted, _) =
-            round(&mut r, &ctrl, &mut |peer| if peer == SCOTT { Attempt::Absent } else { Attempt::Reset });
+            round(&mut r, &ctrl, &mut |peer| if peer == PHONE_A { Attempt::Absent } else { Attempt::Reset });
         assert_eq!(counted, vec![true, false, true], "the first reset crossed the timeout; its re-page counts");
-        assert_eq!(round(&mut r, &ctrl, &mut |_| Attempt::Failed).0, vec![YODA, SCOTT], "the absent phone goes last");
-        assert_eq!(round(&mut r, &ctrl, &mut |_| Attempt::Failed).0, vec![SCOTT, YODA], "a lost claim demotes nobody");
-        round(&mut r, &ctrl, &mut |peer| if peer == SCOTT { Attempt::Absent } else { Attempt::Failed });
+        assert_eq!(round(&mut r, &ctrl, &mut |_| Attempt::Failed).0, vec![PHONE_B, PHONE_A], "the absent phone goes last");
+        assert_eq!(round(&mut r, &ctrl, &mut |_| Attempt::Failed).0, vec![PHONE_A, PHONE_B], "a lost claim demotes nobody");
+        round(&mut r, &ctrl, &mut |peer| if peer == PHONE_A { Attempt::Absent } else { Attempt::Failed });
         r.session();
-        assert_eq!(round(&mut r, &ctrl, &mut |_| Attempt::Failed).0, vec![SCOTT, YODA], "a session: nobody is absent");
-        round(&mut r, &ctrl, &mut |peer| if peer == SCOTT { Attempt::Absent } else { Attempt::Ran });
-        assert_eq!(round(&mut r, &ctrl, &mut |_| Attempt::Failed).0, vec![SCOTT, YODA], "a round that ran clears it");
+        assert_eq!(round(&mut r, &ctrl, &mut |_| Attempt::Failed).0, vec![PHONE_A, PHONE_B], "a session: nobody is absent");
+        round(&mut r, &ctrl, &mut |peer| if peer == PHONE_A { Attempt::Absent } else { Attempt::Ran });
+        assert_eq!(round(&mut r, &ctrl, &mut |_| Attempt::Failed).0, vec![PHONE_A, PHONE_B], "a round that ran clears it");
     }
 
     /// F5: a re-plan whose rest never walks (autoConnect off, no bonds, a session) ends its round, so a later round pages
@@ -1545,30 +1545,30 @@ mod tests {
     fn a_re_plan_whose_rest_never_walks_ends_its_round() {
         let mut r = Rounds::default();
         r.begin();
-        r.paged(SCOTT, Attempt::Absent);
-        assert!(r.end(false, true, &[SCOTT, YODA]), "the app's order came mid-round: a re-plan");
+        r.paged(PHONE_A, Attempt::Absent);
+        assert!(r.end(false, true, &[PHONE_A, PHONE_B]), "the app's order came mid-round: a re-plan");
         r.not_walked();
         r.begin();
-        assert_eq!(r.order(vec![SCOTT, YODA], |b| b), vec![YODA, SCOTT], "every phone, the timed-out one last");
+        assert_eq!(r.order(vec![PHONE_A, PHONE_B], |b| b), vec![PHONE_B, PHONE_A], "every phone, the timed-out one last");
 
         let mut r = Rounds::default();
         r.begin();
-        r.paged(SCOTT, Attempt::Absent);
-        assert!(r.end(false, true, &[SCOTT, YODA]));
+        r.paged(PHONE_A, Attempt::Absent);
+        assert!(r.end(false, true, &[PHONE_A, PHONE_B]));
         r.session();
         r.begin();
-        assert_eq!(r.order(vec![SCOTT, YODA], |b| b), vec![SCOTT, YODA], "after a session nobody is absent");
+        assert_eq!(r.order(vec![PHONE_A, PHONE_B], |b| b), vec![PHONE_A, PHONE_B], "after a session nobody is absent");
     }
 
     /// R3: the demotion comes before the pass-over, so a passed-over phone stays last.
     #[test]
     fn a_passed_over_phone_stays_last() {
-        let r = Rounds { absent_before: vec![SCOTT], ..Rounds::default() };
-        let pass_over_yoda = |b: Vec<[u8; 6]>| {
-            let (y, rest): (Vec<_>, Vec<_>) = b.into_iter().partition(|p| *p == YODA);
+        let r = Rounds { absent_before: vec![PHONE_A], ..Rounds::default() };
+        let pass_over_phone_b = |b: Vec<[u8; 6]>| {
+            let (y, rest): (Vec<_>, Vec<_>) = b.into_iter().partition(|p| *p == PHONE_B);
             rest.into_iter().chain(y).collect()
         };
-        assert_eq!(r.order(vec![SCOTT, YODA, THIRD], pass_over_yoda), vec![THIRD, SCOTT, YODA]);
+        assert_eq!(r.order(vec![PHONE_A, PHONE_B, THIRD], pass_over_phone_b), vec![THIRD, PHONE_A, PHONE_B]);
     }
 
     /// The Mac, 13 Nov: rounds 5 s apart in the early window, and a backoff that starts at its window's end.
@@ -1583,11 +1583,11 @@ mod tests {
     /// walk handed CarPlay to the second phone. It is paged once more first.
     #[test]
     fn a_phone_that_answers_and_resets_is_paged_once_more_before_the_next() {
-        let (paged, walked) = walk_with(&[(&SCOTT, Attempt::Reset), (&SCOTT, Attempt::Ran)]);
-        assert_eq!(&paged[..2], &[SCOTT, SCOTT]);
+        let (paged, walked) = walk_with(&[(&PHONE_A, Attempt::Reset), (&PHONE_A, Attempt::Ran)]);
+        assert_eq!(&paged[..2], &[PHONE_A, PHONE_A]);
         assert!(walked.ran);
-        let (paged, walked) = walk_with(&[(&SCOTT, Attempt::Reset), (&SCOTT, Attempt::Reset), (&YODA, Attempt::Ran)]);
-        assert_eq!(paged, vec![SCOTT, SCOTT, YODA], "only once: then the next phone");
+        let (paged, walked) = walk_with(&[(&PHONE_A, Attempt::Reset), (&PHONE_A, Attempt::Reset), (&PHONE_B, Attempt::Ran)]);
+        assert_eq!(paged, vec![PHONE_A, PHONE_A, PHONE_B], "only once: then the next phone");
         assert!(walked.ran);
     }
 
@@ -1599,16 +1599,16 @@ mod tests {
         let m = Instant::now();
         let t = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         let old = Some(t - Duration::from_secs(3600)); // bonded an hour ago
-        assert!(!s.note(SCOTT, Attempt::Reset, old, t, m));
-        assert!(!s.note(SCOTT, Attempt::Reset, old, t, m));
-        assert!(s.note(SCOTT, Attempt::Reset, old, t, m), "the third in a row tells");
-        assert!(!s.note(SCOTT, Attempt::Reset, old, t, m), "once per streak");
-        assert!(!s.note(SCOTT, Attempt::Failed, old, t, m), "its own failure ends its run");
-        assert!(!s.note(SCOTT, Attempt::Reset, old, t, m));
-        assert!(!s.note(SCOTT, Attempt::Ran, old, t, m));
-        assert!(!s.note(SCOTT, Attempt::Reset, old, t, m));
-        assert!(!s.note(SCOTT, Attempt::Reset, old, t, m), "a session between: the count starts again");
-        assert!(s.note(SCOTT, Attempt::Reset, old, t, m));
+        assert!(!s.note(PHONE_A, Attempt::Reset, old, t, m));
+        assert!(!s.note(PHONE_A, Attempt::Reset, old, t, m));
+        assert!(s.note(PHONE_A, Attempt::Reset, old, t, m), "the third in a row tells");
+        assert!(!s.note(PHONE_A, Attempt::Reset, old, t, m), "once per streak");
+        assert!(!s.note(PHONE_A, Attempt::Failed, old, t, m), "its own failure ends its run");
+        assert!(!s.note(PHONE_A, Attempt::Reset, old, t, m));
+        assert!(!s.note(PHONE_A, Attempt::Ran, old, t, m));
+        assert!(!s.note(PHONE_A, Attempt::Reset, old, t, m));
+        assert!(!s.note(PHONE_A, Attempt::Reset, old, t, m), "a session between: the count starts again");
+        assert!(s.note(PHONE_A, Attempt::Reset, old, t, m));
     }
 
     /// A1: a cut counts once a round toward a forgotten pairing. A not-ready phone cut on every page of two rounds
@@ -1621,18 +1621,18 @@ mod tests {
         let mut s = ResetStreak::default();
         for _ in 0..2 {
             s.new_round();
-            assert!(!s.note(SCOTT, Attempt::Cut, old, t, m));
-            assert!(!s.note(SCOTT, Attempt::Cut, old, t, m), "the round's second cut is not counted");
+            assert!(!s.note(PHONE_A, Attempt::Cut, old, t, m));
+            assert!(!s.note(PHONE_A, Attempt::Cut, old, t, m), "the round's second cut is not counted");
         }
         s.new_round();
-        assert!(s.note(SCOTT, Attempt::Cut, old, t, m), "the third round's cut tells");
-        assert!(!s.note(SCOTT, Attempt::Cut, old, t, m), "once");
+        assert!(s.note(PHONE_A, Attempt::Cut, old, t, m), "the third round's cut tells");
+        assert!(!s.note(PHONE_A, Attempt::Cut, old, t, m), "once");
 
         let mut s = ResetStreak::default();
         s.new_round();
-        assert!(!s.note(SCOTT, Attempt::Cut, old, t, m));
-        assert!(!s.note(SCOTT, Attempt::Reset, old, t, m));
-        assert!(s.note(SCOTT, Attempt::Reset, old, t, m), "a cut and two resets in one round: three");
+        assert!(!s.note(PHONE_A, Attempt::Cut, old, t, m));
+        assert!(!s.note(PHONE_A, Attempt::Reset, old, t, m));
+        assert!(s.note(PHONE_A, Attempt::Reset, old, t, m), "a cut and two resets in one round: three");
         assert_eq!(failure(&crate::sdp_client::cut_error()), Attempt::Cut);
     }
 
@@ -1644,14 +1644,14 @@ mod tests {
         let m = Instant::now();
         let t = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         let old = Some(t - Duration::from_secs(3600));
-        assert!(!s.note(SCOTT, Attempt::Reset, old, t, m));
-        assert!(!s.note(SCOTT, Attempt::Reset, old, t, m));
+        assert!(!s.note(PHONE_A, Attempt::Reset, old, t, m));
+        assert!(!s.note(PHONE_A, Attempt::Reset, old, t, m));
         let new = Some(t); // NEW_LINK_KEY: the store is rewritten
-        assert!(!s.note(SCOTT, Attempt::Reset, new, t, m), "the count starts over");
-        assert!(!s.note(SCOTT, Attempt::Reset, new, t, m));
-        assert!(!s.note(SCOTT, Attempt::Reset, new, t + Duration::from_secs(60), m), "three, but the bond is a minute old");
+        assert!(!s.note(PHONE_A, Attempt::Reset, new, t, m), "the count starts over");
+        assert!(!s.note(PHONE_A, Attempt::Reset, new, t, m));
+        assert!(!s.note(PHONE_A, Attempt::Reset, new, t + Duration::from_secs(60), m), "three, but the bond is a minute old");
         let later = t + ResetStreak::NEW_BOND_HOLD + Duration::from_secs(1);
-        assert!(s.note(SCOTT, Attempt::Reset, new, later, m), "still resetting once the bond is no longer new: tell");
+        assert!(s.note(PHONE_A, Attempt::Reset, new, later, m), "still resetting once the bond is no longer new: tell");
     }
 
     /// The Mac, 6 Nov: after a restart the box clock reads 2020 until Carlink's SETTIME lands, so a bond can be
@@ -1662,11 +1662,11 @@ mod tests {
         let m = Instant::now();
         let t = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         let ahead = Some(t + Duration::from_secs(365 * 24 * 3600)); // written before the restart, by the right clock
-        assert!(!s.note(SCOTT, Attempt::Reset, ahead, t, m));
-        assert!(!s.note(SCOTT, Attempt::Reset, ahead, t, m));
-        assert!(!s.note(SCOTT, Attempt::Reset, ahead, t, m + Duration::from_secs(60)), "held while it is new to btd");
+        assert!(!s.note(PHONE_A, Attempt::Reset, ahead, t, m));
+        assert!(!s.note(PHONE_A, Attempt::Reset, ahead, t, m));
+        assert!(!s.note(PHONE_A, Attempt::Reset, ahead, t, m + Duration::from_secs(60)), "held while it is new to btd");
         let after = m + ResetStreak::NEW_BOND_HOLD + Duration::from_secs(1);
-        assert!(s.note(SCOTT, Attempt::Reset, ahead, t, after), "the hold ends on the monotonic clock");
+        assert!(s.note(PHONE_A, Attempt::Reset, ahead, t, after), "the hold ends on the monotonic clock");
     }
 
     /// The Mac, 6 Nov: two bonded iPhones, the one that forgot the adapter here and the other away. Every round pages
@@ -1676,61 +1676,61 @@ mod tests {
         let t = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         let old = Some(t - Duration::from_secs(3600));
         let m = Instant::now();
-        for order in [[SCOTT, YODA], [YODA, SCOTT]] {
+        for order in [[PHONE_A, PHONE_B], [PHONE_B, PHONE_A]] {
             let mut s = ResetStreak::default();
             let mut told = Vec::new();
             for round in 1..=3 {
                 walk(&order, || false, |_, _| true, |peer| {
-                    let result = if peer == SCOTT { Attempt::Reset } else { Attempt::Failed };
+                    let result = if peer == PHONE_A { Attempt::Reset } else { Attempt::Failed };
                     if s.note(peer, result, old, t, m) {
                         told.push((round, peer));
                     }
                     result
                 });
             }
-            assert_eq!(told, vec![(2, SCOTT)], "{order:?}: told once, in the second round (pages 3 and 4 are its)");
+            assert_eq!(told, vec![(2, PHONE_A)], "{order:?}: told once, in the second round (pages 3 and 4 are its)");
         }
         let mut s = ResetStreak::default();
-        assert!(!s.note(SCOTT, Attempt::Reset, old, t, m));
-        assert!(!s.note(SCOTT, Attempt::Reset, old, t, m));
+        assert!(!s.note(PHONE_A, Attempt::Reset, old, t, m));
+        assert!(!s.note(PHONE_A, Attempt::Reset, old, t, m));
         s.session(); // it started a session itself: it knows the adapter
-        assert!(!s.note(SCOTT, Attempt::Reset, old, t, m), "the run starts over after a session");
-        assert!(!s.note(YODA, Attempt::Ran, old, t, m));
-        assert!(!s.note(SCOTT, Attempt::Reset, old, t, m));
-        assert!(!s.note(SCOTT, Attempt::Reset, old, t, m), "any phone's session ends every run");
-        assert!(s.note(SCOTT, Attempt::Reset, old, t, m));
+        assert!(!s.note(PHONE_A, Attempt::Reset, old, t, m), "the run starts over after a session");
+        assert!(!s.note(PHONE_B, Attempt::Ran, old, t, m));
+        assert!(!s.note(PHONE_A, Attempt::Reset, old, t, m));
+        assert!(!s.note(PHONE_A, Attempt::Reset, old, t, m), "any phone's session ends every run");
+        assert!(s.note(PHONE_A, Attempt::Reset, old, t, m));
     }
 
     /// The Mac, 13 Nov: after a failed first round the absent first-listed phone was paged first again.
     #[test]
     fn a_phone_whose_page_failed_goes_last_next_round() {
         const THIRD: [u8; 6] = [3, 0, 0, 0, 0, 0];
-        assert_eq!(absent_last(vec![SCOTT, YODA, THIRD], &[SCOTT]), vec![YODA, THIRD, SCOTT]);
-        assert_eq!(absent_last(vec![SCOTT, YODA, THIRD], &[THIRD, SCOTT]), vec![YODA, SCOTT, THIRD], "in their own order");
-        assert_eq!(absent_last(vec![SCOTT, YODA], &[]), vec![SCOTT, YODA]);
+        assert_eq!(absent_last(vec![PHONE_A, PHONE_B, THIRD], &[PHONE_A]), vec![PHONE_B, THIRD, PHONE_A]);
+        assert_eq!(absent_last(vec![PHONE_A, PHONE_B, THIRD], &[THIRD, PHONE_A]), vec![PHONE_B, PHONE_A, THIRD], "in their own order");
+        assert_eq!(absent_last(vec![PHONE_A, PHONE_B], &[]), vec![PHONE_A, PHONE_B]);
     }
 
     #[test]
     fn an_absent_phone_is_not_paged_twice() {
-        let (paged, _) = walk_with(&[(&SCOTT, Attempt::Failed), (&YODA, Attempt::Ran)]);
-        assert_eq!(paged, vec![SCOTT, YODA]);
+        let (paged, _) = walk_with(&[(&PHONE_A, Attempt::Failed), (&PHONE_B, Attempt::Ran)]);
+        assert_eq!(paged, vec![PHONE_A, PHONE_B]);
     }
 
     #[test]
     fn a_request_or_a_session_during_the_pause_ends_the_walk() {
         let mut paged = Vec::new();
-        let walked = walk(&[SCOTT, YODA], || false, |_, _| false, |peer| {
+        let walked = walk(&[PHONE_A, PHONE_B], || false, |_, _| false, |peer| {
             paged.push(peer);
             Attempt::Reset
         });
-        assert_eq!(paged, vec![SCOTT]);
+        assert_eq!(paged, vec![PHONE_A]);
         assert_eq!(walked, Walk::default());
     }
 
     #[test]
     fn a_rejected_pairing_still_ends_the_walk() {
-        let (paged, walked) = walk_with(&[(&SCOTT, Attempt::PairRejected)]);
-        assert_eq!(paged, vec![SCOTT]);
+        let (paged, walked) = walk_with(&[(&PHONE_A, Attempt::PairRejected)]);
+        assert_eq!(paged, vec![PHONE_A]);
         assert!(walked.rejected && !walked.ran);
     }
 
