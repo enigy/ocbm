@@ -30,6 +30,13 @@ run "iap2d"      cargo test -p iap2d --quiet
 # binaries, and `carplay-metadata`, a direct dependency of iap2-core.
 run "metadata"   cargo test --manifest-path crates/vendor/metadata/Cargo.toml --quiet
 run "wireless"   cargo test -p btd --quiet
+# carplayd's own tests (its phone gate and discovery) ran nowhere until 15 Nov. Linux only: carplayd uses
+# libc::TCP_KEEPIDLE (above). Without the AAC-ELD feature, whose libfdk-aac a host checkout lacks.
+if [ "$(uname -s)" = Linux ]; then
+  run "carplayd"   cargo test -p carplayd --no-default-features --quiet
+else
+  echo "=== carplayd: skipped, Linux only (TCP_KEEPIDLE)"
+fi
 # bt-common holds the Bluetooth primitives extracted from btd on 2026-09-01. Its
 # 29 tests used to run under the "wireless" line above; without this one they would silently
 # stop running, which is the failure mode an extraction is most likely to cause.

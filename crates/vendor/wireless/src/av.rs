@@ -88,10 +88,7 @@ pub const EXPECT_PHONE_FILE: &str = "/tmp/carplay_expect_phone";
 pub fn expect_phone(peer: Option<[u8; 6]>) {
     match peer {
         Some(a) => {
-            let tmp = format!("{EXPECT_PHONE_FILE}.tmp");
-            let named = std::fs::write(&tmp, crate::control::fmt_addr(&a))
-                .and_then(|_| std::fs::rename(&tmp, EXPECT_PHONE_FILE));
-            if let Err(e) = named {
+            if let Err(e) = write_name(&a) {
                 println!("[av] could not name the phone for carplayd ({e}); it serves any phone");
                 let _ = std::fs::remove_file(EXPECT_PHONE_FILE);
             }
@@ -99,6 +96,133 @@ pub fn expect_phone(peer: Option<[u8; 6]>) {
         None => {
             let _ = std::fs::remove_file(EXPECT_PHONE_FILE);
         }
+    }
+}
+
+fn write_name(a: &[u8; 6]) -> std::io::Result<()> {
+    let tmp = format!("{EXPECT_PHONE_FILE}.tmp");
+    std::fs::write(&tmp, crate::control::fmt_addr(a)).and_then(|_| std::fs::rename(&tmp, EXPECT_PHONE_FILE))
+}
+
+/// The phone the file names now; `None` = none.
+fn named_now() -> Option<[u8; 6]> {
+    std::fs::read_to_string(EXPECT_PHONE_FILE).ok().and_then(|s| crate::control::parse_addr(s.trim()))
+}
+
+fn tail(a: [u8; 6]) -> String {
+    crate::bt_driver::peer_tail(Some(a))
+}
+
+/// A name btd wrote as a Bluetooth session started, and the name it replaced ([`name_at_session_start`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EarlyName {
+    phone: [u8; 6],
+    before: Option<[u8; 6]>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AtStart {
+    Name(EarlyName),
+    /// A CarPlay session is up here: its 0x5703 names this phone, as before.
+    SessionUp,
+    /// No peer, not bonded, or it is named already.
+    Leave,
+}
+
+/// The Mac's 15 Nov bench: btd named a phone only after its 0x5703, and a phone that knows the AP is on it
+/// within ~1.5 s of its Bluetooth link, before that. carplayd refused its record for the last phone's, and
+/// nothing looked again until the browser re-queried, 84 s later. So the phone is named as its session
+/// starts, by the 0x5703's own rule: only a phone this box is bonded with (`bonded`, `wifi_config_allowed`,
+/// R3). And only while no CarPlay session is up here (`session_up`): a session can outlive its phone's
+/// Bluetooth link, and naming another phone would let that phone take it before it had handed off (R2).
+fn at_session_start(
+    peer: Option<[u8; 6]>,
+    bonded: bool,
+    named: Option<[u8; 6]>,
+    session_up: bool,
+) -> AtStart {
+    match peer {
+        Some(p) if bonded && named != Some(p) => {
+            if session_up {
+                AtStart::SessionUp
+            } else {
+                AtStart::Name(EarlyName { phone: p, before: named })
+            }
+        }
+        _ => AtStart::Leave,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AtEnd {
+    /// Write the earlier name back; `None` removes the file (see [`at_session_end`]).
+    PutBack(Option<[u8; 6]>),
+    /// The phone's CarPlay is live: it is the phone served now, as after a 0x5703.
+    CarPlayLive,
+    /// A 0x5703 named it for good, or the file was written since.
+    Leave,
+}
+
+/// R4: a session that named its phone early and ended without a 0x5703 (`handed_off`) must not leave carplayd
+/// serving a phone that is not coming while the phone served before may still be on Wi-Fi: the earlier name
+/// goes back. Never over a name written since (`named`), and not while that phone's own CarPlay is live
+/// (`carplay`, carplayd's identity): a CarPlay session can outlive its Bluetooth link, and the other phone
+/// would take it. No earlier name puts back no file: carplayd is spawned only at a 0x5703, which names its
+/// phone first, so none was running for this one, or the one running already served any phone.
+fn at_session_end(
+    early: EarlyName,
+    handed_off: bool,
+    named: Option<[u8; 6]>,
+    carplay: Option<[u8; 6]>,
+) -> AtEnd {
+    if handed_off || named != Some(early.phone) {
+        AtEnd::Leave
+    } else if carplay == Some(early.phone) {
+        AtEnd::CarPlayLive
+    } else {
+        AtEnd::PutBack(early.before)
+    }
+}
+
+/// Name a bonded `peer` for carplayd as its Bluetooth session starts ([`at_session_start`]). Returns what to
+/// hand [`put_back`] when the session ends.
+pub fn name_at_session_start(peer: Option<[u8; 6]>, bonded: bool) -> Option<EarlyName> {
+    let p = peer.filter(|_| bonded)?;
+    match at_session_start(peer, bonded, named_now(), crate::control::carplay_session_up()) {
+        AtStart::Name(early) => match write_name(&p) {
+            Ok(()) => {
+                println!("[av] named {} for carplayd at its session start", tail(p));
+                Some(early)
+            }
+            Err(e) => {
+                println!("[av] could not name {} at its session start ({e}); its 0x5703 names it", tail(p));
+                None
+            }
+        },
+        AtStart::SessionUp => {
+            println!("[av] not naming {} at its session start: a CarPlay session is up; its 0x5703 names it", tail(p));
+            None
+        }
+        AtStart::Leave => None,
+    }
+}
+
+/// The session that named its phone early ended; `handed_off` when it sent a 0x5703 ([`at_session_end`]).
+/// Its thread is the only writer while it lasts: one Bluetooth session runs at a time (`SessionClaim`, held
+/// until `bt_driver::run` returns), and `teardown_av_layer` runs only after that thread is joined.
+pub fn put_back(early: Option<EarlyName>, handed_off: bool) {
+    let Some(early) = early else { return };
+    match at_session_end(early, handed_off, named_now(), crate::control::carplay_phone()) {
+        AtEnd::PutBack(before) => {
+            expect_phone(before);
+            let to = before.map_or_else(|| "none".to_string(), tail);
+            println!("[av] put back {to}: the session ended without a handoff");
+        }
+        AtEnd::CarPlayLive => println!(
+            "[av] left {} named: the session ended without a handoff, but its CarPlay is live",
+            tail(early.phone)
+        ),
+        AtEnd::Leave => {}
     }
 }
 const WLAN_IFACE: &str = "wlan0";
@@ -530,5 +654,49 @@ mod tests {
             "Command::status() must still work after spawn_detached (no SIGCHLD=SIG_IGN)"
         );
         assert!(st.unwrap().success());
+    }
+
+    // The Mac's 15 Nov bench: phone A had handed off; phone B came back on Bluetooth.
+    const A: [u8; 6] = [0x10, 0x25, 0x00, 0x29, 0xA7, 0x68];
+    const B: [u8; 6] = [0xDE, 0x6A, 0x00, 0xCC, 0xBB, 0xAA];
+
+    #[test]
+    fn a_bonded_phone_is_named_at_its_session_start_while_no_carplay_is_up() {
+        let named = AtStart::Name(EarlyName { phone: B, before: Some(A) });
+        assert_eq!(at_session_start(Some(B), true, Some(A), false), named, "10:54:23.4, B back on Bluetooth");
+        assert_eq!(
+            at_session_start(Some(B), true, None, false),
+            AtStart::Name(EarlyName { phone: B, before: None }),
+            "the first phone after btd starts"
+        );
+        assert_eq!(at_session_start(Some(B), false, Some(A), false), AtStart::Leave, "R3: not bonded, never named");
+        assert_eq!(at_session_start(None, true, Some(A), false), AtStart::Leave, "no peer, nothing to name");
+        assert_eq!(at_session_start(Some(A), true, Some(A), false), AtStart::Leave, "the same phone back: unchanged");
+        assert_eq!(
+            at_session_start(Some(B), true, Some(A), true),
+            AtStart::SessionUp,
+            "R2: A's CarPlay outlives its Bluetooth link; B is named at its 0x5703, as before"
+        );
+    }
+
+    #[test]
+    fn an_early_name_goes_back_only_when_the_session_ends_without_a_handoff() {
+        let early = EarlyName { phone: B, before: Some(A) };
+        assert_eq!(at_session_end(early, false, Some(B), None), AtEnd::PutBack(Some(A)), "R4: A is named again");
+        assert_eq!(at_session_end(early, true, Some(B), None), AtEnd::Leave, "after its 0x5703 the name stays");
+        assert_eq!(at_session_end(early, false, Some(A), None), AtEnd::Leave, "a name written since is not clobbered");
+        assert_eq!(at_session_end(early, false, None, None), AtEnd::Leave, "nor a removed one");
+        assert_eq!(
+            at_session_end(early, false, Some(B), Some(B)),
+            AtEnd::CarPlayLive,
+            "B's CarPlay outlives its Bluetooth link: A must not take it"
+        );
+        assert_eq!(
+            at_session_end(early, false, Some(B), Some(A)),
+            AtEnd::PutBack(Some(A)),
+            "A's CarPlay is live: the name goes back to it"
+        );
+        let first = EarlyName { phone: B, before: None };
+        assert_eq!(at_session_end(first, false, Some(B), None), AtEnd::PutBack(None), "no earlier name: no file");
     }
 }

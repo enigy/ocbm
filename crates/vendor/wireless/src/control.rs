@@ -458,6 +458,18 @@ fn read_ident() -> Ident {
     Some((written, named))
 }
 
+/// Whether a wireless CarPlay session is up or coming up in carplayd: it has published a phone's identity
+/// (from that phone's SETUP to its session's end), or holds a phone's control connection (the transport flag
+/// in its own hand, not btd's claim). btd names a phone early only while neither (`av::name_at_session_start`).
+pub(crate) fn carplay_session_up() -> bool {
+    read_ident().is_some() || carplayd_live(read_carplayd(), SystemTime::UNIX_EPOCH, crate::av::claimed_at())
+}
+
+/// The phone whose CarPlay session is live, by carplayd's identity; `None` = none, or it names no phone.
+pub(crate) fn carplay_phone() -> Option<[u8; 6]> {
+    read_ident().and_then(|(_, phone)| phone)
+}
+
 /// Whether carplayd took a SETUP from `w`'s phone since its session started: the identity file was
 /// rewritten, and names it. A file that already named it then is a leftover, not proof.
 fn carplay_reached(w: &SwitchWatch, now: Ident) -> bool {

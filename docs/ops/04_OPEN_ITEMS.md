@@ -255,7 +255,15 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
      sessions (4 of 5 on the bench before), leaving media and no video for minutes; when no new screen
      stream follows within 3 s, `carplayd` now sends `requestUI` again (`AvSession::nudge_screen_back`).
      Why iOS 15 tears it down is not known; the failing sessions sent one more `modesChanged` before the
-     screen SETUP than the good ones.
+     screen SETUP than the good ones. **Bench 15 Nov (the Mac), two iPhones: 84 s lost.** A phone that
+     knows the AP joins it ~1.5 s after its Bluetooth link, before its 0x5703 names it, so `carplayd`
+     refused its record for the last phone's and nothing looked again until the browser re-queried.
+     Fixed for 2.6.0, NOT yet benched: `btd` names a bonded phone as its Bluetooth session starts, while
+     no CarPlay session is up (`av::name_at_session_start`), and puts the earlier name back when that
+     session ends without a 0x5703, unless the phone's own CarPlay is live (`av::put_back`); discovery
+     reads the name once a second and, when it changes, dials the records it held for that phone and
+     browses `_carplay-ctrl` afresh; the gate keeps a live session across a name change, so a name put
+     back never dials it again.
   3. **"Phone drop on host re-SUBSCRIBE" (`PROJ_MODE NONE` then `SESSION_EVENT PHONE_ABSENT` after
      an app relaunch) — NOT reproduced, 2026-09-25.** Three timelines, all wired, the phone never
      left the bus in any: (a) kill-without-STOP relaunch (`adb install -r`): SUBSCRIBE → stale
