@@ -35,6 +35,64 @@ set -u
 export PATH=${OCBM_TEST_PATH:+$OCBM_TEST_PATH:}/usr/sbin:/usr/bin:/sbin:/bin:/tmp/bin:$PATH
 L="[radio_ap_up]"
 
+# ---- passphrase: set only if MISSING, never blanked ------------------------------------------
+# The vendor bug this guards against is unconditional rewriting from a config oracle that no
+# longer exists. We only ever fill in an absent or too-short key, and never overwrite a good one.
+# A well-known default counts as missing (security review C1, 2026-10-21): Carlinkit ships
+# 12345678, and the old fallback below was derived from the AP's own MAC, which the AP broadcasts.
+# The replacement is random and persisted once; the phone is handed it in the iAP2 0x5703 handoff
+# at every connect, so nobody ever types it.
+# A function of the root it works under ($1, empty on the adapter), defined before anything runs, so
+# tools/radio_ap_up_test.sh sources this file for it alone (RADIO_AP_UP_FUNCS=1) and runs the whole
+# read and write against a scratch tree, under BusyBox too (the Mac's round 2, R1-1). Called below,
+# where the name is set; SUF is the AP interface's suffix by then.
+_known_psk() { case "$1" in 12345678|"carplay$SUF") return 0 ;; esac; return 1; }
+ap_passphrase() {
+  _hc="$1/etc/hostapd.conf"
+  PSK=$(sed -n 's/^wpa_passphrase=//p' "$_hc" | head -1)
+  _known_psk "$PSK" && PSK=""
+  if [ "${#PSK}" -lt 8 ]; then
+    # OCBM's own from before a go-back to stock first (it puts stock's 12345678 back): each phone knows it, and a new one
+    # cost each phone about 6 s of PSK-MISMATCH retries at its first connect after the reinstall (the Mac, 13 Nov).
+    # Which source it came from is logged, never the passphrase (the Mac's review, PSK-SOURCE-UNLOGGED).
+    # tr keeps ' ' to '~', the printable ASCII a WPA passphrase is made of, as a range: BusyBox 1.32.1's tr has no
+    # [:print:] and took it for the letters [ : p r i n t ], so a kept hex key came out empty and /etc/wifi_password was
+    # cut to those letters (the Mac's round 2, R1-1).
+    _psk_src="the one OCBM kept (/etc/ocbm/wifi_psk)"
+    PSK=$(cat "$1/etc/ocbm/wifi_psk" 2>/dev/null | tr -cd ' -~' | head -c 63)
+    _known_psk "$PSK" && PSK=""
+    if [ "${#PSK}" -lt 8 ]; then
+      _psk_src="/etc/wifi_password"
+      PSK=$(cat "$1/etc/wifi_password" 2>/dev/null | tr -cd ' -~' | head -c 63)
+      _known_psk "$PSK" && PSK=""
+    fi
+    if [ "${#PSK}" -lt 8 ]; then
+      _psk_src="a new random one"
+      PSK=$(head -c 64 /dev/urandom | md5sum | cut -c1-20)
+    fi
+    # The key reaches awk through its environment, never sed's replacement or awk -v, which take '\' (and sed '/' and
+    # '&'): a printable ASCII passphrase, a kept one or /etc/wifi_password's, is written as it was read. Read back; a
+    # line that doesn't hold it is logged as a failure, without the key (the Mac's 2.6.0 review, CS-4).
+    cp -p "$_hc" "$_hc.new" 2>/dev/null   # its mode, as sed -i kept it
+    OCBM_PSK="$PSK" awk '/^wpa_passphrase=/ { print "wpa_passphrase=" ENVIRON["OCBM_PSK"]; seen = 1; next }
+      { print }
+      END { if (!seen) print "wpa_passphrase=" ENVIRON["OCBM_PSK"] }' "$_hc" > "$_hc.new" \
+      && mv -f "$_hc.new" "$_hc"
+    rm -f "$_hc.new"
+    if [ "$(sed -n 's/^wpa_passphrase=//p' "$_hc" | head -1)" = "$PSK" ]; then
+      echo "$L wpa_passphrase was absent, too short or a known default - set $_psk_src"
+    else
+      echo "$L wpa_passphrase was absent, too short or a known default - FAILED to set $_psk_src: hostapd.conf does not hold it"
+    fi
+  fi
+  # Kept where a go-back leaves it (/etc/ocbm stays on flash; ocbm_revert.sh), for the install after it. Not logged.
+  # printf, not echo: an echo may take a '\' in it as an escape.
+  if [ -d "$1/etc/ocbm" ] && [ "$(cat "$1/etc/ocbm/wifi_psk" 2>/dev/null)" != "$PSK" ]; then
+    ( umask 077; printf '%s\n' "$PSK" > "$1/etc/ocbm/wifi_psk.new" && mv -f "$1/etc/ocbm/wifi_psk.new" "$1/etc/ocbm/wifi_psk" ) 2>/dev/null
+  fi
+}
+[ "${RADIO_AP_UP_FUNCS:-}" = 1 ] && return 0
+
 IF=${RADIO_WLAN_IF:-wlan0}
 [ -e "/sys/class/net/$IF" ] || { echo "$L interface $IF does not exist - the driver must be up first"; exit 1; }
 # AND IT MUST ACTUALLY BE A WIRELESS INTERFACE. Existence alone is not enough: this script
@@ -102,52 +160,8 @@ SUF=$(cat "/sys/class/net/$IF/address" 2>/dev/null | tr -cd '0-9a-fA-F' | tr 'A-
 sed -i "s/^ssid=.*/ssid=$NAME/" /etc/hostapd.conf
 echo "$NAME" > /etc/wifi_name
 
-# ---- passphrase: set only if MISSING, never blanked ------------------------------------------
-# The vendor bug this guards against is unconditional rewriting from a config oracle that no
-# longer exists. We only ever fill in an absent or too-short key, and never overwrite a good one.
-# A well-known default counts as missing (security review C1, 2026-10-21): Carlinkit ships
-# 12345678, and the old fallback below was derived from the AP's own MAC, which the AP broadcasts.
-# The replacement is random and persisted once; the phone is handed it in the iAP2 0x5703 handoff
-# at every connect, so nobody ever types it.
-_known_psk() { case "$1" in 12345678|"carplay$SUF") return 0 ;; esac; return 1; }
-PSK=$(sed -n 's/^wpa_passphrase=//p' /etc/hostapd.conf | head -1)
-_known_psk "$PSK" && PSK=""
-if [ "${#PSK}" -lt 8 ]; then
-  # OCBM's own from before a go-back to stock first (it puts stock's 12345678 back): each phone knows it, and a new one
-  # cost each phone about 6 s of PSK-MISMATCH retries at its first connect after the reinstall (the Mac, 13 Nov).
-  # Which source it came from is logged, never the passphrase (the Mac's review, PSK-SOURCE-UNLOGGED).
-  _psk_src="the one OCBM kept (/etc/ocbm/wifi_psk)"
-  PSK=$(cat /etc/ocbm/wifi_psk 2>/dev/null | tr -cd '[:print:]' | head -c 63)
-  _known_psk "$PSK" && PSK=""
-  if [ "${#PSK}" -lt 8 ]; then
-    _psk_src="/etc/wifi_password"
-    PSK=$(cat /etc/wifi_password 2>/dev/null | tr -cd '[:print:]' | head -c 63)
-    _known_psk "$PSK" && PSK=""
-  fi
-  if [ "${#PSK}" -lt 8 ]; then
-    _psk_src="a new random one"
-    PSK=$(head -c 64 /dev/urandom | md5sum | cut -c1-20)
-  fi
-  # The key reaches awk through its environment, never sed's replacement or awk -v, which take '\' (and sed '/' and
-  # '&'): any printable passphrase, a kept one or /etc/wifi_password's, is written as it is. Read back; a line that
-  # doesn't hold it is logged as a failure, without the key (the Mac's 2.6.0 review, CS-4).
-  cp -p /etc/hostapd.conf /etc/hostapd.conf.new 2>/dev/null   # its mode, as sed -i kept it
-  OCBM_PSK="$PSK" awk '/^wpa_passphrase=/ { print "wpa_passphrase=" ENVIRON["OCBM_PSK"]; seen = 1; next }
-    { print }
-    END { if (!seen) print "wpa_passphrase=" ENVIRON["OCBM_PSK"] }' /etc/hostapd.conf > /etc/hostapd.conf.new \
-    && mv -f /etc/hostapd.conf.new /etc/hostapd.conf
-  rm -f /etc/hostapd.conf.new
-  if [ "$(sed -n 's/^wpa_passphrase=//p' /etc/hostapd.conf | head -1)" = "$PSK" ]; then
-    echo "$L wpa_passphrase was absent, too short or a known default - set $_psk_src"
-  else
-    echo "$L wpa_passphrase was absent, too short or a known default - FAILED to set $_psk_src: hostapd.conf does not hold it"
-  fi
-fi
-# Kept where a go-back leaves it (/etc/ocbm stays on flash; ocbm_revert.sh), for the install after it. Not logged.
-# printf, not echo: an echo may take a '\' in it as an escape.
-if [ -d /etc/ocbm ] && [ "$(cat /etc/ocbm/wifi_psk 2>/dev/null)" != "$PSK" ]; then
-  ( umask 077; printf '%s\n' "$PSK" > /etc/ocbm/wifi_psk.new && mv -f /etc/ocbm/wifi_psk.new /etc/ocbm/wifi_psk ) 2>/dev/null
-fi
+# ---- passphrase (ap_passphrase, above) -------------------------------------------------------
+ap_passphrase ""
 
 # ---- channel + band ---------------------------------------------------------------------------
 ch=$(sed -n 's/^channel=//p' /etc/hostapd.conf | head -1)

@@ -44,6 +44,7 @@ jobs:
           run "ocbm-stageb"    bash tools/ocbm_stageb_test.sh
           run "ocbm-update"    bash tools/ocbm_update_test.sh
           run "radio-detect"   bash tools/radio_detect_test.sh
+          run "radio-ap-up"    bash tools/radio_ap_up_test.sh
           run "update-img"     bash tools/make_update_img_test.sh
           if [ -n "$failed" ]; then
             echo "FAILURES:$failed"

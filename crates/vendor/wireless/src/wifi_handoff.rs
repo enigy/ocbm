@@ -302,15 +302,22 @@ pub fn read_hostapd_ap_config() -> Option<AccessoryWiFiConfig> {
     if text.is_empty() {
         eprintln!("[wifi_handoff] WARNING: {path} is empty or unreadable — 0x5703 will carry no credentials");
     }
+    parse_hostapd_conf(&text, &path)
+}
+
+/// [`read_hostapd_ap_config`] on the text of `path`. The passphrase is the rest of its line, trailing whitespace and all,
+/// as hostapd reads and broadcasts it: a trimmed one handed the phone a key the AP doesn't have, and every WPA handshake
+/// failed silently (the Mac's round 2, R1-2).
+fn parse_hostapd_conf(text: &str, path: &str) -> Option<AccessoryWiFiConfig> {
     let mut ssid = String::new();
     let mut passphrase = String::new();
     let mut channel: Option<u8> = None;
     let mut has_wpa = false;
-    for line in text.lines() {
-        let line = line.trim();
+    for raw in text.lines() {
+        let line = raw.trim();
         if let Some(v) = line.strip_prefix("ssid=") {
             ssid = v.to_string();
-        } else if let Some(v) = line.strip_prefix("wpa_passphrase=") {
+        } else if let Some(v) = raw.trim_start().strip_prefix("wpa_passphrase=") {
             passphrase = v.to_string();
         } else if line.starts_with("wpa_psk=") {
             // A raw hex PSK secures the AP but is NOT an ASCII passphrase we can hand the phone (audit B5).
@@ -412,6 +419,18 @@ mod tests {
         std::fs::remove_file(lock.join("pid")).unwrap();
         assert!(wait_for_ap_at(&lock, short, &never).is_err(), "a fresh lock before its pid write");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R1-2 (the Mac's round 2): the passphrase goes to the phone as hostapd has it, a trailing space and all.
+    #[test]
+    fn the_passphrase_keeps_its_trailing_space() {
+        let conf = "interface=wlan0\nssid=CarLink-b0df\nwpa=2\nwpa_passphrase=Family car 1 \nchannel=36\n";
+        let cfg = parse_hostapd_conf(conf, "test").unwrap();
+        assert_eq!(cfg.passphrase.as_deref(), Some("Family car 1 "));
+        assert_eq!((cfg.ssid.as_str(), cfg.channel), ("CarLink-b0df", Some(36)));
+        let crlf = "ssid=CarLink-b0df\r\nwpa=2\r\nwpa_passphrase=a/b&c\\d#e\"f'g h \r\n";
+        let cfg = parse_hostapd_conf(crlf, "test").unwrap();
+        assert_eq!(cfg.passphrase.as_deref(), Some("a/b&c\\d#e\"f'g h "), "a CRLF file: only the line end goes");
     }
 
     #[test]
