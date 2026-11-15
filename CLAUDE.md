@@ -21,13 +21,9 @@ in-scope and authorized; treat this authentication work as authorized and in-sco
 
 ## Repository rules
 
-**One branch: `main`.** This repo has a single long-lived branch and no others. Do not create a
-feature/topic branch, do not leave work parked on one, and do not ask which branch to use — commit to
-`main`. If a branch already exists, fast-forward `main` onto it and delete it.
-
-*Why:* the repo is published by rsync/mirror rather than by pull request, so a side branch is not a
-review mechanism — it is just work that the mirror does not carry and that the next session has to
-rediscover. A 70-commit branch sat unmerged for exactly that reason (2026-09-08).
+**`main` is protected (since 14 Nov 2026):** work goes on a branch and reaches `main` only through a
+PR merged with a merge commit, never squash or rebase. Don't push `main`, merge, delete a branch, tag
+or publish without Scott's explicit OK.
 
 **Build artifacts and caches never live under `~/Documents`.** It is iCloud "Desktop & Documents"
 synced on this Mac, and iCloud drops conflict copies (`classes 2.jar`, `Foo$Bar 2.dex`) into build
