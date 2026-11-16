@@ -166,8 +166,10 @@ impl Seen {
         self.sta.is_some() && self.dhcp_ack
     }
 
-    /// The watch's closing line: why it ended, after how long, and what it saw.
-    fn summary(&self, why: &str, secs: f64) -> String {
+    /// The watch's closing line: why it ended, after how long (to the tenth of a second: integers, as a float's
+    /// formatting would cost btd its code), and what it saw.
+    fn summary(&self, why: &str, after: std::time::Duration) -> String {
+        let ms = after.as_millis();
         let yes = |b: bool| if b { "seen" } else { "not seen" };
         let sta = match &self.sta {
             Some(t) if !t.is_empty() => format!("seen ({t})"),
@@ -175,7 +177,9 @@ impl Seen {
             None => "not seen".to_string(),
         };
         format!(
-            "ended ({why}) after {secs:.1} s: AP-ENABLED {}, AP-STA-CONNECTED {sta}, DHCP ACK {}",
+            "ended ({why}) after {}.{} s: AP-ENABLED {}, AP-STA-CONNECTED {sta}, DHCP ACK {}",
+            ms / 1000,
+            ms % 1000 / 100,
             yes(self.ap_enabled),
             yes(self.dhcp_ack)
         )
@@ -301,7 +305,7 @@ mod linux {
             add(&ino, BOX_LOG);
             add(&ino, DHCP_LOG);
         }
-        log(&seen.summary(why, started.elapsed().as_secs_f64()));
+        log(&seen.summary(why, started.elapsed()));
     }
 }
 
@@ -347,7 +351,7 @@ mod tests {
         assert_eq!(seen.note(Writer::Udhcpd, "udhcpd: sending ACK to 192.168.43.100"), Some(Event::DhcpAck));
         assert!(seen.done());
         assert_eq!(
-            seen.summary("the phone is on the AP", 23.44),
+            seen.summary("the phone is on the AP", std::time::Duration::from_millis(23_440)),
             "ended (the phone is on the AP) after 23.4 s: AP-ENABLED seen, AP-STA-CONNECTED seen (..00:0a), DHCP ACK seen"
         );
         let mut late = Seen::default();
@@ -355,11 +359,11 @@ mod tests {
         late.note(Writer::Udhcpd, "udhcpd: sending ACK to 192.168.43.100");
         assert!(late.done(), "AP-ENABLED before the session began: not waited for");
         assert_eq!(
-            late.summary("the phone is on the AP", 3.0),
+            late.summary("the phone is on the AP", std::time::Duration::from_millis(3_000)),
             "ended (the phone is on the AP) after 3.0 s: AP-ENABLED not seen, AP-STA-CONNECTED seen, DHCP ACK seen"
         );
         assert_eq!(
-            Seen::default().summary("a minute passed", 60.0),
+            Seen::default().summary("a minute passed", std::time::Duration::from_secs(60)),
             "ended (a minute passed) after 60.0 s: AP-ENABLED not seen, AP-STA-CONNECTED not seen, DHCP ACK not seen"
         );
     }
