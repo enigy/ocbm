@@ -441,6 +441,8 @@ fn process_one(
     // phone can join wlan0. Intercepted here (not in iap2-core::state) to keep the shared wired state
     // machine untouched. Sent on the control session (1), like identify.
     if msg_id == spec::MSG_REQUEST_ACCESSORY_WI_FI_CONFIGURATION_INFORMATION {
+        // The timeline's `wifi_req`: the phone's first 0x5702 (it asks up to three times).
+        crate::startup::stamp("wifi_req");
         // Checked when the request arrives, not when the session started: a phone pairing for the
         // first time bonds moments before it asks, and the link key is persisted on NEW_LINK_KEY.
         let peer = *SESSION_PEER.lock().unwrap_or_else(|e| e.into_inner());
@@ -491,6 +493,10 @@ fn process_one(
             ),
             abort,
         );
+        if sent {
+            // The timeline's `wifi_rsp`: the 0x5703 is on the link.
+            crate::startup::stamp("wifi_rsp");
+        }
         if sent && !abort() {
             // The iPhone now has the AP credentials and will associate to wlan0, then look for the
             // AirPlay receiver via mDNS. Bring up that layer (carplayd RTSP :5000 + rx-connect
@@ -552,6 +558,10 @@ fn process_one(
     // tell content-specific rejection (iOS names 0x5200 specifically) apart from a general reaction to
     // params 6/7 growing at all (iOS would then just echo back the whole current list) — the exact
     // open question the Phase 5.1 postmortem left unanswered. Log-only; no behavior change.
+    if msg_id == spec::MSG_REQUEST_AUTHENTICATION_CERTIFICATE {
+        // The timeline's `cert_req`: the phone's 0xAA00, as it arrives.
+        crate::startup::stamp("cert_req");
+    }
     if msg_id == spec::MSG_IDENTIFICATION_REJECTED {
         log(&format!(
             "RX 0x1D03 IdentificationRejected raw payload ({} B): {:02x?}",
@@ -575,8 +585,9 @@ fn process_one(
             // budget the instant Identify commits. IdentificationAccepted can arrive coalesced with
             // a following frame, and the ACK for that following frame is written inside THIS
             // `process` call -- at ~120 s the budget would still abort it.
-            if *st >= State::Identified {
-                identified.store(true, Ordering::Relaxed);
+            // The timeline's `ident` as the flag first goes up: the phone accepted the identification (0x1D02).
+            if *st >= State::Identified && !identified.swap(true, Ordering::Relaxed) {
+                crate::startup::stamp("ident");
             }
             publish_bt_phase(phase_for(*st));
             log(&format!("RX 0x{msg_id:04X} -> {st:?}"));
@@ -639,22 +650,27 @@ fn execute(
             }
             None => ExecResult::NoCommit,
         },
-        Action::SignChallenge(chal) => match mfi_retry("sign", || mfi::sign(&chal)) {
-            Some(sig) => {
-                // AuthenticationResponse (0xAA03, Source::Accessory): param 0 = AuthenticationResponse (blob).
-                let body = message::group_one(0x0000, &sig);
-                if write_interruptible(
-                    sock,
-                    &link.build_msg(1, spec::MSG_AUTHENTICATION_RESPONSE, &body),
-                    abort,
-                ) {
-                    ExecResult::Commit
-                } else {
-                    ExecResult::Abort
+        Action::SignChallenge(chal) => {
+            // The timeline's first signature: `sign1_start` as it goes to the chip, `sign1_end` once signed.
+            crate::startup::stamp("sign1_start");
+            match mfi_retry("sign", || mfi::sign(&chal)) {
+                Some(sig) => {
+                    crate::startup::stamp("sign1_end");
+                    // AuthenticationResponse (0xAA03, Source::Accessory): param 0 = AuthenticationResponse (blob).
+                    let body = message::group_one(0x0000, &sig);
+                    if write_interruptible(
+                        sock,
+                        &link.build_msg(1, spec::MSG_AUTHENTICATION_RESPONSE, &body),
+                        abort,
+                    ) {
+                        ExecResult::Commit
+                    } else {
+                        ExecResult::Abort
+                    }
                 }
+                None => ExecResult::NoCommit,
             }
-            None => ExecResult::NoCommit,
-        },
+        }
         Action::SendIdentify => {
             let ib = message::build_ident_info(
                 name,

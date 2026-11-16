@@ -224,6 +224,7 @@ fn run_active_session(
                 }
                 log("RFCOMM client connected -- starting iAP2 handshake");
                 startup::mark("phone");
+                startup::stamp("rfcomm");
                 // Claim the single-session slot ATOMICALLY (compare_exchange, not a plain store) so the
                 // accept path and the Model-B reconnect path can never run two concurrent bt_driver::run
                 // sessions against the same phone, and neither clobbers the other's flag. If a reconnect
