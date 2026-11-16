@@ -5,7 +5,7 @@ released 14 Nov, are this file at e31f249.
 
 ## What would ship
 
-- **OCBM 2.6.0: `bench-hooks`** (a merge-commit PR to main; the release files are the Mac's build from <COMMIT>). The
+- **OCBM 2.6.0: `bench-hooks`** (a merge-commit PR to main; the release files are the Mac's build from e472eb1). The
   changes are 376c4ce to 5d8f5c8, 24 commits on 2.5.0 (main, merged in at 2318bb5), plus the version (97936c6, VERSION
   only):
   - connect speed 2 (376c4ce, c4679c0, bbd29f3, 251b590, 8a3a8b2, eb0ac2e, 8a7e802, 90fcd2f, e27af19, eb8a1f0): one
@@ -46,7 +46,7 @@ For the Mac to publish once Scott OKs them:
   Its subject is the release title and its body the notes; the workflow adds the commit list. The tagged commit's
   subject starts "[320]".
 
-They hold two placeholders for the Mac's build: <COMMIT> (twice in each OCBM text) and <NEED_KB> (v2.6.0.md).
+They hold two placeholders for the Mac's build: e472eb1 (twice in each OCBM text) and 3190 (v2.6.0.md).
 
 The bench figures in them are the Mac's bench of the 2.6.0 candidate with two iPhones: a change of phone, from the phone
 joining the adapter's Wi-Fi to the CarPlay picture, 4.6 s from B to A (44 s before) and 5.7 s from A to B (91 s
@@ -58,7 +58,7 @@ about 19 s. There are no 2.6.0 wake or Reset figures.
 
 - **Updating from 1.0.1 or later:** Carlink 3.20 offers it in the app. An adapter still in its install trial finishes
   its install first (Settings › Adapter and about › Remove stock CarPlay), as for 2.5.0: the package needs about
-  <NEED_KB> KB of flash, and a trial adapter has 1252 KB.
+  3190 KB of flash, and a trial adapter has 1252 KB.
 - **The Wi-Fi password** is kept in /etc/ocbm/wifi_psk from 2.6.0 on, and a trial's go-back to stock (ocbm_revert.sh)
   leaves it for the next install. The adapter takes hostapd.conf's own first, then the kept one, then
   /etc/wifi_password, then a new random one; stock's known default counts as none. A finished adapter's stock restore
@@ -77,9 +77,9 @@ about 19 s. There are no 2.6.0 wake or Reset figures.
 - [ ] The package checked against every published version from 1.0.1 to 2.5.0: the same 18 files as 2.5.0's, of which
   btd, carplayd, ocbmd, ocbm_boot.sh, ocbm_update.sh, radio_ap_up.sh, radio_hal.sh and session_supervisor.sh change
   against 2.5.0, with VERSION, BUDGET and SHA256SUMS; FROM_MIN 1.0.1.
-- [ ] The 2.6.0 files (the Mac): built from <COMMIT> ("2.6.0 ocbm <COMMIT>"). Package <PKG_SHA256> (<PKG_SIZE> B): 18
-  files, FROM_MIN 1.0.1, needKb <NEED_KB>, and the updater's file check passes from all eight published versions. Image
-  <IMG_SHA256> (<IMG_SIZE> B).
+- [ ] The 2.6.0 files (the Mac): built from e472eb1 ("2.6.0 ocbm e472eb1"). Package 140dccbffaabf4eca66ae3d0d44dd7261ee9395afb271b7e4be4e3161bdbf69d (2,142,494 B): 18
+  files, FROM_MIN 1.0.1, needKb 3190, and the updater's file check passes from all eight published versions. Image
+  dd1114c4927662b36b50f2fa354341b520fe0f847b49227a7e38fb0297b94793 (2,158,456 B).
 - [ ] The Mac's dev adapter updated in the app from 2.5.0 to 2.6.0.
 - [ ] [320] pins the Mac's sha256s and sizes; the Mac's gate and test run, and a check of its debug build on the dev
   adapter.

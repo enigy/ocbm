@@ -1,4 +1,4 @@
-OCBM 2.6.0 installer image (A15W_Update.img): converts a stock Carlinkit CPC200-CCPA (A15W, firmware 2025.10.15.1127) to OCBM 2.6.0 from a USB stick, or from Carlink. Built from enigy/ocbm <COMMIT> ("2.6.0 ocbm <COMMIT>"), with 2.0.0's builds of the unchanged iap2d and iap_role_switch; its files match the update package on release v2.6.0, which says what changed since 2.5.0.
+OCBM 2.6.0 installer image (A15W_Update.img): converts a stock Carlinkit CPC200-CCPA (A15W, firmware 2025.10.15.1127) to OCBM 2.6.0 from a USB stick, or from Carlink. Built from enigy/ocbm e472eb1 ("2.6.0 ocbm e472eb1"), with 2.0.0's builds of the unchanged iap2d and iap_role_switch; its files match the update package on release v2.6.0, which says what changed since 2.5.0.
 
 ## Install OCBM from a USB stick (a stock adapter)
 
