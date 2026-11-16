@@ -146,6 +146,7 @@ fn run_active_session(
         "Bluetooth up as \"{accessory_name}\" -- waiting for a phone or preempt (discoverable only while pairing is open)"
     ));
     startup::mark("bt_up");
+    startup::stamp("bt_up");
 
     let ssp_shutdown = Arc::new(AtomicBool::new(false));
     let t = ssp_shutdown.clone();
