@@ -71,6 +71,7 @@ fn connect_out(addr: SocketAddr, dev_dec: u64) -> bool {
         println!("[rx] connect-out {addr} write failed: {e}");
         return false;
     }
+    receiver::startup::stage(receiver::startup::Stage::Dial); // the connect timeline's `dial`: the last one sent before the control connection (receiver::startup)
     println!("[rx] connect-out GET /ctrl-int/1/connect -> {addr} (devid={dev_dec})");
     let mut buf = [0u8; 1024];
     match s.read(&mut buf) {
@@ -479,6 +480,8 @@ fn on_event(ev: ServiceEvent, gate: &PhoneGate, dialer: &mut Dialer, held: &mut 
                     println!("[rx] {}: its session is live here; not dialling it again at {:?}", c.who(), c.addrs);
                 }
                 Verdict::Dial => {
+                    // The connect timeline's `svc_seen`: the record of the phone btd names, the first to resolve.
+                    receiver::startup::stage(receiver::startup::Stage::SvcSeen);
                     held.forget(&c.fullname);
                     dialer.dial(gate, &c, scope, rounds);
                 }
@@ -631,6 +634,8 @@ fn rename(
     due.retain(|c| !resolved.contains(&c.fullname));
     for c in due {
         println!("[rx] {}: resolved while btd named another phone; dialling it now", c.who());
+        // `svc_seen` for a record held from before its phone was named: it is the named phone's from now.
+        receiver::startup::stage(receiver::startup::Stage::SvcSeen);
         let (_, scope) = dialer.scope();
         dialer.dial(gate, &c, scope, RENAME_ROUNDS);
     }

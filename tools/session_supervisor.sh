@@ -495,6 +495,29 @@ ocbmd_wedged() {
   return 0
 }
 
+# The connect timeline's usb_edge_s (crates/box-common/src/timeline.rs): when the host-facing USB link last came up,
+# as this supervisor saw it. Its UDC's state (ci_hdrc.1, docs/carplay/00_ARCHITECTURE.md) is read once a tick, with no
+# fork (usb_observe), and an edge into "configured" from any other state is noted on the uptime clock; wireless_up
+# stamps it beside sup_radios. Not known (empty) from the first reading, whose edge came before this supervisor did,
+# nor once the state reads "suspended": this kernel's chipidea UDC still reads "suspended" after a resume
+# (docs/carplay/02_SESSION_LIFECYCLE.md, "Empirical basis"), so a resume cannot be timed from it.
+USB_UDC_STATE=/sys/class/udc/ci_hdrc.1/state
+usb_class=""           # configured | suspended | down, as last read; empty before the first reading
+usb_configured_at=""   # uptime ms of the last edge into "configured"; empty when not known
+usb_observe() {
+  _uo_s=""
+  read -r _uo_s 2>/dev/null <"$USB_UDC_STATE"
+  case "$_uo_s" in configured) _uo_c=configured ;; suspended) _uo_c=suspended ;; *) _uo_c=down ;; esac
+  [ "$_uo_c" = "$usb_class" ] && return 0
+  usb_configured_at=""
+  if [ -n "$usb_class" ] && [ "$_uo_c" = configured ]; then
+    _uo_up=""
+    read -r _uo_up _uo_idle 2>/dev/null </proc/uptime
+    case "$_uo_up" in *.*) usb_configured_at="${_uo_up%.*}${_uo_up#*.}0" ;; esac
+  fi
+  usb_class=$_uo_c
+}
+
 # apply_pending — at an idle boundary (present==0), apply any peer-store mutation that peer_store.sh
 # deferred while a host was present (docs/carplay/02_SESSION_LIFECYCLE.md, #25). Runs restart-coupled: the store is only ever
 # mutated while idle, and the next ARM's carplayd re-reads it — never the live disk<->memory divergence
@@ -736,6 +759,7 @@ wireless_up() {
   fi
   mode=$(pairing_mode)
   restore_stock_hostapd
+  usb_observe   # this instant's USB state, for the block's usb_edge stamp: the tick's reading may be a second old
   echo "[sup] host PRESENT + wireless enabled -> CLEAN bring-up of wireless stack (detached, pairing=$mode) at uptime $(cut -d' ' -f1 /proc/uptime)"
   # Detached session: the Wi-Fi AP and the BT radio come up side by side, then the CarLink advertiser, each
   # redirected (not piped).
@@ -744,7 +768,8 @@ wireless_up() {
   # that left btd never started). The outer `wireless_running && return` above is the guard.
   # BT_PAIRING_MODE is inherited through setsid -> sh -c -> the exec'd btd. The body is single-quoted on
   # purpose, so values travel as env vars rather than by interpolating into the wrapper's argv.
-  env BT_PAIRING_MODE="$mode" BT_SSP_INTERACTIVE="$(pairing_interactive)" OCBM_WL_REAPED="$_wl_reaped" setsid sh -c '
+  env BT_PAIRING_MODE="$mode" BT_SSP_INTERACTIVE="$(pairing_interactive)" OCBM_WL_REAPED="$_wl_reaped" \
+    OCBM_USB_EDGE="$usb_configured_at" setsid sh -c '
     # Radio bring-up goes through the chipset-neutral seam. It resolves this unit'"'"'s own
     # bring-up mapping at runtime, so the supervisor never names a chip, a module or an attach
     # helper. Exit codes: 0 converged / 1 failed / 2 already up / 3 unsupported on this variant.
@@ -758,6 +783,12 @@ wireless_up() {
     # lock (wlan_driver_up), and a descriptor file per caller (radio_detect.sh).
     # The outer subshell returns at once, so the AP bring-up is no child of the btd exec below (which would never reap it).
     echo "[sup] radios starting at uptime $(cut -d" " -f1 /proc/uptime)" >> /tmp/box.log
+    # The connect timeline (crates/box-common/src/timeline.rs): the radios start now, and the host-facing USB link
+    # last came up at OCBM_USB_EDGE (empty: not known). One append each, no fork; a failed one is ignored.
+    _tl_up=""
+    read -r _tl_up _tl_idle 2>/dev/null </proc/uptime
+    case "$_tl_up" in *.*) echo "t sup_radios ${_tl_up%.*}${_tl_up#*.}0" 2>/dev/null >>/tmp/startup_marks ;; esac
+    [ -n "$OCBM_USB_EDGE" ] && echo "t usb_edge $OCBM_USB_EDGE" 2>/dev/null >>/tmp/startup_marks
     ( sh /script/radio_hal.sh wifi_ap_on >/tmp/wlan.log 2>&1 & )
     # bt.log stays the small truncated per-attempt status file that docs/wireless/01_BT_AND_RADIO.md
     # tells an operator to cat directly. This call is foreground (no trailing ampersand), so teeing
@@ -948,6 +979,7 @@ while :; do
     echo "[sup] host PRESENT seen at uptime $(cut -d' ' -f1 /proc/uptime)"
     wireless_up; wl_edge_done=1
   fi
+  usb_observe   # the host-facing USB link, once a tick, after the host's edge (usb_observe: no fork)
 
   # docs/wireless/00_WIRELESS_CARPLAY.md #1.3 (extended, review finding 2026-07-24): `wireless_down`'s own branch already resets
   # saw_paired/saw_record/healthy when IT tears a wireless session down — but a wireless session can

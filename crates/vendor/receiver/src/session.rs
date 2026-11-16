@@ -1042,6 +1042,7 @@ impl AvSession {
                         );
                         let flag = self.stream_flag(110);
                         spawn_screen(listener, shared, scid, 9001, flag, self.activity.clone());
+                        crate::startup::stage(crate::startup::Stage::ScreenSetup);
                         let mut r = Dictionary::new();
                         r.insert("type".into(), Value::Integer(110.into()));
                         r.insert("dataPort".into(), Value::Integer((port as i64).into()));

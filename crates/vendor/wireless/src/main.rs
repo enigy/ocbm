@@ -16,6 +16,7 @@
 //! iAP2 handshake (`rfcomm.rs`/`bt_driver.rs`) through `IdentifyAccept`. Phase A3 (`wifi_handoff.rs`)
 //! adds the WiFi-credential message codecs + AP hosting.
 
+mod ap_watch;
 mod arbiter_client;
 mod av;
 mod box_identity;
@@ -130,6 +131,9 @@ fn run_active_session(
     // Per-device name derived once per session (reads the Wi-Fi MAC / SoC serial). Used for the EIR
     // Complete Local Name (what the iPhone shows) and the wireless iAP2 identify.
     startup::begin();
+    // The connect timeline's AP events, for this session: hostapd's and udhcpd's lines as they land (ap_watch). It
+    // ends at go-quiet below, or when this returns early.
+    let ap_watch = ap_watch::start();
     let accessory_name = carplay_iap2_core::message::accessory_name(ACCESSORY_BRAND);
     if let Err(e) = bt_bringup::bring_up(HCI_DEV, &accessory_name, just_opened()) {
         log(&format!("Bluetooth bring-up failed: {e} -- retrying"));
@@ -146,6 +150,7 @@ fn run_active_session(
         "Bluetooth up as \"{accessory_name}\" -- waiting for a phone or preempt (discoverable only while pairing is open)"
     ));
     startup::mark("bt_up");
+    startup::stamp("bt_up");
 
     let ssp_shutdown = Arc::new(AtomicBool::new(false));
     let t = ssp_shutdown.clone();
@@ -224,6 +229,7 @@ fn run_active_session(
                 }
                 log("RFCOMM client connected -- starting iAP2 handshake");
                 startup::mark("phone");
+                startup::stamp("rfcomm");
                 // Claim the single-session slot ATOMICALLY (compare_exchange, not a plain store) so the
                 // accept path and the Model-B reconnect path can never run two concurrent bt_driver::run
                 // sessions against the same phone, and neither clobbers the other's flag. If a reconnect
@@ -295,6 +301,8 @@ fn run_active_session(
     sdp_shutdown.store(true, Ordering::Relaxed);
     rfcomm_shutdown.store(true, Ordering::Relaxed);
     reconnect_shutdown.store(true, Ordering::Relaxed);
+    // After the flags, as 2.6.0 raised them: ending the watch joins its thread (the Mac's release review, 16 Nov).
+    drop(ap_watch);
     if let Err(e) = bt_bringup::go_quiet(HCI_DEV) {
         log(&format!("go_quiet failed (non-fatal): {e}"));
     }

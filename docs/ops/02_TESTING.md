@@ -351,6 +351,130 @@ that never reached CarPlay, a wired preempt), so a second session's line counts 
 session's carplayd's. The phantom's pages count as absent. When ocbmd rotated `box.log` (it empties it at its cap) between
 the host's arrival and the first frame, the PSK count is a lower bound: `PSK mismatches >=N (box.log cut)`.
 
+### The connect timeline (16 Nov 2026; M1)
+
+Right after `[startup]`, the wireless carplayd prints one more line at the first frame, on the same stream
+(`/tmp/carplayd_wl.log`, CH_LOG source `airplayd-wl`), so it reaches Carlink's drive log the same way. Every
+critical-path event of the connect, stamped where it happens:
+
+    [timeline] v1 sup_radios=406 bt_power=1246 btd_start=1276 bt_up=1286 page_start=1296 acl=1556 sdp=1716 rfcomm=1866 cert_req=1946 sign1_start=2066 sign1_end=2376 ident=2566 wifi_req=2666 wifi_rsp=2696 ap_start=1666 ap_up=1876 ap_enabled=2646 sta_assoc=3266 dhcp_ack=3566 carplayd_start=3166 svc_seen=3866 dial=3916 pv_done=4366 auth_in=4416 auth_out=4766 record_in=4846 record=5066 screen_setup=5116 first_frame=5466 chip1_ms=298 cert1_ms=41 chip2_ms=301 cert2_ms=40 usb_edge_s=11
+
+(the unit test's line, not a measurement). The grammar is the one Carlink stores, `^\[timeline\] v1( [a-z0-9_]+=(-|\d+))+$`;
+the keys come in this order always (`crates/box-common/src/timeline.rs`, which owns them). Every event is whole ms
+since the origin; `-` is a value not stamped, one before the origin, or every event when there is no origin.
+
+**Benched twice** (the Mac, 16 Nov: the dev adapter on `e75a0ac`, 5 connects, then on `335ef1d`, 4 connects). The line
+arrived in the drive log under `[box/airplayd-wl]` right after `[startup]`, one line of about 440 to 480 bytes;
+`first_frame` agreed with `[startup]`'s within 6-13 ms, and every shell stamp fell in order with the daemons' (so
+`/proc/uptime` and CLOCK_BOOTTIME share their base on this kernel); the chip took 1640-1651 ms from go to ready and
+110-170 ms for the certificate, every time. `usb_edge_s` was `-` in all nine (no configure edge after the supervisor's
+start). On `335ef1d`: `bt_up` came 30-40 ms after `btd_start`, `record_in` 0-3 ms before `record`; the AP watch ended
+each session in 2.2 to 4.6 s with all three lines seen on the wakes (`ap_enabled` is `-` on a cold start, as written
+below); `ap_enabled - ap_start` was 850-870 ms in all three wakes, `sta_assoc` 550-610 ms after `rfcomm`, `dhcp_ack`
+90-220 ms after `sta_assoc`. Not seen on the device yet: a session ending while its watch still runs, and a session
+with more than one control connection.
+
+| Key | The event | Stamped in |
+|---|---|---|
+| `sup_radios` | the supervisor starts the radios (`wifi_ap_on` and `bt_on`) | `tools/session_supervisor.sh`, `wireless_up`'s block |
+| `bt_power` | `bt_on` has the controller up and answering (each of its success paths; not the boot preload) | `radio_hal.sh`, `do_bt_on` |
+| `btd_start` | btd begins this session's record | `wireless/src/startup.rs`, `begin` |
+| `bt_up` | btd's Bluetooth bring-up done: `[startup]`'s "Bluetooth up", on the timeline's clock | `wireless/src/main.rs`, `run_active_session` |
+| `page_start` | the session's first page (the SDP connect that pages) | `sdp_client.rs`, `connect_sdp` |
+| `acl` | the phone answered the page, as the 25 ms look first saw it | `sdp_client.rs`, `wait_connected` |
+| `sdp` | the phone's iAP2 RFCOMM channel known | `sdp_client.rs`, `query` |
+| `rfcomm` | RFCOMM up: out (reconnect) or in (accept) | `reconnect.rs` `attempt`, `main.rs` accept loop |
+| `cert_req` | RX 0xAA00 | `bt_driver.rs`, `process_one` |
+| `sign1_start`, `sign1_end` | btd's signature goes to the chip, and is back (its retries inside) | `bt_driver.rs`, `execute` |
+| `ident` | 0x1D02: Identified | `bt_driver.rs`, `process_one` |
+| `wifi_req`, `wifi_rsp` | the first RX 0x5702; the 0x5703 written | `bt_driver.rs`, `process_one` |
+| `ap_start` | hostapd launched | `radio_ap_up.sh` |
+| `ap_up` | the AP's processes are up: the first `ap_serving` pass (hostapd and udhcpd running, the address on the interface), before the second that confirms it 1 s on. Not the radio: 200-230 ms after `ap_start` on the bench, before hostapd has the AP enabled | `radio_ap_up.sh` |
+| `ap_enabled` | the radio's own word: hostapd's `AP-ENABLED` (about 1 s after `ap_start` in earlier logs). Its timing: see the AP watch's buffering note | the AP watch, `wireless/src/ap_watch.rs` |
+| `sta_assoc` | a station associated and keyed: hostapd's `AP-STA-CONNECTED`, after the WPA2 handshake (a bare 802.11 association can come earlier and fail). Its timing: see the buffering note | the AP watch |
+| `dhcp_ack` | udhcpd's `sending ACK to`, as it sends | the AP watch |
+| `carplayd_start` | carplayd's `main` | `ccpa/carplayd/src/main.rs` |
+| `svc_seen` | the `_carplay-ctrl` of the phone btd names first resolved (or a record held from before it was named, as it is) | `discovery.rs` |
+| `dial` | the last connect-out written before the control connection that produced the picture (`-`: the phone came by itself) | `discovery.rs` `connect_out`, taken as that connection begins |
+| `pv_done` | pair-verify OK, the control channel encrypted | `receiver/src/server.rs`, `feed` |
+| `auth_in`, `auth_out` | `POST /auth-setup` received; answered | `server.rs`, `handle` |
+| `record_in` | RECORD received | `server.rs`, `handle` |
+| `record` | RECORD answered (its handler waits for the event channel, up to about 5 s) | `server.rs`, `handle` |
+| `screen_setup` | the main screen's (type 110) SETUP | `session.rs`, `setup_phase2` |
+| `first_frame` | the first frame to the host, as `[startup]` | `receiver/src/startup.rs`, `first_frame` |
+| `chip1_ms`, `cert1_ms` | btd's signature (chip, go to ready) and certificate read (under the lock), ms | `wireless/src/mfi_local.rs` |
+| `chip2_ms`, `cert2_ms` | auth-setup's, the same two, in the control connection that produced the picture | carplayd's `LocalMfiSigner` |
+| `usb_edge_s` | whole seconds from the host-facing USB link's last edge into "configured" to the origin | the supervisor's `usb_observe` |
+
+**One clock.** Every stamp is the uptime on CLOCK_BOOTTIME, the clock `/proc/uptime` shows (the shell's stamps to its
+10 ms, the daemons' to the ms), never the wall clock, which has no RTC behind it and jumps when Carlink sets it
+mid-session. The origin is the moment ocbmd raises `/tmp/host_present` to 1, the one `[startup]` counts from: ocbmd
+writes that uptime (ms) to `/tmp/host_present_uptime` with each raise, and btd copies it into each session's record.
+`[startup]` keeps its wall-clock arithmetic; the timeline is printed whatever that made of it. A value wider than 13
+digits (over 300 years of uptime) cannot come from this clock, and prints `-`.
+
+**Where the stamps live.** btd's record, `/tmp/startup_marks`, one line each in a single write: `t <key> <uptime ms>`
+for an event, `d <key> <ms>` for a duration. The first of a key stands: in btd's session for its own; in carplayd
+(kept in memory: it prints the line), in the process for `carplayd_start` and `svc_seen` and in the control connection
+for the rest. Each new control connection starts those afresh, auth-setup's chip times with them, so the line
+describes the connection that produced the picture, not a failed one before it; its `dial` is the last connect-out
+sent since the connection before it began. The shell's radio stamps are appended before btd begins a session, and btd
+carries them from the bring-up's `t sup_radios` on into each session under that bring-up: a phone switch keeps them, a
+radio restart brings new ones, an earlier host's are dropped. `ap_enabled` is carried with them (the AP's, not the
+phone's); `sta_assoc` and `dhcp_ack` are each session's own. The supervisor's USB edge rides along as `t usb_edge`. A
+shell stamp landing in the instant btd rewrites the record for a new session is lost (its value `-`; the AP's are the
+ones that can, as `wifi_ap_on` runs beside `bt_on`). A wired carplayd prints no timeline (it is gated on the wireless
+spawn's `CARPLAY_WIRELESS_METADATA`). On a unit with the IW416 baseline's own AP scripts (`backend=owned`) `ap_start`
+and `ap_up` are `-`: its AP comes up inside them, and chipset scripts are not stamped.
+
+**The AP watch** (`wireless/src/ap_watch.rs`). hostapd and udhcpd stamp nothing of their own, and their lines carry no
+time, so btd watches the files they write, and stamps each line as it lands: `/tmp/box.log`, into which
+`radio_ap_up.sh` runs hostapd in the foreground, and udhcpd's `/tmp/radio_ap_dhcp.log`. One thread per btd session,
+from the session's start until it has seen `AP-STA-CONNECTED` and a DHCP ACK (the phone on the AP, whose AP was
+enabled before that), 60 s, or the session's end. Event-driven: inotify on the two files, and the session's end
+through a pipe; nothing polls, and between sessions nothing runs. It reads those two files only: hostapd's and
+udhcpd's configuration and start-up are untouched. Each key is the session's first matching line, stamped as the watch
+wakes. It ends with one line in `/tmp/wl.log`, e.g. `[ap-watch] ended (the phone is on the AP) after 4.1 s:
+AP-ENABLED seen, AP-STA-CONNECTED seen (..XX:YY), DHCP ACK seen`: a station's last two octets are all of its address
+that appears anywhere, and none of it reaches the timeline.
+
+- **Which phone.** Neither line tells the phone btd serves from another on the AP: the phone joins under a private
+  Wi-Fi address, not the one its 0x4E0E names (the 12 Nov bench's iPhone showed two different ones), and udhcpd names
+  only an IP. With a second phone on the AP (one a switch dropped, joining again), the first line can be that phone's.
+- **What it misses.** A line written before the session began. On a cold start the AP comes up beside a Bluetooth
+  attach that can take 7 s (the bench above: `ap_start=4275`, `btd_start=7556`), so hostapd's `AP-ENABLED` is usually
+  in `box.log` before btd starts, and `ap_enabled` is `-`. So is `sta_assoc` for a phone that joined the AP, knowing
+  it, before btd began.
+- **Buffering.** udhcpd (BusyBox) writes each line in one write as it sends, so `dhcp_ack` is the ACK's time to within
+  the watch's wake. hostapd writes through stdio into a file, which may be block-buffered: the 12 Nov drive log shows
+  its station lines arriving at their own times, seconds apart, so they look flushed per line, and the 16 Nov bench agrees (`ap_enabled - ap_start` within 20 ms over three wakes); it is not proven.
+  If they are buffered, `ap_enabled` and `sta_assoc` are late by an unknown amount. On a bench, `ap_enabled - ap_start`
+  steady at about 1 s says they are not. If they are, the other sources are a passive EAPOL socket or hostapd's
+  `ctrl_interface` (a change to the AP itself; this section in git at `e75a0ac` has both, with their costs).
+
+**`usb_edge_s`.** The supervisor reads `/sys/class/udc/ci_hdrc.1/state` (the host-facing UDC) once a tick, with no
+fork, and once more as it brings the radios up, and notes the uptime of each edge into `configured`; `wireless_up`
+stamps the last one. `-` when the state last read `suspended` (this kernel's UDC still reads `suspended` after a
+resume, [02_SESSION_LIFECYCLE.md](../carplay/02_SESSION_LIFECYCLE.md#empirical-basis), so a resume cannot be timed),
+when the edge came before the supervisor started, or on a unit without that file. Resolution is the 1 s tick: an
+edge seen only after the origin counts 0. A large value is a link that stayed up: the host came back without the
+link going down (or into `suspended`) since.
+
+**The chip, in the logs.** Each chip call on the video path logs its time, the signature from "go" to status ready
+(the fixed 100 ms wait before its first status read included) and under the lock, the certificate read under the
+lock, both with the wait for the lock: btd's in `/tmp/wl.log` (`[mfi-local] cert: 945 B in 41 ms under the lock, 0 ms
+waiting for it`, `[mfi-local] sign: chip 298 ms from go to ready, 305 ms under the lock, 0 ms waiting for it`),
+auth-setup's as `[carplayd] mfi: cert ...` and `[carplayd] mfi: sign: ...`. The tunnel's signature comes after the
+first frame, so it is a line of its own and no timeline value: `[mfi] tunnel sign 305 ms (chip 298 ms from go to
+ready, 0 ms waiting for the lock), cert 41 ms (chip)`, or `(cached)` for the boot's cached certificate.
+
+**Length.** At most 794 bytes: no value is printed wider than 13 digits (above), and the widest-line test builds the
+line with every value at that width; the one above is 479. ocbmd clips a forwarded line at 1024 bytes
+(`LOG_MAX_LINE`), and Carlink clips nothing more: its CH_LOG parser takes each entry's length, and its drive log
+writes the text through `LogRedactor`, which only shortens MAC addresses. So one line, never two. (With 20-digit
+values, the u64's widest, the three keys added after the bench would have taken the line to 1029 bytes: the 13-digit
+cap is what keeps the bound.)
+
 ### Release gate — OCBM 1.0.5, the CarPlay-only cleanup (8 Nov 2026)
 
 One build, one bench, on the same branches; a failure is fixed there and the whole list runs again.

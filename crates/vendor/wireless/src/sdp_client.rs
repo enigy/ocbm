@@ -219,6 +219,8 @@ fn wait_connected(
         if let (None, None, Some(dev)) = (polled, answered, dev) {
             if let Some(acl) = crate::hci::acl_info(dev, peer).filter(|a| a.answered()) {
                 answered = Some((std::time::Instant::now(), acl.handle));
+                // The timeline's `acl`: the phone answered, as this 25 ms look first saw it.
+                crate::startup::stamp("acl");
             }
         }
         match next_step(polled, answered.map(|(at, _)| at.elapsed()), after_acl) {
@@ -491,6 +493,9 @@ fn connect_sdp(peer: [u8; 6], timeout_secs: i64, watch: &Watch<'_>) -> std::io::
     let link_before = crate::hci::dev_id(crate::HCI_DEV)
         .ok()
         .and_then(|dev| before_page(dev, peer, watch.session_active.load(std::sync::atomic::Ordering::Relaxed)));
+    // The timeline's `page_start`: the connect below is what pages the phone; the session's first page stands.
+    // Before `start`, so the page's own clock does not carry the stamp's write.
+    crate::startup::stamp("page_start");
     let start = std::time::Instant::now();
     let ret = unsafe {
         libc::connect(
@@ -518,6 +523,9 @@ fn connect_sdp(peer: [u8; 6], timeout_secs: i64, watch: &Watch<'_>) -> std::io::
     let acl = || crate::hci::dev_id(crate::HCI_DEV).ok().and_then(|dev| crate::hci::acl_info(dev, peer));
     page_ended(&mut LEFT_LINK.lock().unwrap_or_else(|p| p.into_inner()), peer, end, acl);
     let fd = connected?;
+    // Connected with no answer seen first (a connect that completed at once, or no hci device to look at): the link
+    // is up by now. The answer's own time, when it was seen, stands.
+    crate::startup::stamp("acl");
     // Blocking again, for the SDP exchange and its SO_RCVTIMEO-bounded reads.
     set_nonblocking(fd.as_raw_fd(), false)?;
     Ok(std::fs::File::from(fd))
@@ -672,6 +680,8 @@ pub fn query(peer: [u8; 6], timeout_secs: i64, watch: &Watch<'_>) -> std::io::Re
     log(&format!("iAP2-UUID search -> {} bytes: {}", iap2.len(), hex(&iap2)));
     if let Some(ch) = scan_rfcomm_channel(&iap2) {
         log(&format!("iAP2 RFCOMM channel on the phone = {ch}"));
+        // The timeline's `sdp`: the phone's iAP2 channel is known.
+        crate::startup::stamp("sdp");
         return Ok(Services { iap2: Some(ch) });
     }
 

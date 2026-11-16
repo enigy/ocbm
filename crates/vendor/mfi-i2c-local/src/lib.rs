@@ -240,11 +240,15 @@ pub enum MfiError {
 /// bytes would otherwise go to every phone for the rest of the boot. A read that isn't one still goes to this phone,
 /// as before the cache, and the next session reads the chip again (the Mac's 2.6.0 review, CS-3).
 pub fn try_cert() -> Result<Vec<u8>, MfiError> {
+    let asked = Instant::now();
     if let Some(c) = read_cert_cache(CERT_CACHE) {
+        note_cert(CertTime { took: asked.elapsed(), cached: true });
         return Ok(c);
     }
     let _lock = MfiLock::acquire()?;
+    let held = Instant::now();
     let c = cert_locked().ok_or(MfiError::Chip)?;
+    note_cert(CertTime { took: held.elapsed(), cached: false });
     if is_der_sequence(&c) {
         write_cert_cache(CERT_CACHE, &c);
     } else {
@@ -294,8 +298,47 @@ const CERT_CACHE: &str = "/tmp/mfi_i2c_local_selftest_cert.der";
 
 /// [`sign`] with the failure reason.
 pub fn try_sign(chal: &[u8]) -> Result<Vec<u8>, MfiError> {
-    let _lock = MfiLock::acquire()?;
-    sign_locked(chal).ok_or(MfiError::Chip)
+    let asked = Instant::now();
+    let lock = MfiLock::acquire()?;
+    let held = Instant::now();
+    let (sig, ready) = sign_locked(chal).ok_or(MfiError::Chip)?;
+    let under = held.elapsed();
+    drop(lock); // released as the sequence ends, as before; the time is told after
+    let cert = LAST_CERT.lock().unwrap_or_else(|p| p.into_inner()).take();
+    eprintln!("{}", tunnel_line(ready, under, held.duration_since(asked), cert));
+    Ok(sig)
+}
+
+// ---- Instrumentation: how long the chip took. The tunnel's signature comes after the first frame, so it is a log line
+// of its own, not one of the connect timeline's values (box_common::timeline). ----------------------------------------
+
+/// A certificate read's time: under the lock from the chip, or from the boot's cache ([`CERT_CACHE`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CertTime {
+    took: Duration,
+    cached: bool,
+}
+
+/// The last certificate read's, for the signature's line after it.
+static LAST_CERT: std::sync::Mutex<Option<CertTime>> = std::sync::Mutex::new(None);
+
+fn note_cert(t: CertTime) {
+    *LAST_CERT.lock().unwrap_or_else(|p| p.into_inner()) = Some(t);
+}
+
+/// The tunnel's line for a signature: its time under the lock, the chip's from go to status ready (the fixed 100 ms
+/// first wait included) and the wait for the lock; then the certificate read before it, when there was one.
+fn tunnel_line(ready: Duration, under: Duration, waited: Duration, cert: Option<CertTime>) -> String {
+    let cert = match cert {
+        Some(c) => format!("{} ms ({})", c.took.as_millis(), if c.cached { "cached" } else { "chip" }),
+        None => "-".to_string(),
+    };
+    format!(
+        "[mfi] tunnel sign {} ms (chip {} ms from go to ready, {} ms waiting for the lock), cert {cert}",
+        under.as_millis(),
+        ready.as_millis(),
+        waited.as_millis()
+    )
 }
 
 pub fn cert() -> Option<Vec<u8>> {
@@ -324,8 +367,8 @@ fn cert_locked() -> Option<Vec<u8>> {
 }
 
 /// Sign a challenge digest. CreateSignature: write challenge (`0x20` len, `0x21` data), go
-/// (`0x10`=1), poll status bit4, read `0x11` len / `0x12` sig.
-fn sign_locked(chal: &[u8]) -> Option<Vec<u8>> {
+/// (`0x10`=1), poll status bit4, read `0x11` len / `0x12` sig. With it, the chip's time from go to ready.
+fn sign_locked(chal: &[u8]) -> Option<(Vec<u8>, Duration)> {
     let clen = chal.len();
     if !i2c_wr(0x20, &[(clen >> 8) as u8, clen as u8]) {
         return None;
@@ -336,6 +379,7 @@ fn sign_locked(chal: &[u8]) -> Option<Vec<u8>> {
     if !i2c_wr(0x10, &[0x01]) {
         return None;
     }
+    let go = Instant::now();
     unsafe { libc::usleep(100_000) };
     // Bounded by WALL CLOCK, not iteration count. `for _ in 0..200` with a 10 ms sleep looks like
     // ~2.1 s, and is — but only when every status read succeeds. `i2c_rd` is itself `for _ in 0..5`
@@ -360,6 +404,7 @@ fn sign_locked(chal: &[u8]) -> Option<Vec<u8>> {
     if !done {
         return None;
     }
+    let ready = go.elapsed();
     let mut sl = [0u8; 2];
     if !i2c_rd(0x11, &mut sl) {
         return None;
@@ -372,12 +417,30 @@ fn sign_locked(chal: &[u8]) -> Option<Vec<u8>> {
     if !i2c_rd(0x12, &mut sig) {
         return None;
     }
-    Some(sig)
+    Some((sig, ready))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{forget_cert, is_der_sequence, read_cert_cache, write_cert_cache, CERT_CACHE};
+    use super::{forget_cert, is_der_sequence, read_cert_cache, tunnel_line, write_cert_cache, CertTime, CERT_CACHE};
+    use std::time::Duration;
+
+    #[test]
+    fn the_tunnel_line_tells_the_sign_and_the_cert_before_it() {
+        let ms = Duration::from_millis;
+        assert_eq!(
+            tunnel_line(ms(298), ms(305), ms(0), Some(CertTime { took: ms(41), cached: false })),
+            "[mfi] tunnel sign 305 ms (chip 298 ms from go to ready, 0 ms waiting for the lock), cert 41 ms (chip)"
+        );
+        assert_eq!(
+            tunnel_line(ms(298), ms(305), ms(7), Some(CertTime { took: ms(0), cached: true })),
+            "[mfi] tunnel sign 305 ms (chip 298 ms from go to ready, 7 ms waiting for the lock), cert 0 ms (cached)"
+        );
+        assert_eq!(
+            tunnel_line(ms(298), ms(305), ms(0), None),
+            "[mfi] tunnel sign 305 ms (chip 298 ms from go to ready, 0 ms waiting for the lock), cert -"
+        );
+    }
 
     /// A certificate's shape: `30 82` and a length that is the rest of it.
     fn der(body: usize) -> Vec<u8> {

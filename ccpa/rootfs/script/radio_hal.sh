@@ -562,6 +562,17 @@ do_preload() {
 # =============================================================================================
 # BLUETOOTH
 # =============================================================================================
+# The connect timeline's bt_power (crates/box-common/src/timeline.rs): bt_on has the controller up and answering. For
+# the bt_on verb only (the boot preload shares do_bt_on, and is no connect). One append, no fork; a failed one is
+# ignored.
+bt_power_stamp() {
+  [ "$VERB" = bt_on ] || return 0
+  _bps_up=""
+  read -r _bps_up _bps_idle 2>/dev/null </proc/uptime
+  case "$_bps_up" in *.*) echo "t bt_power ${_bps_up%.*}${_bps_up#*.}0" 2>/dev/null >>/tmp/startup_marks ;; esac
+  return 0
+}
+
 do_bt_on() {
   caps || { publish "$BT_STATE" "result=unsupported" "detail=no-descriptor"; return 3; }
   # Whether this bring-up found the controller warm (attached, at most powered down): btd then pages at once, with no
@@ -574,6 +585,7 @@ do_bt_on() {
   # before the power-up branch below - paid on every session that starts from the supervisor's
   # between-sessions state (measured 2026-10-20: bt_on 9.5 s from DOWN vs 0.4 s for the power-up).
   if [ -n "$_d" ] && bt_powered_up "$_d" && bt_responsive_confirmed "$_d"; then
+    bt_power_stamp
     log "already converged ($_d responsive)"
     : > "$BT_WARM"
     publish "$BT_STATE" "result=ok" "backend=$RADIO_BACKEND" "hci_dev=$_d" \
@@ -599,6 +611,7 @@ do_bt_on() {
     fi
     hci_rt "$_d" up 2>/dev/null
     if bt_responsive_confirmed "$_d"; then
+      bt_power_stamp
       log "$_d was only powered down - up and responsive, no reset needed"
       # "opened": this `up` opened a DOWN device, so the kernel set its event mask just now, and btd's first bring-up
       # can skip its own down/up (bt_bringup.rs; the Mac's 13 Nov brief, item 1).
@@ -616,6 +629,7 @@ do_bt_on() {
       sh /script/bt_on.sh; _rc=$?
       _d=$(hci_dev 2>/dev/null) || _d=""
       if [ -n "$_d" ] && bt_responsive_confirmed "$_d"; then
+        bt_power_stamp
         publish "$BT_STATE" "result=ok" "backend=owned" "hci_dev=$_d" \
                 "bt_mac=$(cat /sys/class/bluetooth/$_d/address 2>/dev/null)"
         return 0
@@ -779,6 +793,7 @@ do_bt_on() {
         log "  attempt $_try did not converge"
       done
       if [ -n "$_d" ] && bt_responsive "$_d"; then
+        bt_power_stamp
         # Vendor SCO tuning where the mapping carried it; non-fatal. Was a HARDCODED
         # `scomtu 240:32` despite this comment -- which is the Realtek/NXP value and nobody
         # else's, and which skipped the routing command the NXP and BCM4358 branches need.
