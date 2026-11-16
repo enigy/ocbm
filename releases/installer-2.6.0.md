@@ -1,4 +1,4 @@
-OCBM 2.6.0 installer image (A15W_Update.img): converts a stock Carlinkit CPC200-CCPA (A15W, firmware 2025.10.15.1127) to OCBM 2.6.0 from a USB stick, or from Carlink. Built from enigy/ocbm e472eb1 ("2.6.0 ocbm e472eb1"), with 2.0.0's builds of the unchanged iap2d and iap_role_switch; its files match the update package on release v2.6.0, which says what changed since 2.5.0.
+OCBM 2.6.0 installer image (A15W_Update.img): converts a stock Carlinkit CPC200-CCPA (A15W, firmware 2025.10.15.1127) to OCBM 2.6.0 from a USB stick, or from Carlink 3.20. Built from enigy/ocbm e472eb1 ("2.6.0 ocbm e472eb1"), with 2.0.0's builds of the unchanged iap2d and iap_role_switch; its files match the update package on release v2.6.0, which says what changed since 2.5.0.
 
 ## Install OCBM from a USB stick (a stock adapter)
 
@@ -10,11 +10,11 @@ The adapter must be a Carlinkit CPC200-CCPA (A15W) on the stock 2025.10.15.1127 
 4. The adapter restarts on OCBM. OCBM_RESULT.txt on the stick says INSTALLED, or REFUSED or STOPPED and why.
 5. Take the stick out and keep it: OCBM_BACKUP on it is the adapter's factory flash, and the only copy. It holds the adapter's Wi-Fi password and Bluetooth keys, so keep it private.
 
-Carlink can also write this image to a stick in the adapter for you. Stock firmware stays on the adapter as a failsafe until you remove it in Carlink (Settings > Adapter and about).
+Carlink 3.20 can also write this image to a stick in the adapter for you (each Carlink writes the image it was released with). Stock firmware stays on the adapter as a failsafe until you remove it in Carlink (Settings > Adapter and about).
 
 Going back to stock from a finished adapter (stock firmware removed) wipes its paired phones: forget the adapter (CarLink-xxxx) on each phone first, and pair them again afterwards.
 
-The image also updates an adapter already on any OCBM from 1.0.1 to 2.5.0, if it has room. More: MIGRATING.md and docs/ops/01_RECOVERY.md.
+The image also updates an adapter already on any OCBM from 1.0.1 to 2.5.0 once its install is final. An adapter still in its trial lacks the flash for it: finish the install first (in Carlink: Settings › Adapter and about › Remove stock CarPlay). More: MIGRATING.md and docs/ops/01_RECOVERY.md.
 
 No install is guaranteed to succeed. Until you remove the stock firmware, the adapter goes back to it by itself if OCBM fails its start-up self-test.
 
