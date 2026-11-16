@@ -25,7 +25,7 @@ const BOX_LOG: &str = "/tmp/box.log";
 const DHCP_LOG: &str = "/tmp/radio_ap_dhcp.log";
 /// How long a session's watch lasts at most.
 const WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
-/// The most read from a file at one wake; the rest at the next.
+/// A file is read in pieces this big, to its end at each wake.
 const READ_MAX: u64 = 64 * 1024;
 /// The longest line kept whole; a longer one is cut (it is no line of hostapd's or udhcpd's).
 const LINE_MAX: usize = 4096;
@@ -99,7 +99,8 @@ impl Follow {
         Follow { path: path.to_string(), off, ino, partial: Vec::new() }
     }
 
-    /// The complete lines appended since the last call; a line still being written waits for the next.
+    /// The complete lines appended since the last call, to the file's end as it is now; a line still being written
+    /// waits for the next.
     fn lines(&mut self) -> Vec<String> {
         let Ok(mut f) = std::fs::File::open(&self.path) else { return Vec::new() };
         let Ok(m) = f.metadata() else { return Vec::new() };
@@ -108,21 +109,25 @@ impl Follow {
             self.off = 0;
             self.partial.clear();
         }
-        let want = m.len().saturating_sub(self.off).min(READ_MAX);
-        if want == 0 || f.seek(SeekFrom::Start(self.off)).is_err() {
-            return Vec::new();
+        let mut out = Vec::new();
+        if self.off >= m.len() || f.seek(SeekFrom::Start(self.off)).is_err() {
+            return out;
         }
         let mut chunk = Vec::new();
-        let Ok(n) = f.take(want).read_to_end(&mut chunk) else { return Vec::new() };
-        self.off += n as u64;
-        let mut out = Vec::new();
-        for piece in chunk.split_inclusive(|&b| b == b'\n') {
-            let room = LINE_MAX.saturating_sub(self.partial.len());
-            let body = piece.strip_suffix(b"\n").unwrap_or(piece);
-            self.partial.extend_from_slice(&body[..body.len().min(room)]);
-            if piece.ends_with(b"\n") {
-                out.push(String::from_utf8_lossy(&self.partial).into_owned());
-                self.partial.clear();
+        while self.off < m.len() {
+            chunk.clear();
+            match (&mut f).take((m.len() - self.off).min(READ_MAX)).read_to_end(&mut chunk) {
+                Ok(n) if n > 0 => self.off += n as u64,
+                _ => break,
+            }
+            for piece in chunk.split_inclusive(|&b| b == b'\n') {
+                let room = LINE_MAX.saturating_sub(self.partial.len());
+                let body = piece.strip_suffix(b"\n").unwrap_or(piece);
+                self.partial.extend_from_slice(&body[..body.len().min(room)]);
+                if piece.ends_with(b"\n") {
+                    out.push(String::from_utf8_lossy(&self.partial).into_owned());
+                    self.partial.clear();
+                }
             }
         }
         out
@@ -278,7 +283,9 @@ mod linux {
                 libc::pollfd { fd: stop.as_raw_fd(), events: libc::POLLIN, revents: 0 },
             ];
             // SAFETY: two pollfds of our own descriptors.
-            let r = unsafe { libc::poll(fds.as_mut_ptr(), 2, left.as_millis().min(i32::MAX as u128) as libc::c_int) };
+            // At least 1 ms: a remainder under a millisecond must wait, not spin.
+            let wait = left.as_millis().clamp(1, i32::MAX as u128) as libc::c_int;
+            let r = unsafe { libc::poll(fds.as_mut_ptr(), 2, wait) };
             if r < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
                 why = "poll failed";
                 break;
@@ -395,6 +402,11 @@ mod tests {
         append(&format!("{}\nnext\n", "x".repeat(LINE_MAX + 10)));
         let got = f.lines();
         assert_eq!((got[0].len(), got[1].as_str()), (LINE_MAX, "next"), "a long line is cut, the next one whole");
+
+        let burst = "ocbmd: a line of the box log's own\n".repeat(READ_MAX as usize / 20);
+        append(&format!("{burst}sta0: AP-ENABLED \n"));
+        let got = f.lines();
+        assert_eq!(got.last().map(String::as_str), Some("sta0: AP-ENABLED "), "a burst past one piece, read to its end");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
