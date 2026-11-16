@@ -773,6 +773,14 @@ const HOST_PRESENT_FLAG: &str = "/tmp/host_present";
 #[cfg(test)]
 const HOST_PRESENT_FLAG: &str = "/tmp/ocbmd_selftest_host_present";
 
+/// The uptime at which [`HOST_PRESENT_FLAG`] last went to 1: the connect timeline's origin
+/// (`box_common::timeline::ORIGIN`). The flag's own mtime is on the wall clock, which the host sets mid-session.
+/// `cfg(test)` for the reason [`HOST_PRESENT_FLAG`] has it.
+#[cfg(not(test))]
+const HOST_PRESENT_UPTIME: &str = box_common::timeline::ORIGIN;
+#[cfg(test)]
+const HOST_PRESENT_UPTIME: &str = "/tmp/ocbmd_selftest_host_present_uptime";
+
 /// The uptime (seconds) when a host's first HELLO arrived, and when it first sent anything after it
 /// ([`Daemon::note_host_frame`]). The one-file install's dispatcher sends a trial back to stock when the
 /// first has been there two minutes without the second: an ocbmd that hears the host and never
@@ -1588,6 +1596,17 @@ fn clear_cfg_file() {
     let _ = std::fs::remove_file(CARPLAY_CFG_FILE);
 }
 
+/// [`write_flag_atomic`] for [`HOST_PRESENT_FLAG`] where it may go to 1, and then the uptime it did so at
+/// ([`HOST_PRESENT_UPTIME`]): the clock is read before the flag is written, the file after, so the flag goes out
+/// when it did. Instrumentation: a failed stamp only costs the timeline its values.
+fn write_presence_flag(present: bool) {
+    let at = if present { box_common::timeline::now_ms() } else { None };
+    write_flag_atomic(HOST_PRESENT_FLAG, present);
+    if let Some(ms) = at {
+        box_common::timeline::write_origin(HOST_PRESENT_UPTIME, ms);
+    }
+}
+
 /// Write the presence flag atomically (`.tmp` + rename) so a concurrent shell `cat` in the supervisor
 /// never reads an empty/partial file (which it would misread as "gone" and tear down a live session).
 fn write_flag_atomic(path: &str, present: bool) {
@@ -1978,7 +1997,7 @@ impl Daemon {
             return;
         }
         self.present = present;
-        write_flag_atomic(HOST_PRESENT_FLAG, present);
+        write_presence_flag(present);
         if present {
             wake_supervisor(SUPERVISOR_PID_FILE);
         }
@@ -2137,7 +2156,7 @@ impl Daemon {
                 self.rearm_deadline = None;
                 // Mirror `present`, do NOT hardcode true: the flag is a view of daemon state, and a
                 // deadline that outlived its session (see go_idle) must not be able to invent one.
-                write_flag_atomic(HOST_PRESENT_FLAG, self.present);
+                write_presence_flag(self.present);
                 // The supervisor then sees the host this tick, not on its next 1 s one (the Mac's review of bbd29f3, A7).
                 if self.present {
                     wake_supervisor(SUPERVISOR_PID_FILE);
@@ -5946,6 +5965,29 @@ mod tests {
         d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &[p::CT_SUBSCRIBE, b'x']);
         assert!(d.present);
         assert!(d.rearm_deadline.is_none(), "an already-visible GONE edge needs no hold");
+    }
+
+    /// The connect timeline's origin (box_common::timeline::ORIGIN): the uptime each time the flag goes to 1, when it
+    /// really goes (a held raise at its deadline), and never as it goes to 0.
+    #[test]
+    fn the_timeline_origin_is_stamped_as_the_flag_goes_to_1() {
+        let _flag = presence_flag_lock(); // shares HOST_PRESENT_FLAG with every other presence test
+        let origin = || box_common::timeline::read_origin(HOST_PRESENT_UPTIME);
+        let _ = std::fs::remove_file(HOST_PRESENT_UPTIME);
+        let mut d = td();
+        let before = box_common::timeline::now_ms().unwrap();
+        d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &[p::CT_SUBSCRIBE, b'x']);
+        let first = origin().expect("stamped as the flag went to 1");
+        assert!(first >= before && first <= box_common::timeline::now_ms().unwrap());
+        d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &[p::CT_STOP]);
+        assert_eq!(origin(), Some(first), "not as it went to 0");
+        let gone_at = d.present_cleared_at.expect("CT_STOP must stamp the GONE edge");
+        let _ = std::fs::remove_file(HOST_PRESENT_UPTIME);
+        d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &[p::CT_SUBSCRIBE, b'x']);
+        assert_eq!(origin(), None, "a raise held for REARM_HOLD has not reached the flag");
+        d.presence_tick(gone_at + REARM_HOLD);
+        assert!(origin().is_some(), "stamped when the held raise reaches the flag");
+        let _ = std::fs::remove_file(HOST_PRESENT_UPTIME);
     }
 
     #[test]
