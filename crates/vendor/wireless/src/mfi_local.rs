@@ -180,7 +180,9 @@ fn i2c_wr(reg: u8, data: &[u8]) -> bool {
 /// Fetch the accessory certificate. CopyCertificate: reg `0x30` len (2 BE), reg `0x31` cert. Same
 /// return shape as `carplay_iap2_core::mfi::cert()` (the auth op `0x01`), fed to iAP2 0xAA01.
 pub fn cert() -> Option<Vec<u8>> {
-    let _lock = MfiLock::acquire()?; // serialize vs iap2d for the whole cert read (#109)
+    let asked = Instant::now();
+    let lock = MfiLock::acquire()?; // serialize vs iap2d for the whole cert read (#109)
+    let held = Instant::now();
     let mut lb = [0u8; 2];
     if !i2c_rd(0x30, &mut lb) {
         return None;
@@ -193,6 +195,10 @@ pub fn cert() -> Option<Vec<u8>> {
     if !i2c_rd(0x31, &mut o) {
         return None;
     }
+    let under = held.elapsed();
+    drop(lock); // released as the read ends, as before; the time is told after
+    eprintln!("{}", cert_line(o.len(), under, held.duration_since(asked)));
+    crate::startup::duration("cert1_ms", ms(under));
     Some(o)
 }
 
@@ -200,7 +206,9 @@ pub fn cert() -> Option<Vec<u8>> {
 /// (`0x10`=1), poll status bit4, read `0x11` len / `0x12` sig. Same as the auth op `0x02`, fed to
 /// iAP2 0xAA03.
 pub fn sign(chal: &[u8]) -> Option<Vec<u8>> {
-    let _lock = MfiLock::acquire()?; // hold the lock across the ENTIRE stateful sequence (#109)
+    let asked = Instant::now();
+    let lock = MfiLock::acquire()?; // hold the lock across the ENTIRE stateful sequence (#109)
+    let held = Instant::now();
     let clen = chal.len();
     if !i2c_wr(0x20, &[(clen >> 8) as u8, clen as u8]) {
         return None;
@@ -211,6 +219,7 @@ pub fn sign(chal: &[u8]) -> Option<Vec<u8>> {
     if !i2c_wr(0x10, &[0x01]) {
         return None;
     }
+    let go = Instant::now();
     unsafe { libc::usleep(100_000) };
     let mut done = false;
     // Bounded by WALL CLOCK, not iteration count — the same defect audit #8 fixed in
@@ -241,6 +250,7 @@ pub fn sign(chal: &[u8]) -> Option<Vec<u8>> {
     if !done {
         return None;
     }
+    let ready = go.elapsed();
     let mut sl = [0u8; 2];
     if !i2c_rd(0x11, &mut sl) {
         return None;
@@ -253,5 +263,46 @@ pub fn sign(chal: &[u8]) -> Option<Vec<u8>> {
     if !i2c_rd(0x12, &mut sig) {
         return None;
     }
+    let under = held.elapsed();
+    drop(lock); // released as the sequence ends, as before; the time is told after
+    eprintln!("{}", sign_line(ready, under, held.duration_since(asked)));
+    crate::startup::duration("chip1_ms", ms(ready));
     Some(sig)
+}
+
+// ---- Instrumentation: how long the chip took (the connect timeline's chip1_ms and cert1_ms) ----------------------
+
+fn ms(d: Duration) -> u64 {
+    d.as_millis() as u64
+}
+
+/// A certificate read's line: its bytes and time under the lock, and the wait for the lock.
+fn cert_line(bytes: usize, under: Duration, waited: Duration) -> String {
+    format!("[mfi-local] cert: {bytes} B in {} ms under the lock, {} ms waiting for it", ms(under), ms(waited))
+}
+
+/// A signature's line: the chip's time from go to status ready (the fixed 100 ms first wait included), the whole
+/// sequence's time under the lock, and the wait for the lock.
+fn sign_line(ready: Duration, under: Duration, waited: Duration) -> String {
+    format!(
+        "[mfi-local] sign: chip {} ms from go to ready, {} ms under the lock, {} ms waiting for it",
+        ms(ready),
+        ms(under),
+        ms(waited)
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_chip_times_read_as_they_are_logged() {
+        let ms = Duration::from_millis;
+        assert_eq!(cert_line(945, ms(41), ms(0)), "[mfi-local] cert: 945 B in 41 ms under the lock, 0 ms waiting for it");
+        assert_eq!(
+            sign_line(ms(298), ms(305), ms(12)),
+            "[mfi-local] sign: chip 298 ms from go to ready, 305 ms under the lock, 12 ms waiting for it"
+        );
+    }
 }

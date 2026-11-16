@@ -225,7 +225,9 @@ impl Drop for MfiLock {
 impl MfiSigner for LocalMfiSigner {
     /// CopyCertificate: reg 0x30 = length (2 BE), reg 0x31 = cert bytes (the genuine ~945-byte cert).
     fn copy_certificate(&mut self) -> io::Result<Vec<u8>> {
-        let _lock = MfiLock::acquire()?; // held for the whole 0x30→0x31 transaction
+        let asked = std::time::Instant::now();
+        let lock = MfiLock::acquire()?; // held for the whole 0x30→0x31 transaction
+        let held = std::time::Instant::now();
         let mut lb = [0u8; 2];
         if !self.rd(0x30, &mut lb) {
             return Err(io::Error::other("MFi cert length read failed"));
@@ -238,6 +240,10 @@ impl MfiSigner for LocalMfiSigner {
         if !self.rd(0x31, &mut cert) {
             return Err(io::Error::other("MFi cert read failed"));
         }
+        let under = held.elapsed();
+        drop(lock); // released as the read ends, as before; the time is told after
+        eprintln!("{}", mfi_cert_line(cert.len(), under, held.duration_since(asked)));
+        receiver::startup::chip(receiver::startup::Chip::Cert, under.as_millis() as u64);
         Ok(cert)
     }
 
@@ -258,7 +264,9 @@ impl MfiSigner for LocalMfiSigner {
         }
         // Held across the ENTIRE write→trigger→poll→read sequence, not just the first register: the
         // poll window is exactly where an interleaving writer would corrupt the in-flight challenge.
-        let _lock = MfiLock::acquire()?;
+        let asked = std::time::Instant::now();
+        let lock = MfiLock::acquire()?;
+        let held = std::time::Instant::now();
         let clen = digest.len();
         if !self.wr(0x20, &[(clen >> 8) as u8, clen as u8]) {
             return Err(io::Error::other("MFi challenge-len write failed"));
@@ -269,6 +277,7 @@ impl MfiSigner for LocalMfiSigner {
         if !self.wr(0x10, &[0x01]) {
             return Err(io::Error::other("MFi sign trigger failed"));
         }
+        let go = std::time::Instant::now();
         unsafe { libc::usleep(100_000) };
         // Bounded by WALL CLOCK, not iteration count — the same fix `mfi-i2c-local` already carries
         // (`SIGN_POLL_DEADLINE`). `for _ in 0..200` with a 10 ms sleep looks like ~2.1 s, and is, but
@@ -292,6 +301,7 @@ impl MfiSigner for LocalMfiSigner {
         if !done {
             return Err(io::Error::other("MFi sign poll timeout"));
         }
+        let ready = go.elapsed();
         let mut sl = [0u8; 2];
         if !self.rd(0x11, &mut sl) {
             return Err(io::Error::other("MFi sig length read failed"));
@@ -304,8 +314,29 @@ impl MfiSigner for LocalMfiSigner {
         if !self.rd(0x12, &mut sig) {
             return Err(io::Error::other("MFi sig read failed"));
         }
+        let under = held.elapsed();
+        drop(lock); // released as the sequence ends, as before; the time is told after
+        eprintln!("{}", mfi_sign_line(ready, under, held.duration_since(asked)));
+        receiver::startup::chip(receiver::startup::Chip::Sign, ready.as_millis() as u64);
         Ok(sig)
     }
+}
+
+/// auth-setup's certificate read, for the log (and the connect timeline's cert2_ms): its bytes and time under the
+/// lock, and the wait for the lock.
+fn mfi_cert_line(bytes: usize, under: Duration, waited: Duration) -> String {
+    format!("[carplayd] mfi: cert {bytes} B in {} ms under the lock, {} ms waiting for it", under.as_millis(), waited.as_millis())
+}
+
+/// auth-setup's signature, for the log (and the timeline's chip2_ms): the chip's time from go to status ready (the
+/// fixed 100 ms first wait included), the whole sequence's time under the lock, and the wait for the lock.
+fn mfi_sign_line(ready: Duration, under: Duration, waited: Duration) -> String {
+    format!(
+        "[carplayd] mfi: sign: chip {} ms from go to ready, {} ms under the lock, {} ms waiting for it",
+        ready.as_millis(),
+        under.as_millis(),
+        waited.as_millis()
+    )
 }
 
 fn hex8(b: &[u8]) -> String {
@@ -1868,6 +1899,17 @@ mod tests {
         let mut tunnel = vec![0u8; 3 + ocbm_proto::MAX_INPUT_TUNNEL];
         tunnel[0] = ocbm_proto::INPUT_TUNNEL;
         assert!(input_sub_frame_fits(&tunnel));
+    }
+
+    /// auth-setup's chip times, as logged (the connect timeline's chip2_ms and cert2_ms come from the same numbers).
+    #[test]
+    fn the_chip_times_read_as_they_are_logged() {
+        let ms = Duration::from_millis;
+        assert_eq!(mfi_cert_line(945, ms(40), ms(0)), "[carplayd] mfi: cert 945 B in 40 ms under the lock, 0 ms waiting for it");
+        assert_eq!(
+            mfi_sign_line(ms(301), ms(308), ms(15)),
+            "[carplayd] mfi: sign: chip 301 ms from go to ready, 308 ms under the lock, 15 ms waiting for it"
+        );
     }
 
     /// Route A's playbackStatus words are LIVI's three; a byte past them is refused, never guessed.

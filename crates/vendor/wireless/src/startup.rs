@@ -4,12 +4,12 @@
 //! truck's own numbers (the Mac's 13 Nov connect-time brief). Best effort: a failed write costs only the line.
 //!
 //! The same record carries the `[timeline]` line's stamps (`box_common::timeline`), on the uptime clock rather than
-//! the wall clock: btd's events ([`stamp`]) and chip times (`d` lines), the origin and this session's start, and
+//! the wall clock: btd's events ([`stamp`]) and chip times ([`duration`]), the origin and this session's start, and
 //! the radio bring-up's, which the shell appends and [`begin`] carries into each session it starts under it.
 
 use std::io::Write as _;
 
-use box_common::timeline::{self, STAMP};
+use box_common::timeline::{self, DURATION, STAMP};
 
 /// The stages as written; read back by carplayd (`receiver::startup::MARKS`).
 pub const MARKS: &str = "/tmp/startup_marks";
@@ -152,6 +152,11 @@ pub fn stamp(key: &str) {
     if let Some(ms) = timeline::now_ms() {
         note(MARKS, STAMP, key, ms);
     }
+}
+
+/// Note one of btd's chip times for the timeline (`chip1_ms`, `cert1_ms`), once per session: the first stands.
+pub fn duration(key: &str, ms: u64) {
+    note(MARKS, DURATION, key, ms);
 }
 
 /// A `<kind> <key> <ms>` line in the record at `path`, unless it has one for `key` already.
