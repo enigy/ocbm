@@ -7,9 +7,12 @@ license = "Unlicense"
 # The box-side foundation the CarPlay daemons (ocbmd, carplayd, btd) share.
 #
 #   box-common
-#   ├── ocbm   — OCBM framing/channels (re-exports ocbm-proto)
-#   ├── flags  — projection ownership + session flags
-#   └── net    — the adapter's network constants
+#   ├── ocbm      — OCBM framing/channels (re-exports ocbm-proto)
+#   ├── flags     — projection ownership + session flags
+#   ├── net       — the adapter's network constants
+#   └── timeline  — the connect timeline's clock, marks and line
 
 [dependencies]
 ocbm-proto = { path = "../ocbm-proto" }
+# clock_gettime(CLOCK_BOOTTIME) for the timeline's clock; every daemon above links it already.
+libc = "0.2"

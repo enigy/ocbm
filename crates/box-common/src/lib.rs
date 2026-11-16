@@ -1,8 +1,9 @@
-//! box-common — the box-side foundation the CarPlay daemons share: OCBM, the session flags and the
-//! network constants. See Cargo.toml for the layering.
+//! box-common — the box-side foundation the CarPlay daemons share: OCBM, the session flags, the
+//! network constants and the connect timeline. See Cargo.toml for the layering.
 
 pub mod flags;
 pub mod net;
+pub mod timeline;
 
 /// The agnostic OCBM framing/channel layer. For now a re-export of `ocbm-proto` so every box crate
 /// references ONE definition of the channel ids and frame codec; ocbmd's mux-core (OutQueue/poll
