@@ -258,7 +258,7 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
      screen SETUP than the good ones. **Bench 15 Nov (the Mac), two iPhones: 84 s lost.** A phone that
      knows the AP joins it ~1.5 s after its Bluetooth link, before its 0x5703 names it, so `carplayd`
      refused its record for the last phone's and nothing looked again until the browser re-queried.
-     Fixed for 2.6.0, NOT yet benched: `btd` names a bonded phone as its Bluetooth session starts, while
+     Fixed for 2.6.0, benched 15 Nov (the Mac, two iPhones: a change of phone 4.6-5.7 s from AP join to video, 44-91 s before; the switched-from phone not dialled back): `btd` names a bonded phone as its Bluetooth session starts, while
      no CarPlay session is up and btd is not going quiet (`av::name_at_session_start`), and puts the
      earlier name back when that session ends without a 0x5703, unless the phone's own CarPlay is live,
      `carplayd` holds a control connection, or btd is going quiet (`av::put_back`). `discovery` reads the
@@ -300,6 +300,22 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
      `closed 3` and `closed 2 keyed A/V seam(s)`. The other
      same-nonce path, the heartbeat re-SUBSCRIBE after `SEV_HOST_GONE` (`OcbmClient.startHeartbeat`),
      follows a presence drop and so a re-arm; it is still unbenched.
+
+- **Two phones, left for 2.6.x or later (the Mac's reviews for 2.6.0, 15 Nov; not in 2.6.0).**
+  - `carplayd-1`: a capped rename-path dial that misses has no retry and waits for the 90 s never-reached
+    end (`Control::carplay_never_reached`).
+  - `carplayd-2`: fresh resolves read inside `rename()`'s replay loop get `RENAME_ROUNDS`.
+  - `carplayd-3`: `forget_phone` can repeat a dial made moments earlier under the new name.
+  - `btd-p1-carlink-1`: `put_back`'s Connected should be provisional.
+  - `e2e-4`: the same phone back within ~5 s while its own dead session is held is never re-checked
+    (backstop: `carplay_never_reached` at 90 s).
+  - `e2e-3`: watch for a second connect-out before SETUP.
+  - `btd-5` and `btd-6`, from the Mac's round 5 review.
+
+- **`MFI-CACHE-SCOPE`: btd's Bluetooth iAP2 and carplayd's AirPlay auth-setup still read the MFi chip each
+  session.** 2.6.0's once-per-boot certificate cache serves only the CarPlay session's iAP2 link.
+
+- **The doubled `[update]` lines in box.log (ocbmd's `start_update`).** Not in 2.6.0.
 
 - **No inbound `stopSession` handler.** The box declares a five-value `stopSessionReasons`
   vocabulary and then ignores the command; `disconnectReason` plumbing to the supervisor follows
@@ -741,6 +757,10 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
   `grep -rn "0x4E0D" --include="*.rs" crates ccpa` → every hit is a spec-table entry or a declaration
   list; no handler.
 
+- **Carlink's lane watcher matching `RX 0x1D03` (after Carlink 3.20).** In 3.20,
+  `CarlinkManager.watchLaneRefusal` matches "IdentificationRejected" in the box log. Carlink's item, kept here
+  with the box's log line it reads.
+
 ---
 
 ### Wireless transport — the RCS DataStream and the BT→WiFi path
@@ -981,6 +1001,10 @@ The macOS host app (`host/MacHost`) left the tree in OCBM 1.0.5; its items are a
   `grep -n "wpa_passphrase" ccpa/rootfs/script/radio_ap_up.sh` → the guard is `[ "${#PSK}" -lt 8 ]`;
   `cat ccpa/rootfs/etc/init.d/rcS` → `busybox telnetd -l /bin/sh -p 23 &`;
   `grep -rn "ap_isolate" ccpa/` → no matches.
+
+- **No Linux CI job runs the BusyBox suites under BusyBox 1.32.1, the adapter's.** `shell-tests.yml` runs
+  the shell suites on macOS under sh and dash only, so an applet difference (1.32.1's `tr` has no
+  `[:print:]`, found in the Mac's round 2 for 2.6.0, `e27af19`) is not caught in CI. Not in 2.6.0.
 
 ---
 
