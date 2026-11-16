@@ -301,6 +301,22 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
      same-nonce path, the heartbeat re-SUBSCRIBE after `SEV_HOST_GONE` (`OcbmClient.startHeartbeat`),
      follows a presence drop and so a re-arm; it is still unbenched.
 
+- **Two phones, left for 2.6.x or later (the Mac's reviews for 2.6.0, 15 Nov; not in 2.6.0).**
+  - `carplayd-1`: a capped rename-path dial that misses has no retry and waits for the 90 s never-reached
+    end (`Control::carplay_never_reached`).
+  - `carplayd-2`: fresh resolves read inside `rename()`'s replay loop get `RENAME_ROUNDS`.
+  - `carplayd-3`: `forget_phone` can repeat a dial made moments earlier under the new name.
+  - `btd-p1-carlink-1`: `put_back`'s Connected should be provisional.
+  - `e2e-4`: the same phone back within ~5 s while its own dead session is held is never re-checked
+    (backstop: `carplay_never_reached` at 90 s).
+  - `e2e-3`: watch for a second connect-out before SETUP.
+  - `btd-5` and `btd-6`, from the Mac's round 5 review.
+
+- **`MFI-CACHE-SCOPE`: btd's Bluetooth iAP2 and carplayd's AirPlay auth-setup still read the MFi chip each
+  session.** 2.6.0's once-per-boot certificate cache serves only the CarPlay session's iAP2 link.
+
+- **The doubled `[update]` lines in box.log (ocbmd's `start_update`).** Not in 2.6.0.
+
 - **No inbound `stopSession` handler.** The box declares a five-value `stopSessionReasons`
   vocabulary and then ignores the command; `disconnectReason` plumbing to the supervisor follows
   from the same gap. Both halves sit behind `CARPLAY_SESSION_MGMT`, so shipping the declaration
@@ -741,6 +757,10 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
   `grep -rn "0x4E0D" --include="*.rs" crates ccpa` → every hit is a spec-table entry or a declaration
   list; no handler.
 
+- **Carlink's lane watcher matching `RX 0x1D03` (after Carlink 3.20).** In 3.20,
+  `CarlinkManager.watchLaneRefusal` matches "IdentificationRejected" in the box log. Carlink's item, kept here
+  with the box's log line it reads.
+
 ---
 
 ### Wireless transport — the RCS DataStream and the BT→WiFi path
@@ -981,6 +1001,10 @@ The macOS host app (`host/MacHost`) left the tree in OCBM 1.0.5; its items are a
   `grep -n "wpa_passphrase" ccpa/rootfs/script/radio_ap_up.sh` → the guard is `[ "${#PSK}" -lt 8 ]`;
   `cat ccpa/rootfs/etc/init.d/rcS` → `busybox telnetd -l /bin/sh -p 23 &`;
   `grep -rn "ap_isolate" ccpa/` → no matches.
+
+- **No Linux CI job runs the BusyBox suites under BusyBox 1.32.1, the adapter's.** `shell-tests.yml` runs
+  the shell suites on macOS under sh and dash only, so an applet difference (1.32.1's `tr` has no
+  `[:print:]`, found in the Mac's round 2 for 2.6.0, `e27af19`) is not caught in CI. Not in 2.6.0.
 
 ---
 
