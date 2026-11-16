@@ -150,8 +150,13 @@ pub fn tally(what: &str) {
 /// Note timeline event `key` now, on the uptime clock (`box_common::timeline`), once per session: the first stands.
 pub fn stamp(key: &str) {
     if let Some(ms) = timeline::now_ms() {
-        note(MARKS, STAMP, key, ms);
+        stamp_at(key, ms);
     }
+}
+
+/// [`stamp`] with the uptime it happened at (`ms`), taken by the caller: the AP watch's, as it woke.
+pub fn stamp_at(key: &str, ms: u64) {
+    note(MARKS, STAMP, key, ms);
 }
 
 /// Note one of btd's chip times for the timeline (`chip1_ms`, `cert1_ms`), once per session: the first stands.
@@ -247,14 +252,23 @@ mod tests {
 
         // A second session under the same host (a phone switch): the bring-up again, with the AP's stamps that came
         // since; the first session's own stamps and chip times stay behind, its counts come along.
-        let prev2 = format!("{rec}t page_start 62530\nd chip1_ms 298\nt ap_start 62900\ntally absent\nt ap_up 63600\nt wifi_rsp 63930\n");
+        // The AP watch's AP-ENABLED is the bring-up's too; the phone's association and lease are that session's.
+        let prev2 = format!(
+            "{rec}t page_start 62530\nd chip1_ms 298\nt ap_start 62900\ntally absent\nt ap_up 63600\nt ap_enabled 63880\n\
+             t wifi_rsp 63930\nt sta_assoc 64500\nt dhcp_ack 64800\n"
+        );
         let fresh2 = "host_present 2000\npreload done\nt host 61234\nt btd_start 90100\n";
         let rec2 = carry_over(&prev2, 2000, fresh2);
         assert_eq!(
             rec2,
-            format!("{fresh2}tally absent\nt sup_radios 61640\nt usb_edge 49700\nt bt_power 62480\nt ap_start 62900\nt ap_up 63600\n")
+            format!(
+                "{fresh2}tally absent\nt sup_radios 61640\nt usb_edge 49700\nt bt_power 62480\nt ap_start 62900\nt ap_up 63600\n\
+                 t ap_enabled 63880\n"
+            )
         );
         assert_eq!(timeline::find(&rec2, STAMP, "page_start"), None, "the stamps are the new session's");
+        assert_eq!(timeline::find(&rec2, STAMP, "sta_assoc"), None, "the next phone's association is its own");
+        assert_eq!(timeline::find(&rec2, STAMP, "dhcp_ack"), None);
         assert_eq!(timeline::find(&rec2, timeline::DURATION, "chip1_ms"), None);
         assert_eq!(timeline::find(&rec2, STAMP, "btd_start"), Some(90100));
 

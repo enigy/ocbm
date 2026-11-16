@@ -16,6 +16,7 @@
 //! iAP2 handshake (`rfcomm.rs`/`bt_driver.rs`) through `IdentifyAccept`. Phase A3 (`wifi_handoff.rs`)
 //! adds the WiFi-credential message codecs + AP hosting.
 
+mod ap_watch;
 mod arbiter_client;
 mod av;
 mod box_identity;
@@ -130,6 +131,9 @@ fn run_active_session(
     // Per-device name derived once per session (reads the Wi-Fi MAC / SoC serial). Used for the EIR
     // Complete Local Name (what the iPhone shows) and the wireless iAP2 identify.
     startup::begin();
+    // The connect timeline's AP events, for this session: hostapd's and udhcpd's lines as they land (ap_watch). It
+    // ends at go-quiet below, or when this returns early.
+    let ap_watch = ap_watch::start();
     let accessory_name = carplay_iap2_core::message::accessory_name(ACCESSORY_BRAND);
     if let Err(e) = bt_bringup::bring_up(HCI_DEV, &accessory_name, just_opened()) {
         log(&format!("Bluetooth bring-up failed: {e} -- retrying"));
@@ -293,6 +297,7 @@ fn run_active_session(
         log("switching phones -- ending this session so the phone asked for can connect");
     }
     log("going quiet");
+    drop(ap_watch);
     ssp_shutdown.store(true, Ordering::Relaxed);
     sdp_shutdown.store(true, Ordering::Relaxed);
     rfcomm_shutdown.store(true, Ordering::Relaxed);
