@@ -71,7 +71,7 @@ fn connect_out(addr: SocketAddr, dev_dec: u64) -> bool {
         println!("[rx] connect-out {addr} write failed: {e}");
         return false;
     }
-    receiver::startup::stage(receiver::startup::Stage::Dial); // the connect timeline's `dial`: the first one sent
+    receiver::startup::stage(receiver::startup::Stage::Dial); // the connect timeline's `dial`: the last one sent before the control connection (receiver::startup)
     println!("[rx] connect-out GET /ctrl-int/1/connect -> {addr} (devid={dev_dec})");
     let mut buf = [0u8; 1024];
     match s.read(&mut buf) {

@@ -363,12 +363,16 @@ critical-path event of the connect, stamped where it happens:
 the keys come in this order always (`crates/box-common/src/timeline.rs`, which owns them). Every event is whole ms
 since the origin; `-` is a value not stamped, one before the origin, or every event when there is no origin.
 
-**Benched once** (the Mac, 16 Nov: the dev adapter on `e75a0ac`, 5 connects). The line arrived in the drive log under
-`[box/airplayd-wl]` right after `[startup]`, one line of about 440 bytes; `first_frame` agreed with `[startup]`'s within
-6-13 ms, and every shell stamp fell in order with the daemons' (so `/proc/uptime` and CLOCK_BOOTTIME share their base
-on this kernel); the chip took 1640-1651 ms from go to ready and 112-159 ms for the certificate, every time.
-`usb_edge_s` was `-` in all five (no configure edge after the supervisor's start). `bt_up`, `record_in`, the AP watch's
-three keys and the stages per control connection came after that bench, and are not benched yet.
+**Benched twice** (the Mac, 16 Nov: the dev adapter on `e75a0ac`, 5 connects, then on `335ef1d`, 4 connects). The line
+arrived in the drive log under `[box/airplayd-wl]` right after `[startup]`, one line of about 440 to 480 bytes;
+`first_frame` agreed with `[startup]`'s within 6-13 ms, and every shell stamp fell in order with the daemons' (so
+`/proc/uptime` and CLOCK_BOOTTIME share their base on this kernel); the chip took 1640-1651 ms from go to ready and
+110-170 ms for the certificate, every time. `usb_edge_s` was `-` in all nine (no configure edge after the supervisor's
+start). On `335ef1d`: `bt_up` came 30-40 ms after `btd_start`, `record_in` 0-3 ms before `record`; the AP watch ended
+each session in 2.2 to 4.6 s with all three lines seen on the wakes (`ap_enabled` is `-` on a cold start, as written
+below); `ap_enabled - ap_start` was 850-870 ms in all three wakes, `sta_assoc` 550-610 ms after `rfcomm`, `dhcp_ack`
+90-220 ms after `sta_assoc`. Not seen on the device yet: a session ending while its watch still runs, and a session
+with more than one control connection.
 
 | Key | The event | Stamped in |
 |---|---|---|
@@ -443,7 +447,7 @@ that appears anywhere, and none of it reaches the timeline.
   it, before btd began.
 - **Buffering.** udhcpd (BusyBox) writes each line in one write as it sends, so `dhcp_ack` is the ACK's time to within
   the watch's wake. hostapd writes through stdio into a file, which may be block-buffered: the 12 Nov drive log shows
-  its station lines arriving at their own times, seconds apart, so they look flushed per line, but that is not proven.
+  its station lines arriving at their own times, seconds apart, so they look flushed per line, and the 16 Nov bench agrees (`ap_enabled - ap_start` within 20 ms over three wakes); it is not proven.
   If they are buffered, `ap_enabled` and `sta_assoc` are late by an unknown amount. On a bench, `ap_enabled - ap_start`
   steady at about 1 s says they are not. If they are, the other sources are a passive EAPOL socket or hostapd's
   `ctrl_interface` (a change to the AP itself; this section in git at `e75a0ac` has both, with their costs).

@@ -297,11 +297,12 @@ fn run_active_session(
         log("switching phones -- ending this session so the phone asked for can connect");
     }
     log("going quiet");
-    drop(ap_watch);
     ssp_shutdown.store(true, Ordering::Relaxed);
     sdp_shutdown.store(true, Ordering::Relaxed);
     rfcomm_shutdown.store(true, Ordering::Relaxed);
     reconnect_shutdown.store(true, Ordering::Relaxed);
+    // After the flags, as 2.6.0 raised them: ending the watch joins its thread (the Mac's release review, 16 Nov).
+    drop(ap_watch);
     if let Err(e) = bt_bringup::go_quiet(HCI_DEV) {
         log(&format!("go_quiet failed (non-fatal): {e}"));
     }
