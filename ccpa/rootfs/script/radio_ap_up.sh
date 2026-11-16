@@ -93,6 +93,15 @@ ap_passphrase() {
 }
 [ "${RADIO_AP_UP_FUNCS:-}" = 1 ] && return 0
 
+# The connect timeline's ap_start and ap_up (crates/box-common/src/timeline.rs): `t <key> <uptime ms>` appended to btd's
+# record. One append, no fork; a failed one is ignored.
+tl_stamp() {
+  _tls_up=""
+  read -r _tls_up _tls_idle 2>/dev/null </proc/uptime
+  case "$_tls_up" in *.*) echo "t $1 ${_tls_up%.*}${_tls_up#*.}0" 2>/dev/null >>/tmp/startup_marks ;; esac
+  return 0
+}
+
 IF=${RADIO_WLAN_IF:-wlan0}
 [ -e "/sys/class/net/$IF" ] || { echo "$L interface $IF does not exist - the driver must be up first"; exit 1; }
 # AND IT MUST ACTUALLY BE A WIRELESS INTERFACE. Existence alone is not enough: this script
@@ -264,7 +273,7 @@ test -e /tmp/bin/hostapd || cp /usr/sbin/hostapd /tmp/bin/hostapd 2>/dev/null
 # fresh session's link was lost. It runs in the foreground under setsid instead, as udhcpd does below,
 # appending (O_APPEND, for bound_logs' in-place truncate); the converge step waits for it.
 echo "[radio] hostapd starting on $IF" >> /tmp/box.log
-ps | grep -v grep | grep -qw hostapd || { setsid hostapd /etc/hostapd.conf </dev/null >>/tmp/box.log 2>&1 & }
+ps | grep -v grep | grep -qw hostapd || { setsid hostapd /etc/hostapd.conf </dev/null >>/tmp/box.log 2>&1 & tl_stamp ap_start; }
 
 # The AP's DHCP server, explicitly scoped. The stock script masked this behind a global udhcpd
 # check, so the always-running NCM instance satisfied it and the AP's own server never started -
@@ -303,7 +312,8 @@ ap_serving() {
   return 0
 }
 n=0
-while [ "$n" -lt 50 ]; do ap_serving && break; n=$((n+1)); sleep 0.2; done
+# The first pass is the timeline's ap_up: the AP serving, before the second below that confirms it.
+while [ "$n" -lt 50 ]; do ap_serving && { tl_stamp ap_up; break; }; n=$((n+1)); sleep 0.2; done
 # Re-test the FULL predicate after the loop: falling out of it on the bound is not success, and
 # re-checking only hostapd here would let a missing address or a dead DHCP server report as up.
 # A second on: in the foreground hostapd is in the process list before its start-up is through,
