@@ -399,6 +399,7 @@ impl<'a, P: Pairings, S: MfiSigner> ControlServer<'a, P, S> {
                 }
             }
             Route::Record => {
+                crate::startup::stage(crate::startup::Stage::RecordIn);
                 let resp = self.session.record();
                 crate::startup::stage(crate::startup::Stage::Record);
                 Ok(Response::ok(req, None, resp))

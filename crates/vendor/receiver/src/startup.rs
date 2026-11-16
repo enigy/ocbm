@@ -30,14 +30,16 @@ pub fn nudged(second: bool) {
     NUDGES[usize::from(second)].fetch_add(1, Ordering::Relaxed);
 }
 
-/// carplayd's own events for the `[timeline]` line (`box_common::timeline::EVENTS`), the first of each standing.
+/// carplayd's own events for the `[timeline]` line (`box_common::timeline::EVENTS`). The first of each stands: in the
+/// process for `carplayd_start` and `svc_seen`, in the control connection for the rest ([`new_connection`]), so the
+/// line tells the connection that produced the picture. `dial` is the last connect-out sent before that connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
     /// carplayd started (main).
     CarplaydStart,
     /// The `_carplay-ctrl` of the phone btd names first resolved (discovery).
     SvcSeen,
-    /// The connect-out (`GET /ctrl-int/1/connect`) sent (discovery).
+    /// A connect-out (`GET /ctrl-int/1/connect`) sent (discovery).
     Dial,
     /// Pair-verify OK: the control channel encrypted.
     PvDone,
@@ -45,6 +47,8 @@ pub enum Stage {
     AuthIn,
     /// `/auth-setup` answered.
     AuthOut,
+    /// RECORD received.
+    RecordIn,
     /// RECORD answered.
     Record,
     /// The main screen's (type 110) SETUP answered.
@@ -54,13 +58,25 @@ pub enum Stage {
 }
 
 impl Stage {
-    const ALL: [Stage; 9] = [
+    const ALL: [Stage; 10] = [
         Stage::CarplaydStart,
         Stage::SvcSeen,
         Stage::Dial,
         Stage::PvDone,
         Stage::AuthIn,
         Stage::AuthOut,
+        Stage::RecordIn,
+        Stage::Record,
+        Stage::ScreenSetup,
+        Stage::FirstFrame,
+    ];
+
+    /// The stages of one control connection, started afresh at each.
+    const PER_CONNECTION: [Stage; 7] = [
+        Stage::PvDone,
+        Stage::AuthIn,
+        Stage::AuthOut,
+        Stage::RecordIn,
         Stage::Record,
         Stage::ScreenSetup,
         Stage::FirstFrame,
@@ -75,6 +91,7 @@ impl Stage {
             Stage::PvDone => "pv_done",
             Stage::AuthIn => "auth_in",
             Stage::AuthOut => "auth_out",
+            Stage::RecordIn => "record_in",
             Stage::Record => "record",
             Stage::ScreenSetup => "screen_setup",
             Stage::FirstFrame => "first_frame",
@@ -82,7 +99,8 @@ impl Stage {
     }
 }
 
-/// auth-setup's chip calls (`LocalMfiSigner`): the signature's time from go to ready, the certificate read's.
+/// auth-setup's chip calls (`LocalMfiSigner`): the signature's time from go to ready, the certificate read's. Per
+/// control connection, as its stages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Chip {
     Sign,
@@ -102,36 +120,93 @@ impl Chip {
 
 /// Not stamped yet.
 const UNSET: u64 = u64::MAX;
-static STAGES: [AtomicU64; 9] = [
-    AtomicU64::new(UNSET),
-    AtomicU64::new(UNSET),
-    AtomicU64::new(UNSET),
-    AtomicU64::new(UNSET),
-    AtomicU64::new(UNSET),
-    AtomicU64::new(UNSET),
-    AtomicU64::new(UNSET),
-    AtomicU64::new(UNSET),
-    AtomicU64::new(UNSET),
-];
-static CHIPS: [AtomicU64; 2] = [AtomicU64::new(UNSET), AtomicU64::new(UNSET)];
+#[allow(clippy::declare_interior_mutable_const)]
+const NOT_YET: AtomicU64 = AtomicU64::new(UNSET);
 
-/// Stamp `stage` now, on the timeline's uptime clock: once per carplayd, the first standing.
-pub fn stage(stage: Stage) {
-    if let Some(ms) = box_common::timeline::now_ms() {
-        let _ = STAGES[stage as usize].compare_exchange(UNSET, ms, Ordering::Relaxed, Ordering::Relaxed);
+/// carplayd's stamps, in memory ([`OWN`]; a test keeps its own).
+struct Stamps {
+    stages: [AtomicU64; 10],
+    chips: [AtomicU64; 2],
+    /// The last connect-out sent: the `dial` of the connection after it.
+    dial_sent: AtomicU64,
+    /// When the current control connection began.
+    connection_at: AtomicU64,
+}
+
+impl Stamps {
+    const fn new() -> Self {
+        Stamps { stages: [NOT_YET; 10], chips: [NOT_YET; 2], dial_sent: NOT_YET, connection_at: NOT_YET }
+    }
+
+    fn stage(&self, stage: Stage, ms: u64) {
+        if stage == Stage::Dial {
+            self.dial_sent.store(ms, Ordering::Relaxed);
+        } else {
+            let _ = self.stages[stage as usize].compare_exchange(UNSET, ms, Ordering::Relaxed, Ordering::Relaxed);
+        }
+    }
+
+    fn chip(&self, chip: Chip, ms: u64) {
+        let _ = self.chips[chip as usize].compare_exchange(UNSET, ms, Ordering::Relaxed, Ordering::Relaxed);
+    }
+
+    /// A control connection begins at `now`: its stages and chip times start afresh, and its `dial` is the last
+    /// connect-out sent since the connection before it began.
+    fn new_connection(&self, now: Option<u64>) {
+        for s in Stage::PER_CONNECTION {
+            self.stages[s as usize].store(UNSET, Ordering::Relaxed);
+        }
+        for c in &self.chips {
+            c.store(UNSET, Ordering::Relaxed);
+        }
+        let before = match now {
+            Some(n) => self.connection_at.swap(n, Ordering::Relaxed),
+            None => self.connection_at.load(Ordering::Relaxed),
+        };
+        let dial = dial_for(self.dial_sent.load(Ordering::Relaxed), before);
+        self.stages[Stage::Dial as usize].store(dial, Ordering::Relaxed);
+    }
+
+    /// What is stamped, as the timeline line takes it.
+    fn own(&self) -> Vec<(&'static str, u64)> {
+        let stages = Stage::ALL.iter().map(|&s| (s.key(), self.stages[s as usize].load(Ordering::Relaxed)));
+        let chips = Chip::ALL.iter().map(|&c| (c.key(), self.chips[c as usize].load(Ordering::Relaxed)));
+        stages.chain(chips).filter(|&(_, v)| v != UNSET).collect()
     }
 }
 
-/// Note how long one of auth-setup's chip calls took (ms): once per carplayd, the first standing.
+/// A connection's `dial`: the last connect-out (`sent`), when it went since the connection before began (`before`;
+/// any, for the first). None (UNSET): the phone came by itself.
+fn dial_for(sent: u64, before: u64) -> u64 {
+    if sent != UNSET && (before == UNSET || sent >= before) {
+        sent
+    } else {
+        UNSET
+    }
+}
+
+static OWN: Stamps = Stamps::new();
+
+/// Stamp `stage` now, on the timeline's uptime clock ([`Stage`] says which first stands).
+pub fn stage(stage: Stage) {
+    if let Some(ms) = box_common::timeline::now_ms() {
+        OWN.stage(stage, ms);
+    }
+}
+
+/// Note how long one of auth-setup's chip calls took (ms): once per control connection, the first standing.
 pub fn chip(chip: Chip, ms: u64) {
-    let _ = CHIPS[chip as usize].compare_exchange(UNSET, ms, Ordering::Relaxed, Ordering::Relaxed);
+    OWN.chip(chip, ms);
+}
+
+/// A new control connection (carplayd's serve loop): the line describes the one that produces the picture.
+pub fn new_connection() {
+    OWN.new_connection(box_common::timeline::now_ms());
 }
 
 /// What this carplayd stamped, as the timeline line takes it.
 fn own() -> Vec<(&'static str, u64)> {
-    let stages = Stage::ALL.iter().map(|&s| (s.key(), STAGES[s as usize].load(Ordering::Relaxed)));
-    let chips = Chip::ALL.iter().map(|&c| (c.key(), CHIPS[c as usize].load(Ordering::Relaxed)));
-    stages.chain(chips).filter(|&(_, v)| v != UNSET).collect()
+    OWN.own()
 }
 
 /// Whether this is the wireless carplayd: `CARPLAY_WIRELESS_METADATA` is set at its spawn alone (btd's av.rs), and
@@ -339,28 +414,69 @@ mod tests {
         assert_eq!(psk_mismatches(p, 0, None), None, "no log");
     }
 
-    /// The timeline from this carplayd's own stamps and btd's record: carplayd's events by its uptime, btd's and the
-    /// shell's from the record, every one from the origin btd copied in (box_common::timeline).
+    /// carplayd's stamps per control connection: a failed first connection's stages and chip times go with it, the
+    /// one that produces the picture keeps its own, `dial` is the connect-out before each, and carplayd_start and
+    /// svc_seen stay the process's (a local [`Stamps`]: the globals are other tests' too).
+    #[test]
+    fn the_stages_are_the_connection_that_produced_the_picture() {
+        let st = Stamps::new();
+        let get = |st: &Stamps, key: &str| st.own().iter().find(|(k, _)| *k == key).map(|&(_, v)| v);
+        st.stage(Stage::CarplaydStart, 1000);
+        st.stage(Stage::SvcSeen, 1500);
+        st.stage(Stage::Dial, 1600);
+        assert_eq!(get(&st, "dial"), None, "a dial counts for the connection after it");
+        st.new_connection(Some(1700));
+        st.stage(Stage::PvDone, 1800);
+        st.stage(Stage::PvDone, 1850);
+        st.chip(Chip::Sign, 301);
+        st.chip(Chip::Sign, 999);
+        assert_eq!((get(&st, "dial"), get(&st, "pv_done"), get(&st, "chip2_ms")), (Some(1600), Some(1800), Some(301)));
+
+        // The first connection fails; discovery dials again, and the second produces the picture.
+        st.stage(Stage::SvcSeen, 2900);
+        st.stage(Stage::Dial, 3000);
+        st.stage(Stage::Dial, 3100);
+        st.new_connection(Some(3200));
+        assert_eq!(get(&st, "pv_done"), None, "the failed connection's stages went with it");
+        assert_eq!(get(&st, "chip2_ms"), None, "and its chip times");
+        assert_eq!(get(&st, "dial"), Some(3100), "the last connect-out before this connection");
+        assert_eq!((get(&st, "carplayd_start"), get(&st, "svc_seen")), (Some(1000), Some(1500)), "the process's");
+        st.stage(Stage::RecordIn, 3500);
+        st.stage(Stage::Record, 3600);
+        st.stage(Stage::FirstFrame, 4000);
+        st.stage(Stage::Dial, 4100);
+        assert_eq!(get(&st, "dial"), Some(3100), "a dial after the connection began is the next one's");
+
+        // A third connection the phone opened by itself: no dial since the second began.
+        st.new_connection(Some(4200));
+        assert_eq!(get(&st, "dial"), Some(4100), "the dial at 4100 came after the second began");
+        st.new_connection(Some(4300));
+        assert_eq!(get(&st, "dial"), None, "none since the third began: the phone came by itself");
+        assert_eq!(dial_for(UNSET, UNSET), UNSET);
+        assert_eq!(dial_for(500, UNSET), 500, "the first connection takes any dial before it");
+    }
+
+    /// The timeline from carplayd's own stamps and btd's record: carplayd's by their uptime, btd's and the shell's from
+    /// the record, all from the origin btd copied in (box_common::timeline).
     #[test]
     fn the_timeline_takes_carplayds_own_stamps_and_btds_record() {
-        let before = box_common::timeline::now_ms().unwrap();
-        stage(Stage::Dial);
-        stage(Stage::Dial);
-        chip(Chip::Sign, 301);
-        chip(Chip::Sign, 999);
-        let own = own();
-        let dial = own.iter().find(|(k, _)| *k == "dial").map(|&(_, v)| v).expect("stamped");
-        assert!(dial >= before && dial <= box_common::timeline::now_ms().unwrap());
-        assert_eq!(own.iter().filter(|(k, _)| *k == "dial").count(), 1);
-        assert!(own.contains(&("chip2_ms", 301)), "the first stands");
-        assert!(!own.iter().any(|(k, _)| *k == "cert2_ms"), "not noted: not there");
-
-        let marks = format!("host_present 1763300000123\nt host {}\nt wifi_rsp {}\n", dial - 3000, dial - 400);
-        let line = box_common::timeline::line(&marks, &own);
+        let st = Stamps::new();
+        st.stage(Stage::Dial, 64_000);
+        st.new_connection(Some(64_100));
+        st.stage(Stage::RecordIn, 66_080);
+        st.chip(Chip::Sign, 301);
+        let marks = "host_present 1763300000123\nt host 61000\nt bt_up 62000\nt wifi_rsp 63600\n";
+        let line = box_common::timeline::line(marks, &st.own());
         assert!(box_common::timeline::is_line(&line), "{line}");
-        assert!(line.contains(" wifi_rsp=2600 ") && line.contains(" dial=3000 "), "{line}");
+        assert!(line.contains(" bt_up=1000 ") && line.contains(" wifi_rsp=2600 ") && line.contains(" dial=3000 "), "{line}");
+        assert!(line.contains(" record_in=5080 ") && line.contains(" record=- "), "{line}");
         assert!(line.contains(" chip2_ms=301 ") && line.contains(" cert2_ms=- "), "{line}");
         assert!(line.contains(" page_start=- "), "{line}");
+
+        let before = box_common::timeline::now_ms().unwrap();
+        stage(Stage::CarplaydStart);
+        let at = own().iter().find(|(k, _)| *k == "carplayd_start").map(|&(_, v)| v).expect("the global stamps it");
+        assert!(at >= before && at <= box_common::timeline::now_ms().unwrap());
     }
 
     #[test]

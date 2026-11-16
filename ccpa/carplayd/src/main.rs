@@ -1732,6 +1732,8 @@ fn run_pairing_server() -> io::Result<()> {
         }
         let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
         println!("[carplayd] ── control connection from {peer} ──");
+        // The connect timeline's stages start afresh: the line tells the connection that produces the picture.
+        receiver::startup::new_connection();
         let ident_before = phone_ident_written();
         // Already registered as the current (hijackable) session by the accept thread; publish the
         // bearer here, before the per-connection setup (config read, MFi open). The registration is
