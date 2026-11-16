@@ -188,6 +188,7 @@ impl<'a, P: Pairings, S: MfiSigner> ControlServer<'a, P, S> {
             }
             // pair-verify just succeeded → all subsequent traffic is encrypted.
             if let Some(secret) = self.activate.take() {
+                crate::startup::stage(crate::startup::Stage::PvDone);
                 self.channel = Some(ControlChannel::new(derive_control_keys(&secret)));
                 self.shared = Some(secret);
                 self.session.on_paired(secret);
@@ -344,20 +345,24 @@ impl<'a, P: Pairings, S: MfiSigner> ControlServer<'a, P, S> {
                     }
                 }
             }
-            Route::AuthSetup => match self.sap.exchange(&req.body, &mut self.signer) {
-                Ok(body) => {
-                    if self.verbose {
-                        eprintln!("[receiver] auth-setup (MFi-SAP) OK → {} B M2", body.len());
+            Route::AuthSetup => {
+                crate::startup::stage(crate::startup::Stage::AuthIn);
+                match self.sap.exchange(&req.body, &mut self.signer) {
+                    Ok(body) => {
+                        crate::startup::stage(crate::startup::Stage::AuthOut);
+                        if self.verbose {
+                            eprintln!("[receiver] auth-setup (MFi-SAP) OK → {} B M2", body.len());
+                        }
+                        Ok(Response::ok(req, Some(OCTET), body))
                     }
-                    Ok(Response::ok(req, Some(OCTET), body))
-                }
-                Err(e) => {
-                    if self.verbose {
-                        eprintln!("[receiver] auth-setup FAILED: {e:?}");
+                    Err(e) => {
+                        if self.verbose {
+                            eprintln!("[receiver] auth-setup FAILED: {e:?}");
+                        }
+                        Err(ServerError::AuthSetup)
                     }
-                    Err(ServerError::AuthSetup)
                 }
-            },
+            }
             Route::Options => {
                 let mut r = Response::ok(req, None, Vec::new());
                 r.headers.push((
@@ -395,6 +400,7 @@ impl<'a, P: Pairings, S: MfiSigner> ControlServer<'a, P, S> {
             }
             Route::Record => {
                 let resp = self.session.record();
+                crate::startup::stage(crate::startup::Stage::Record);
                 Ok(Response::ok(req, None, resp))
             }
             Route::Teardown => {

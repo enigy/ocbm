@@ -1820,6 +1820,7 @@ fn install_panic_hook(name: &'static str) {
 }
 
 fn main() {
+    receiver::startup::stage(receiver::startup::Stage::CarplaydStart); // the connect timeline's carplayd_start
     install_panic_hook("carplayd");
     if std::env::args().nth(1).as_deref() == Some("mfi") {
         mfi_selftest();

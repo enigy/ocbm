@@ -2,7 +2,12 @@
 //! [`MARKS`] (its `startup` module: host present, Bluetooth up, phone connected, Wi-Fi handoff) and this frame,
 //! each as +ms from the host's arrival. A drive log then carries the truck's own connect time (the Mac's 13 Nov
 //! brief). Nothing is printed for a session btd didn't note (a wired one), or for a record from an older session.
+//!
+//! Right after it, in a wireless carplayd, the `[timeline] v1 ...` line (`box_common::timeline`): every
+//! critical-path event on the uptime clock, from btd's record and from carplayd's own [`Stage`]s and [`Chip`] times,
+//! kept here in memory.
 
+use portable_atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 /// btd's record of this session's stages (`wireless::startup::MARKS`).
@@ -25,18 +30,143 @@ pub fn nudged(second: bool) {
     NUDGES[usize::from(second)].fetch_add(1, Ordering::Relaxed);
 }
 
-/// The first video frame went to the host: print the line, once per carplayd (one per session).
+/// carplayd's own events for the `[timeline]` line (`box_common::timeline::EVENTS`), the first of each standing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    /// carplayd started (main).
+    CarplaydStart,
+    /// The `_carplay-ctrl` of the phone btd names first resolved (discovery).
+    SvcSeen,
+    /// The connect-out (`GET /ctrl-int/1/connect`) sent (discovery).
+    Dial,
+    /// Pair-verify OK: the control channel encrypted.
+    PvDone,
+    /// `POST /auth-setup` received.
+    AuthIn,
+    /// `/auth-setup` answered.
+    AuthOut,
+    /// RECORD answered.
+    Record,
+    /// The main screen's (type 110) SETUP answered.
+    ScreenSetup,
+    /// The first video frame to the host.
+    FirstFrame,
+}
+
+impl Stage {
+    const ALL: [Stage; 9] = [
+        Stage::CarplaydStart,
+        Stage::SvcSeen,
+        Stage::Dial,
+        Stage::PvDone,
+        Stage::AuthIn,
+        Stage::AuthOut,
+        Stage::Record,
+        Stage::ScreenSetup,
+        Stage::FirstFrame,
+    ];
+
+    /// Its key in the line.
+    fn key(self) -> &'static str {
+        match self {
+            Stage::CarplaydStart => "carplayd_start",
+            Stage::SvcSeen => "svc_seen",
+            Stage::Dial => "dial",
+            Stage::PvDone => "pv_done",
+            Stage::AuthIn => "auth_in",
+            Stage::AuthOut => "auth_out",
+            Stage::Record => "record",
+            Stage::ScreenSetup => "screen_setup",
+            Stage::FirstFrame => "first_frame",
+        }
+    }
+}
+
+/// auth-setup's chip calls (`LocalMfiSigner`): the signature's time from go to ready, the certificate read's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Chip {
+    Sign,
+    Cert,
+}
+
+impl Chip {
+    const ALL: [Chip; 2] = [Chip::Sign, Chip::Cert];
+
+    fn key(self) -> &'static str {
+        match self {
+            Chip::Sign => "chip2_ms",
+            Chip::Cert => "cert2_ms",
+        }
+    }
+}
+
+/// Not stamped yet.
+const UNSET: u64 = u64::MAX;
+static STAGES: [AtomicU64; 9] = [
+    AtomicU64::new(UNSET),
+    AtomicU64::new(UNSET),
+    AtomicU64::new(UNSET),
+    AtomicU64::new(UNSET),
+    AtomicU64::new(UNSET),
+    AtomicU64::new(UNSET),
+    AtomicU64::new(UNSET),
+    AtomicU64::new(UNSET),
+    AtomicU64::new(UNSET),
+];
+static CHIPS: [AtomicU64; 2] = [AtomicU64::new(UNSET), AtomicU64::new(UNSET)];
+
+/// Stamp `stage` now, on the timeline's uptime clock: once per carplayd, the first standing.
+pub fn stage(stage: Stage) {
+    if let Some(ms) = box_common::timeline::now_ms() {
+        let _ = STAGES[stage as usize].compare_exchange(UNSET, ms, Ordering::Relaxed, Ordering::Relaxed);
+    }
+}
+
+/// Note how long one of auth-setup's chip calls took (ms): once per carplayd, the first standing.
+pub fn chip(chip: Chip, ms: u64) {
+    let _ = CHIPS[chip as usize].compare_exchange(UNSET, ms, Ordering::Relaxed, Ordering::Relaxed);
+}
+
+/// What this carplayd stamped, as the timeline line takes it.
+fn own() -> Vec<(&'static str, u64)> {
+    let stages = Stage::ALL.iter().map(|&s| (s.key(), STAGES[s as usize].load(Ordering::Relaxed)));
+    let chips = Chip::ALL.iter().map(|&c| (c.key(), CHIPS[c as usize].load(Ordering::Relaxed)));
+    stages.chain(chips).filter(|&(_, v)| v != UNSET).collect()
+}
+
+/// Whether this is the wireless carplayd: `CARPLAY_WIRELESS_METADATA` is set at its spawn alone (btd's av.rs), and
+/// never for the wired one the supervisor starts, whose first frame may find a wireless session's record.
+fn wireless() -> bool {
+    std::env::var_os("CARPLAY_WIRELESS_METADATA").is_some()
+}
+
+/// The first video frame went to the host: print the line, once per carplayd (one per session), and the timeline
+/// after it.
 pub fn first_frame() {
     if PRINTED.load(Ordering::Relaxed) || PRINTED.swap(true, Ordering::Relaxed) {
         return;
     }
+    stage(Stage::FirstFrame);
     let now = now_ms();
-    let Ok(marks) = std::fs::read_to_string(MARKS) else { return };
-    let Some(line) = summary(&marks, now) else { return };
-    let at = mark_value(&marks, "boxlog_at").unwrap_or(0);
-    let head = mark_word(&marks, "boxlog_head");
-    let nudges = [NUDGES[0].load(Ordering::Relaxed), NUDGES[1].load(Ordering::Relaxed)];
-    eprintln!("[startup] {line}{}", counts(&marks, nudges, psk_mismatches(BOX_LOG, at, head)));
+    let marks = std::fs::read_to_string(MARKS).unwrap_or_default();
+    let mut out = String::new();
+    if let Some(line) = summary(&marks, now) {
+        let at = mark_value(&marks, "boxlog_at").unwrap_or(0);
+        let head = mark_word(&marks, "boxlog_head");
+        let nudges = [NUDGES[0].load(Ordering::Relaxed), NUDGES[1].load(Ordering::Relaxed)];
+        out = format!("[startup] {line}{}\n", counts(&marks, nudges, psk_mismatches(BOX_LOG, at, head)));
+    }
+    // Printed whatever [startup] made of the wall clock: the timeline's own is the uptime.
+    if wireless() {
+        out.push_str(&box_common::timeline::line(&marks, &own()));
+        out.push('\n');
+    }
+    // One write for both: eprintln! writes a line in pieces, and another thread's println! (stdout, the same file)
+    // could land between them.
+    if !out.is_empty() {
+        use std::io::Write as _;
+        let _ = std::io::stderr().write_all(out.as_bytes());
+    }
 }
 
 /// The counts, for the Mac's bench to read one line per session (its 13 Nov bench-hooks brief, item 8): since the host came,
@@ -207,6 +337,30 @@ mod tests {
         );
         let _ = std::fs::remove_file(&path);
         assert_eq!(psk_mismatches(p, 0, None), None, "no log");
+    }
+
+    /// The timeline from this carplayd's own stamps and btd's record: carplayd's events by its uptime, btd's and the
+    /// shell's from the record, every one from the origin btd copied in (box_common::timeline).
+    #[test]
+    fn the_timeline_takes_carplayds_own_stamps_and_btds_record() {
+        let before = box_common::timeline::now_ms().unwrap();
+        stage(Stage::Dial);
+        stage(Stage::Dial);
+        chip(Chip::Sign, 301);
+        chip(Chip::Sign, 999);
+        let own = own();
+        let dial = own.iter().find(|(k, _)| *k == "dial").map(|&(_, v)| v).expect("stamped");
+        assert!(dial >= before && dial <= box_common::timeline::now_ms().unwrap());
+        assert_eq!(own.iter().filter(|(k, _)| *k == "dial").count(), 1);
+        assert!(own.contains(&("chip2_ms", 301)), "the first stands");
+        assert!(!own.iter().any(|(k, _)| *k == "cert2_ms"), "not noted: not there");
+
+        let marks = format!("host_present 1763300000123\nt host {}\nt wifi_rsp {}\n", dial - 3000, dial - 400);
+        let line = box_common::timeline::line(&marks, &own);
+        assert!(box_common::timeline::is_line(&line), "{line}");
+        assert!(line.contains(" wifi_rsp=2600 ") && line.contains(" dial=3000 "), "{line}");
+        assert!(line.contains(" chip2_ms=301 ") && line.contains(" cert2_ms=- "), "{line}");
+        assert!(line.contains(" page_start=- "), "{line}");
     }
 
     #[test]
