@@ -14,7 +14,8 @@
 //!   adds its own events and chip durations as they happen, the first of each in a session standing;
 //! - the supervisor, `radio_hal.sh` and `radio_ap_up.sh` append the radio bring-up's ([`RADIO`]) with one write
 //!   each; btd carries them from the bring-up's `t sup_radios` on into each session it starts under it;
-//! - carplayd keeps its own in memory and prints the line itself.
+//! - btd's AP watch (`wireless::ap_watch`) adds hostapd's and udhcpd's own events as their lines land;
+//! - carplayd keeps its own in memory, per control connection, and prints the line itself.
 
 /// btd's record of a session (`wireless::startup::MARKS`, `receiver::startup::MARKS`).
 pub const MARKS: &str = "/tmp/startup_marks";
@@ -34,10 +35,11 @@ pub const USB_EDGE_KEY: &str = "usb_edge";
 
 /// The events, in the line's order: the radios, Bluetooth and iAP2 (btd), the Wi-Fi handoff and the AP, the AirPlay
 /// session (carplayd) and the first frame.
-pub const EVENTS: [&str; 26] = [
+pub const EVENTS: [&str; 29] = [
     "sup_radios",
     "bt_power",
     "btd_start",
+    "bt_up",
     "page_start",
     "acl",
     "sdp",
@@ -50,6 +52,7 @@ pub const EVENTS: [&str; 26] = [
     "wifi_rsp",
     "ap_start",
     "ap_up",
+    "ap_enabled",
     "sta_assoc",
     "dhcp_ack",
     "carplayd_start",
@@ -58,6 +61,7 @@ pub const EVENTS: [&str; 26] = [
     "pv_done",
     "auth_in",
     "auth_out",
+    "record_in",
     "record",
     "screen_setup",
     "first_frame",
@@ -69,9 +73,15 @@ pub const DURATIONS: [&str; 4] = ["chip1_ms", "cert1_ms", "chip2_ms", "cert2_ms"
 /// The last key: how many whole seconds before the origin the host-facing USB link last came up ([`USB_EDGE_KEY`]).
 pub const USB_EDGE_S: &str = "usb_edge_s";
 
-/// The radio bring-up's stamps (the supervisor's, `radio_hal.sh`'s and `radio_ap_up.sh`'s), which btd carries into
-/// each session it starts under that bring-up. `sup_radios` opens a bring-up.
-pub const RADIO: [&str; 5] = ["sup_radios", USB_EDGE_KEY, "bt_power", "ap_start", "ap_up"];
+/// The radio bring-up's stamps (the supervisor's, `radio_hal.sh`'s and `radio_ap_up.sh`'s, and hostapd's own
+/// AP-ENABLED as btd's AP watch saw it), which btd carries into each session it starts under that bring-up.
+/// `sup_radios` opens a bring-up.
+pub const RADIO: [&str; 6] = ["sup_radios", USB_EDGE_KEY, "bt_power", "ap_start", "ap_up", "ap_enabled"];
+
+/// The widest value the line prints: 13 digits, over 300 years of uptime in ms, more than this 32-bit kernel's clock
+/// can hold. A larger one cannot have come from the clock and prints `-`, so the line's length has a bound
+/// (the widest-line test) under the 1024 bytes ocbmd forwards (`ocbm_proto::LOG_MAX_LINE`).
+pub const MAX_VALUE: u64 = 9_999_999_999_999;
 
 /// The uptime in ms on CLOCK_BOOTTIME (`/proc/uptime`'s clock; CLOCK_MONOTONIC off Linux, for the tests), or None if
 /// the clock can't be read.
@@ -121,8 +131,8 @@ pub fn read_origin(path: &str) -> Option<u64> {
 
 /// The `[timeline] v1 ...` line for a session's `marks` and carplayd's `own` stamps and durations (`(key, ms)`; an
 /// event's ms is its uptime): every event as ms since the origin (`t host`), every duration as noted, and
-/// `usb_edge_s` as whole seconds before the origin. A value not there, or an event before the origin, is `-`; so is
-/// every event when there is no origin. An own value wins over one in the marks.
+/// `usb_edge_s` as whole seconds before the origin. A value not there, an event before the origin, or one past
+/// [`MAX_VALUE`] is `-`; so is every event when there is no origin. An own value wins over one in the marks.
 pub fn line(marks: &str, own: &[(&str, u64)]) -> String {
     let value = |kind: &str, key: &str| own.iter().find(|(k, _)| *k == key).map(|&(_, v)| v).or_else(|| find(marks, kind, key));
     let origin = find(marks, STAMP, ORIGIN_KEY);
@@ -142,7 +152,7 @@ pub fn line(marks: &str, own: &[(&str, u64)]) -> String {
 
 fn push(out: &mut String, key: &str, value: Option<u64>) {
     use std::fmt::Write as _;
-    let _ = match value {
+    let _ = match value.filter(|&v| v <= MAX_VALUE) {
         Some(v) => write!(out, " {key}={v}"),
         None => write!(out, " {key}=-"),
     };
@@ -189,9 +199,10 @@ mod tests {
     fn every_event_counts_from_the_origin_and_a_missing_one_is_a_dash() {
         // A connect as it might fall: the origin at 61.234 s of uptime, the shell's stamps to the 10 ms they have.
         let marks = "host_present 1763300000123\npreload done\nt host 61234\nt btd_start 62510\n\
-                     t sup_radios 61640\nt usb_edge 49700\nt bt_power 62480\nt page_start 62530\nt acl 62790\n\
+                     t sup_radios 61640\nt usb_edge 49700\nt bt_power 62480\nt bt_up 62520\nt page_start 62530\nt acl 62790\n\
                      t sdp 62950\nt rfcomm 63100\nt cert_req 63180\nd cert1_ms 41\nt sign1_start 63300\nd chip1_ms 298\n\
-                     t sign1_end 63610\nt ident 63800\nt wifi_req 63900\nt wifi_rsp 63930\nt ap_start 62900\nt ap_up 63600\n";
+                     t sign1_end 63610\nt ident 63800\nt wifi_req 63900\nt wifi_rsp 63930\nt ap_start 62900\nt ap_up 63110\n\
+                     t ap_enabled 63880\nt sta_assoc 64500\nt dhcp_ack 64800\n";
         let own = [
             ("carplayd_start", 64400),
             ("svc_seen", 65100),
@@ -199,6 +210,7 @@ mod tests {
             ("pv_done", 65600),
             ("auth_in", 65650),
             ("auth_out", 66000),
+            ("record_in", 66080),
             ("record", 66300),
             ("screen_setup", 66350),
             ("first_frame", 66700),
@@ -208,11 +220,11 @@ mod tests {
         let l = line(marks, &own);
         assert_eq!(
             l,
-            "[timeline] v1 sup_radios=406 bt_power=1246 btd_start=1276 page_start=1296 acl=1556 sdp=1716 rfcomm=1866 \
-             cert_req=1946 sign1_start=2066 sign1_end=2376 ident=2566 wifi_req=2666 wifi_rsp=2696 ap_start=1666 \
-             ap_up=2366 sta_assoc=- dhcp_ack=- carplayd_start=3166 svc_seen=3866 dial=3916 pv_done=4366 auth_in=4416 \
-             auth_out=4766 record=5066 screen_setup=5116 first_frame=5466 chip1_ms=298 cert1_ms=41 chip2_ms=301 \
-             cert2_ms=40 usb_edge_s=11"
+            "[timeline] v1 sup_radios=406 bt_power=1246 btd_start=1276 bt_up=1286 page_start=1296 acl=1556 sdp=1716 \
+             rfcomm=1866 cert_req=1946 sign1_start=2066 sign1_end=2376 ident=2566 wifi_req=2666 wifi_rsp=2696 \
+             ap_start=1666 ap_up=1876 ap_enabled=2646 sta_assoc=3266 dhcp_ack=3566 carplayd_start=3166 svc_seen=3866 \
+             dial=3916 pv_done=4366 auth_in=4416 auth_out=4766 record_in=4846 record=5066 screen_setup=5116 \
+             first_frame=5466 chip1_ms=298 cert1_ms=41 chip2_ms=301 cert2_ms=40 usb_edge_s=11"
         );
         assert!(is_line(&l));
     }
@@ -274,20 +286,26 @@ mod tests {
         assert!(!is_line("@1763300000123 [timeline] v1 a=1"), "the write-time stamp is ocbmd's to strip");
     }
 
-    /// ocbmd clips a forwarded line at LOG_MAX_LINE: the line fits whole even with every value at its widest.
+    /// ocbmd clips a forwarded line at LOG_MAX_LINE: the line fits whole even with every value at its widest
+    /// ([`MAX_VALUE`], 13 digits), usb_edge_s included; one wider prints `-`.
     #[test]
     fn the_widest_line_fits_one_forwarded_log_line() {
-        let mut marks = String::from("t host 0\n");
+        let origin = MAX_VALUE * 1000;
+        let mut marks = format!("t host {origin}\nt usb_edge 0\n");
         for key in EVENTS {
-            marks.push_str(&entry(STAMP, key, u64::MAX));
+            marks.push_str(&entry(STAMP, key, origin + MAX_VALUE));
         }
         for key in DURATIONS {
-            marks.push_str(&entry(DURATION, key, u64::MAX));
+            marks.push_str(&entry(DURATION, key, MAX_VALUE));
         }
         let l = line(&marks, &[]);
-        assert!(l.split(' ').skip(2).all(|p| !p.ends_with("=-") || p.starts_with("usb_edge_s")), "{l}");
+        assert!(l.split(' ').skip(2).all(|p| p.ends_with(&format!("={MAX_VALUE}"))), "every value at its widest: {l}");
         assert!(is_line(&l));
+        assert_eq!(l.len(), 794, "the bound the docs give");
         assert!(l.len() < ocbm_proto::LOG_MAX_LINE, "{} bytes", l.len());
+
+        let past = line(&format!("t host 0\nt acl {}\nd chip1_ms {}\n", MAX_VALUE + 1, u64::MAX), &[]);
+        assert!(past.contains(" acl=- ") && past.contains(" chip1_ms=- "), "past the widest: a dash, {past}");
     }
 
     #[test]
