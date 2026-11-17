@@ -218,6 +218,14 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   boot "$sh" "$d" BTD_UP= BTD_RUNNING=true
   check 'waitfor "is_old \"$d\" && [ -e \"$d/rebooted\" ]" 12 && result_is "$d" "rolled_back $NEW: btd never came up"' \
     "a btd only armed, never serving the host: not up, the old version back"
+  # The same with a phase file beside it (one an earlier btd left, which every arm now removes): the armed pid alone
+  # decides this one (the second review of resident-bt, item 4; without a phase the check before it already says no).
+  d="$T/$sh-armedphase"; make_box "$d" final; make_pkg "$d/run/ocbm-update.tgz" dispatch
+  update "$sh" "$d"; restart "$d"; touch "$d/run/ocbmd_answered" "$d/run/bt_phase"
+  echo 4244 > "$d/run/.btd_armed"; mkdir -p "$d/proc/4244"
+  boot "$sh" "$d" BTD_UP= BTD_RUNNING=true
+  check 'waitfor "is_old \"$d\" && [ -e \"$d/rebooted\" ]" 12 && result_is "$d" "rolled_back $NEW: btd never came up"' \
+    "a phase file beside a live armed btd: still not up, the old version back"
   d="$T/$sh-session"; make_box "$d" final; make_pkg "$d/run/ocbm-update.tgz" dispatch
   update "$sh" "$d"; restart "$d"; touch "$d/run/ocbmd_answered" "$d/run/bt_phase"
   boot "$sh" "$d" BTD_UP= BTD_RUNNING=true
