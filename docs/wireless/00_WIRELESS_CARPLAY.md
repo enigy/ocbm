@@ -159,19 +159,24 @@ then opens RTSP to `:5000`. carplayd used to be spawned when the phone asked for
 `carplayd_start` to `svc_seen` on the 16 Nov bench, 2.0-2.5 s after the phone had its lease. Now:
 
 - **carplayd starts as btd's host session begins** (`av::session_starting`, the one call in `wireless/src/main.rs`),
-  in the background, once a Wi-Fi interface exists: the per-box identity it is handed is derived from the Wi-Fi
-  driver's address (`box_identity.rs`), so on a cold start it waits for the driver (15 s at most, then the 0x5703
-  starts it as before). At the 0x5703 the identity is derived again, and a carplayd started with another one is
-  restarted before it may dial. `ensure_av_layer` stays the idempotent fallback ("AV layer already existing"), and
-  btd's "wireless" transport claim still waits for the 0x5703, so the wired supervisor is not held off for a phone
-  that has not agreed to Wi-Fi. A carplayd that never gets a phone idles and goes with the supervisor's
-  `wireless_down` or btd's go-quiet teardown, as one spawned at a 0x5703 does.
+  in the background, once the per-box identity it is handed comes from what `box_identity::derive` reads first, the
+  Wi-Fi driver's address, the same on two looks 100 ms apart (`box_identity::derive_primary`; A2-4). Until then derive
+  would fall back to the SoC serial, another identity; so when the address has not come and held within 15 s (or
+  never will: a unit whose Wi-Fi interface is not the one derive reads), the 0x5703 starts carplayd, as before. At
+  the 0x5703 the identity is derived again, and a carplayd started with another one is restarted before it may dial.
+  `ensure_av_layer` stays the idempotent fallback ("AV layer already existing"), and btd's "wireless" transport claim
+  still waits for the 0x5703, so the wired supervisor is not held off for a phone that has not agreed to Wi-Fi. A
+  carplayd that never gets a phone idles and goes with the supervisor's `wireless_down` or btd's go-quiet teardown, as
+  one spawned at a 0x5703 does.
 - **Who it serves and when it dials.** btd names the phone in `/tmp/carplay_expect_phone` when its Bluetooth session
   starts (its address alone) and at its 0x5703 (the address and ` wifi`: the Wi-Fi details went to that phone); a
-  session that ends without a 0x5703 puts the earlier name back with its mark. Until a phone is named carplayd serves
-  and dials nobody. It serves only the named phone (`phone_gate.rs`), and dials it only with the mark: a record that
-  resolves before then is held and dialled the moment the mark comes (`dial_ok` in the timeline). The bench lever
-  `/tmp/bench_dial_early` dials at the first resolve instead (docs/ops/02_TESTING.md, "Bench hooks").
+  session that ends without a 0x5703 puts the earlier name back with its mark. The mark is this Bluetooth session's
+  (the owner's rule, A2-2): the same phone back on Bluetooth is named afresh without it, unless its own CarPlay
+  session is up or connecting (outliving its Bluetooth link: then nothing changes, and a live session is never
+  dialled). Until a phone is named carplayd serves and dials nobody. It serves only the named phone
+  (`phone_gate.rs`), and dials it only with the mark: a record that resolves before then is held and dialled the
+  moment the mark comes (`dial_ok` in the timeline), a mark that lands while a browse restarts included (A2-1). The
+  bench lever `/tmp/bench_dial_early` dials at the first resolve instead (docs/ops/02_TESTING.md, "Bench hooks").
 - **Before the AP has its address.** Every socket carplayd binds is a wildcard or the loopback (`[::]:5000`,
   `127.0.0.1:9110`/`:9112`, the per-session `[::]:0`), so none needs the AP. mdns-sd does: it reads the host's
   interfaces when its daemon starts and then every 30 s (`IP_CHECK_INTERVAL_MILLIS`). An address watch (NETLINK_ROUTE,
@@ -191,6 +196,17 @@ Expected on the 16 Nov wake (ms after host present): `carplayd_start` about 1.2 
 phone has announced, `dial_ok` and `dial` at `wifi_rsp` (4.77 s, about 4.6 s with A4's cached certificate shortening
 the Bluetooth authentication), `auth_in` about 0.11 s after (was 5.56 s): about 0.2 s after `sign1_end`, 0.08 s of it
 the phone's own identification and 0x5702 before the 0x5703 the dial waits for.
+
+**Benched 16 Nov** (the dev adapter on A2 and A4 merged with the resident btd, one iPhone on iOS 15): 12 wakes and a
+cold boot connected. `carplayd_start` about 200 ms after the host's arrival; `[rx] an interface or address came up` in
+every session; the phone's service seen about 1.05 s after its DHCP ack; `dial` 44 ms after `dial_ok`; auth-setup
+1.68 s (1.83 before, the certificate now from the cache). With `/tmp/bench_dial_early` the phone accepted the dial
+before its 0x5703 in 3 of 3 wakes (HTTP 200, a normal session), 0.5-0.72 s before `dial_ok`, but gained only about
+0.3 s: auth-setup then waits for the chip, which signature 1 holds (`auth_out` came 1.68 s after `sign1_end`,
+against 2.0 s). The lever stays off until a current iPhone has tried it. Not benched: two phones, a switch, and the
+four fixes the release review asked for after that bench (A2-1 to A2-4: the mark landing during a browse's restart,
+the same phone back named afresh, a teardown beside a wired carplayd, the identity's primary source; A2-4's second
+look puts `carplayd_start` about 100 ms later).
 
 #### 2.4 The two ways to start wireless CarPlay (WWDC 2017-717, authoritative)
 

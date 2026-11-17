@@ -319,7 +319,8 @@ fn txt_line<'a>(props: impl Iterator<Item = (&'a str, &'a str)>) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Change {
     None,
-    /// Another phone named, or none.
+    /// Another phone named, or none, or the same phone named afresh (its mark gone: btd names a phone back on
+    /// Bluetooth without the mark of its earlier session, A2-2).
     Renamed,
     /// The same phone, and btd has now sent it its 0x5703: its held records may be dialled.
     Cleared,
@@ -335,6 +336,8 @@ struct Held {
     named: Option<String>,
     /// Whether btd had sent the named phone its 0x5703 when discovery last acted on the name.
     wifi: bool,
+    /// Whether the connect timeline's `dial_ok` was noted for this naming ([`Loop::note_mark`]).
+    mark_noted: bool,
     /// Each held record, and the rounds its dial gets.
     records: HashMap<String, (Ctrl, u32)>,
     /// Each record as discovery last saw it resolved, until it is removed (carplayd-2, [`rounds_for`]).
@@ -347,6 +350,7 @@ impl Held {
         Self {
             wifi: now.as_ref().is_some_and(|n| n.wifi),
             named: now.map(|n| n.phone),
+            mark_noted: false,
             records: HashMap::new(),
             seen: HashMap::new(),
         }
@@ -360,19 +364,32 @@ impl Held {
         self.records.remove(fullname);
     }
 
-    /// How the name changed since the last call ([`Change`]).
+    /// How the name changed since the last call ([`Change`]), and the name noted as acted on.
     fn check(&mut self, gate: &PhoneGate) -> Change {
+        let (phone, wifi) = Self::read(gate);
+        let change = self.change_to(&phone, wifi);
+        self.named = phone;
+        self.wifi = wifi;
+        change
+    }
+
+    /// What [`Held::check`] would say now, the name not noted: for a wake read inside a browse's restart, where only the
+    /// mark is acted on at once and a rename is left to the loop ([`Loop::rebrowse`]).
+    fn peek(&self, gate: &PhoneGate) -> Change {
+        let (phone, wifi) = Self::read(gate);
+        self.change_to(&phone, wifi)
+    }
+
+    fn read(gate: &PhoneGate) -> (Option<String>, bool) {
         let now = gate.named_state();
         let wifi = now.as_ref().is_some_and(|n| n.wifi);
-        let phone = now.map(|n| n.phone);
-        if phone != self.named {
-            self.named = phone;
-            self.wifi = wifi;
-            return Change::Renamed;
-        }
-        let cleared = wifi && !self.wifi;
-        self.wifi = wifi;
-        if cleared {
+        (now.map(|n| n.phone), wifi)
+    }
+
+    fn change_to(&self, phone: &Option<String>, wifi: bool) -> Change {
+        if *phone != self.named || (self.wifi && !wifi) {
+            Change::Renamed
+        } else if wifi && !self.wifi {
             Change::Cleared
         } else {
             Change::None
@@ -381,14 +398,26 @@ impl Held {
 
     /// The held records the gate lets dial now, taken out to be dialled: never one whose session is live here, nor
     /// another phone's, nor the named phone's before its 0x5703.
+    #[cfg(test)]
     fn due(&mut self, gate: &PhoneGate) -> Vec<(Ctrl, u32)> {
+        self.due_marked(gate).0
+    }
+
+    /// [`Held::due`], and whether the gate let one of them through for btd's 0x5703 ([`Dial::Now`], armed): the
+    /// mark read by the gate itself, which can be newer than the name the loop last read ([`Loop::take_due`]).
+    fn due_marked(&mut self, gate: &PhoneGate) -> (Vec<(Ctrl, u32)>, bool) {
+        let mut marked = false;
         let due: Vec<String> = self
             .records
             .values()
-            .filter(|(c, _)| gate.dial(c.id.as_deref()).0.now())
+            .filter(|(c, _)| {
+                let v = gate.dial(c.id.as_deref()).0;
+                marked |= v == Dial::Now && gate.armed();
+                v.now()
+            })
             .map(|(c, _)| c.fullname.clone())
             .collect();
-        due.iter().filter_map(|k| self.records.remove(k)).collect()
+        (due.iter().filter_map(|k| self.records.remove(k)).collect(), marked)
     }
 
     /// carplayd-2: the rounds a resolved record's dial gets, and the record noted as seen. One discovery has seen as it is
@@ -763,9 +792,37 @@ struct Loop<'a> {
     net: &'a mut Net,
     /// The name file is read again every [`NAME_POLL`] (no watch on it).
     poll_name: bool,
+    /// The connect timeline's `dial_ok` (`receiver::startup::dial_ok`; a test's own).
+    on_dial_ok: fn(),
 }
 
+/// How many times in a row the loop looks at the name and the addresses again after a pass that changed something: a
+/// rename or a browse's restart reads the browse for a while, and a name or a mark that came meanwhile is acted on in
+/// the next pass, not at the next unrelated wake (A2-1). A bound, against a name that never holds still.
+const SETTLE_PASSES: usize = 8;
+
 impl Loop<'_> {
+    /// The connect timeline's `dial_ok`, once per naming: as discovery first learns that btd sent the named phone its
+    /// 0x5703, whether by the name (a rename with the mark, the mark coming: [`Loop::cleared`]) or by the gate first
+    /// letting it dial a record of that phone ([`Dial::Now`]), whichever comes first. So it never comes after the dial
+    /// it allowed, even when the mark's wake was read inside a browse's restart (A2-1).
+    fn note_mark(&mut self) {
+        if !self.held.mark_noted {
+            self.held.mark_noted = true;
+            (self.on_dial_ok)();
+        }
+    }
+
+    /// The held records due now ([`Held::due_marked`]); one the gate lets through for btd's 0x5703 notes it first
+    /// ([`Loop::note_mark`]), so `dial_ok` precedes its dial even when the mark landed after the loop read the name.
+    fn take_due(&mut self) -> Vec<(Ctrl, u32)> {
+        let (due, marked) = self.held.due_marked(self.gate);
+        if marked {
+            self.note_mark();
+        }
+        due
+    }
+
     /// Dial `c` for `rounds`, and try it again later when it missed ([`Retries`]).
     fn dial(&mut self, c: &Ctrl, rounds: u32) -> Dialled {
         let (_, scope) = self.dialer.scope();
@@ -833,6 +890,8 @@ impl Loop<'_> {
                         self.held.forget(&c.fullname);
                         if verdict == Dial::Early {
                             println!("[bench] dial_early: dialling {} before btd has sent it its 0x5703", c.who());
+                        } else if self.gate.armed() {
+                            self.note_mark();
                         }
                         self.dial(&c, rounds);
                     }
@@ -866,14 +925,19 @@ impl Loop<'_> {
     ///   which it sends at once and again 1 s, 2 s, ... later. Each is dialled by the rounds its news earns
     ///   ([`Held::rounds_for`]).
     ///
-    /// Returns the new browse and the instances it resolved.
-    fn rebrowse(&mut self, b: &dyn Browser, mut old: Events) -> Result<(Events, HashSet<String>), String> {
+    /// A wake read meanwhile (btd's name file, an address) is not lost (A2-1): btd's 0x5703 mark for the phone named
+    /// now is acted on at once ([`Loop::cleared`]), anything else is left to the loop, which looks at the name and the
+    /// addresses again after every restart.
+    ///
+    /// Returns the new browse, the instances it resolved, and whether a wake was read.
+    fn rebrowse(&mut self, b: &dyn Browser, mut old: Events) -> Result<(Events, HashSet<String>, bool), String> {
         if let Err(e) = b.stop() {
             println!("[rx] stop _carplay-ctrl browse: {e}; browsing again all the same");
         }
         let mut events = browse_again(b)?;
         let until = Instant::now() + DRAIN;
         let mut left = Vec::new();
+        let mut woken = false;
         loop {
             let wait = until.saturating_duration_since(Instant::now());
             if wait.is_zero() {
@@ -881,13 +945,16 @@ impl Loop<'_> {
             }
             match old(Some(wait)) {
                 Recv::Event(ServiceEvent::SearchStopped(_)) | Recv::Gone | Recv::Quiet => break,
-                Recv::Woken => {}
+                Recv::Woken => woken = true,
                 Recv::Event(ev) => left.push(ev),
             }
         }
         let mut resolved = HashSet::new();
         for ev in left {
             resolved.extend(self.on_event(ev));
+        }
+        if woken {
+            self.woken_in_rebrowse();
         }
         let until = Instant::now() + REPLAY_MAX;
         let mut quiet = Instant::now() + QUIET;
@@ -905,11 +972,23 @@ impl Loop<'_> {
                     resolved.extend(self.on_event(ev));
                     quiet = Instant::now() + QUIET;
                 }
-                Recv::Woken => {}
+                Recv::Woken => {
+                    woken = true;
+                    self.woken_in_rebrowse();
+                }
                 Recv::Quiet => break,
             }
         }
-        Ok((events, resolved))
+        Ok((events, resolved, woken))
+    }
+
+    /// A wake read inside a browse's restart: btd's mark for the phone named now is acted on at once; a rename is left
+    /// to the loop's next pass ([`browse_loop`]), which a rebrowse always gets.
+    fn woken_in_rebrowse(&mut self) {
+        if self.held.peek(self.gate) == Change::Cleared {
+            self.held.check(self.gate);
+            self.cleared();
+        }
     }
 
     /// The phone btd serves changed (the Mac's 15 Nov bench, R1). In order:
@@ -922,16 +1001,17 @@ impl Loop<'_> {
     fn rename(&mut self, b: &dyn Browser, old: Events) -> Result<Events, String> {
         println!("[rx] the phone btd serves changed: asking _carplay-ctrl again");
         receiver::startup::naming_changed();
+        self.held.mark_noted = false;
         if self.held.wifi {
             // Named with its 0x5703 already sent (at a handoff that named it, or put back): its dial may go now.
-            receiver::startup::dial_ok();
+            self.note_mark();
         }
         if let Some(named) = self.held.named.clone() {
             self.dialer.forget_phone(&named, self.gate.epoch());
         }
-        let mut due = self.held.due(self.gate);
+        let mut due = self.take_due();
         self.held.records.clear();
-        let (events, resolved) = self.rebrowse(b, old)?;
+        let (events, resolved, _) = self.rebrowse(b, old)?;
         due.retain(|(c, _)| !resolved.contains(&c.fullname));
         for (c, _) in due {
             println!("[rx] {}: resolved while btd named another phone; dialling it now", c.who());
@@ -945,8 +1025,8 @@ impl Loop<'_> {
     /// btd has sent the phone it names its 0x5703 (the name file's mark): the connect timeline's `dial_ok`, and the
     /// records held for that phone are dialled now, each by its rounds.
     fn cleared(&mut self) {
-        receiver::startup::dial_ok();
-        let due = self.held.due(self.gate);
+        self.note_mark();
+        let due = self.take_due();
         println!("[rx] btd has sent the phone it names its 0x5703: {} record(s) of it to dial", due.len());
         for (c, rounds) in due {
             self.dial(&c, rounds);
@@ -963,6 +1043,7 @@ impl Loop<'_> {
                     self.held.keep(r.c, RENAME_ROUNDS);
                     continue;
                 }
+                Dial::Now if self.gate.armed() => self.note_mark(),
                 _ => {}
             }
             if self.gate.connection_open() {
@@ -1002,23 +1083,33 @@ fn browse_loop(b: &dyn Browser, mut lp: Loop<'_>) -> String {
             }
             Recv::Woken | Recv::Quiet => {}
         }
-        if lp.net.changed() {
-            println!("[rx] an interface or address came up: mDNS reads them again, announces again and asks again");
-            b.interfaces_changed();
-            events = match lp.rebrowse(b, events) {
-                Ok((e, _)) => e,
-                Err(e) => return e,
-            };
-        }
-        match lp.held.check(lp.gate) {
-            Change::Renamed => {
-                events = match lp.rename(b, events) {
-                    Ok(e) => e,
+        // Whatever woke it: the addresses and the name, looked at again after every pass that restarted the browse, until
+        // one changes nothing (A2-1: a wake read inside a restart is otherwise acted on only at the next unrelated one).
+        for _ in 0..SETTLE_PASSES {
+            let mut again = false;
+            if lp.net.changed() {
+                println!("[rx] an interface or address came up: mDNS reads them again, announces again and asks again");
+                b.interfaces_changed();
+                events = match lp.rebrowse(b, events) {
+                    Ok((e, _, _)) => e,
                     Err(e) => return e,
-                }
+                };
+                again = true;
             }
-            Change::Cleared => lp.cleared(),
-            Change::None => {}
+            match lp.held.check(lp.gate) {
+                Change::Renamed => {
+                    events = match lp.rename(b, events) {
+                        Ok(e) => e,
+                        Err(e) => return e,
+                    };
+                    again = true;
+                }
+                Change::Cleared => lp.cleared(),
+                Change::None => {}
+            }
+            if !again {
+                break;
+            }
         }
         lp.retry();
     }
@@ -1100,20 +1191,21 @@ fn run(
 
     let mut dialer = Dialer::new(dev_dec, iface, adv_addr);
     let mut held = Held::new(gate);
-    if held.wifi {
-        // Started with its phone already named and handed off (the 0x5703's own start, when the early one did not).
-        receiver::startup::dial_ok();
-    }
     let mut retries = Retries::new(RETRY_FIRST);
     let browser = Mdns { daemon: &mdns, svc, wakes };
-    let lp = Loop {
+    let mut lp = Loop {
         gate,
         dialer: &mut dialer,
         held: &mut held,
         retries: &mut retries,
         net: &mut net,
         poll_name: gate.armed() && !name_watched,
+        on_dial_ok: receiver::startup::dial_ok,
     };
+    if lp.held.wifi {
+        // Started with its phone already named and handed off (the 0x5703's own start, when the early one did not).
+        lp.note_mark();
+    }
     let why = browse_loop(&browser, lp);
     drop(wake);
     // A browse that ends is started again; only one mdns-sd will not start ends here, which means its daemon
@@ -1384,7 +1476,21 @@ mod tests {
         SocketAddr::from(([192, 168, 43, last], 7000))
     }
 
-    /// A dialer that records each connect; `accept` decides it.
+    thread_local! {
+        /// What a test's loop did, in order: its dials and its `dial_ok`s (each test is a thread of its own).
+        static TRACE: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// The loop's `dial_ok`, in a test: into the trace.
+    fn trace_dial_ok() {
+        TRACE.with(|t| t.borrow_mut().push("dial_ok".to_string()));
+    }
+
+    fn trace() -> Vec<String> {
+        TRACE.with(|t| t.borrow().clone())
+    }
+
+    /// A dialer that records each connect, here and in the trace; `accept` decides it.
     fn dialer(dials: &Rc<RefCell<Vec<SocketAddr>>>, accept: impl Fn(SocketAddr) -> bool + 'static) -> Dialer {
         let seen = dials.clone();
         Dialer {
@@ -1394,6 +1500,7 @@ mod tests {
             dialed_by: HashMap::new(),
             connect: Box::new(move |sa| {
                 seen.borrow_mut().push(sa);
+                TRACE.with(|t| t.borrow_mut().push(format!("dial {sa}")));
                 accept(sa)
             }),
             pause: Duration::ZERO,
@@ -1405,7 +1512,7 @@ mod tests {
     fn run_loop(fake: &FakeBrowse, gate: &PhoneGate, d: &mut Dialer, net: &mut Net, retry_first: Duration) -> String {
         let mut held = Held::new(gate);
         let mut retries = Retries::new(retry_first);
-        let lp = Loop { gate, dialer: d, held: &mut held, retries: &mut retries, net, poll_name: false };
+        let lp = Loop { gate, dialer: d, held: &mut held, retries: &mut retries, net, poll_name: false, on_dial_ok: trace_dial_ok };
         browse_loop(fake, lp)
     }
 
@@ -1455,7 +1562,7 @@ mod tests {
         let mut held = Held::new(&gate);
         let mut retries = Retries::new(NEVER);
         let mut net = Net::off();
-        let lp = Loop { gate: &gate, dialer: &mut d, held: &mut held, retries: &mut retries, net: &mut net, poll_name: false };
+        let lp = Loop { gate: &gate, dialer: &mut d, held: &mut held, retries: &mut retries, net: &mut net, poll_name: false, on_dial_ok: trace_dial_ok };
         browse_loop(&fake, lp);
         assert_eq!(*dials.borrow(), [at(150), at(150), at(101)], "two rounds from the replay, then the fresh one");
         assert!(held.records.is_empty(), "C, not resolved again, is not held over");
@@ -1686,7 +1793,7 @@ mod tests {
         let mut d = dialer(&dials, |_| true);
         let mut held = Held::new(&gate);
         let mut net = Net::off();
-        let mut lp = Loop { gate: &gate, dialer: &mut d, held: &mut held, retries: &mut retries, net: &mut net, poll_name: false };
+        let mut lp = Loop { gate: &gate, dialer: &mut d, held: &mut held, retries: &mut retries, net: &mut net, poll_name: false, on_dial_ok: trace_dial_ok };
         lp.retry();
         assert!(dials.borrow().is_empty(), "the open connection may be the phone's own");
         assert_eq!(lp.retries.list.len(), 1, "it waits");
@@ -1740,11 +1847,138 @@ mod tests {
         std::fs::write(&path, handed(PHONE_B)).unwrap();
         let mut retries = Retries::new(NEVER);
         let mut net = Net::off();
-        let mut lp = Loop { gate: &gate, dialer: &mut d, held: &mut held, retries: &mut retries, net: &mut net, poll_name: false };
+        let mut lp = Loop { gate: &gate, dialer: &mut d, held: &mut held, retries: &mut retries, net: &mut net, poll_name: false, on_dial_ok: trace_dial_ok };
         lp.on_event(resolved_ev("B", PHONE_B, 101));
         assert_eq!(*dials.borrow(), [at(101)]);
         browse_loop(&fake, lp);
         assert_eq!(*dials.borrow(), [at(101)], "the rename's replay finds it dialled under this naming");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A2-1: btd's 0x5703 mark lands while a rename's browse restart reads the cache's replay (the phone already on the
+    /// AP). It is dialled from there at once, `dial_ok` before the dial: nothing else wakes the loop after it here.
+    #[test]
+    fn a_0x5703_mark_that_lands_during_a_rebrowse_is_dialled_at_once() {
+        let (gate, path) = gate_naming(PHONE_A);
+        let fake = FakeBrowse::new(
+            &path,
+            false,
+            vec![
+                // B's Bluetooth session starts: named, no mark yet.
+                vec![Step::Name(PHONE_B.to_string())],
+                // The rename's replay: B, waiting; then its 0x5703 lands inside the replay window.
+                vec![resolved("B", PHONE_B, 101), Step::Name(handed(PHONE_B)), Step::Quiet],
+            ],
+        );
+        let dials = Rc::new(RefCell::new(Vec::new()));
+        let mut d = dialer(&dials, |_| true);
+        run_loop(&fake, &gate, &mut d, &mut Net::off(), NEVER);
+        assert_eq!(*dials.borrow(), [at(101)], "dialled within the restart, not at the next wake (none comes here)");
+        assert_eq!(trace(), ["dial_ok", "dial 192.168.43.101:7000"], "dial_ok noted once, before the dial");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A2-1: a held record the gate lets through for its 0x5703 notes `dial_ok` before it is dialled, even when the mark
+    /// landed after the loop last read the name (between a rename's read of the name and its held records' turn).
+    #[test]
+    fn a_held_record_let_through_for_its_0x5703_notes_dial_ok_first() {
+        let (gate, path) = gate_with(PHONE_B);
+        let dials = Rc::new(RefCell::new(Vec::new()));
+        let mut d = dialer(&dials, |_| true);
+        let mut held = Held::new(&gate);
+        let mut retries = Retries::new(NEVER);
+        let mut net = Net::off();
+        let mut lp = Loop {
+            gate: &gate,
+            dialer: &mut d,
+            held: &mut held,
+            retries: &mut retries,
+            net: &mut net,
+            poll_name: false,
+            on_dial_ok: trace_dial_ok,
+        };
+        lp.on_event(resolved_ev("B", PHONE_B, 101));
+        assert!(dials.borrow().is_empty(), "B has had no 0x5703: held");
+        assert!(lp.take_due().is_empty(), "still nothing due");
+        std::fs::write(&path, handed(PHONE_B)).unwrap();
+        assert_eq!(names(&lp.take_due()), ["B._carplay-ctrl._tcp.local."], "the gate reads the mark");
+        assert!(!lp.held.wifi, "the loop has not read it yet");
+        assert_eq!(trace(), ["dial_ok"], "noted as the gate let the record through, before any dial");
+        assert_eq!(lp.held.check(&gate), Change::Cleared, "the loop reads the mark after");
+        lp.cleared();
+        assert_eq!(trace(), ["dial_ok"], "once per naming");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A2-1: the name changes again while a rename's browse restart reads (another phone handed off meanwhile): the
+    /// loop looks again after the restart and renames once more, at once.
+    #[test]
+    fn a_name_that_changes_during_a_rebrowse_is_acted_on_after_it() {
+        let (gate, path) = gate_naming(PHONE_A);
+        let fake = FakeBrowse::new(
+            &path,
+            false,
+            vec![
+                vec![Step::Name(PHONE_B.to_string())],
+                vec![resolved("B", PHONE_B, 101), resolved("C", PHONE_C, 102), Step::Name(handed(PHONE_C)), Step::Quiet],
+                vec![resolved("C", PHONE_C, 102), Step::Quiet],
+            ],
+        );
+        let dials = Rc::new(RefCell::new(Vec::new()));
+        let mut d = dialer(&dials, |_| true);
+        run_loop(&fake, &gate, &mut d, &mut Net::off(), NEVER);
+        assert_eq!(*dials.borrow(), [at(102)], "C, from the second rename's replay; B never");
+        assert_eq!(fake.starts.get(), 3, "the second rename came straight after the first restart");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// `dial_ok` once per naming, before the dial it allowed: for a fresh record after the mark, as for a held one at the
+    /// mark; a new naming notes it again.
+    #[test]
+    fn dial_ok_is_noted_once_per_naming_and_before_its_dial() {
+        let (gate, path) = gate_with(PHONE_B);
+        let fake = FakeBrowse::new(
+            &path,
+            false,
+            vec![vec![
+                Step::Name(handed(PHONE_B)),
+                resolved("B", PHONE_B, 101),
+                resolved("B", PHONE_B, 102),
+                Step::Name(handed(PHONE_C)),
+            ]],
+        );
+        let dials = Rc::new(RefCell::new(Vec::new()));
+        let mut d = dialer(&dials, |_| true);
+        run_loop(&fake, &gate, &mut d, &mut Net::off(), NEVER);
+        assert_eq!(
+            trace(),
+            ["dial_ok", "dial 192.168.43.101:7000", "dial 192.168.43.102:7000", "dial_ok"],
+            "B's mark once for both its dials, then C named with its own"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A2-2: the same phone back on Bluetooth is named afresh without its mark: its earlier dial is forgotten, its record
+    /// held, and dialled again only at this session's 0x5703.
+    #[test]
+    fn the_same_phone_named_afresh_is_dialled_again_only_after_its_new_0x5703() {
+        let (gate, path) = gate_naming(PHONE_B);
+        let fake = FakeBrowse::new(
+            &path,
+            false,
+            vec![
+                vec![resolved("B", PHONE_B, 101), Step::Name(PHONE_B.to_string())],
+                vec![resolved("B", PHONE_B, 101), Step::Quiet, Step::Name(handed(PHONE_B))],
+            ],
+        );
+        let dials = Rc::new(RefCell::new(Vec::new()));
+        let file = path.clone();
+        let mut d = dialer(&dials, move |_| {
+            assert!(std::fs::read_to_string(&file).unwrap().ends_with(" wifi"), "never between its two 0x5703s");
+            true
+        });
+        run_loop(&fake, &gate, &mut d, &mut Net::off(), NEVER);
+        assert_eq!(*dials.borrow(), [at(101), at(101)], "once per Bluetooth session's 0x5703");
         let _ = std::fs::remove_file(path);
     }
 

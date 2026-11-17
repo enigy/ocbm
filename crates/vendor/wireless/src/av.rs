@@ -111,8 +111,9 @@ pub const EXPECT_PHONE_FILE: &str = "/tmp/carplay_expect_phone";
 const WIFI_MARK: &str = "wifi";
 
 /// What the name file says: the phone btd names, and whether btd has sent it its 0x5703 in this naming (`wifi`). The
-/// mark goes with the naming: a phone named afresh starts without it, the same phone back keeps it, and a put-back
-/// name ([`put_back`]) carries the one it had.
+/// mark goes with the naming: a phone named at its Bluetooth session's start has none, the same phone back on Bluetooth
+/// loses it unless its own CarPlay session is up or connecting (A2-2: no dial before this session's 0x5703), and a
+/// put-back name ([`put_back`]) carries the one it had.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Named {
     phone: [u8; 6],
@@ -196,34 +197,75 @@ pub struct EarlyName {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AtStart {
     Name(EarlyName),
+    /// The phone named already, with the mark from an earlier Bluetooth session, back while no CarPlay session of its
+    /// own is up or connecting: named afresh without it, so carplayd dials it only after this session's 0x5703.
+    Unmark,
     /// A CarPlay session is up here: its 0x5703 names this phone, as before.
     SessionUp,
-    /// No peer, not bonded, it is named already, or btd is going quiet.
+    /// No peer, not bonded, it is named already (with no mark, or with one while its own CarPlay is, or may be, up or
+    /// connecting), or btd is going quiet.
     Leave,
+}
+
+/// A CarPlay session here, up or connecting, as btd can tell it as a Bluetooth session starts: carplayd's identity
+/// names its phone from the SETUP to the session's end; before the SETUP (a control connection alone) nobody can tell
+/// whose it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CarPlayNow {
+    /// None up or connecting.
+    Idle,
+    /// One up or connecting: its phone, once carplayd's identity names it.
+    Of(Option<[u8; 6]>),
+}
+
+impl CarPlayNow {
+    /// What carplayd shows now ([`crate::control::carplay_phone`], [`crate::control::carplay_session_up`]).
+    fn now() -> Self {
+        match crate::control::carplay_phone() {
+            Some(q) => CarPlayNow::Of(Some(q)),
+            None if crate::control::carplay_session_up() => CarPlayNow::Of(None),
+            None => CarPlayNow::Idle,
+        }
+    }
+
+    /// Whether it is, or may be, `p`'s: carplayd's identity names `p`, or no phone yet.
+    fn may_be(self, p: [u8; 6]) -> bool {
+        matches!(self, CarPlayNow::Of(q) if q.is_none_or(|q| q == p))
+    }
 }
 
 /// The Mac's 15 Nov bench: btd named a phone only after its 0x5703, and a phone that knows the AP is on it
 /// within ~1.5 s of its Bluetooth link, before that. carplayd refused its record for the last phone's, and
 /// nothing looked again until the browser re-queried, 84 s later. So the phone is named as its session
 /// starts, by the 0x5703's own rule: only a phone this box is bonded with (`bonded`, `wifi_config_allowed`,
-/// R3). And only while no CarPlay session is up here (`session_up`): a session can outlive its phone's
+/// R3). And only while no CarPlay session is up here (`carplay`): a session can outlive its phone's
 /// Bluetooth link, and naming another phone would let that phone take it before it had handed off (R2).
 /// Not while btd is going quiet (`quiet`): its teardown removes the name anyway. The early name has no mark: carplayd
 /// may serve that phone, and dials it only after its 0x5703 ([`expect_phone`]).
+///
+/// The owner's rule (A2-2): no dial before THIS Bluetooth session's 0x5703. So the phone named already, its mark from an
+/// earlier Bluetooth session, is named afresh without it ([`AtStart::Unmark`]) unless a CarPlay session of its own is
+/// up or connecting here: when none is, or another phone's is (carplayd dials the named phone while another phone's
+/// session is live). With its own (outliving its Bluetooth link: R2), or a control connection before its SETUP (while
+/// the phone is named, its own coming up, as [`at_session_end`] takes it), the name stays as it is: carplayd never
+/// dials a live session, and the connection coming up needs no dial.
 fn at_session_start(
     peer: Option<[u8; 6]>,
     bonded: bool,
     named: Option<Named>,
-    session_up: bool,
+    carplay: CarPlayNow,
     quiet: bool,
 ) -> AtStart {
     match peer {
-        Some(p) if bonded && named.map(|n| n.phone) != Some(p) && !quiet => {
-            if session_up {
+        Some(p) if bonded && !quiet && named.map(|n| n.phone) != Some(p) => {
+            if carplay != CarPlayNow::Idle {
                 AtStart::SessionUp
             } else {
                 AtStart::Name(EarlyName { phone: p, before: named })
             }
+        }
+        Some(p) if bonded && !quiet && named == Some(Named { phone: p, wifi: true }) && !carplay.may_be(p) => {
+            AtStart::Unmark
         }
         _ => AtStart::Leave,
     }
@@ -282,7 +324,7 @@ fn at_session_end(early: EarlyName, handed_off: bool, seen: Seen, quiet: bool) -
 /// going quiet already. Returns what to hand [`put_back`] when the session ends.
 pub fn name_at_session_start(peer: Option<[u8; 6]>, bonded: bool, quiet: bool) -> Option<EarlyName> {
     let p = peer.filter(|_| bonded && !quiet)?;
-    match at_session_start(peer, bonded, named_now(), crate::control::carplay_session_up(), quiet) {
+    match at_session_start(peer, bonded, named_now(), CarPlayNow::now(), quiet) {
         AtStart::Name(early) => match write_named(Named { phone: p, wifi: false }) {
             Ok(()) => {
                 log(&format!("named {} for carplayd at its session start", tail(p)));
@@ -293,6 +335,14 @@ pub fn name_at_session_start(peer: Option<[u8; 6]>, bonded: bool, quiet: bool) -
                 None
             }
         },
+        AtStart::Unmark => {
+            // No put-back: the name before it was this phone's, mark and all, and the mark is what goes.
+            match write_named(Named { phone: p, wifi: false }) {
+                Ok(()) => log(&format!("named {} afresh at its session start: dialled only after this session's 0x5703", tail(p))),
+                Err(e) => log(&format!("could not name {} afresh at its session start ({e}): its earlier 0x5703 stands", tail(p))),
+            }
+            None
+        }
         AtStart::SessionUp => {
             log(&format!("not naming {} at its session start: a CarPlay session is up; its 0x5703 names it", tail(p)));
             None
@@ -503,10 +553,12 @@ pub fn teardown_av_layer() {
 }
 
 /// Wait (bounded) for the carplayd just signalled to be gone: by its pid when this process started it (a `/proc` read,
-/// no process-table scan), else by `pgrep`. SIGKILL after a second. carplayd installs no SIGTERM handler, so it is
-/// normally gone within milliseconds.
+/// no process-table scan), else by `pgrep -x` of the full path alone, the form its callers' `pkill -x <path>` and the
+/// SIGKILL here signal. [`running`] also matches the bare name, and so the wired supervisor's carplayd, which none of
+/// them signals: every teardown beside one waited its whole 2 s (A2-3). SIGKILL after a second. carplayd installs no
+/// SIGTERM handler, so it is normally gone within milliseconds.
 fn wait_gone(pid: u32, carplayd: &str) {
-    let alive = || if pid != 0 { pid_alive(pid, carplayd) } else { running(carplayd) };
+    let alive = || if pid != 0 { pid_alive(pid, carplayd) } else { pgrep_exact(carplayd) };
     let step = if pid != 0 { Duration::from_millis(10) } else { Duration::from_millis(100) };
     let started = std::time::Instant::now();
     let mut killed = false;
@@ -579,8 +631,8 @@ enum Early {
     /// A carplayd is running that this process did not start (the wired supervisor's, or one a dead btd left): left
     /// alone, to the 0x5703, which replaces or adopts it as before.
     Resident,
-    /// No Wi-Fi interface yet: the identity carplayd is handed is derived from the Wi-Fi driver's address, so the 0x5703
-    /// starts it, as before.
+    /// The identity's primary source is not there, or did not hold still: `box_identity::derive` falls back to the SoC
+    /// serial without it, which gives another identity than at the 0x5703, so the 0x5703 starts carplayd, as before.
     NoWifi,
 }
 
@@ -598,36 +650,47 @@ fn early_decision(torn_down: bool, up: bool, resident: bool, wifi: bool) -> Earl
     }
 }
 
-/// Whether this unit's Wi-Fi interface exists, whatever its name: the radio seam's own test (`radio_hal.sh`
-/// `wlan_iface`), a netdev with `wireless/` or `phy80211/` in sysfs. Once it does, `box_identity::derive` reads what it
-/// will read at the 0x5703.
-fn wifi_iface_present() -> bool {
-    std::fs::read_dir("/sys/class/net").is_ok_and(|dir| {
-        dir.flatten().any(|e| e.path().join("wireless").exists() || e.path().join("phy80211").exists())
-    })
-}
-
-/// How long the session's-start spawn waits for the Wi-Fi interface, in steps of [`WIFI_STEP`]: on a cold start the
-/// driver can load beside the Bluetooth attach (the supervisor brings both up at once). One it had to wait for is given
-/// [`WIFI_SETTLE`] more: a driver can create its interfaces one after another (the IW416 dev adapter has `sta0` and
-/// `wlan0`), and the identity reads one of them.
+/// How long the session's-start spawn waits for the identity's primary source, looking every [`WIFI_STEP`]: on a cold
+/// start the Wi-Fi driver can load beside the Bluetooth attach (the supervisor brings both up at once).
 const WIFI_WAIT: Duration = Duration::from_secs(15);
 const WIFI_STEP: Duration = Duration::from_millis(100);
-const WIFI_SETTLE: Duration = Duration::from_millis(250);
+
+/// The identity carplayd may be handed at the session's start (A2-4): what `box_identity::derive_primary` gives, the
+/// same on two looks in a row, `step` apart (a driver can create its interfaces one after another, and give one an
+/// address after it is created), within `wait`; `None` past it, or when `stop` says the session was torn down.
+/// `look` is `derive_primary` (a test's own); `None` from it is the primary source not there yet.
+fn steady_identity(
+    mut look: impl FnMut() -> Option<(String, String, String)>,
+    wait: Duration,
+    step: Duration,
+    stop: impl Fn() -> bool,
+) -> Option<(String, String, String)> {
+    let t0 = std::time::Instant::now();
+    let mut last = look();
+    loop {
+        if stop() || t0.elapsed() >= wait {
+            return None;
+        }
+        std::thread::sleep(step);
+        let now = look();
+        if now.is_some() && now == last {
+            return now;
+        }
+        last = now;
+    }
+}
+
+/// The identity as `box_identity::derive_primary` gives it: only while derive reads its primary source.
+fn primary_identity() -> Option<(String, String, String)> {
+    crate::box_identity::derive_primary().map(|id| (id.device_id, id.pi, id.ed_seed_hex))
+}
 
 /// The session's-start spawn, on its own thread ([`session_starting`]): `session` is [`AV_SESSION`] as the session began.
 fn early_start(session: u64) {
     let t0 = std::time::Instant::now();
     let torn_down = || AV_SESSION.load(Ordering::Acquire) != session;
-    // A short bounded wait for the Wi-Fi driver, by its sysfs entry (no event exists for it there), off the lock.
-    let mut waited = false;
-    while !wifi_iface_present() && t0.elapsed() < WIFI_WAIT && !torn_down() {
-        std::thread::sleep(WIFI_STEP);
-        waited = true;
-    }
-    if waited && wifi_iface_present() {
-        std::thread::sleep(WIFI_SETTLE);
-    }
+    // A short bounded wait, off the lock, for the identity to come from what derive reads first and to hold still.
+    let id = steady_identity(primary_identity, WIFI_WAIT, WIFI_STEP, torn_down);
     let _guard = AV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let carplayd = env_or("AIRPLAYD_BIN", AIRPLAYD_BIN_DEFAULT);
     let mut up = AV_LAYER_UP.load(Ordering::Acquire);
@@ -639,10 +702,9 @@ fn early_start(session: u64) {
         *SPAWNED_ID.lock().unwrap_or_else(|e| e.into_inner()) = None;
         up = false;
     }
-    let decision = early_decision(torn_down(), up, !up && running(&carplayd), wifi_iface_present());
-    match decision {
-        Early::Start => {
-            let id = identity_now();
+    let decision = early_decision(torn_down(), up, !up && running(&carplayd), id.is_some());
+    match (decision, id) {
+        (Early::Start, Some(id)) => {
             if spawn_carplayd(&carplayd, &id, true) {
                 latch(&carplayd, id);
                 log(&format!("carplayd started at the session's start in {} ms (it dials no phone until its 0x5703)", t0.elapsed().as_millis()));
@@ -650,12 +712,12 @@ fn early_start(session: u64) {
                 log("carplayd did not start at the session's start; the 0x5703 starts it, as before");
             }
         }
-        Early::TornDown | Early::Up => {}
-        Early::Resident => log("a carplayd this btd did not start is running: left to the 0x5703, as before"),
-        Early::NoWifi => log(&format!(
-            "no Wi-Fi interface {} s into the session: carplayd waits for the 0x5703, as before",
+        (Early::Resident, _) => log("a carplayd this btd did not start is running: left to the 0x5703, as before"),
+        (Early::NoWifi, _) => log(&format!(
+            "the box identity's primary source was not there and steady within {} s: carplayd waits for the 0x5703, as before",
             WIFI_WAIT.as_secs()
         )),
+        _ => {}
     }
 }
 
@@ -964,29 +1026,59 @@ mod tests {
     /// A named with its 0x5703 sent: the name 2.6.0 wrote at a handoff.
     const A_HANDED: Named = Named { phone: A, wifi: true };
 
+    /// No CarPlay session up or connecting; A's up (outliving its Bluetooth link).
+    const IDLE: CarPlayNow = CarPlayNow::Idle;
+    const A_LIVE: CarPlayNow = CarPlayNow::Of(Some(A));
+
     #[test]
     fn a_bonded_phone_is_named_at_its_session_start_while_no_carplay_is_up() {
         let named = AtStart::Name(EarlyName { phone: B, before: Some(A_HANDED) });
-        assert_eq!(at_session_start(Some(B), true, Some(A_HANDED), false, false), named, "10:54:23.4, B back on Bluetooth");
+        assert_eq!(at_session_start(Some(B), true, Some(A_HANDED), IDLE, false), named, "10:54:23.4, B back on Bluetooth");
         assert_eq!(
-            at_session_start(Some(B), true, None, false, false),
+            at_session_start(Some(B), true, None, IDLE, false),
             AtStart::Name(EarlyName { phone: B, before: None }),
             "the first phone after btd starts"
         );
-        assert_eq!(at_session_start(Some(B), false, Some(A_HANDED), false, false), AtStart::Leave, "R3: not bonded");
-        assert_eq!(at_session_start(None, true, Some(A_HANDED), false, false), AtStart::Leave, "no peer, nothing to name");
-        assert_eq!(at_session_start(Some(A), true, Some(A_HANDED), false, false), AtStart::Leave, "the same phone back");
+        assert_eq!(at_session_start(Some(B), false, Some(A_HANDED), IDLE, false), AtStart::Leave, "R3: not bonded");
+        assert_eq!(at_session_start(None, true, Some(A_HANDED), IDLE, false), AtStart::Leave, "no peer, nothing to name");
         assert_eq!(
-            at_session_start(Some(A), true, Some(Named { phone: A, wifi: false }), false, false),
+            at_session_start(Some(A), true, Some(A_HANDED), IDLE, false),
+            AtStart::Unmark,
+            "A2-2: the same phone back, its mark from an earlier session: named afresh, dialled after this session's 0x5703"
+        );
+        assert_eq!(
+            at_session_start(Some(A), true, Some(A_HANDED), A_LIVE, false),
+            AtStart::Leave,
+            "the same phone back while its own CarPlay outlives its Bluetooth link (R2): the name stays as it is"
+        );
+        assert_eq!(
+            at_session_start(Some(A), true, Some(A_HANDED), CarPlayNow::Of(None), false),
+            AtStart::Leave,
+            "a control connection before its SETUP, perhaps A's own: the name stays as it is"
+        );
+        assert_eq!(
+            at_session_start(Some(A), true, Some(A_HANDED), CarPlayNow::Of(Some(B)), false),
+            AtStart::Unmark,
+            "A2-2: B's CarPlay is live (A was handed off to take it over): A is dialled after this session's 0x5703"
+        );
+        assert_eq!(
+            at_session_start(Some(A), true, Some(Named { phone: A, wifi: false }), IDLE, false),
             AtStart::Leave,
             "the same phone back, named early before: its name stays as it is"
         );
+        assert_eq!(at_session_start(Some(A), false, Some(A_HANDED), IDLE, false), AtStart::Leave, "R3: not bonded");
+        assert_eq!(at_session_start(Some(A), true, Some(A_HANDED), IDLE, true), AtStart::Leave, "P5: btd going quiet");
         assert_eq!(
-            at_session_start(Some(B), true, Some(A_HANDED), true, false),
+            at_session_start(Some(B), true, Some(A_HANDED), A_LIVE, false),
             AtStart::SessionUp,
             "R2: A's CarPlay outlives its Bluetooth link; B is named at its 0x5703, as before"
         );
-        assert_eq!(at_session_start(Some(B), true, Some(A_HANDED), false, true), AtStart::Leave, "P5: btd going quiet");
+        assert_eq!(
+            at_session_start(Some(B), true, Some(A_HANDED), CarPlayNow::Of(None), false),
+            AtStart::SessionUp,
+            "R2: a control connection before its SETUP; B is named at its 0x5703, as before"
+        );
+        assert_eq!(at_session_start(Some(B), true, Some(A_HANDED), IDLE, true), AtStart::Leave, "P5: btd going quiet");
     }
 
     #[test]
@@ -1040,6 +1132,38 @@ mod tests {
         assert_eq!(early_decision(true, true, true, false), Early::TornDown, "the teardown wins");
     }
 
+    fn id(n: u8) -> (String, String, String) {
+        (format!("02:00:00:00:00:{n:02X}"), format!("pi-{n}"), format!("{n:064x}"))
+    }
+
+    /// A2-4: the early start takes the identity only from what derive reads first, once it holds still on two looks.
+    #[test]
+    fn the_session_start_spawn_waits_for_a_steady_primary_identity() {
+        let quick = Duration::from_millis(1);
+        let never = || false;
+        let looks = |seq: Vec<Option<(String, String, String)>>| {
+            let mut it = seq.into_iter();
+            move || it.next().flatten()
+        };
+        assert_eq!(steady_identity(looks(vec![Some(id(1)), Some(id(1))]), Duration::from_secs(1), quick, never), Some(id(1)));
+        assert_eq!(
+            steady_identity(looks(vec![None, None, Some(id(1)), Some(id(1))]), Duration::from_secs(1), quick, never),
+            Some(id(1)),
+            "the Wi-Fi driver came up: its address, held still"
+        );
+        assert_eq!(
+            steady_identity(looks(vec![Some(id(1)), Some(id(2)), Some(id(2))]), Duration::from_secs(1), quick, never),
+            Some(id(2)),
+            "an address that changed once: the one that held"
+        );
+        assert_eq!(
+            steady_identity(|| None, Duration::from_millis(20), quick, never),
+            None,
+            "never there (derive falls back to the serial): the 0x5703 starts carplayd"
+        );
+        assert_eq!(steady_identity(|| Some(id(1)), Duration::from_secs(1), quick, || true), None, "torn down meanwhile");
+    }
+
     #[test]
     fn going_quiet_neither_names_nor_puts_back() {
         // P5: go-quiet always ends in teardown_av_layer, which removes the name; a put-back seconds before it
@@ -1047,7 +1171,7 @@ mod tests {
         let early = EarlyName { phone: B, before: Some(A_HANDED) };
         let seen = Seen { named: Some(B), carplay: None, connected: false };
         assert_eq!(at_session_end(early, false, seen, true), AtEnd::Quiet);
-        assert_eq!(at_session_start(Some(B), true, Some(A_HANDED), false, true), AtStart::Leave);
+        assert_eq!(at_session_start(Some(B), true, Some(A_HANDED), IDLE, true), AtStart::Leave);
     }
 
     #[test]
