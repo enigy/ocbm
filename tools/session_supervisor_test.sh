@@ -323,6 +323,7 @@ check "! called \"kill -USR1\"" "and no go to a btd that never armed"
 arm_pid=360; arm_since=10
 wireless_up; settle
 check "[ -z \"\$arm_pid\" ] && called \"OCBM_GO_FALLBACK=0\" && ! called \"kill -USR1\"" "no armed btd: today'"'"'s bring-up"
+check "[ \"\$wl_raised\" = 1 ]" "today'"'"'s bring-up raised the radios too: no early return until a teardown has run"
 '
 done
 [ "$fails" -eq 0 ] && echo "session_supervisor_test: all passed ($passes checks)" || { echo "session_supervisor_test: $fails failed"; exit 1; }
