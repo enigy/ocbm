@@ -249,6 +249,14 @@ impl CarPlayNow {
 /// session is live). With its own (outliving its Bluetooth link: R2), or a control connection before its SETUP (while
 /// the phone is named, its own coming up, as [`at_session_end`] takes it), the name stays as it is: carplayd never
 /// dials a live session, and the connection coming up needs no dial.
+///
+/// Known and left so (the second review, LOW): the rule holds at the session's start only. The mark kept there is the
+/// earlier session's, and if that CarPlay ends, or its connection never reaches a SETUP, before this session's 0x5703,
+/// carplayd may dial the phone on it when its record resolves again. That is a reconnect dial to the phone whose own
+/// CarPlay this box was serving or setting up moments before, handed off earlier in this host session, as 2.6.0 made
+/// after every drop; no other phone can come in by it. Closing it would mean dropping the mark under a live session,
+/// so that a Wi-Fi drop mid-session waits for a 0x5703 the phone need not ask for while its CarPlay is up, or watching
+/// for CarPlay's end from `bt_driver` while the Bluetooth session lasts; neither is benched.
 fn at_session_start(
     peer: Option<[u8; 6]>,
     bonded: bool,
