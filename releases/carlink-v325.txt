@@ -1,0 +1,9 @@
+Carlink 3.25: the picture sooner, with the OCBM 2.6.5 update
+
+- The CarPlay picture shows as soon as the iPhone's first frame is drawn. The loading screen used to wait for the connection to be marked as streaming, about 2 s longer when Carlink had just been opened.
+- Carlink gets its video decoder ready as the display comes on, from the last session's stream settings, so the iPhone's first frame is drawn within about 0.1 s of arriving. If a decoder built ahead draws nothing, Carlink builds a fresh one, and never leaves the loading screen up over a picture that is ready.
+- When the display comes on before the adapter is listed on USB, Carlink connects as the adapter attaches, without waiting for its next check.
+- Night mode reaches CarPlay with its first picture, not a moment later.
+- Offers the adapter update to OCBM 2.6.5 in Settings › Adapter and about, from OCBM 1.0.1 or later, and installs 2.6.5 on a stock adapter from the connecting screen (Convert to OCBM). 2.6.5 connects sooner: it keeps Bluetooth ready but invisible between sessions, starts its Wi-Fi and its CarPlay receiver earlier, and reads the authentication chip's certificate once. On the bench a wake reached the picture in 5.2 to 6.4 s with the iPhone in use, where 2.6.1 with Carlink 3.21 took 8.2 to 9.4 s.
+- Connect time's records gain two times for each connect: when video arrived and when the decoder was ready.
+- The bench hooks in this version's commits are in debug builds only, never in this release.
