@@ -1,0 +1,6 @@
+Carlink 3.21: connect times, and the OCBM 2.6.1 measuring update
+
+- Settings › Adapter and about › Connect time: how long CarPlay takes from the display coming on to the picture, over your last 20 wakes: the time half of them were within, and the time 9 in 10 were within. It needs five wakes first, and counts a wake only when Carlink's screen was in front as the display came on.
+- To work that out, Carlink keeps the times of the last 200 connects on the head unit: when each began, what started it, how long each step took and how it ended. It names no phone, never leaves the head unit by itself, and comes out with Save Logs. PRIVACY.md has the row.
+- Offers the adapter update to OCBM 2.6.1 in Settings › Adapter and about, from OCBM 1.0.1 or later, and installs 2.6.1 on a stock adapter from the connecting screen (Convert to OCBM). 2.6.1 changes nothing in how the adapter connects: it adds the time of each connect step to its log, and Carlink keeps that line with the connect while Record drive logs is on.
+- The bench hooks in this version's commits are in debug builds only, never in this release.
