@@ -304,16 +304,27 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
 
 - **Two phones, left for 2.6.x or later (the Mac's reviews for 2.6.0, 15 Nov; not in 2.6.0).**
   - `carplayd-1`: a capped rename-path dial that misses has no retry and waits for the 90 s never-reached
-    end (`Control::carplay_never_reached`). **Fixed 16 Nov on branch `carplayd-early` (A2), NOT benched:** a dial
-    that tried every round and missed is tried again 2, 4 and 8 s after (two rounds each), while its record stands
-    and its phone is still the one to dial, and never while a control connection is open (`discovery::Retries`).
+    end (`Control::carplay_never_reached`). **Fixed 16 Nov on branch `carplayd-early` (A2):** a dial that tried
+    every round and missed is tried again 2, 4 and 8 s after (two rounds each), while its record stands and its
+    phone is still the one to dial, and never while a control connection is open (`discovery::Retries`).
   - `carplayd-2`: fresh resolves read inside `rename()`'s replay loop get `RENAME_ROUNDS`. **Fixed 16 Nov, same
-    branch, NOT benched:** the rounds follow the news, wherever the record is read: one resolved as discovery last saw
-    it (mdns-sd sends nothing for an unchanged record, so that is its cache replaying) gets `RENAME_ROUNDS`, anything
-    new or changed `FRESH_ROUNDS` (`Held::rounds_for`).
+    branch:** the rounds follow the news, wherever the record is read: one resolved as discovery last saw it
+    (mdns-sd sends nothing for an unchanged record, so that is its cache replaying) gets `RENAME_ROUNDS`, anything new
+    or changed `FRESH_ROUNDS` (`Held::rounds_for`).
   - `carplayd-3`: `forget_phone` can repeat a dial made moments earlier under the new name. **Fixed 16 Nov, same
-    branch, NOT benched:** each dial carries the naming's epoch it was made under (`PhoneGate::dial`), and a rename
-    forgets only the newly named phone's dials from an earlier naming.
+    branch:** each dial carries the naming's epoch it was made under (`PhoneGate::dial`), and a rename forgets only
+    the newly named phone's dials from an earlier naming.
+  - The three above, **benched 16 Nov with one phone** (the dev adapter on A2 and A4 merged with the resident btd, an
+    iPhone on iOS 15, 12 wakes and a cold boot, all connected; the numbers are in
+    [../wireless/00_WIRELESS_CARPLAY.md](../wireless/00_WIRELESS_CARPLAY.md) §2.3). Still open: their two-phone
+    cases (a switch, a no-handoff exit, a rename while a record is held) and `/tmp/bench_dial_early` on a current
+    iPhone (iOS 15 accepted the dial before its 0x5703 3 times of 3). The release review's four fixes after that
+    bench, on the same branch, NOT benched: A2-1, a 0x5703 mark (or a name) that lands while a browse restarts is
+    acted on at once, not at the next unrelated wake, and `dial_ok` is noted once per naming, never after its dial;
+    A2-2, the same phone back on Bluetooth is named afresh without the mark of its earlier session unless its own
+    CarPlay session is up or connecting (the owner's rule: no dial before this Bluetooth session's 0x5703); A2-3, a
+    teardown beside the wired carplayd no longer waits 2 s for it; A2-4, the early start waits for what
+    `box_identity::derive` reads first.
   - `btd-p1-carlink-1`: `put_back`'s Connected should be provisional.
   - `e2e-4`: the same phone back within ~5 s while its own dead session is held is never re-checked
     (backstop: `carplay_never_reached` at 90 s).
@@ -322,7 +333,8 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
 
 - **`MFI-CACHE-SCOPE`: btd's Bluetooth iAP2 and carplayd's AirPlay auth-setup still read the MFi chip each
   session.** 2.6.0's once-per-boot certificate cache serves only the CarPlay session's iAP2 link. **Closed in code
-  16 Nov on branch `carplayd-early` (A4), NOT benched:** the tunnel's cache (`mfi_i2c_local::cert_cache`,
+  16 Nov on branch `carplayd-early` (A4); benched 16 Nov with one phone** (`cert1_ms` and `cert2_ms` 0, auth-setup
+  1.68 s against 1.83 s; its two-phone cases still open): the tunnel's cache (`mfi_i2c_local::cert_cache`,
   `/tmp/carplay_mfi_cert.der`) now serves all three, through one implementation of its rules: only one DER
   certificate is cached or served; a read that isn't one is sent once and not cached; the cache is looked at again
   once the lock is held and written after it is let go, so the lock is held no longer than the chip read; signatures

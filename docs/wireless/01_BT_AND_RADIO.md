@@ -450,7 +450,7 @@ because BT attach waits for WLAN on this part, Bluetooth with it. Both forms now
   would still slip through.
 * A reversible radio verification gate in the baseline, run while still on NCM.
 * Rust parameterisation: `WLAN_IFACE`/`AP_IP` from the seam (`av.rs:63,66`), the identity chain
-  (`box_identity.rs`'s `hardware_id()` :15, `iap2-core/src/message.rs`'s `device_suffix()` :215 — a
+  (`box_identity.rs`'s `SOURCES` :10, which `hardware_id()` reads; `iap2-core/src/message.rs`'s `device_suffix()` :215 — a
   live bug on IW416 too, since `/sys/class/net/wlan0/address` is absent whenever the driver is
   unloaded, which under on-demand radios is most of the time). **Added 2026-08-16:** that same chain is why §6c's "one box, one name" is
   **not yet achieved**. `/etc/carplay_ident` is read only by `radio_hal.sh` and `radio_ap_up.sh`;
@@ -469,10 +469,11 @@ because BT attach waits for WLAN on this part, Bluetooth with it. Both forms now
   down, and Carlink's pairing screen and Settings › Phones showed that name too. The seam's own name
   and the BT-only role still differ. **16 Nov (A2, branch `carplayd-early`):** the chain now matters to carplayd's
   start too. carplayd starts as btd's host session begins, and the identity it is handed (`box_identity::derive`)
-  changes when `wlan0` appears; so that start waits, by the seam's own test (an interface with `wireless/` or
-  `phy80211/`), for the Wi-Fi driver (15 s at most, a 250 ms settle when it had to wait), and the 0x5703 derives the
-  identity again and restarts a carplayd started with another one before it may dial (`av::expect_phone`). No
-  interface name is added to the Rust side.
+  changes when `wlan0` appears; so that start waits for what derive reads first (`box_identity::derive_primary`, the
+  same path, no other name: A2-4, the release review) to give the same identity on two looks 100 ms apart, 15 s at
+  most, and otherwise leaves the start to the 0x5703, as before. A unit whose Wi-Fi interface is not `wlan0` never has
+  that source, and keeps 2.6.x's start at the 0x5703. The 0x5703 derives the identity again and restarts a carplayd
+  started with another one before it may dial (`av::expect_phone`). No interface name is added to the Rust side.
 * The startup decode transient described in §6b.
 * **Broadcom is entirely untested** and is the known-hardest case: `wlan0` there does not exist
   until it is explicitly created on top of `sta0` (`iw dev sta0 interface add wlan0 type
