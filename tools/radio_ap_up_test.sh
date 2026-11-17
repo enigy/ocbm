@@ -240,5 +240,23 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   check 'serving "$MATCH" 777 && ! serving "udhcpd .*nothing-$TAG" 777' "the pid setsid's, not the server's: asked by config path, as before"
   check 'serving "$MATCH" "" && ! serving "udhcpd .*nothing-$TAG" ""' "none launched by this start (an AP already up): by config path, as before"
   kill -9 "$alive" 2>/dev/null
+
+  # hostapd's AP-ENABLED, counted against the box log as it was at the launch; a box log ocbmd emptied at its cap in
+  # between counts below that baseline, and the baseline then goes to 0 (the release review of resident-bt, A3-3).
+  echo "== $sh: hostapd's AP-ENABLED, through a box log emptied at its cap"
+  B="$T/box.log"
+  seen() {  # $1 the baseline at the launch: "seen <baseline after>" or "waiting <baseline after>"
+    env AP_BOXLOG="$B" RADIO_AP_UP_FUNCS=1 _ae0="$1" "$sh" -c '. "$1"; if ap_enabled_seen; then echo "seen $_ae0"; else echo "waiting $_ae0"; fi' sh "$AP"
+  }
+  printf 'x\nsta0: AP-ENABLED \nsta0: AP-ENABLED \nsta0: AP-ENABLED \n' > "$B"
+  check '[ "$(seen 3)" = "waiting 3" ]' "the three it held at the launch: not yet"
+  echo "sta0: AP-ENABLED " >> "$B"
+  check '[ "$(seen 3)" = "seen 3" ]' "a fourth: this hostapd's"
+  : > "$B"
+  check '[ "$(seen 3)" = "waiting 0" ]' "emptied at its cap: still waiting, the baseline gone to 0"
+  echo "sta0: AP-ENABLED " >> "$B"
+  check '[ "$(seen 3)" = "seen 0" ]' "and the first AP-ENABLED written since is this hostapd's (it was never seen before: the bound)"
+  rm -f "$B"
+  check '[ "$(seen 0)" = "waiting 0" ]' "no box log at all: waiting"
 done
 [ "$fails" -eq 0 ] && echo "radio_ap_up_test: all passed" || { echo "radio_ap_up_test: $fails failed"; exit 1; }

@@ -318,6 +318,18 @@ ap_dhcp_serving() {
     [ -n "$(ap_dhcp_pids)" ]
   fi
 }
+# ---- hostapd's own word ---------------------------------------------------------------------------
+# Its AP-ENABLED: one more in the box log than when it was launched (_ae0, counted then). A count BELOW that is a box
+# log ocbmd emptied at its cap in between (the release review of resident-bt, A3-3): every line in it is new, so the
+# baseline goes to 0, where it would otherwise never be passed and the wait would run to its bound holding the wlan lock
+# btd's 0x5703 reply waits on. AP_BOXLOG is a test hook; hostapd writes the box log itself.
+AP_BOXLOG=${AP_BOXLOG:-/tmp/box.log}
+ap_enabled_seen() {
+  _ae=$(grep -c "AP-ENABLED" "$AP_BOXLOG" 2>/dev/null)
+  case "$_ae" in ''|*[!0-9]*) _ae=0 ;; esac
+  [ "$_ae" -lt "$_ae0" ] && _ae0=0
+  [ "$_ae" -gt "$_ae0" ]
+}
 [ "${RADIO_AP_UP_FUNCS:-}" = 1 ] && return 0
 
 # The connect timeline's ap_start and ap_up (crates/box-common/src/timeline.rs): `t <key> <uptime ms>` appended to btd's
@@ -408,7 +420,7 @@ if ! pidof hostapd >/dev/null 2>&1; then
   _launched=1
   # How many AP-ENABLED lines the box log held as it started (it prints its own a good half second in, at the
   # earliest): the converge step waits for one more.
-  _ae0=$(grep -c "AP-ENABLED" /tmp/box.log 2>/dev/null)
+  _ae0=$(grep -c "AP-ENABLED" "$AP_BOXLOG" 2>/dev/null)
   case "$_ae0" in ''|*[!0-9]*) _ae0=0 ;; esac
 fi
 
@@ -480,9 +492,7 @@ _ae_ms=""
 if [ "$_launched" = 1 ]; then
   n=0
   while [ "$n" -lt 20 ] && ! hapd_exited; do
-    _ae=$(grep -c "AP-ENABLED" /tmp/box.log 2>/dev/null)
-    case "$_ae" in ''|*[!0-9]*) _ae=0 ;; esac
-    [ "$_ae" -gt "$_ae0" ] && { _ae_ms=$((n * 100)); break; }
+    ap_enabled_seen && { _ae_ms=$((n * 100)); break; }
     n=$((n+1)); sleep 0.1
   done
 else
