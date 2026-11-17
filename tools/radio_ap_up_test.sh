@@ -358,22 +358,28 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
     "the NCM server untouched; hostapd stopped and the interface down, as before"
   kill -9 "$ncm" 2>/dev/null
 
-  # hostapd's AP-ENABLED, counted against the box log as it was at the launch; a box log ocbmd emptied at its cap in
-  # between counts below that baseline, and the baseline then goes to 0 (the release review of resident-bt, A3-3).
-  echo "== $sh: hostapd's AP-ENABLED, through a box log emptied at its cap"
-  B="$T/box.log"
-  seen() {  # $1 the baseline at the launch: "seen <baseline after>" or "waiting <baseline after>"
-    env AP_BOXLOG="$B" RADIO_AP_UP_FUNCS=1 _ae0="$1" "$sh" -c '. "$1"; if ap_enabled_seen; then echo "seen $_ae0"; else echo "waiting $_ae0"; fi' sh "$AP"
+  # hostapd's AP-ENABLED: one after this start's own line in the box log (the second review of resident-bt, item 3). A
+  # box log ocbmd emptied at its cap took that line with it, and every AP-ENABLED in it then is this hostapd's.
+  echo "== $sh: hostapd's AP-ENABLED, after the start's own line, through a box log emptied at its cap"
+  B="$T/box.log"; M="[radio] hostapd starting on sta0"
+  seen() {  # "seen" or "waiting", the start's own line $1 (M when not given)
+    env AP_BOXLOG="$B" RADIO_AP_UP_FUNCS=1 _ae_mark="${1-$M}" "$sh" -c '. "$1"; if ap_enabled_seen; then echo seen; else echo waiting; fi' sh "$AP"
   }
-  printf 'x\nsta0: AP-ENABLED \nsta0: AP-ENABLED \nsta0: AP-ENABLED \n' > "$B"
-  check '[ "$(seen 3)" = "waiting 3" ]' "the three it held at the launch: not yet"
+  printf '%s\nsta0: AP-ENABLED \n%s\nx\nsta0: AP-ENABLED \n%s\ny\n' "$M" "$M" "$M" > "$B"
+  check '[ "$(seen)" = waiting ]' "two earlier starts and their AP-ENABLED, then this start's line: not yet"
   echo "sta0: AP-ENABLED " >> "$B"
-  check '[ "$(seen 3)" = "seen 3" ]' "a fourth: this hostapd's"
+  check '[ "$(seen)" = seen ]' "one after this start's own line: this hostapd's"
+  printf 'x\nsta0: AP-ENABLED \n%s\n' "$M" > "$B"
+  check '[ "$(seen)" = waiting ]' "one AP-ENABLED before the start's line (a count's baseline of 1): not yet"
   : > "$B"
-  check '[ "$(seen 3)" = "waiting 0" ]' "emptied at its cap: still waiting, the baseline gone to 0"
+  check '[ "$(seen)" = waiting ]' "the log emptied at its cap: waiting"
   echo "sta0: AP-ENABLED " >> "$B"
-  check '[ "$(seen 3)" = "seen 0" ]' "and the first AP-ENABLED written since is this hostapd's (it was never seen before: the bound)"
+  check '[ "$(seen)" = seen ]' "emptied, then this hostapd's AP-ENABLED, the count back at that baseline: seen (the count missed it)"
+  printf '[log] rotated 262200 bytes (not streamed)\nsta0: AP-ENABLED \n' > "$B"
+  check '[ "$(seen)" = seen ]' "emptied by the idle rotation, its own line first: seen"
   rm -f "$B"
-  check '[ "$(seen 0)" = "waiting 0" ]' "no box log at all: waiting"
+  check '[ "$(seen)" = waiting ]' "no box log at all: waiting"
+  printf 'sta0: AP-ENABLED \n' > "$B"
+  check '[ "$(seen "")" = waiting ]' "no line of its own (its write failed): never seen, the wait runs to its bound"
 done
 [ "$fails" -eq 0 ] && echo "radio_ap_up_test: all passed" || { echo "radio_ap_up_test: $fails failed"; exit 1; }
