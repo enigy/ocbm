@@ -231,68 +231,139 @@ pub enum MfiError {
 
 /// [`cert`] with the failure reason. `cert` is kept as the `Option` shim for existing callers.
 ///
-/// Read from the chip once per boot, then from [`CERT_CACHE`]: the certificate is the chip's public one, the same on
-/// every read and sent as-is to every phone (the private key never leaves the chip, and signing still goes to it
-/// every time). The tunnel's first read of a session failed with a chip NAK and cost a retry in 23 of 23 sessions
-/// (the Mac's 13 Nov brief, item 2).
+/// Read from the chip once per boot, then from the boot's cache ([`cert_cache`]): the certificate is the chip's public
+/// one, the same on every read and sent as-is to every phone (the private key never leaves the chip, and signing still
+/// goes to it every time). The tunnel's first read of a session failed with a chip NAK and cost a retry in 23 of 23
+/// sessions (the Mac's 13 Nov brief, item 2). Since A4 the same cache serves btd's Bluetooth authentication
+/// (`wireless/src/mfi_local.rs`) and carplayd's auth-setup (`LocalMfiSigner`), and btd fills it as a host session
+/// begins.
 ///
-/// Only one DER SEQUENCE is cached or served from the cache ([`is_der_sequence`]): one read that completed with bad
-/// bytes would otherwise go to every phone for the rest of the boot. A read that isn't one still goes to this phone,
-/// as before the cache, and the next session reads the chip again (the Mac's 2.6.0 review, CS-3).
+/// Only one DER SEQUENCE is cached or served from the cache ([`cert_cache::is_certificate`]): one read that completed
+/// with bad bytes would otherwise go to every phone for the rest of the boot. A read that isn't one still goes to this
+/// phone, as before the cache, and the next session reads the chip again (the Mac's 2.6.0 review, CS-3). The cache is
+/// looked at again once the lock is held, as another chip user may have filled it while this one waited, and written
+/// after the lock is let go, so the lock is held no longer than the chip read.
 pub fn try_cert() -> Result<Vec<u8>, MfiError> {
-    let asked = Instant::now();
-    if let Some(c) = read_cert_cache(CERT_CACHE) {
-        note_cert(CertTime { took: asked.elapsed(), cached: true });
-        return Ok(c);
+    let f = cert_cache::fetch(CERT_CACHE, MfiLock::acquire, || cert_locked().ok_or(MfiError::Chip))?;
+    let cached = matches!(f.from, cert_cache::Source::Cache);
+    note_cert(CertTime { took: f.under, cached });
+    if f.from == (cert_cache::Source::Chip { cached: false }) {
+        eprintln!("[mfi-i2c-local] the certificate read ({} B) is not one DER SEQUENCE: sent, not cached", f.cert.len());
     }
-    let _lock = MfiLock::acquire()?;
-    let held = Instant::now();
-    let c = cert_locked().ok_or(MfiError::Chip)?;
-    note_cert(CertTime { took: held.elapsed(), cached: false });
-    if is_der_sequence(&c) {
-        write_cert_cache(CERT_CACHE, &c);
-    } else {
-        eprintln!("[mfi-i2c-local] the certificate read ({} B) is not one DER SEQUENCE: sent, not cached", c.len());
-    }
-    Ok(c)
+    Ok(f.cert)
 }
 
 /// Forget the cached certificate, so the next session reads it from the chip: a phone failed the authentication. True
 /// when one was cached, and is gone.
 pub fn forget_cert() -> bool {
-    std::fs::remove_file(CERT_CACHE).is_ok()
+    cert_cache::forget(CERT_CACHE)
 }
 
-/// Whether `c` is one DER SEQUENCE with a two-byte length, as the chip's certificate is (`30 82 hi lo`, 945 bytes on
-/// this unit's 2.0C: docs/ops/captures/README.md), its length the rest of the bytes exactly, within the chip's 2048.
-fn is_der_sequence(c: &[u8]) -> bool {
-    match c {
-        [0x30, 0x82, hi, lo, ..] => c.len() <= 2048 && usize::from(u16::from_be_bytes([*hi, *lo])) + 4 == c.len(),
-        _ => false,
+/// The boot's cached MFi certificate, one file every chip user that sends the certificate shares: the tunnel here, btd's
+/// Bluetooth authentication and carplayd's auth-setup (A4, MFI-CACHE-SCOPE). The rules are the tunnel's since 2.6.0:
+/// - only one DER certificate ([`is_certificate`]) is cached or served; a file that isn't one is removed when read;
+/// - a read from the chip that isn't one is sent to that phone once and not cached, so the next session reads again;
+/// - a phone reporting a failed authentication drops it ([`forget`]), so the next session of any user reads the chip;
+/// - signing never comes from here: it always goes to the chip.
+///
+/// tmpfs, so a reboot clears it. Written aside and renamed, so a reader in another process never sees half of it.
+pub mod cert_cache {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+
+    /// Where it lives (`/tmp`, tmpfs).
+    pub const PATH: &str = "/tmp/carplay_mfi_cert.der";
+
+    /// Where a certificate came from ([`fetch`]).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Source {
+        /// The boot's cache: no lock, no chip.
+        Cache,
+        /// The chip, under the lock; whether it was then cached (only one DER certificate is).
+        Chip { cached: bool },
+    }
+
+    /// A certificate for one authentication, where it came from, its time under the lock (zero for the cache) and the
+    /// wait for the lock.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Fetched {
+        pub cert: Vec<u8>,
+        pub from: Source,
+        pub under: Duration,
+        pub waited: Duration,
+    }
+
+    /// The certificate by the cache's rules, for every user alike: the one cached at `path`; else, holding the chip lock
+    /// (`lock`, the user's own: its guard is held until the read is done) and once the cache has been looked at again
+    /// (another user may have filled it while this one waited), the chip's (`read`). That read is cached after the lock
+    /// is let go when it is one DER certificate, so the lock is held no longer than the chip read; one that isn't is
+    /// returned (sent once) and not cached. No lock, or no read: the user's error, and nothing cached.
+    pub fn fetch<L, E>(
+        path: &str,
+        lock: impl FnOnce() -> Result<L, E>,
+        read: impl FnOnce() -> Result<Vec<u8>, E>,
+    ) -> Result<Fetched, E> {
+        let cached = |cert| Fetched { cert, from: Source::Cache, under: Duration::ZERO, waited: Duration::ZERO };
+        if let Some(c) = self::read(path) {
+            return Ok(cached(c));
+        }
+        let asked = Instant::now();
+        let guard = lock()?;
+        let held = Instant::now();
+        if let Some(c) = self::read(path) {
+            return Ok(cached(c));
+        }
+        let cert = read()?;
+        let under = held.elapsed();
+        drop(guard);
+        let cached = keep(path, &cert);
+        Ok(Fetched { cert, from: Source::Chip { cached }, under, waited: held.duration_since(asked) })
+    }
+
+    /// Whether `c` is one DER SEQUENCE with a two-byte length, as the chip's certificate is (`30 82 hi lo`, 945 bytes
+    /// on this unit's 2.0C: docs/ops/captures/README.md), its length the rest of the bytes exactly, within the chip's
+    /// 2048.
+    pub fn is_certificate(c: &[u8]) -> bool {
+        match c {
+            [0x30, 0x82, hi, lo, ..] => c.len() <= 2048 && usize::from(u16::from_be_bytes([*hi, *lo])) + 4 == c.len(),
+            _ => false,
+        }
+    }
+
+    /// The certificate cached at `path`, when it is one; a file that isn't is removed.
+    pub fn read(path: &str) -> Option<Vec<u8>> {
+        let c = std::fs::read(path).ok()?;
+        if is_certificate(&c) {
+            return Some(c);
+        }
+        let _ = std::fs::remove_file(path);
+        None
+    }
+
+    /// Cache `c` at `path`, when it is one certificate: written aside (a name of this write's own, as two threads of a
+    /// process can write at once) and renamed. Whether it was cached.
+    pub fn keep(path: &str, c: &[u8]) -> bool {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        if !is_certificate(c) {
+            return false;
+        }
+        let tmp = format!("{path}.{}.{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed));
+        if std::fs::write(&tmp, c).and_then(|_| std::fs::rename(&tmp, path)).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            return false;
+        }
+        true
+    }
+
+    /// Forget the certificate cached at `path`. True when one was cached, and is gone.
+    pub fn forget(path: &str) -> bool {
+        std::fs::remove_file(path).is_ok()
     }
 }
 
-/// The certificate cached at `path`, when it is one DER SEQUENCE; one that isn't is removed.
-fn read_cert_cache(path: &str) -> Option<Vec<u8>> {
-    let c = std::fs::read(path).ok()?;
-    if is_der_sequence(&c) {
-        return Some(c);
-    }
-    let _ = std::fs::remove_file(path);
-    None
-}
-
-/// Cache `c` at `path`: written aside and renamed, so a reader never sees half of it.
-fn write_cert_cache(path: &str, c: &[u8]) {
-    let tmp = format!("{path}.{}", std::process::id());
-    if std::fs::write(&tmp, c).and_then(|_| std::fs::rename(&tmp, path)).is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-}
-
-/// The certificate as last read from the chip this boot (tmpfs). `cfg(test)`: a path of its own.
+/// The certificate the tunnel caches and reads ([`cert_cache::PATH`]). `cfg(test)`: a path of its own.
 #[cfg(not(test))]
-const CERT_CACHE: &str = "/tmp/carplay_mfi_cert.der";
+const CERT_CACHE: &str = cert_cache::PATH;
 #[cfg(test)]
 const CERT_CACHE: &str = "/tmp/mfi_i2c_local_selftest_cert.der";
 
@@ -422,7 +493,8 @@ fn sign_locked(chal: &[u8]) -> Option<(Vec<u8>, Duration)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{forget_cert, is_der_sequence, read_cert_cache, tunnel_line, write_cert_cache, CertTime, CERT_CACHE};
+    use super::cert_cache::{forget, is_certificate, keep, read};
+    use super::{forget_cert, tunnel_line, CertTime, CERT_CACHE};
     use std::time::Duration;
 
     #[test]
@@ -452,46 +524,106 @@ mod tests {
     /// The Mac's 2.6.0 review, CS-3: only one whole DER SEQUENCE with a two-byte length passes.
     #[test]
     fn only_one_whole_der_sequence_is_a_certificate() {
-        assert!(is_der_sequence(&der(941)), "the 2.0C's 945 bytes, 30 82 03 ad");
-        assert!(is_der_sequence(&der(2044)), "the chip's 2048 at most");
-        assert!(!is_der_sequence(&der(2045)), "past the chip's 2048");
+        assert!(is_certificate(&der(941)), "the 2.0C's 945 bytes, 30 82 03 ad");
+        assert!(is_certificate(&der(2044)), "the chip's 2048 at most");
+        assert!(!is_certificate(&der(2045)), "past the chip's 2048");
         let mut c = der(941);
         c.push(0);
-        assert!(!is_der_sequence(&c), "a byte past its length");
-        assert!(!is_der_sequence(&c[..900]), "cut short");
+        assert!(!is_certificate(&c), "a byte past its length");
+        assert!(!is_certificate(&c[..900]), "cut short");
         c = der(941);
         c[0] = 0x31;
-        assert!(!is_der_sequence(&c), "not a SEQUENCE");
+        assert!(!is_certificate(&c), "not a SEQUENCE");
         c = der(941);
         c[1] = 0x81;
-        assert!(!is_der_sequence(&c), "not a two-byte length");
-        assert!(!is_der_sequence(&[0u8; 945]), "a read of zeros");
-        assert!(!is_der_sequence(&[0xffu8; 945]), "a read of ones");
-        assert!(!is_der_sequence(&[0x30u8, 0x82, 0x00]), "shorter than its header");
-        assert!(!is_der_sequence(&[]), "empty");
+        assert!(!is_certificate(&c), "not a two-byte length");
+        assert!(!is_certificate(&[0u8; 945]), "a read of zeros");
+        assert!(!is_certificate(&[0xffu8; 945]), "a read of ones");
+        assert!(!is_certificate(&[0x30u8, 0x82, 0x00]), "shorter than its header");
+        assert!(!is_certificate(&[]), "empty");
     }
 
-    /// The cache holds and serves only a certificate; one that isn't is removed when read.
+    /// The cache holds and serves only a certificate; one that isn't is removed when read, and a read that isn't one is
+    /// never written.
     #[test]
     fn the_cache_serves_only_a_certificate() {
         let path = std::env::temp_dir().join(format!("mfi_i2c_local_cache_{}.der", std::process::id()));
         let p = path.to_str().unwrap();
-        write_cert_cache(p, &der(941));
-        assert_eq!(read_cert_cache(p), Some(der(941)));
+        assert!(keep(p, &der(941)));
+        assert_eq!(read(p), Some(der(941)));
         let mut bad = der(941);
         bad.truncate(600);
         std::fs::write(&path, &bad).unwrap();
-        assert_eq!(read_cert_cache(p), None, "a cache that isn't one is not served");
+        assert_eq!(read(p), None, "a cache that isn't one is not served");
         assert!(!path.exists(), "and is removed, so the next read goes to the chip");
-        assert_eq!(read_cert_cache(p), None, "none cached");
+        assert_eq!(read(p), None, "none cached");
+        assert!(!keep(p, &bad), "a read that isn't one is sent once, never cached");
+        assert!(!path.exists());
+        let tmps = std::fs::read_dir(std::env::temp_dir())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(&format!("mfi_i2c_local_cache_{}.der.", std::process::id())))
+            .count();
+        assert_eq!(tmps, 0, "no file written aside is left");
+    }
+
+    fn scratch(tag: &str) -> String {
+        let p = std::env::temp_dir().join(format!("mfi_i2c_local_fetch_{tag}_{}.der", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        p.to_str().unwrap().to_string()
+    }
+
+    /// A4: the rules every user shares. The first fetch of a boot reads the chip under the lock and caches the read;
+    /// every later one comes from the cache, with neither the lock nor the chip.
+    #[test]
+    fn a_fetch_reads_the_chip_once_then_serves_the_cache() {
+        use super::cert_cache::{fetch, Source};
+        let path = scratch("once");
+        let locks = std::cell::Cell::new(0);
+        let lock = || -> Result<(), ()> {
+            locks.set(locks.get() + 1);
+            Ok(())
+        };
+        let first = fetch(&path, lock, || Ok(der(941))).unwrap();
+        assert_eq!(first.from, Source::Chip { cached: true });
+        let second = fetch(&path, lock, || -> Result<Vec<u8>, ()> { panic!("no chip read once cached") }).unwrap();
+        assert_eq!((second.cert, second.from, second.under), (der(941), Source::Cache, Duration::ZERO));
+        assert_eq!(locks.get(), 1, "the lock for the chip read only");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// CS-3: a read that isn't one DER certificate is sent once and not cached; a cache another user filled while this
+    /// one waited is served without the chip; no lock or no read caches nothing.
+    #[test]
+    fn a_fetch_caches_only_a_certificate_and_looks_again_under_the_lock() {
+        use super::cert_cache::{fetch, keep, Source};
+        let path = scratch("rules");
+        let bad = fetch(&path, || Ok::<_, ()>(()), || Ok(vec![0u8; 945])).unwrap();
+        assert_eq!((bad.cert, bad.from), (vec![0u8; 945], Source::Chip { cached: false }));
+        assert!(!std::path::Path::new(&path).exists());
+        let filled = fetch(
+            &path,
+            || {
+                assert!(keep(&path, &der(941)), "another user caches it while this one waits");
+                Ok::<_, ()>(())
+            },
+            || panic!("filled meanwhile: no chip read"),
+        )
+        .unwrap();
+        assert_eq!(filled.from, Source::Cache);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(fetch(&path, || Err::<(), _>("busy"), || Ok(der(941))), Err("busy"));
+        assert_eq!(fetch(&path, || Ok::<_, &str>(()), || Err("nak")), Err("nak"));
+        assert!(!std::path::Path::new(&path).exists(), "nothing cached by either");
     }
 
     /// R1-3 (the Mac's round 2): forgetting says whether there was a cached certificate to forget.
     #[test]
     fn forgetting_says_whether_one_was_cached() {
-        write_cert_cache(CERT_CACHE, &der(941));
+        assert!(keep(CERT_CACHE, &der(941)));
         assert!(forget_cert(), "one was cached");
         assert!(!std::path::Path::new(CERT_CACHE).exists());
         assert!(!forget_cert(), "none left to forget");
+        assert!(!forget(CERT_CACHE));
     }
 }
