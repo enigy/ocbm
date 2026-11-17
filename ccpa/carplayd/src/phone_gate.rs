@@ -12,7 +12,8 @@
 //! outlives a phone's Bluetooth link (since A2 it starts with btd's host session, before any phone is named), and the
 //! next phone must not be refused by a carplayd that was told about the last one. One line: the phone's BR/EDR
 //! address, then ` wifi` once btd has sent that phone its 0x5703 (its Wi-Fi details) in this naming. btd names a
-//! bonded phone when its Bluetooth session starts, while no CarPlay session is up (no mark yet), and again at its
+//! bonded phone when its Bluetooth session starts, while no CarPlay session is up (no mark yet; the same phone back
+//! loses the mark of its earlier session unless its own CarPlay session is up or connecting, A2-2), and again at its
 //! 0x5703 (with the mark); it puts the earlier name back, mark and all, if that session ends without a 0x5703 (the
 //! Mac's 15 Nov bench: a phone that knows the AP was on it before its 0x5703, and was refused). The file is re-read at
 //! each decision, and discovery is woken when it changes (inotify, `watch.rs`). A new name forgets the refusals decided
@@ -167,7 +168,8 @@ impl PhoneGate {
     }
 
     /// The name file now, read afresh; another phone than last time (or none) forgets every refusal decided for the
-    /// old one and moves the epoch on. The live session is kept (`State::serving`).
+    /// old one and moves the epoch on, and so does the same phone named afresh: its mark gone, as btd names a phone
+    /// back on Bluetooth without the mark of its earlier session (A2-2). The live session is kept (`State::serving`).
     fn expected_now(&self, st: &mut State) -> Option<Named> {
         let now = self.file.as_ref().and_then(|f| std::fs::read_to_string(f).ok()).and_then(|s| Named::parse(&s));
         if now.as_ref().map(|n| &n.phone) != st.expected.as_ref().map(|n| &n.phone) {
@@ -175,6 +177,8 @@ impl PhoneGate {
                 eprintln!("[carplayd] phone gate: the phone btd serves changed; earlier refusals forgotten");
             }
             st.refused.clear();
+            st.epoch += 1;
+        } else if st.expected.as_ref().is_some_and(|n| n.wifi) && now.as_ref().is_some_and(|n| !n.wifi) {
             st.epoch += 1;
         }
         st.expected = now.clone();
@@ -550,9 +554,16 @@ mod tests {
         let (v, e4) = gate.dial(Some(OWNER));
         assert_eq!(v, Dial::Now, "put back with its mark (R4)");
         assert!(e4 > e3);
+        std::fs::write(&path, OWNER).unwrap();
+        let (v, e5) = gate.dial(Some(OWNER));
+        assert_eq!(v, Dial::Waiting, "A2-2: the same phone back on Bluetooth, named afresh without its mark");
+        assert!(e5 > e4, "a new naming of the same phone");
+        std::fs::write(&path, format!("{OWNER} wifi")).unwrap();
+        let (v, e6) = gate.dial(Some(OWNER));
+        assert_eq!((v, e6), (Dial::Now, e5), "its new 0x5703: the same naming");
         let _ = std::fs::remove_file(&path);
         assert_eq!(gate.dial(Some(OWNER)).0, Dial::Unnamed, "the file removed: nobody");
-        assert!(gate.epoch() > e4);
+        assert!(gate.epoch() > e6);
     }
 
     #[test]

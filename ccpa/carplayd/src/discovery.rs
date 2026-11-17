@@ -319,7 +319,8 @@ fn txt_line<'a>(props: impl Iterator<Item = (&'a str, &'a str)>) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Change {
     None,
-    /// Another phone named, or none.
+    /// Another phone named, or none, or the same phone named afresh (its mark gone: btd names a phone back on
+    /// Bluetooth without the mark of its earlier session, A2-2).
     Renamed,
     /// The same phone, and btd has now sent it its 0x5703: its held records may be dialled.
     Cleared,
@@ -386,7 +387,7 @@ impl Held {
     }
 
     fn change_to(&self, phone: &Option<String>, wifi: bool) -> Change {
-        if *phone != self.named {
+        if *phone != self.named || (self.wifi && !wifi) {
             Change::Renamed
         } else if wifi && !self.wifi {
             Change::Cleared
@@ -1954,6 +1955,30 @@ mod tests {
             ["dial_ok", "dial 192.168.43.101:7000", "dial 192.168.43.102:7000", "dial_ok"],
             "B's mark once for both its dials, then C named with its own"
         );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A2-2: the same phone back on Bluetooth is named afresh without its mark: its earlier dial is forgotten, its record
+    /// held, and dialled again only at this session's 0x5703.
+    #[test]
+    fn the_same_phone_named_afresh_is_dialled_again_only_after_its_new_0x5703() {
+        let (gate, path) = gate_naming(PHONE_B);
+        let fake = FakeBrowse::new(
+            &path,
+            false,
+            vec![
+                vec![resolved("B", PHONE_B, 101), Step::Name(PHONE_B.to_string())],
+                vec![resolved("B", PHONE_B, 101), Step::Quiet, Step::Name(handed(PHONE_B))],
+            ],
+        );
+        let dials = Rc::new(RefCell::new(Vec::new()));
+        let file = path.clone();
+        let mut d = dialer(&dials, move |_| {
+            assert!(std::fs::read_to_string(&file).unwrap().ends_with(" wifi"), "never between its two 0x5703s");
+            true
+        });
+        run_loop(&fake, &gate, &mut d, &mut Net::off(), NEVER);
+        assert_eq!(*dials.borrow(), [at(101), at(101)], "once per Bluetooth session's 0x5703");
         let _ = std::fs::remove_file(path);
     }
 
