@@ -120,6 +120,7 @@ dependencies = [
  "libc",
  "mdns-sd",
  "mfi",
+ "mfi-i2c-local",
  "ocbm-proto",
  "pairing",
  "portable-atomic",
