@@ -266,7 +266,8 @@ btd_expected() {
 # A btd serving a host's session, not one only armed between sessions (16 Nov 2026: the supervisor starts the next
 # host's btd early, Bluetooth up and invisible, and that btd counts as "running" long before it serves anything; the
 # release review of resident-bt, A1-3). A btd process, its phase published (/tmp/bt_phase: written as a btd's host
-# session begins, so never by an armed btd before its go, and removed by every teardown), and no armed btd waiting
+# session begins, so never by an armed btd before its go; the complete teardown removes it, and every arm removes
+# one before its btd starts, as the teardown that leaves a wired carplayd running does not), and no armed btd waiting
 # (/tmp/.btd_armed names none that lives).
 btd_session_up() {
   $BTD_RUNNING >/dev/null 2>&1 || return 1

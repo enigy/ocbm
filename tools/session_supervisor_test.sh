@@ -24,7 +24,7 @@ passes=0
 cat > "$T/prelude.sh" <<'EOF'
 R="$1"
 export SUP_PROC="$R/proc" SUP_SYS="$R/sys" CARPLAY_CFG_FILE="$R/cfg.yaml" FLAG="$R/host_present"
-export BTD_ARMED_FILE="$R/btd_armed" BTD_GO_FILE="$R/btd_go" BTD_GO_RESULT="$R/btd_go_result"
+export BTD_ARMED_FILE="$R/btd_armed" BTD_GO_FILE="$R/btd_go" BTD_GO_RESULT="$R/btd_go_result" BT_PHASE_FILE="$R/bt_phase"
 export ARM_OFF_FILE="$R/radio_arm_off" ARM_BENCH_OFF="$R/bench_arm_off" STARTUP_MARKS="$R/startup_marks"
 export RADIO_LOCKS="$R/locks" WL_TEARDOWN_MARK="$R/wl_teardown" CARPLAY_TRANSPORT_FLAG="$R/carplay_transport"
 export RADIO_OFF_FLAG="$R/radio_off" OCBM_SUP_FUNCS=1
@@ -186,8 +186,10 @@ check "! arm_gate && [ \"\$arm_next\" = 0 ]" "switched off: closed, and not aske
 
   run_case "$sh" '
 arm_next=1
+echo 7 > "$BT_PHASE_FILE"
 arm_wireless; settle
 check "[ \"\$arm_next\" = 0 ] && [ -n \"\$arm_pid\" ] && [ \"\$arm_since\" = 100 ]" "the arm: started once, its pid and time kept"
+check "[ ! -e \"\$BT_PHASE_FILE\" ]" "a phase a previous btd left is gone before the armed one starts (none while armed)"
 check "called \"env OCBM_BTD_ARM=1\"" "btd started armed (OCBM_BTD_ARM=1)"
 check "called \"radio_hal.sh wifi_ap_prep\" && called \"exec /usr/sbin/btd\"" "the AP configured ahead, then btd"
 check "[ -s \"\$R/body\" ] && ! grep -q -e carplayd -e hostapd \"\$R/body\" && grep -q /usr/sbin/btd \"\$R/body\"" \

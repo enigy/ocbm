@@ -595,7 +595,9 @@ applies the pairing window as always (discoverable inside it, or while no phone 
 placed with a host here (a session btd) and restarts the adapter; the new version's boot preload then precedes its
 arm. The update trial's commit (`ocbm_dispatch.sh` `btd_settles`) waits for a btd serving a host's session (a btd
 process, its phase published in `/tmp/bt_phase`, none armed in `/tmp/.btd_armed`), never one only armed (corrected
-16 Nov 2026, the release review's A1-3: the first build counted any btd process). *ocbmd
+16 Nov 2026, the release review's A1-3: the first build counted any btd process). An armed btd publishes no phase
+before its go, and every arm removes one a previous btd left (the teardown that leaves a wired `carplayd` running
+does not), so a phase never stands beside a btd only armed. *ocbmd
 restarting:* with a host here it drops presence, a teardown, then an arm or today's path; with none here nothing
 changes. *The supervisor restarting:* an armed btd it did not start is torn down at its start; it arms its own.
 *btd crashing while armed:* its controller is left powered and scan-off; `arm_watch` sees the btd gone and powers it

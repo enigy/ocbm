@@ -745,6 +745,7 @@ restore_stock_hostapd() {
 BTD_ARMED_FILE=${BTD_ARMED_FILE:-/tmp/.btd_armed}      # the armed btd's pid, written by btd once armed
 BTD_GO_FILE=${BTD_GO_FILE:-/tmp/.btd_go}               # the go: pid=<the armed btd> and the session's inputs
 BTD_GO_RESULT=${BTD_GO_RESULT:-/tmp/.btd_go_result}    # btd's answer: "ok <uptime ms>" or "fail <why>"
+BT_PHASE_FILE=${BT_PHASE_FILE:-/tmp/bt_phase}          # btd's phase mirror: a host session's, so none while armed
 ARM_OFF_FILE=${ARM_OFF_FILE:-/script/radio_arm_off}    # the owner's off switch, on flash
 ARM_BENCH_OFF=${ARM_BENCH_OFF:-/tmp/bench_arm_off}     # the bench's (box_common::bench_flag's rule)
 STARTUP_MARKS=${STARTUP_MARKS:-/tmp/startup_marks}     # the connect timeline's record (box_common::timeline)
@@ -827,6 +828,10 @@ arm_wireless() {
   _ar=0
   if ! pgrep -x carplayd >/dev/null 2>&1; then _ar=1; pkill -f carplayd 2>/dev/null; fi
   restore_stock_hostapd
+  # No phase while armed: a btd publishes one only once its host session has begun (after the go), so a phase file
+  # here is a previous btd's (the teardown that leaves a wired carplayd running does not remove it). An update trial's
+  # commit (ocbm_dispatch.sh, btd_session_up) counts a btd with a phase as one serving a host; this one serves none.
+  rm -f "$BT_PHASE_FILE" 2>/dev/null
   uptime_now
   echo "[sup] no host: arming Bluetooth for the next one (powered, invisible) at uptime $_up_raw"
   env OCBM_BTD_ARM=1 OCBM_WL_REAPED="$_ar" OCBM_AV_NAME=carplayd OCBM_AV_LOG=/tmp/carplayd_wl.log setsid sh -c '
