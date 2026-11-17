@@ -85,6 +85,7 @@ dependencies = [
  "bt-common",
  "carplay-iap2-core",
  "libc",
+ "mfi-i2c-local",
  "ocbm-proto",
  "sha2",
  "signal-hook",

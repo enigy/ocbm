@@ -134,7 +134,7 @@ fn run_active_session(
     // The connect timeline's AP events, for this session: hostapd's and udhcpd's lines as they land (ap_watch). It
     // ends at go-quiet below, or when this returns early.
     let ap_watch = ap_watch::start();
-    av::session_starting(); // carplayd, ready before the phone needs it (A2)
+    av::session_starting(); // carplayd and the MFi certificate cache, ready before the phone needs them (A2/A4)
     let accessory_name = carplay_iap2_core::message::accessory_name(ACCESSORY_BRAND);
     if let Err(e) = bt_bringup::bring_up(HCI_DEV, &accessory_name, just_opened()) {
         log(&format!("Bluetooth bring-up failed: {e} -- retrying"));

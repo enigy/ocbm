@@ -304,8 +304,10 @@ pub fn name_at_session_start(peer: Option<[u8; 6]>, bonded: bool, quiet: bool) -
 /// A Bluetooth session ended (`bt_driver::run`, at every exit): `handed_off` when it sent a 0x5703, `quiet` when btd is
 /// going quiet. A session that named its phone early (`early`) may put the earlier name back ([`at_session_end`]). Its
 /// thread is the only writer while it lasts: one Bluetooth session runs at a time (`SessionClaim`, held until
-/// `bt_driver::run` returns), and `teardown_av_layer` runs only after that thread is joined.
+/// `bt_driver::run` returns), and `teardown_av_layer` runs only after that thread is joined. The MFi certificate cache
+/// hears of every session's end here too ([`crate::mfi_local::session_over`]).
 pub fn put_back(early: Option<EarlyName>, handed_off: bool, quiet: bool) {
+    crate::mfi_local::session_over(handed_off);
     let Some(early) = early else { return };
     let seen = Seen {
         named: named_now().map(|n| n.phone),
@@ -554,10 +556,11 @@ fn identity_moved() -> bool {
 /// until the supervisor's teardown or btd's own, as one started at a 0x5703 does.
 ///
 /// Idempotent: nobody is named at a session's start, so the name file is cleared again; a carplayd already up is
-/// kept.
+/// kept. Also warms the MFi certificate cache when nothing is cached yet (A4, `mfi_local::warm_cert_cache`).
 pub fn session_starting() {
     let _ = std::fs::remove_file(EXPECT_PHONE_FILE);
     UNGATED.store(false, Ordering::Relaxed);
+    crate::mfi_local::warm_cert_cache();
     let session = AV_SESSION.load(Ordering::Acquire);
     if let Err(e) = std::thread::Builder::new().name("av-early".into()).spawn(move || early_start(session)) {
         log(&format!("carplayd not started at the session's start ({e}); the 0x5703 starts it, as before"));
