@@ -37,7 +37,7 @@
 # ocbm_install.sh gets from ::respawn.
 #
 # Test hooks (tools/ocbm_stageb_test.sh, tools/ocbm_update_test.sh): ROOT RUN STICK PROC POLL
-# STICK_WAIT STICK_PKG_WAIT REBOOT ANSWER_SECS UMOUNT INSTALL_START INSTALL_WAIT BTD_SECS BTD_UP.
+# STICK_WAIT STICK_PKG_WAIT REBOOT ANSWER_SECS UMOUNT INSTALL_START INSTALL_WAIT BTD_SECS BTD_UP BTD_RUNNING.
 ROOT="${ROOT:-}"
 RUN="${RUN:-/tmp}"
 STICK="${STICK:-/mnt/UPAN}"
@@ -55,7 +55,8 @@ UMOUNT="${UMOUNT:-umount}"
 INSTALL_START="${INSTALL_START:-60}"   # deliver(): how long an install image may take to start its once.sh
 INSTALL_WAIT="${INSTALL_WAIT:-900}"    # ...and to finish
 BTD_SECS="${BTD_SECS:-90}"             # an update's trial: how long the commit waits for btd (btd_settles)
-BTD_UP="${BTD_UP:-pgrep -f /usr/sbin/btd}"   # ...and how it asks whether btd runs
+BTD_UP="${BTD_UP:-btd_session_up}"     # ...how it asks whether a btd serves a host's session (below)
+BTD_RUNNING="${BTD_RUNNING:-pgrep -f /usr/sbin/btd}"   # ...and whether a btd process runs at all
 update_trial=0
 export PATH=${OCBM_TEST_PATH:+$OCBM_TEST_PATH:}/usr/sbin:/usr/bin:/sbin:/bin:/tmp/bin:$PATH
 
@@ -262,19 +263,32 @@ btd_expected() {
   case "$(cat "$RUN/projection_owner" 2>/dev/null)" in wired-*) return 1 ;; esac
   return 0
 }
+# A btd serving a host's session, not one only armed between sessions (16 Nov 2026: the supervisor starts the next
+# host's btd early, Bluetooth up and invisible, and that btd counts as "running" long before it serves anything; the
+# release review of resident-bt, A1-3). A btd process, its phase published (/tmp/bt_phase: written as a btd's host
+# session begins, so never by an armed btd before its go; the complete teardown removes it, and every arm removes
+# one before its btd starts, as the teardown that leaves a wired carplayd running does not), and no armed btd waiting
+# (/tmp/.btd_armed names none that lives).
+btd_session_up() {
+  $BTD_RUNNING >/dev/null 2>&1 || return 1
+  [ -e "$RUN/bt_phase" ] || return 1
+  _ba=$(cat "$RUN/.btd_armed" 2>/dev/null)
+  case "$_ba" in ''|*[!0-9]*) return 0 ;; esac
+  [ ! -d "$PROC/$_ba" ]
+}
 btd_settles() {
   waited=0; seen=0
   while [ "$waited" -lt "$BTD_SECS" ]; do
     btd_expected || { log "update trial: btd not expected (radios off or wired); not waited for"; return 0; }
     if $BTD_UP >/dev/null 2>&1; then
       seen=$((seen + 1))
-      [ "$seen" -ge 2 ] && { log "update trial: btd is up"; return 0; }
+      [ "$seen" -ge 2 ] && { log "update trial: btd is up, serving the host's session"; return 0; }
     else
       seen=0
     fi
     sleep "$POLL"; waited=$((waited + POLL))
   done
-  log "update trial: btd never came up in $BTD_SECS s"
+  log "update trial: btd never came up in $BTD_SECS s (no btd serving a host's session at two looks in a row)"
   return 1
 }
 

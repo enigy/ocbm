@@ -4,8 +4,12 @@
 # the Rust daemons) asks for "wifi up" / "bt up" and never names a chip, a module, a firmware
 # path or an attach helper.
 #
-# VERBS   probe | status | wifi_ap_on | wifi_ap_off | bt_on | bt_off | preload
+# VERBS   probe | status | wifi_ap_on | wifi_ap_off | wifi_ap_prep | bt_on | bt_off | preload
 # EXIT    0 converged now   1 ran and failed   2 already converged   3 unsupported on this unit
+#
+# wifi_ap_prep (16 Nov 2026) writes the AP's configuration ahead, with no host here and nothing raised: the files
+# radio_ap_up.sh would write at the AP's bring-up, and a stamp that lets the next wifi_ap_on go straight to launching
+# it. The supervisor runs it as it arms Bluetooth between host sessions (session_supervisor.sh, "Armed Bluetooth").
 #
 # ---------------------------------------------------------------------------------------------
 # WHY THE VERB AND SCRIPT NAMES LOOK LIKE THIS. session_supervisor's teardown runs inside a
@@ -64,8 +68,13 @@ LOGP="[radio_hal]"
 # Uptime (seconds since boot, /proc/uptime) on every line: the box clock is bogus until the host's
 # CT_SETTIME, so cold-boot radio bring-up (firmware preload, hciattach, convergence) is otherwise
 # untimeable in a drive log (Carlink3, 2026-10-20). Plain text after the prefix, so `grep` on the
-# message words still matches.
-log() { echo "$LOGP [up $(cut -d' ' -f1 /proc/uptime 2>/dev/null)] $*"; }
+# message words still matches. Read with `read`, not `cut`: a fork per line was about 15 ms each on the
+# path a host's arrival waits on (16 Nov 2026).
+log() {
+  _log_up=""
+  read -r _log_up _log_idle 2>/dev/null </proc/uptime
+  echo "$LOGP [up ${_log_up}] $*"
+}
 
 # Single-flight per subsystem. mkdir is the portable atomic test-and-set on busybox (no flock
 # dependency). A concurrent second bring-up must not run - the supervisor can manufacture
@@ -376,7 +385,63 @@ apply_sco() {  # $1 = hci dev; echoes what it did. 0 = applied, 3 = nothing to a
 # =============================================================================================
 # WLAN
 # =============================================================================================
+# The AP's configuration written ahead (wifi_ap_prep; radio_ap_up.sh PREP leaves this stamp) for an interface that is
+# still there. Cheap on purpose, no fork: radio_ap_up.sh checks the rest (nothing it read changed since) before it
+# trusts it. Sets _api, the interface.
+AP_PREPARED=/tmp/.radio_ap_prepared
+ap_prepared_iface() {
+  _api=""
+  read -r _api _api_rest 2>/dev/null <"$AP_PREPARED"
+  [ -n "$_api" ] || return 1
+  [ -e "/sys/class/net/$_api/wireless" ] || [ -e "/sys/class/net/$_api/phy80211" ]
+}
+
+# Write the AP's configuration ahead, raising nothing: no address, no hostapd, no udhcpd. The armed state between host
+# sessions runs it, so the host's arrival launches the AP at once (session_supervisor.sh, "Armed Bluetooth"). Only for
+# the owned AP layer (backend=mapped), and only with the WLAN driver's interface there: the boot preload loads it on
+# a part whose Bluetooth needs it, and a session leaves it loaded. Without either, the AP is configured at its
+# bring-up, as before.
+do_wifi_ap_prep() {
+  caps || { log "AP prep: no descriptor - nothing prepared"; return 3; }
+  [ "$RADIO_BACKEND" = mapped ] || {
+    log "AP prep: backend=$RADIO_BACKEND brings its AP up with its own scripts - nothing prepared"; return 3; }
+  _i=$(wlan_iface 2>/dev/null) || {
+    rm -f "$AP_PREPARED"; log "AP prep: no WLAN interface - the AP is configured at its bring-up"; return 3; }
+  [ -x /script/radio_ap_up.sh ] || { log "AP prep: the owned AP layer (/script/radio_ap_up.sh) is not installed"; return 1; }
+  if ap_running; then
+    log "AP prep: an AP is running on $_i - its configuration is left as it is"; return 2
+  fi
+  RADIO_WLAN_IF="$_i" RADIO_BOX_NAME="$(box_name)" sh /script/radio_ap_up.sh PREP 2>&1 | sed "s/^/$LOGP   /"
+  if ap_prepared_iface && [ "$_api" = "$_i" ]; then
+    log "AP configured ahead on $_i (nothing raised: no address, no AP, no DHCP)"
+    return 0
+  fi
+  log "AP prep did not finish on $_i - the AP is configured at its bring-up"
+  return 1
+}
+
 do_wifi_ap_on() {
+  # FAST PATH (16 Nov 2026). The configuration was written ahead (wifi_ap_prep) and the WLAN driver is loaded (its
+  # interface is there): straight to the owned AP layer, whose first launch is then hostapd. No descriptor read, no
+  # driver step, no configuration writes: about 0.9 s of every connect went there before hostapd started.
+  if ap_prepared_iface && [ -x /script/radio_ap_up.sh ]; then
+    log "AP configured ahead on $_api - launching it"
+    ONDEMAND_WIFI=1 RADIO_WLAN_IF="$_api" sh /script/radio_ap_up.sh AP 2>&1 | sed "s/^/$LOGP   /"
+    _n=0; while [ "$_n" -lt 50 ]; do ap_running && break; _n=$((_n+1)); sleep 0.2; done
+    if ap_running; then
+      # The address the AP layer configured, from its stamp (rewritten if it configured afresh), and the MAC, both
+      # with `read`: this lock is what btd's 0x5703 reply waits on.
+      _api_ip=""; _api_mac=""
+      read -r _api _api_name _api_ip _api_rest 2>/dev/null <"$AP_PREPARED"
+      read -r _api_mac 2>/dev/null <"/sys/class/net/$_api/address"
+      publish "$WLAN_STATE" "result=ok" "backend=mapped" "ap_iface=$_api" "ap_ip=$_api_ip" "wlan_mac=$_api_mac"
+      log "AP converged on $_api"
+      return 0
+    fi
+    publish "$WLAN_STATE" "result=fail" "backend=mapped" "ap_iface=$_api" "detail=ap-did-not-start"
+    log "AP did not start on $_api"
+    return 1
+  fi
   caps || { publish "$WLAN_STATE" "result=unsupported" "detail=no-descriptor"; return 3; }
 
   if ap_running && wlan_iface >/dev/null 2>&1; then
@@ -463,6 +528,29 @@ do_wifi_ap_on() {
 
 ap_ip_of() { ifconfig "$1" 2>/dev/null | sed -n 's/.*inet addr:\([0-9.]*\).*/\1/p' | head -1; }
 
+# The AP's DHCP server(s), by config path (never the NCM server, `busybox udhcpd -f /tmp/udhcpd_ncm.conf`), and their
+# stop: SIGTERM, up to 3 s for them to go, then SIGKILL and up to 1 s more. BusyBox udhcpd writes its lease file
+# (/var/lib/udhcpd.leases, on the jffs2 root) as it exits on SIGTERM; with flash slow (garbage collection just after an
+# update's commit removed its .prev binaries) the server outlived the teardown, the next AP start took it for its own and
+# started none, and once it had gone the AP had no DHCP (the release review of resident-bt, A3-1; radio_ap_up.sh keeps
+# the same functions for its start, whose stop takes 1.5 s at most). AP_DHCP_MATCH is a test hook.
+AP_DHCP_MATCH=${AP_DHCP_MATCH:-udhcpd .*etc/udhcpd.conf}
+ap_dhcp_pids() { ps 2>/dev/null | grep -v grep | grep "$AP_DHCP_MATCH" | awk '{print $1}'; }
+ap_pids_live() { for _apl in "$@"; do kill -0 "$_apl" 2>/dev/null && return 0; done; return 1; }
+ap_dhcp_stop() {
+  _ads=$(ap_dhcp_pids)
+  [ -n "$_ads" ] || return 0
+  for _adp in $_ads; do kill "$_adp" 2>/dev/null; done
+  _adn=0; while [ "$_adn" -lt 15 ] && ap_pids_live $_ads; do _adn=$((_adn + 1)); sleep 0.2; done
+  ap_pids_live $_ads || return 0
+  log "the AP's DHCP server is still there 3 s after SIGTERM (its lease file on flash?) - SIGKILL"
+  for _adp in $_ads; do kill -9 "$_adp" 2>/dev/null; done
+  _adn=0; while [ "$_adn" -lt 10 ] && ap_pids_live $_ads; do _adn=$((_adn + 1)); sleep 0.1; done
+  ap_pids_live $_ads || return 0
+  log "the AP's DHCP server survived SIGKILL (a kernel wait?)"
+  return 1
+}
+
 do_wifi_ap_off() {
   caps || true
   # Chipset-neutral teardown. Deliberately NO module unload: whether rmmod is safe (and whether
@@ -479,10 +567,10 @@ do_wifi_ap_off() {
   # the management link - on a box with no UART that is the only way in, and it is exactly what
   # the vendor's close_bluetooth_wifi.sh does. Identify it by its CONFIG PATH, which is
   # unambiguous: the NCM server runs `busybox udhcpd -f /tmp/udhcpd_ncm.conf`.
-  for _p in $(ps 2>/dev/null | grep -v grep | grep "udhcpd .*etc/udhcpd.conf" | awk '{print $1}'); do
-    kill "$_p" 2>/dev/null
-  done
-  [ -e /var/run/udhcpd.pid ] && kill "$(cat /var/run/udhcpd.pid 2>/dev/null)" 2>/dev/null
+  # And see it GONE (ap_dhcp_stop): one still writing its lease file was the next AP's DHCP server
+  # that never was. Its pidfile's pid is no longer killed blind: the server is found by its config path
+  # as above, and a stale pidfile can name any process.
+  ap_dhcp_stop
   _i=$(wlan_iface 2>/dev/null) && ifconfig "$_i" down 2>/dev/null
   _n=0; while [ "$_n" -lt 25 ] && ap_running; do _n=$((_n+1)); sleep 0.2; done
   ap_running && { log "hostapd still running after teardown"; publish "$WLAN_STATE" "result=fail" "detail=ap-survived"; return 1; }
@@ -494,8 +582,10 @@ do_wifi_ap_off() {
 # =============================================================================================
 # BOOT PRELOAD (on by default since 13 Nov 2026, off with /script/radio_preload_off; started by ocbm_boot.sh)
 # =============================================================================================
-# Load this unit's WLAN driver and attach BT, then power BT down: exactly the state the supervisor
+# Load this unit's WLAN driver and attach BT, then power BT down: exactly the state a teardown
 # leaves between sessions (drivers loaded, attached, hci0 DOWN, no AP - nothing a phone can see).
+# The supervisor then arms Bluetooth powered but invisible for the next host unless /script/radio_arm_off
+# (session_supervisor.sh, "Armed Bluetooth"); this preload is what attaches it for that at boot.
 # The first app connect after power-up then skips the driver and firmware load (~7 s measured
 # 2026-10-20, IW416), done here while the box waits for the head unit to boot. A deliberate,
 # owner-approved exception to docs/carplay/04_CAPABILITIES_AND_CONFIG.md directive 3 - see there.
@@ -844,6 +934,7 @@ do_bt_off() {
 }
 
 # =============================================================================================
+[ "${RADIO_HAL_FUNCS:-}" = 1 ] && return 0   # sourced for its functions (tools/radio_ap_up_test.sh)
 case "$VERB" in
   probe)
     caps || exit 3
@@ -863,11 +954,12 @@ case "$VERB" in
     exit 0 ;;
   wifi_ap_on)  lock_take wlan || exit 1; do_wifi_ap_on;  _r=$?; lock_drop wlan; exit $_r ;;
   wifi_ap_off) lock_take wlan || exit 1; do_wifi_ap_off; _r=$?; lock_drop wlan; exit $_r ;;
+  wifi_ap_prep) lock_take wlan || exit 1; do_wifi_ap_prep; _r=$?; lock_drop wlan; exit $_r ;;
   bt_on)       lock_take bt   || exit 1; do_bt_on;       _r=$?; lock_drop bt;   exit $_r ;;
   bt_off)      lock_take bt   || exit 1; do_bt_off;      _r=$?; lock_drop bt;   exit $_r ;;
   # Both locks, wlan first (the supervisor's own order, one at a time, so no deadlock): bt_on loads
   # the WLAN driver, which an app-driven wifi_ap_on arriving mid-preload must not race.
   preload)     lock_take wlan || exit 1; lock_take bt || { lock_drop wlan; exit 1; }
                do_preload; _r=$?; lock_drop bt; rm -rf /tmp/.radio_lock_wlan 2>/dev/null; exit $_r ;;
-  *) echo "$LOGP usage: radio_hal.sh probe|status|wifi_ap_on|wifi_ap_off|bt_on|bt_off|preload" >&2; exit 64 ;;
+  *) echo "$LOGP usage: radio_hal.sh probe|status|wifi_ap_on|wifi_ap_off|wifi_ap_prep|bt_on|bt_off|preload" >&2; exit 64 ;;
 esac

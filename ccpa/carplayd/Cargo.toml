@@ -33,6 +33,14 @@ libc = "0.2"
 # (flume + polling + socket2), so folding discovery in here dropped tokio from the project's box
 # binaries entirely rather than moving an async runtime into the A/V process.
 mdns-sd = "0.11"
+# mdns-sd's own channel crate, with its Selector (A2): discovery waits on its browse and on the wakes from btd's name
+# file and the address watch at once, instead of polling the name. The same flume mdns-sd links (its Receiver type).
+flume = { version = "0.11", default-features = false, features = ["select"] }
+# The bench flags' one reading (`box_common::bench_flag`, /tmp/bench_dial_early). Linked already through receiver.
+box-common = { path = "../../crates/box-common" }
+# The boot's cached MFi certificate (`cert_cache`, A4): auth-setup's signer serves it, by the tunnel's rules. Linked
+# already through receiver.
+mfi-i2c-local = { path = "../../crates/vendor/mfi-i2c-local" }
 
 # `mic-uplink-eld` statically links a cross-built libfdk-aac, so it needs FDK_AAC_PREFIX for the
 # SAME ABI. Only `install-android-x86_64` and the armv7 box prefix exist today, which is why the

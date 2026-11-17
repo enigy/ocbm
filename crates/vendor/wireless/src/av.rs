@@ -11,20 +11,40 @@
 //!     advertise `_airplay._tcp` on `wlan0` (`RX_ADDR` = the AP gateway) + browse
 //!     the phone's `_carplay-ctrl._tcp` + connect-out `GET /ctrl-int/1/connect`.
 //!
-//! Idempotent by "start if not already running", so calling it on every 0x5703 is safe: repeated
-//! 0x5702s are no-ops, and a reconnect re-spawns a daemon that died. Children are `setsid`-detached so
+//! carplayd starts as btd's host session begins ([`session_starting`], A2), so it is up, advertising and
+//! browsing before the phone needs it, rather than at the phone's 0x5703, where it had to start, advertise and
+//! find the phone's `_carplay-ctrl` after the handoff (0.4-1.2 s on the 16 Nov bench). It dials nobody until btd
+//! names a phone and has sent that phone its 0x5703 (the name file's `wifi` mark, [`expect_phone`]).
+//! [`ensure_av_layer`] stays at the 0x5703 as the idempotent fallback it was: "start if not already running", so
+//! repeated 0x5702s are no-ops, and a reconnect re-spawns a daemon that died. Children are `setsid`-detached so
 //! they outlive this RFCOMM session (and this process).
 
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
-/// Serializes `ensure_av_layer` so two 0x5703 handshakes in quick succession can't BOTH spawn carplayd
-/// / rx-connect (the observed "Address in use" double-spawn): the double-fork means a just-spawned
-/// daemon isn't visible to `pgrep` for a few ms, so without this lock + the post-spawn visibility wait
-/// the second caller's `running()` check misses the first spawn and starts a duplicate.
+/// Serializes every start and stop of carplayd: `ensure_av_layer` (two 0x5703 handshakes in quick succession can't BOTH
+/// spawn carplayd — the observed "Address in use" double-spawn: the double-fork means a just-spawned daemon isn't
+/// visible to `pgrep` for a few ms, so without this lock + the post-spawn visibility wait the second caller's
+/// `running()` check misses the first spawn and starts a duplicate), the session's-start spawn ([`session_starting`]),
+/// and `teardown_av_layer`, which so never runs while a spawn is half done (#106: a spawn finishing after the teardown
+/// would orphan carplayd).
 static AV_LOCK: Mutex<()> = Mutex::new(());
+
+/// Moved on by every teardown: a session's-start spawn that finds it moved since its session began was torn down
+/// before it got the lock, and spawns nothing.
+static AV_SESSION: AtomicU64 = AtomicU64::new(0);
+
+/// The identity the running carplayd was started with (`box_identity::derive`), when this process started it. Checked
+/// again at each 0x5703 ([`identity_moved`]): an early start can come before the Wi-Fi driver whose address the
+/// identity is derived from (`box_identity.rs`), and a carplayd advertising another identity than it pairs with at
+/// the 0x5703 would fail the phone's pair-verify.
+static SPAWNED_ID: Mutex<Option<(String, String, String)>> = Mutex::new(None);
+
+/// btd could not name the phone at its 0x5703 ([`expect_phone`]): as 2.6.0 did then, carplayd serves any phone, so
+/// the next spawn is not handed the name file. Cleared as a host session begins and at teardown.
+static UNGATED: AtomicBool = AtomicBool::new(false);
 
 /// When btd itself last wrote `/tmp/carplay_transport` ("wireless", at the 0x5703 handoff), as the file's own
 /// modification time. A flag still bearing it is btd's claim, not a carplayd with a phone's control connection
@@ -80,33 +100,81 @@ const AIRPLAYD_BIN_DEFAULT: &str = "/usr/sbin/carplayd";
 /// Where btd names the phone it serves, for carplayd's phone gate (`ccpa/carplayd/src/phone_gate.rs`,
 /// two-iPhone bench 2026-11-01: a switch's dropped phone, still on the AP, was dialled and hijacked the
 /// session). Only the carplayd spawned below is told the path; the wired one never gates.
+///
+/// One line: the named phone's BR/EDR address, then ` wifi` once btd has sent that phone its 0x5703 (its Wi-Fi details)
+/// in this naming. carplayd serves only the phone it names and dials it only with the mark ([`Named`]); absent, no phone
+/// is named and an armed carplayd serves and dials nobody. Written whole, through a rename, so carplayd's watch
+/// (inotify) sees each change as one.
 pub const EXPECT_PHONE_FILE: &str = "/tmp/carplay_expect_phone";
 
-/// Name `peer` (its BR/EDR address) as the phone carplayd serves, or no phone: then the gate lets every
-/// phone through, as before. Called at each Wi-Fi handoff, before the AV layer is ensured, so a carplayd
-/// latched from an earlier phone follows the one that just handed off. Written whole, through a rename.
-pub fn expect_phone(peer: Option<[u8; 6]>) {
-    match peer {
-        Some(a) => {
-            if let Err(e) = write_name(&a) {
-                println!("[av] could not name the phone for carplayd ({e}); it serves any phone");
-                let _ = std::fs::remove_file(EXPECT_PHONE_FILE);
-            }
+/// The name file's mark: btd sent the named phone its 0x5703.
+const WIFI_MARK: &str = "wifi";
+
+/// What the name file says: the phone btd names, and whether btd has sent it its 0x5703 in this naming (`wifi`). The
+/// mark goes with the naming: a phone named at its Bluetooth session's start has none, the same phone back on Bluetooth
+/// loses it unless its own CarPlay session is up or connecting (A2-2: no dial before this session's 0x5703), and a
+/// put-back name ([`put_back`]) carries the one it had.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Named {
+    phone: [u8; 6],
+    wifi: bool,
+}
+
+impl Named {
+    /// The file's text.
+    fn text(self) -> String {
+        let addr = crate::control::fmt_addr(&self.phone);
+        if self.wifi {
+            format!("{addr} {WIFI_MARK}")
+        } else {
+            addr
         }
-        None => {
-            let _ = std::fs::remove_file(EXPECT_PHONE_FILE);
-        }
+    }
+
+    /// The file's text read back; `None` for one that names no phone.
+    fn parse(s: &str) -> Option<Named> {
+        let mut words = s.split_whitespace();
+        let phone = crate::control::parse_addr(words.next()?)?;
+        Some(Named { phone, wifi: words.any(|w| w == WIFI_MARK) })
     }
 }
 
-fn write_name(a: &[u8; 6]) -> std::io::Result<()> {
-    let tmp = format!("{EXPECT_PHONE_FILE}.tmp");
-    std::fs::write(&tmp, crate::control::fmt_addr(a)).and_then(|_| std::fs::rename(&tmp, EXPECT_PHONE_FILE))
+/// The phone's 0x5703 is written (`bt_driver`, on the reply's success): name `peer` for carplayd with the mark, so
+/// carplayd may dial it from now on, and follows it if it served another phone. `None` names no phone. Called before
+/// the AV layer is ensured. A carplayd started with an identity derive() no longer gives is stopped first
+/// ([`identity_moved`]), before the mark lets it dial; `ensure_av_layer` then starts it again.
+///
+/// A name that cannot be written leaves carplayd serving any phone, as 2.6.0 did: the gated carplayd is stopped, and
+/// the one `ensure_av_layer` starts next is not handed the name file ([`UNGATED`]).
+pub fn expect_phone(peer: Option<[u8; 6]>) {
+    let Some(a) = peer else {
+        let _ = std::fs::remove_file(EXPECT_PHONE_FILE);
+        return;
+    };
+    {
+        let _guard = AV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if identity_moved() {
+            log("the box identity is not the one carplayd started with (the Wi-Fi driver came up after it): carplayd restarts with it");
+            stop_carplayd();
+        }
+    }
+    if let Err(e) = write_named(Named { phone: a, wifi: true }) {
+        log(&format!("could not name the phone for carplayd ({e}); a carplayd that serves any phone takes over, as before"));
+        let _ = std::fs::remove_file(EXPECT_PHONE_FILE);
+        UNGATED.store(true, Ordering::Relaxed);
+        let _guard = AV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        stop_carplayd();
+    }
 }
 
-/// The phone the file names now; `None` = none.
-fn named_now() -> Option<[u8; 6]> {
-    std::fs::read_to_string(EXPECT_PHONE_FILE).ok().and_then(|s| crate::control::parse_addr(s.trim()))
+fn write_named(n: Named) -> std::io::Result<()> {
+    let tmp = format!("{EXPECT_PHONE_FILE}.tmp");
+    std::fs::write(&tmp, n.text()).and_then(|_| std::fs::rename(&tmp, EXPECT_PHONE_FILE))
+}
+
+/// The name file now; `None` = no phone named.
+fn named_now() -> Option<Named> {
+    std::fs::read_to_string(EXPECT_PHONE_FILE).ok().and_then(|s| Named::parse(&s))
 }
 
 fn tail(a: [u8; 6]) -> String {
@@ -119,43 +187,93 @@ fn log(m: &str) {
     println!("@{ms} [av] {m}");
 }
 
-/// A name btd wrote as a Bluetooth session started, and the name it replaced ([`name_at_session_start`]).
+/// A name btd wrote as a Bluetooth session started, and the name it replaced, its mark with it ([`name_at_session_start`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EarlyName {
     phone: [u8; 6],
-    before: Option<[u8; 6]>,
+    before: Option<Named>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AtStart {
     Name(EarlyName),
+    /// The phone named already, with the mark from an earlier Bluetooth session, back while no CarPlay session of its
+    /// own is up or connecting: named afresh without it, so carplayd dials it only after this session's 0x5703.
+    Unmark,
     /// A CarPlay session is up here: its 0x5703 names this phone, as before.
     SessionUp,
-    /// No peer, not bonded, it is named already, or btd is going quiet.
+    /// No peer, not bonded, it is named already (with no mark, or with one while its own CarPlay is, or may be, up or
+    /// connecting), or btd is going quiet.
     Leave,
+}
+
+/// A CarPlay session here, up or connecting, as btd can tell it as a Bluetooth session starts: carplayd's identity
+/// names its phone from the SETUP to the session's end; before the SETUP (a control connection alone) nobody can tell
+/// whose it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CarPlayNow {
+    /// None up or connecting.
+    Idle,
+    /// One up or connecting: its phone, once carplayd's identity names it.
+    Of(Option<[u8; 6]>),
+}
+
+impl CarPlayNow {
+    /// What carplayd shows now ([`crate::control::carplay_phone`], [`crate::control::carplay_session_up`]).
+    fn now() -> Self {
+        match crate::control::carplay_phone() {
+            Some(q) => CarPlayNow::Of(Some(q)),
+            None if crate::control::carplay_session_up() => CarPlayNow::Of(None),
+            None => CarPlayNow::Idle,
+        }
+    }
+
+    /// Whether it is, or may be, `p`'s: carplayd's identity names `p`, or no phone yet.
+    fn may_be(self, p: [u8; 6]) -> bool {
+        matches!(self, CarPlayNow::Of(q) if q.is_none_or(|q| q == p))
+    }
 }
 
 /// The Mac's 15 Nov bench: btd named a phone only after its 0x5703, and a phone that knows the AP is on it
 /// within ~1.5 s of its Bluetooth link, before that. carplayd refused its record for the last phone's, and
 /// nothing looked again until the browser re-queried, 84 s later. So the phone is named as its session
 /// starts, by the 0x5703's own rule: only a phone this box is bonded with (`bonded`, `wifi_config_allowed`,
-/// R3). And only while no CarPlay session is up here (`session_up`): a session can outlive its phone's
+/// R3). And only while no CarPlay session is up here (`carplay`): a session can outlive its phone's
 /// Bluetooth link, and naming another phone would let that phone take it before it had handed off (R2).
-/// Not while btd is going quiet (`quiet`): its teardown removes the name anyway.
+/// Not while btd is going quiet (`quiet`): its teardown removes the name anyway. The early name has no mark: carplayd
+/// may serve that phone, and dials it only after its 0x5703 ([`expect_phone`]).
+///
+/// The owner's rule (A2-2): no dial before THIS Bluetooth session's 0x5703. So the phone named already, its mark from an
+/// earlier Bluetooth session, is named afresh without it ([`AtStart::Unmark`]) unless a CarPlay session of its own is
+/// up or connecting here: when none is, or another phone's is (carplayd dials the named phone while another phone's
+/// session is live). With its own (outliving its Bluetooth link: R2), or a control connection before its SETUP (while
+/// the phone is named, its own coming up, as [`at_session_end`] takes it), the name stays as it is: carplayd never
+/// dials a live session, and the connection coming up needs no dial.
+///
+/// Known and left so (the second review, LOW): the rule holds at the session's start only. The mark kept there is the
+/// earlier session's, and if that CarPlay ends, or its connection never reaches a SETUP, before this session's 0x5703,
+/// carplayd may dial the phone on it when its record resolves again. That is a reconnect dial to the phone whose own
+/// CarPlay this box was serving or setting up moments before, handed off earlier in this host session, as 2.6.0 made
+/// after every drop; no other phone can come in by it. Closing it would mean dropping the mark under a live session,
+/// so that a Wi-Fi drop mid-session waits for a 0x5703 the phone need not ask for while its CarPlay is up, or watching
+/// for CarPlay's end from `bt_driver` while the Bluetooth session lasts; neither is benched.
 fn at_session_start(
     peer: Option<[u8; 6]>,
     bonded: bool,
-    named: Option<[u8; 6]>,
-    session_up: bool,
+    named: Option<Named>,
+    carplay: CarPlayNow,
     quiet: bool,
 ) -> AtStart {
     match peer {
-        Some(p) if bonded && named != Some(p) && !quiet => {
-            if session_up {
+        Some(p) if bonded && !quiet && named.map(|n| n.phone) != Some(p) => {
+            if carplay != CarPlayNow::Idle {
                 AtStart::SessionUp
             } else {
                 AtStart::Name(EarlyName { phone: p, before: named })
             }
+        }
+        Some(p) if bonded && !quiet && named == Some(Named { phone: p, wifi: true }) && !carplay.may_be(p) => {
+            AtStart::Unmark
         }
         _ => AtStart::Leave,
     }
@@ -174,8 +292,8 @@ struct Seen {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AtEnd {
-    /// Write the earlier name back; `None` removes the file (see [`at_session_end`]).
-    PutBack(Option<[u8; 6]>),
+    /// Write the earlier name back, with the mark it had; `None` removes the file (see [`at_session_end`]).
+    PutBack(Option<Named>),
     /// The phone's CarPlay is live: it is the phone served now, as after a 0x5703.
     CarPlayLive,
     /// carplayd holds a control connection: the named phone's own, coming up.
@@ -192,9 +310,10 @@ enum AtEnd {
 /// goes back. Never over a name written since (`seen.named`); not while that phone's own CarPlay is live
 /// (`seen.carplay`, carplayd's identity), as a CarPlay session can outlive its Bluetooth link and the other
 /// phone would take it; and not while carplayd holds a control connection (`seen.connected`), which during
-/// an early name is the named phone's own, before its SETUP publishes it. No earlier name puts back no file:
-/// carplayd is spawned only at a 0x5703, which names its phone first, so none was running for this one, or
-/// the one running already served any phone.
+/// an early name is the named phone's own, before its SETUP publishes it. No earlier name puts back no file: no
+/// phone named, so the carplayd that started with the host session serves and dials nobody again. The earlier name
+/// goes back with its mark: it was a phone btd had handed off (a name comes to stand between sessions only through a
+/// 0x5703 or a put-back), and carplayd dials it again, as 2.6.0 did, unless its session is live.
 fn at_session_end(early: EarlyName, handed_off: bool, seen: Seen, quiet: bool) -> AtEnd {
     if handed_off || seen.named != Some(early.phone) {
         AtEnd::Leave
@@ -213,8 +332,8 @@ fn at_session_end(early: EarlyName, handed_off: bool, seen: Seen, quiet: bool) -
 /// going quiet already. Returns what to hand [`put_back`] when the session ends.
 pub fn name_at_session_start(peer: Option<[u8; 6]>, bonded: bool, quiet: bool) -> Option<EarlyName> {
     let p = peer.filter(|_| bonded && !quiet)?;
-    match at_session_start(peer, bonded, named_now(), crate::control::carplay_session_up(), quiet) {
-        AtStart::Name(early) => match write_name(&p) {
+    match at_session_start(peer, bonded, named_now(), CarPlayNow::now(), quiet) {
+        AtStart::Name(early) => match write_named(Named { phone: p, wifi: false }) {
             Ok(()) => {
                 log(&format!("named {} for carplayd at its session start", tail(p)));
                 Some(early)
@@ -224,6 +343,14 @@ pub fn name_at_session_start(peer: Option<[u8; 6]>, bonded: bool, quiet: bool) -
                 None
             }
         },
+        AtStart::Unmark => {
+            // No put-back: the name before it was this phone's, mark and all, and the mark is what goes.
+            match write_named(Named { phone: p, wifi: false }) {
+                Ok(()) => log(&format!("named {} afresh at its session start: dialled only after this session's 0x5703", tail(p))),
+                Err(e) => log(&format!("could not name {} afresh at its session start ({e}): its earlier 0x5703 stands", tail(p))),
+            }
+            None
+        }
         AtStart::SessionUp => {
             log(&format!("not naming {} at its session start: a CarPlay session is up; its 0x5703 names it", tail(p)));
             None
@@ -232,14 +359,16 @@ pub fn name_at_session_start(peer: Option<[u8; 6]>, bonded: bool, quiet: bool) -
     }
 }
 
-/// The session that named its phone early ended; `handed_off` when it sent a 0x5703, `quiet` when btd is going
-/// quiet ([`at_session_end`]). Its thread is the only writer while it lasts: one Bluetooth session runs at a
-/// time (`SessionClaim`, held until `bt_driver::run` returns), and `teardown_av_layer` runs only after that
-/// thread is joined.
+/// A Bluetooth session ended (`bt_driver::run`, at every exit): `handed_off` when it sent a 0x5703, `quiet` when btd is
+/// going quiet. A session that named its phone early (`early`) may put the earlier name back ([`at_session_end`]). Its
+/// thread is the only writer while it lasts: one Bluetooth session runs at a time (`SessionClaim`, held until
+/// `bt_driver::run` returns), and `teardown_av_layer` runs only after that thread is joined. The MFi certificate cache
+/// hears of every session's end here too ([`crate::mfi_local::session_over`]).
 pub fn put_back(early: Option<EarlyName>, handed_off: bool, quiet: bool) {
+    crate::mfi_local::session_over(handed_off);
     let Some(early) = early else { return };
     let seen = Seen {
-        named: named_now(),
+        named: named_now().map(|n| n.phone),
         carplay: crate::control::carplay_phone(),
         connected: crate::control::carplayd_connected(),
     };
@@ -248,9 +377,18 @@ pub fn put_back(early: Option<EarlyName>, handed_off: bool, quiet: bool) {
     };
     match at_session_end(early, handed_off, seen, quiet) {
         AtEnd::PutBack(before) => {
-            expect_phone(before);
-            let to = before.map_or_else(|| "none".to_string(), tail);
-            log(&format!("put back {to}: the session ended without a handoff"));
+            let written = match before {
+                Some(n) => write_named(n),
+                None => match std::fs::remove_file(EXPECT_PHONE_FILE) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+                    _ => Ok(()),
+                },
+            };
+            let to = before.map_or_else(|| "none".to_string(), |n| tail(n.phone));
+            match written {
+                Ok(()) => log(&format!("put back {to}: the session ended without a handoff")),
+                Err(e) => log(&format!("could not put back {to} ({e}): {} stays named", tail(early.phone))),
+            }
         }
         AtEnd::CarPlayLive => left("its CarPlay is live"),
         AtEnd::Connected => left("carplayd has its control connection"),
@@ -389,18 +527,23 @@ fn carplayd_is_wireless_configured(carplayd_path: &str) -> bool {
 /// dialing a connection-refused receiver) or `carplay_transport` stuck at "wireless" (which would keep
 /// the wired supervisor suppressed forever). Called on preempt / shutdown.
 ///
+/// Under [`AV_LOCK`], after moving [`AV_SESSION`] on: a session's-start spawn still in hand finishes first and is
+/// stopped here with the rest, and one not yet in hand spawns nothing. It waits (bounded) for the carplayd it stops
+/// to be gone, so the next session's start finds no carplayd half dead.
+///
 /// NOTE: this kills BY NAME (`pkill -x`), not by the PIDs we spawned — fine in today's standalone
 /// single-transport mode (only ONE carplayd runs). If a true concurrent dual-transport arbiter ever
 /// lets a wired carplayd run alongside, this would need PID-scoping (rx-connect is wireless-only, so
 /// only carplayd is at risk); the transport-flag suppression already keeps the wired supervisor out of
 /// carplayd's way, so the two don't run simultaneously in the current design.
 pub fn teardown_av_layer() {
+    let _guard = AV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    AV_SESSION.fetch_add(1, Ordering::AcqRel);
     // `pkill -x` needs the full invoked path too (see `running`'s doc comment) — a bare-name `pkill -x
     // carplayd` silently kills nothing on this BusyBox, leaving the real daemon running untouched.
-    let _ = Command::new("pkill")
-        .arg("-x")
-        .arg(env_or("AIRPLAYD_BIN", AIRPLAYD_BIN_DEFAULT))
-        .status();
+    let carplayd = env_or("AIRPLAYD_BIN", AIRPLAYD_BIN_DEFAULT);
+    let _ = Command::new("pkill").arg("-x").arg(&carplayd).status();
+    wait_gone(AV_AIRPLAYD_PID.load(Ordering::Acquire), &carplayd);
     // Root cause #3 (dual-transport wired<->wireless switch) used to need a SECOND reap here for a
     // bare-name `rx-connect` left over from the wired supervisor's `arm()`. That form no longer
     // exists — discovery is a thread inside carplayd — so killing carplayd necessarily stops the
@@ -412,11 +555,310 @@ pub fn teardown_av_layer() {
     let _ = std::fs::remove_file("/tmp/phone_identity");
     AV_AIRPLAYD_PID.store(0, Ordering::Release);
     AV_LAYER_UP.store(false, Ordering::Release);
+    *SPAWNED_ID.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    UNGATED.store(false, Ordering::Relaxed);
     println!("[av] wireless A/V layer torn down (carplayd stopped, discovery with it)");
 }
 
-/// Spawn `bin` detached (own session via setsid, so a SIGTERM to us won't take it down), stdout+stderr
-/// appended to `log`, with `envs` set. Fire-and-forget; we never reap it.
+/// Wait (bounded) for the carplayd just signalled to be gone: by its pid when this process started it (a `/proc` read,
+/// no process-table scan), else by `pgrep -x` of the full path alone, the form its callers' `pkill -x <path>` and the
+/// SIGKILL here signal. [`running`] also matches the bare name, and so the wired supervisor's carplayd, which none of
+/// them signals: every teardown beside one waited its whole 2 s (A2-3). SIGKILL after a second. carplayd installs no
+/// SIGTERM handler, so it is normally gone within milliseconds.
+fn wait_gone(pid: u32, carplayd: &str) {
+    let alive = || if pid != 0 { pid_alive(pid, carplayd) } else { pgrep_exact(carplayd) };
+    let step = if pid != 0 { Duration::from_millis(10) } else { Duration::from_millis(100) };
+    let started = std::time::Instant::now();
+    let mut killed = false;
+    while alive() {
+        if started.elapsed() >= Duration::from_secs(2) {
+            log("carplayd still there 2 s after it was stopped");
+            return;
+        }
+        if !killed && started.elapsed() >= Duration::from_secs(1) {
+            let _ = Command::new("pkill").arg("-9").arg("-x").arg(carplayd).status();
+            killed = true;
+        }
+        std::thread::sleep(step);
+    }
+}
+
+/// Stop the carplayd this process latched and forget it (the name file stays), so `ensure_av_layer` starts a fresh one:
+/// its identity moved ([`identity_moved`]), or the gate must go ([`UNGATED`]). Called with [`AV_LOCK`] held.
+fn stop_carplayd() {
+    let carplayd = env_or("AIRPLAYD_BIN", AIRPLAYD_BIN_DEFAULT);
+    let pid = AV_AIRPLAYD_PID.load(Ordering::Acquire);
+    let _ = Command::new("pkill").arg("-x").arg(&carplayd).status();
+    wait_gone(pid, &carplayd);
+    AV_AIRPLAYD_PID.store(0, Ordering::Release);
+    AV_LAYER_UP.store(false, Ordering::Release);
+    *SPAWNED_ID.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// The identity as `box_identity::derive` gives it now, in the forms carplayd is handed.
+fn identity_now() -> (String, String, String) {
+    let id = crate::box_identity::derive();
+    (id.device_id, id.pi, id.ed_seed_hex)
+}
+
+/// Whether the carplayd this process started was handed another identity than derive() gives now ([`SPAWNED_ID`]).
+fn identity_moved() -> bool {
+    let spawned = SPAWNED_ID.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    spawned.is_some_and(|id| id != identity_now())
+}
+
+/// btd begins a host session (`main.rs`, where the session starts, before any Bluetooth session of it can): carplayd is
+/// started now, in the background, so it is up, advertising and browsing when the phone joins the AP, instead of at
+/// the phone's 0x5703 ([`ensure_av_layer`], still the fallback). Until btd names a phone carplayd serves and dials
+/// nobody, and it dials the named phone only once btd has sent it its 0x5703 ([`expect_phone`]); btd's "wireless"
+/// claim (`/tmp/carplay_transport`) still waits for that 0x5703, so the wired supervisor is not held off for a phone
+/// that has not agreed to Wi-Fi. A carplayd that never gets a phone idles (its threads blocked, nothing polls the name)
+/// until the supervisor's teardown or btd's own, as one started at a 0x5703 does.
+///
+/// Idempotent: nobody is named at a session's start, so the name file is cleared again; a carplayd already up is
+/// kept. Also warms the MFi certificate cache when nothing is cached yet (A4, `mfi_local::warm_cert_cache`).
+pub fn session_starting() {
+    let _ = std::fs::remove_file(EXPECT_PHONE_FILE);
+    UNGATED.store(false, Ordering::Relaxed);
+    crate::mfi_local::warm_cert_cache();
+    let session = AV_SESSION.load(Ordering::Acquire);
+    if let Err(e) = std::thread::Builder::new().name("av-early".into()).spawn(move || early_start(session)) {
+        log(&format!("carplayd not started at the session's start ({e}); the 0x5703 starts it, as before"));
+    }
+}
+
+/// What the session's-start spawn does ([`early_start`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Early {
+    /// Start carplayd now.
+    Start,
+    /// A teardown came first: nothing.
+    TornDown,
+    /// Already up (a 0x5703 came first): nothing.
+    Up,
+    /// A carplayd is running that this process did not start (the wired supervisor's, or one a dead btd left): left
+    /// alone, to the 0x5703, which replaces or adopts it as before.
+    Resident,
+    /// The identity's primary source is not there, or did not hold still: `box_identity::derive` falls back to the SoC
+    /// serial without it, which gives another identity than at the 0x5703, so the 0x5703 starts carplayd, as before.
+    NoWifi,
+}
+
+fn early_decision(torn_down: bool, up: bool, resident: bool, wifi: bool) -> Early {
+    if torn_down {
+        Early::TornDown
+    } else if up {
+        Early::Up
+    } else if resident {
+        Early::Resident
+    } else if !wifi {
+        Early::NoWifi
+    } else {
+        Early::Start
+    }
+}
+
+/// How long the session's-start spawn waits for the identity's primary source, looking every [`WIFI_STEP`]: on a cold
+/// start the Wi-Fi driver can load beside the Bluetooth attach (the supervisor brings both up at once).
+const WIFI_WAIT: Duration = Duration::from_secs(15);
+const WIFI_STEP: Duration = Duration::from_millis(100);
+
+/// The identity carplayd may be handed at the session's start (A2-4): what `box_identity::derive_primary` gives, the
+/// same on two looks in a row, `step` apart (a driver can create its interfaces one after another, and give one an
+/// address after it is created), within `wait`; `None` past it, or when `stop` says the session was torn down.
+/// `look` is `derive_primary` (a test's own); `None` from it is the primary source not there yet.
+fn steady_identity(
+    mut look: impl FnMut() -> Option<(String, String, String)>,
+    wait: Duration,
+    step: Duration,
+    stop: impl Fn() -> bool,
+) -> Option<(String, String, String)> {
+    let t0 = std::time::Instant::now();
+    let mut last = look();
+    loop {
+        if stop() || t0.elapsed() >= wait {
+            return None;
+        }
+        std::thread::sleep(step);
+        let now = look();
+        if now.is_some() && now == last {
+            return now;
+        }
+        last = now;
+    }
+}
+
+/// The identity as `box_identity::derive_primary` gives it: only while derive reads its primary source.
+fn primary_identity() -> Option<(String, String, String)> {
+    crate::box_identity::derive_primary().map(|id| (id.device_id, id.pi, id.ed_seed_hex))
+}
+
+/// The session's-start spawn, on its own thread ([`session_starting`]): `session` is [`AV_SESSION`] as the session began.
+fn early_start(session: u64) {
+    let t0 = std::time::Instant::now();
+    let torn_down = || AV_SESSION.load(Ordering::Acquire) != session;
+    // A short bounded wait, off the lock, for the identity to come from what derive reads first and to hold still.
+    let id = steady_identity(primary_identity, WIFI_WAIT, WIFI_STEP, torn_down);
+    let _guard = AV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let carplayd = env_or("AIRPLAYD_BIN", AIRPLAYD_BIN_DEFAULT);
+    let mut up = AV_LAYER_UP.load(Ordering::Acquire);
+    let pid = AV_AIRPLAYD_PID.load(Ordering::Acquire);
+    if up && pid != 0 && !pid_alive(pid, &carplayd) {
+        // The carplayd an earlier start latched has died (a bring-up that failed returns without a teardown).
+        AV_AIRPLAYD_PID.store(0, Ordering::Release);
+        AV_LAYER_UP.store(false, Ordering::Release);
+        *SPAWNED_ID.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        up = false;
+    }
+    let decision = early_decision(torn_down(), up, !up && running(&carplayd), id.is_some());
+    match (decision, id) {
+        (Early::Start, Some(id)) => {
+            if spawn_carplayd(&carplayd, &id, true) {
+                latch(&carplayd, id);
+                log(&format!("carplayd started at the session's start in {} ms (it dials no phone until its 0x5703)", t0.elapsed().as_millis()));
+            } else {
+                log("carplayd did not start at the session's start; the 0x5703 starts it, as before");
+            }
+        }
+        (Early::Resident, _) => log("a carplayd this btd did not start is running: left to the 0x5703, as before"),
+        (Early::NoWifi, _) => log(&format!(
+            "the box identity's primary source was not there and steady within {} s: carplayd waits for the 0x5703, as before",
+            WIFI_WAIT.as_secs()
+        )),
+        _ => {}
+    }
+}
+
+/// Record the carplayd just confirmed up behind the latch: its pid ONCE, here, while `running`/`wait_visible` just
+/// confirmed visibility (so `pgrep -x -o` resolving it is as reliable as it ever gets) — every later liveness question
+/// on the retry path is answered from this value via `pid_alive`'s /proc read, never from a fresh process-table
+/// snapshot (see AV_AIRPLAYD_PID) — and the identity it was handed. Stored before the latch so a latch-observing
+/// reader also sees the pid.
+fn latch(carplayd: &str, id: (String, String, String)) {
+    AV_AIRPLAYD_PID.store(pid_of(carplayd).unwrap_or(0), Ordering::Release);
+    *SPAWNED_ID.lock().unwrap_or_else(|e| e.into_inner()) = Some(id);
+    AV_LAYER_UP.store(true, Ordering::Release);
+}
+
+/// Ensure the wireless A/V receiver layer is running. Idempotent; call after answering 0x5703.
+///
+/// Since A2 carplayd normally starts with btd's host session ([`session_starting`]), and this finds it up: "AV layer
+/// already existing". It still claims the transport flag here, at the handoff, and starts carplayd when the early
+/// start did not (no Wi-Fi interface then, a resident carplayd, a spawn that failed) or the one started has died.
+pub fn ensure_av_layer() {
+    let t0 = std::time::Instant::now();
+    ensure_av_layer_timed();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    println!("@{now_ms} [av] ensure_av_layer done in {} ms", t0.elapsed().as_millis());
+}
+
+fn ensure_av_layer_timed() {
+    // Serialize (see AV_LOCK): two rapid 0x5703s must not both spawn the daemons.
+    let _guard = AV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    // docs/wireless/00_WIRELESS_CARPLAY.md #1.6: claim the transport flag HERE, at spawn time, rather than waiting for carplayd to
+    // see the phone's first control connection (that write happens seconds later, inside carplayd
+    // itself). The gap between those two points was a real race: the wired supervisor's `arm()` guard
+    // checks this same flag, and with nothing written yet it could kill/replace a correctly-configured
+    // wireless carplayd mid-handoff. Reaching this function at all means a 0x5703 handoff just
+    // succeeded, so wireless legitimately owns the session from this point on. A flag carplayd already
+    // holds for a phone's connection is left as it is ([`claim_due`]).
+    if claim_due(crate::control::read_carplayd(), claimed_at()) {
+        claim_transport();
+    }
+
+    let carplayd = env_or("AIRPLAYD_BIN", AIRPLAYD_BIN_DEFAULT);
+
+    // Cinemo-pattern in-memory guard (see AV_LAYER_UP doc comment): once THIS process has confirmed the
+    // layer up, later 0x5702 retries (iOS legitimately resends the BT WiFi-config handshake) are a no-op
+    // here — never re-touch `pgrep`/spawn/rollback for them. This is what actually closes the live bug:
+    // it removes the repeated `running("carplayd")` snapshots (racy under BT+WiFi load) from the retry
+    // path entirely, rather than just widening their timeout.
+    //
+    // Extended (review fix 2026-07-31): the latch is only trusted while the RECORDED carplayd pid is
+    // still alive, checked via `pid_alive` — a `/proc/<pid>/cmdline` read, so the Cinemo "no fresh
+    // process-table snapshot on the retry path" rationale still holds (a file read on a known pid
+    // cannot false-negative under load the way pgrep did). Without this, a crashed carplayd
+    // (`panic = "abort"`, no unwinding to reset anything) stayed latched-up forever and no reconnect
+    // could ever respawn it. Dead → reset the latch and fall through to the normal spawn path.
+    // pid 0 (never resolved — `pid_of` raced the ONE post-confirm lookup) keeps the pre-fix
+    // trust-the-latch behavior rather than reintroducing a pgrep on every retry.
+    if AV_LAYER_UP.load(Ordering::Acquire) {
+        let ap_pid = AV_AIRPLAYD_PID.load(Ordering::Acquire);
+        let ap_ok = ap_pid == 0 || pid_alive(ap_pid, &carplayd);
+        if ap_ok {
+            println!("[av] AV layer already existing — nothing to do");
+            return;
+        }
+        println!("[av] latched AV layer degraded (carplayd pid {ap_pid} dead) — resetting the latch, respawning");
+        AV_AIRPLAYD_PID.store(0, Ordering::Release);
+        AV_LAYER_UP.store(false, Ordering::Release);
+        *SPAWNED_ID.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    // NOTE ON `running`/`pkill` TARGETS BELOW: this specific block deliberately checks the BARE name
+    // "carplayd", not the full `carplayd` path variable — it exists to catch a WIRED-spawned resident
+    // specifically (`tools/session_supervisor.sh`'s `arm()` runs `setsid carplayd` via bare-name PATH
+    // lookup, so ITS `argv[0]` really is "carplayd"). Every wireless-spawned carplayd is spawned via the
+    // full path below and is always wireless-configured by construction, so it can never be the resident
+    // this block is looking for — bare-name matching is correct here, not a leftover bug (see `running`'s
+    // doc comment for why bare names otherwise never match this module's OWN full-path spawns).
+    if running("carplayd") && !carplayd_is_wireless_configured("carplayd") {
+        // docs/wireless/00_WIRELESS_CARPLAY.md #1.1: a resident carplayd exists but wasn't spawned for wireless (e.g. the wired
+        // supervisor's env-less instance survived a prior session, or an unplug left it running) — do
+        // NOT silently reuse it, or every wireless session would be starved of iAPChannel/metadata
+        // support with no visible error. Kill it and fall through to the normal spawn path below.
+        println!("[av] resident carplayd is not wireless-configured — replacing it");
+        let _ = Command::new("pkill").arg("-x").arg("carplayd").status();
+        // Poll for it to actually die (mirrors `wait_visible`'s pattern), escalating to -9 if a SIGTERM
+        // handler (e.g. OCBM teardown) runs long — a single fixed short sleep here previously let a
+        // slow-dying process still read as `running()` right below, silently falling into the "already
+        // running (wireless-configured)" branch with a log message asserting the opposite (review
+        // finding, 2026-07-24).
+        for i in 0..20 {
+            if !running("carplayd") {
+                break;
+            }
+            if i == 9 {
+                let _ = Command::new("pkill").arg("-9").arg("-x").arg("carplayd").status();
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    // From here on, `running`/`wait_visible` target THIS module's own full-path spawns, so they take the
+    // resolved `carplayd`/`rx-connect` path variables (see `running`'s doc comment) — not bare names.
+    let id = identity_now();
+    let carplayd_up = if running(&carplayd) {
+        println!("[av] carplayd already running (wireless-configured)");
+        true
+    } else {
+        spawn_carplayd(&carplayd, &id, !UNGATED.load(Ordering::Relaxed))
+    };
+
+    // docs/wireless/00_WIRELESS_CARPLAY.md #1.6 (extended, review finding 2026-07-24; hardened 2026-07-24 field bug fix): the
+    // transport flag is claimed at the TOP of this function, before the spawn is even attempted, to
+    // close the pre-flag `arm()` race as early as possible. The tradeoff: if the spawn above ultimately
+    // fails, the flag would be orphaned at "wireless" with no live carplayd — `wireless_owns_session` in
+    // `tools/session_supervisor.sh` would then suppress `arm()`/`kill_session`/`escalate` indefinitely,
+    // stranding the box out of the wired path too. Roll the claim back if the spawn genuinely failed.
+    //
+    // Deciding this from `carplayd_up` (the `wait_visible` result captured above) rather than a FRESH
+    // `running("carplayd")` snapshot is the actual fix for the live bug: a fresh pgrep here re-opens the
+    // exact same race `wait_visible` just spent up to 6s resolving, so re-querying it moments later can
+    // still catch a false negative under BT+WiFi load. `carplayd_up` is authoritative for what THIS call
+    // just did; trust it instead of re-deriving the answer from the OS process table a second time.
+    if carplayd_up {
+        latch(&carplayd, id);
+    } else {
+        println!("[av] carplayd failed to start — releasing the transport flag");
+        let _ = std::fs::remove_file("/tmp/carplay_transport");
+    }
+}
+
 /// Append [`SPAWN_MARK`] to `log`, on a line of its own.
 fn mark_spawn(log: &str) {
     use std::io::Write as _;
@@ -425,6 +867,8 @@ fn mark_spawn(log: &str) {
     }
 }
 
+/// Spawn `bin` detached (own session via setsid, so a SIGTERM to us won't take it down), stdout+stderr
+/// appended to `log`, with `envs` set. Fire-and-forget; we never reap it.
 fn spawn_detached(bin: &str, log: &str, envs: &[(&str, &str)]) {
     let mut cmd = Command::new(bin);
     cmd.stdin(Stdio::null());
@@ -485,209 +929,82 @@ fn wait_visible(path: &str) -> bool {
     false
 }
 
-/// Ensure the wireless A/V receiver layer is running. Idempotent; call after answering 0x5703.
-///
-/// Timed (2026-10-20): spawning carplayd at the 0x5703 reply costs the session its start-up time
-/// before the phone's control connection can be accepted (~0.5 s on a GM truck drive log). Starting
-/// it earlier would also move the `/tmp/carplay_transport` claim ahead of the Wi-Fi handoff, which
-/// suppresses the wired supervisor for a phone that has not agreed to Wi-Fi yet — so this measures
-/// the cost first instead of moving the spawn.
-pub fn ensure_av_layer() {
-    let t0 = std::time::Instant::now();
-    ensure_av_layer_timed();
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    println!("@{now_ms} [av] ensure_av_layer done in {} ms", t0.elapsed().as_millis());
-}
-
-fn ensure_av_layer_timed() {
-    // Serialize (see AV_LOCK): two rapid 0x5703s must not both spawn the daemons.
-    let _guard = AV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-
-    // docs/wireless/00_WIRELESS_CARPLAY.md #1.6: claim the transport flag HERE, at spawn time, rather than waiting for carplayd to
-    // see the phone's first control connection (that write happens seconds later, inside carplayd
-    // itself). The gap between those two points was a real race: the wired supervisor's `arm()` guard
-    // checks this same flag, and with nothing written yet it could kill/replace a correctly-configured
-    // wireless carplayd mid-handoff. Reaching this function at all means a 0x5703 handoff just
-    // succeeded, so wireless legitimately owns the session from this point on. A flag carplayd already
-    // holds for a phone's connection is left as it is ([`claim_due`]).
-    if claim_due(crate::control::read_carplayd(), claimed_at()) {
-        claim_transport();
+/// Spawn the wireless carplayd with this box's identity (`id`: device id, `pi`, Ed25519 seed) and confirm it up
+/// ([`wait_visible`]). `gated`: it is handed the name file and serves only the phone btd names; not, only after btd
+/// could not write the name ([`UNGATED`]). Called with [`AV_LOCK`] held.
+fn spawn_carplayd(carplayd: &str, id: &(String, String, String), gated: bool) -> bool {
+    // OCBM_FWD_ENC=1 = the committed forwarding model (encrypted frames + key over the seam;
+    // the HOST decrypts/decodes), exactly as the wired launcher sets it
+    // (tools/session_supervisor.sh). Without it carplayd falls back to the legacy on-box
+    // decrypt path, whose VideoConfig→Annex-B conversion is avcC-only — an HEVC session
+    // (app cfg `hevc=true`) then yields a 0-byte config and the host can never decode.
+    // Log to a WIRELESS-specific file (not the wired /tmp/carplayd.log the supervisor scans): so the
+    // wired supervisor's milestone grep can't latch a wireless session's "RECORD done" and mark the
+    // wired projection healthy (per-transport logs, critical-finding cross-attribution fix).
+    let mut envs: Vec<(&str, &str)> = vec![
+        ("OCBM_FWD_ENC", "1"),
+        // Bearer selection for the in-process mDNS thread (was rx-connect's own env, passed to a
+        // second spawn until 2026-09-08). LOAD-BEARING for wireless: without these, discovery
+        // defaults to ncm0/addr-auto and advertises the wired bearer while the phone is on the AP.
+        ("RX_IFACE", WLAN_IFACE),
+        ("RX_ADDR", AP_IP),
+        // Advertise the wireless AAC audioFormats set so iOS negotiates media audio over
+        // type-102 AAC-LC (Apple Music etc.); the wired supervisor-spawned carplayd does NOT get
+        // this, so it keeps its PCM-only advert. (#400 — grounded in the carplayd-rs reference.)
+        ("CARPLAY_WIRELESS_AUDIO", "1"),
+        ("CARPLAY_DEVICE_ID", &id.0),
+        ("CARPLAY_PI", &id.1),
+        ("CARPLAY_ED_SEED", &id.2),
+        // EXPERIMENTAL (docs/wireless/00_WIRELESS_CARPLAY.md, 2026-07-22, unverified on hardware): subscribe to NowPlaying/
+        // RouteGuidance/CallState over the iAP2-over-AirPlay tunnel once the event channel wires
+        // up (events.rs::send_wireless_metadata_subscriptions). THIS is the actual wireless
+        // spawn path — session_supervisor.sh's launch line is wired-only and irrelevant here.
+        ("CARPLAY_WIRELESS_METADATA", "1"),
+        // EXPERIMENTAL (docs/wireless/00_WIRELESS_CARPLAY.md #2.1): declare sessionManagementInfo/stopSessionReasons.
+        // Deliberately a SEPARATE flag from CARPLAY_WIRELESS_METADATA (not reused) so the two
+        // features stay independently toggleable — docs/carplay/05_METADATA_AND_CONTROLS.md found sessionManagementInfo is in
+        // Apple's own validated-feature-key cluster while iAPChannelInfo is NOT, so isolating
+        // them is what makes it possible to tell which one (if either) is the real gate.
+        ("CARPLAY_SESSION_MGMT", "1"),
+    ];
+    // The phone gate: serve only the phone this file names (`expect_phone`).
+    if gated {
+        envs.push(("CARPLAY_EXPECT_PHONE_FILE", EXPECT_PHONE_FILE));
     }
-
-    let carplayd = env_or("AIRPLAYD_BIN", AIRPLAYD_BIN_DEFAULT);
-
-    // Cinemo-pattern in-memory guard (see AV_LAYER_UP doc comment): once THIS process has confirmed the
-    // layer up, later 0x5702 retries (iOS legitimately resends the BT WiFi-config handshake) are a no-op
-    // here — never re-touch `pgrep`/spawn/rollback for them. This is what actually closes the live bug:
-    // it removes the repeated `running("carplayd")` snapshots (racy under BT+WiFi load) from the retry
-    // path entirely, rather than just widening their timeout.
-    //
-    // Extended (review fix 2026-07-31): the latch is only trusted while the RECORDED carplayd pid is
-    // still alive, checked via `pid_alive` — a `/proc/<pid>/cmdline` read, so the Cinemo "no fresh
-    // process-table snapshot on the retry path" rationale still holds (a file read on a known pid
-    // cannot false-negative under load the way pgrep did). Without this, a crashed carplayd
-    // (`panic = "abort"`, no unwinding to reset anything) stayed latched-up forever and no reconnect
-    // could ever respawn it. Dead → reset the latch and fall through to the normal spawn path.
-    // pid 0 (never resolved — `pid_of` raced the ONE post-confirm lookup) keeps the pre-fix
-    // trust-the-latch behavior rather than reintroducing a pgrep on every retry.
-    if AV_LAYER_UP.load(Ordering::Acquire) {
-        // The latch vouches for the WHOLE layer — carplayd AND the rx-connect mDNS advertiser. Check
-        // both (audit Fix #11a): if EITHER died, fall through to respawn (the per-daemon `running()`
-        // checks below are idempotent, so only the dead one is actually restarted). `pid == 0` keeps the
-        // pre-fix trust-the-latch behavior for a pid the ONE post-confirm `pid_of` lookup failed to
-        // resolve, rather than reintroducing a pgrep on every retry.
-        let ap_pid = AV_AIRPLAYD_PID.load(Ordering::Acquire);
-        let ap_ok = ap_pid == 0 || pid_alive(ap_pid, &carplayd);
-        if ap_ok {
-            println!("[av] AV layer already existing — nothing to do (0x5702 retry)");
-            return;
-        }
-        println!("[av] latched AV layer degraded (carplayd pid {ap_pid} dead) — resetting the latch, respawning");
-        AV_AIRPLAYD_PID.store(0, Ordering::Release);
-        AV_LAYER_UP.store(false, Ordering::Release);
+    // cornerMask experiment (Phase 1): opt-in via the on-box flag file /tmp/cornermask_test (tmpfs,
+    // so a reboot disarms it — same gate the wired supervisor uses). When present, advertise
+    // cornerMasks and dump the phone's `topLeftCornerMask` buffer (CARPLAY_CORNERMASK_CAPTURE) so we
+    // can learn its undocumented wire format. Absent = byte-identical to the proven wireless spawn.
+    if std::path::Path::new("/tmp/cornermask_test").exists() {
+        envs.push(("CARPLAY_CORNERMASKS", "1"));
+        envs.push(("CARPLAY_CORNERMASK_CAPTURE", "/tmp"));
     }
-
-    // Per-box identity (#636): derive it once and hand it to carplayd, which now advertises with the
-    // SAME values it pairs with — the identity-lock that used to be an unenforced convention between
-    // two processes (the advertised deviceid/pi MUST equal the pairing server's or pair-verify fails)
-    // is a function call inside one process since the rx-connect merge.
-    let id = crate::box_identity::derive();
-
-    // NOTE ON `running`/`pkill` TARGETS BELOW: this specific block deliberately checks the BARE name
-    // "carplayd", not the full `carplayd` path variable — it exists to catch a WIRED-spawned resident
-    // specifically (`tools/session_supervisor.sh`'s `arm()` runs `setsid carplayd` via bare-name PATH
-    // lookup, so ITS `argv[0]` really is "carplayd"). Every wireless-spawned carplayd is spawned via the
-    // full path below and is always wireless-configured by construction, so it can never be the resident
-    // this block is looking for — bare-name matching is correct here, not a leftover bug (see `running`'s
-    // doc comment for why bare names otherwise never match this module's OWN full-path spawns).
-    if running("carplayd") && !carplayd_is_wireless_configured("carplayd") {
-        // docs/wireless/00_WIRELESS_CARPLAY.md #1.1: a resident carplayd exists but wasn't spawned for wireless (e.g. the wired
-        // supervisor's env-less instance survived a prior session, or an unplug left it running) — do
-        // NOT silently reuse it, or every wireless session would be starved of iAPChannel/metadata
-        // support with no visible error. Kill it and fall through to the normal spawn path below.
-        println!("[av] resident carplayd is not wireless-configured — replacing it");
-        let _ = Command::new("pkill").arg("-x").arg("carplayd").status();
-        // Poll for it to actually die (mirrors `wait_visible`'s pattern), escalating to -9 if a SIGTERM
-        // handler (e.g. OCBM teardown) runs long — a single fixed short sleep here previously let a
-        // slow-dying process still read as `running()` right below, silently falling into the "already
-        // running (wireless-configured)" branch with a log message asserting the opposite (review
-        // finding, 2026-07-24).
-        for i in 0..20 {
-            if !running("carplayd") {
-                break;
-            }
-            if i == 9 {
-                let _ = Command::new("pkill").arg("-9").arg("-x").arg("carplayd").status();
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
+    // mainBufferedAudio Phase-A (docs/carplay/04_CAPABILITIES_AND_CONFIG.md; docs/carplay/04_CAPABILITIES_AND_CONFIG.md workstream B4): the PRIMARY arm is now the
+    // app-pushed `accessoryConfig.enablesMainBufferedAudio` (app default OFF), which carplayd
+    // applies per control connection FROM THE YAML ALONE — so with an app connected this flag is
+    // INERT (any parsed config overwrites the seeded env, in both directions). It survives only
+    // for the no-config / parse-failure paths (manually launched carplayd, no
+    // /tmp/carplay_cfg.yaml). Mirrors the wired supervisor block. CARPLAY_SETUP_DUMP captures the
+    // phone's SETUP request to /tmp/setup_req.N. WARNING: NO buffered stream handler exists — if
+    // iOS opens a MainBuffered stream we omit it (session.rs phase-2 default arm) and MEDIA GOES
+    // SILENT; wireless is the arm where iOS is most likely to try (buffered audio is the
+    // wireless-drop remedy, unlike wired which declined it) and is NOT yet captured. Disable the
+    // config toggle / remove this flag on any audio dropout.
+    if std::path::Path::new("/tmp/mainbuffered_test").exists() {
+        envs.push(("CARPLAY_MAINBUFFERED", "1"));
+        envs.push(("CARPLAY_SETUP_DUMP", "/tmp/setup_req"));
     }
-
-    // From here on, `running`/`wait_visible` target THIS module's own full-path spawns, so they take the
-    // resolved `carplayd`/`rx-connect` path variables (see `running`'s doc comment) — not bare names.
-    let carplayd_up = if running(&carplayd) {
-        println!("[av] carplayd already running (wireless-configured)");
-        true
-    } else {
-        // OCBM_FWD_ENC=1 = the committed forwarding model (encrypted frames + key over the seam;
-        // the HOST decrypts/decodes), exactly as the wired launcher sets it
-        // (tools/session_supervisor.sh). Without it carplayd falls back to the legacy on-box
-        // decrypt path, whose VideoConfig→Annex-B conversion is avcC-only — an HEVC session
-        // (app cfg `hevc=true`) then yields a 0-byte config and the host can never decode.
-        // Log to a WIRELESS-specific file (not the wired /tmp/carplayd.log the supervisor scans): so the
-        // wired supervisor's milestone grep can't latch a wireless session's "RECORD done" and mark the
-        // wired projection healthy (per-transport logs, critical-finding cross-attribution fix).
-        let mut envs: Vec<(&str, &str)> = vec![
-            ("OCBM_FWD_ENC", "1"),
-            // Bearer selection for the in-process mDNS thread (was rx-connect's own env, passed to a
-            // second spawn until 2026-09-08). LOAD-BEARING for wireless: without these, discovery
-            // defaults to ncm0/addr-auto and advertises the wired bearer while the phone is on the AP.
-            ("RX_IFACE", WLAN_IFACE),
-            ("RX_ADDR", AP_IP),
-            // Advertise the wireless AAC audioFormats set so iOS negotiates media audio over
-            // type-102 AAC-LC (Apple Music etc.); the wired supervisor-spawned carplayd does NOT get
-            // this, so it keeps its PCM-only advert. (#400 — grounded in the carplayd-rs reference.)
-            ("CARPLAY_WIRELESS_AUDIO", "1"),
-            ("CARPLAY_DEVICE_ID", &id.device_id),
-            ("CARPLAY_PI", &id.pi),
-            ("CARPLAY_ED_SEED", &id.ed_seed_hex),
-            // EXPERIMENTAL (docs/wireless/00_WIRELESS_CARPLAY.md, 2026-07-22, unverified on hardware): subscribe to NowPlaying/
-            // RouteGuidance/CallState over the iAP2-over-AirPlay tunnel once the event channel wires
-            // up (events.rs::send_wireless_metadata_subscriptions). THIS is the actual wireless
-            // spawn path — session_supervisor.sh's launch line is wired-only and irrelevant here.
-            ("CARPLAY_WIRELESS_METADATA", "1"),
-            // EXPERIMENTAL (docs/wireless/00_WIRELESS_CARPLAY.md #2.1): declare sessionManagementInfo/stopSessionReasons.
-            // Deliberately a SEPARATE flag from CARPLAY_WIRELESS_METADATA (not reused) so the two
-            // features stay independently toggleable — docs/carplay/05_METADATA_AND_CONTROLS.md found sessionManagementInfo is in
-            // Apple's own validated-feature-key cluster while iAPChannelInfo is NOT, so isolating
-            // them is what makes it possible to tell which one (if either) is the real gate.
-            ("CARPLAY_SESSION_MGMT", "1"),
-            // The phone gate: serve only the phone this file names (`expect_phone`).
-            ("CARPLAY_EXPECT_PHONE_FILE", EXPECT_PHONE_FILE),
-        ];
-        // cornerMask experiment (Phase 1): opt-in via the on-box flag file /tmp/cornermask_test (tmpfs,
-        // so a reboot disarms it — same gate the wired supervisor uses). When present, advertise
-        // cornerMasks and dump the phone's `topLeftCornerMask` buffer (CARPLAY_CORNERMASK_CAPTURE) so we
-        // can learn its undocumented wire format. Absent = byte-identical to the proven wireless spawn.
-        if std::path::Path::new("/tmp/cornermask_test").exists() {
-            envs.push(("CARPLAY_CORNERMASKS", "1"));
-            envs.push(("CARPLAY_CORNERMASK_CAPTURE", "/tmp"));
-        }
-        // mainBufferedAudio Phase-A (docs/carplay/04_CAPABILITIES_AND_CONFIG.md; docs/carplay/04_CAPABILITIES_AND_CONFIG.md workstream B4): the PRIMARY arm is now the
-        // app-pushed `accessoryConfig.enablesMainBufferedAudio` (app default OFF), which carplayd
-        // applies per control connection FROM THE YAML ALONE — so with an app connected this flag is
-        // INERT (any parsed config overwrites the seeded env, in both directions). It survives only
-        // for the no-config / parse-failure paths (manually launched carplayd, no
-        // /tmp/carplay_cfg.yaml). Mirrors the wired supervisor block. CARPLAY_SETUP_DUMP captures the
-        // phone's SETUP request to /tmp/setup_req.N. WARNING: NO buffered stream handler exists — if
-        // iOS opens a MainBuffered stream we omit it (session.rs phase-2 default arm) and MEDIA GOES
-        // SILENT; wireless is the arm where iOS is most likely to try (buffered audio is the
-        // wireless-drop remedy, unlike wired which declined it) and is NOT yet captured. Disable the
-        // config toggle / remove this flag on any audio dropout.
-        if std::path::Path::new("/tmp/mainbuffered_test").exists() {
-            envs.push(("CARPLAY_MAINBUFFERED", "1"));
-            envs.push(("CARPLAY_SETUP_DUMP", "/tmp/setup_req"));
-        }
-        // Capturing the phone's SETUP request had been reachable ONLY through the flag above, which
-        // also arms mainBufferedAudio — a combination the comment there warns can silence media on
-        // exactly this (wireless) arm. That coupling makes a read-only diagnostic cost a real audio
-        // risk, so it gets its own flag: `touch /tmp/setup_dump` writes /tmp/setup_req.N and changes
-        // nothing else about the session.
-        else if std::path::Path::new("/tmp/setup_dump").exists() {
-            envs.push(("CARPLAY_SETUP_DUMP", "/tmp/setup_req"));
-        }
-        mark_spawn("/tmp/carplayd_wl.log");
-        spawn_detached(&carplayd, "/tmp/carplayd_wl.log", &envs);
-        wait_visible(&carplayd) // confirm up before a concurrent call could re-check (no double-spawn)
-    };
-
-    // docs/wireless/00_WIRELESS_CARPLAY.md #1.6 (extended, review finding 2026-07-24; hardened 2026-07-24 field bug fix): the
-    // transport flag is claimed at the TOP of this function, before the spawn is even attempted, to
-    // close the pre-flag `arm()` race as early as possible. The tradeoff: if the spawn above ultimately
-    // fails, the flag would be orphaned at "wireless" with no live carplayd — `wireless_owns_session` in
-    // `tools/session_supervisor.sh` would then suppress `arm()`/`kill_session`/`escalate` indefinitely,
-    // stranding the box out of the wired path too. Roll the claim back if the spawn genuinely failed.
-    //
-    // Deciding this from `carplayd_up` (the `wait_visible` result captured above) rather than a FRESH
-    // `running("carplayd")` snapshot is the actual fix for the live bug: a fresh pgrep here re-opens the
-    // exact same race `wait_visible` just spent up to 6s resolving, so re-querying it moments later can
-    // still catch a false negative under BT+WiFi load. `carplayd_up` is authoritative for what THIS call
-    // just did; trust it instead of re-deriving the answer from the OS process table a second time.
-    if carplayd_up {
-        // Record the pid behind the latch ONCE, here, while `running`/`wait_visible` just confirmed
-        // visibility (so `pgrep -x -o` resolving it is as reliable as it ever gets). Every later
-        // liveness question on the retry path is answered from this value via `pid_alive`'s /proc
-        // read — never from a fresh process-table snapshot (see AV_AIRPLAYD_PID). Stored before the
-        // latch so a latch-observing reader also sees the pid.
-        AV_AIRPLAYD_PID.store(pid_of(&carplayd).unwrap_or(0), Ordering::Release);
-        AV_LAYER_UP.store(true, Ordering::Release);
-    } else {
-        println!("[av] carplayd failed to start — releasing the transport flag");
-        let _ = std::fs::remove_file("/tmp/carplay_transport");
+    // Capturing the phone's SETUP request had been reachable ONLY through the flag above, which
+    // also arms mainBufferedAudio — a combination the comment there warns can silence media on
+    // exactly this (wireless) arm. That coupling makes a read-only diagnostic cost a real audio
+    // risk, so it gets its own flag: `touch /tmp/setup_dump` writes /tmp/setup_req.N and changes
+    // nothing else about the session.
+    else if std::path::Path::new("/tmp/setup_dump").exists() {
+        envs.push(("CARPLAY_SETUP_DUMP", "/tmp/setup_req"));
     }
+    mark_spawn("/tmp/carplayd_wl.log");
+    spawn_detached(carplayd, "/tmp/carplayd_wl.log", &envs);
+    wait_visible(carplayd) // confirm up before a concurrent call could re-check (no double-spawn)
 }
 
 #[cfg(test)]
@@ -714,58 +1031,164 @@ mod tests {
     const A: [u8; 6] = [0x0A, 0x00, 0x00, 0x00, 0x00, 0x02];
     const B: [u8; 6] = [0x0B, 0x00, 0x00, 0x00, 0x00, 0x02];
 
+    /// A named with its 0x5703 sent: the name 2.6.0 wrote at a handoff.
+    const A_HANDED: Named = Named { phone: A, wifi: true };
+
+    /// No CarPlay session up or connecting; A's up (outliving its Bluetooth link).
+    const IDLE: CarPlayNow = CarPlayNow::Idle;
+    const A_LIVE: CarPlayNow = CarPlayNow::Of(Some(A));
+
     #[test]
     fn a_bonded_phone_is_named_at_its_session_start_while_no_carplay_is_up() {
-        let named = AtStart::Name(EarlyName { phone: B, before: Some(A) });
-        assert_eq!(at_session_start(Some(B), true, Some(A), false, false), named, "10:54:23.4, B back on Bluetooth");
+        let named = AtStart::Name(EarlyName { phone: B, before: Some(A_HANDED) });
+        assert_eq!(at_session_start(Some(B), true, Some(A_HANDED), IDLE, false), named, "10:54:23.4, B back on Bluetooth");
         assert_eq!(
-            at_session_start(Some(B), true, None, false, false),
+            at_session_start(Some(B), true, None, IDLE, false),
             AtStart::Name(EarlyName { phone: B, before: None }),
             "the first phone after btd starts"
         );
-        assert_eq!(at_session_start(Some(B), false, Some(A), false, false), AtStart::Leave, "R3: not bonded");
-        assert_eq!(at_session_start(None, true, Some(A), false, false), AtStart::Leave, "no peer, nothing to name");
-        assert_eq!(at_session_start(Some(A), true, Some(A), false, false), AtStart::Leave, "the same phone back");
+        assert_eq!(at_session_start(Some(B), false, Some(A_HANDED), IDLE, false), AtStart::Leave, "R3: not bonded");
+        assert_eq!(at_session_start(None, true, Some(A_HANDED), IDLE, false), AtStart::Leave, "no peer, nothing to name");
         assert_eq!(
-            at_session_start(Some(B), true, Some(A), true, false),
+            at_session_start(Some(A), true, Some(A_HANDED), IDLE, false),
+            AtStart::Unmark,
+            "A2-2: the same phone back, its mark from an earlier session: named afresh, dialled after this session's 0x5703"
+        );
+        assert_eq!(
+            at_session_start(Some(A), true, Some(A_HANDED), A_LIVE, false),
+            AtStart::Leave,
+            "the same phone back while its own CarPlay outlives its Bluetooth link (R2): the name stays as it is"
+        );
+        assert_eq!(
+            at_session_start(Some(A), true, Some(A_HANDED), CarPlayNow::Of(None), false),
+            AtStart::Leave,
+            "a control connection before its SETUP, perhaps A's own: the name stays as it is"
+        );
+        assert_eq!(
+            at_session_start(Some(A), true, Some(A_HANDED), CarPlayNow::Of(Some(B)), false),
+            AtStart::Unmark,
+            "A2-2: B's CarPlay is live (A was handed off to take it over): A is dialled after this session's 0x5703"
+        );
+        assert_eq!(
+            at_session_start(Some(A), true, Some(Named { phone: A, wifi: false }), IDLE, false),
+            AtStart::Leave,
+            "the same phone back, named early before: its name stays as it is"
+        );
+        assert_eq!(at_session_start(Some(A), false, Some(A_HANDED), IDLE, false), AtStart::Leave, "R3: not bonded");
+        assert_eq!(at_session_start(Some(A), true, Some(A_HANDED), IDLE, true), AtStart::Leave, "P5: btd going quiet");
+        assert_eq!(
+            at_session_start(Some(B), true, Some(A_HANDED), A_LIVE, false),
             AtStart::SessionUp,
             "R2: A's CarPlay outlives its Bluetooth link; B is named at its 0x5703, as before"
         );
-        assert_eq!(at_session_start(Some(B), true, Some(A), false, true), AtStart::Leave, "P5: btd going quiet");
+        assert_eq!(
+            at_session_start(Some(B), true, Some(A_HANDED), CarPlayNow::Of(None), false),
+            AtStart::SessionUp,
+            "R2: a control connection before its SETUP; B is named at its 0x5703, as before"
+        );
+        assert_eq!(at_session_start(Some(B), true, Some(A_HANDED), IDLE, true), AtStart::Leave, "P5: btd going quiet");
     }
 
     #[test]
     fn an_early_name_goes_back_only_when_the_session_ends_without_a_handoff() {
-        let early = EarlyName { phone: B, before: Some(A) };
+        let early = EarlyName { phone: B, before: Some(A_HANDED) };
         let seen = |named, carplay| Seen { named, carplay, connected: false };
         let ended = |s| at_session_end(early, false, s, false);
-        assert_eq!(ended(seen(Some(B), None)), AtEnd::PutBack(Some(A)), "R4: A is named again");
+        assert_eq!(ended(seen(Some(B), None)), AtEnd::PutBack(Some(A_HANDED)), "R4: A is named again, with its mark");
         assert_eq!(at_session_end(early, true, seen(Some(B), None), false), AtEnd::Leave, "after its 0x5703 it stays");
         assert_eq!(ended(seen(Some(A), None)), AtEnd::Leave, "a name written since is not clobbered");
         assert_eq!(ended(seen(None, None)), AtEnd::Leave, "nor a removed one");
         assert_eq!(ended(seen(Some(B), Some(B))), AtEnd::CarPlayLive, "B's CarPlay outlives its link");
-        assert_eq!(ended(seen(Some(B), Some(A))), AtEnd::PutBack(Some(A)), "A's CarPlay is live: back to it");
+        assert_eq!(ended(seen(Some(B), Some(A))), AtEnd::PutBack(Some(A_HANDED)), "A's CarPlay is live: back to it");
         let first = EarlyName { phone: B, before: None };
         assert_eq!(at_session_end(first, false, seen(Some(B), None), false), AtEnd::PutBack(None), "none: no file");
+        // A name with no mark goes back as it was: carplayd may serve that phone, and dials it only after a 0x5703.
+        let unmarked = Named { phone: A, wifi: false };
+        let early = EarlyName { phone: B, before: Some(unmarked) };
+        assert_eq!(at_session_end(early, false, seen(Some(B), None), false), AtEnd::PutBack(Some(unmarked)));
     }
 
     #[test]
-    fn the_name_stays_while_carplayd_holds_the_named_phones_connection() {
-        // P7: B was dialled and connected, and its Bluetooth session ended before its SETUP published it.
-        let early = EarlyName { phone: B, before: Some(A) };
-        let seen = Seen { named: Some(B), carplay: None, connected: true };
-        assert_eq!(at_session_end(early, false, seen, false), AtEnd::Connected);
-        assert_eq!(at_session_end(early, true, seen, false), AtEnd::Leave, "a handoff leaves it as ever");
+    fn the_name_file_carries_the_phone_and_its_0x5703_mark() {
+        // A2: carplayd dials the named phone only with the mark; an early name has none.
+        let b = Named { phone: B, wifi: false };
+        assert_eq!(b.text(), "02:00:00:00:00:0B");
+        assert_eq!(Named { phone: B, wifi: true }.text(), "02:00:00:00:00:0B wifi");
+        assert_eq!(Named::parse(&b.text()), Some(b));
+        assert_eq!(Named::parse("02:00:00:00:00:0B wifi\n"), Some(Named { phone: B, wifi: true }));
+        assert_eq!(Named::parse("02-00-00-00-00-0b"), Some(b), "any spelling parse_addr takes");
+        assert_eq!(Named::parse("02:00:00:00:00:0B later"), Some(b), "an unknown word is no mark");
+        assert_eq!(Named::parse(""), None);
+        assert_eq!(Named::parse("wifi"), None, "a mark with no phone names nobody");
+    }
+
+    #[test]
+    fn the_session_start_spawn_starts_carplayd_only_on_a_clean_slate() {
+        assert_eq!(early_decision(false, false, false, true), Early::Start);
+        assert_eq!(early_decision(true, false, false, true), Early::TornDown, "a teardown came first: no orphan");
+        assert_eq!(early_decision(false, true, false, true), Early::Up, "a 0x5703 came first");
+        assert_eq!(
+            early_decision(false, false, true, true),
+            Early::Resident,
+            "the wired supervisor's carplayd, or one a dead btd left: the 0x5703 deals with it, as before"
+        );
+        assert_eq!(
+            early_decision(false, false, false, false),
+            Early::NoWifi,
+            "the identity comes from the Wi-Fi driver's address: not before it is there"
+        );
+        assert_eq!(early_decision(true, true, true, false), Early::TornDown, "the teardown wins");
+    }
+
+    fn id(n: u8) -> (String, String, String) {
+        (format!("02:00:00:00:00:{n:02X}"), format!("pi-{n}"), format!("{n:064x}"))
+    }
+
+    /// A2-4: the early start takes the identity only from what derive reads first, once it holds still on two looks.
+    #[test]
+    fn the_session_start_spawn_waits_for_a_steady_primary_identity() {
+        let quick = Duration::from_millis(1);
+        let never = || false;
+        let looks = |seq: Vec<Option<(String, String, String)>>| {
+            let mut it = seq.into_iter();
+            move || it.next().flatten()
+        };
+        assert_eq!(steady_identity(looks(vec![Some(id(1)), Some(id(1))]), Duration::from_secs(1), quick, never), Some(id(1)));
+        assert_eq!(
+            steady_identity(looks(vec![None, None, Some(id(1)), Some(id(1))]), Duration::from_secs(1), quick, never),
+            Some(id(1)),
+            "the Wi-Fi driver came up: its address, held still"
+        );
+        assert_eq!(
+            steady_identity(looks(vec![Some(id(1)), Some(id(2)), Some(id(2))]), Duration::from_secs(1), quick, never),
+            Some(id(2)),
+            "an address that changed once: the one that held"
+        );
+        assert_eq!(
+            steady_identity(|| None, Duration::from_millis(20), quick, never),
+            None,
+            "never there (derive falls back to the serial): the 0x5703 starts carplayd"
+        );
+        assert_eq!(steady_identity(|| Some(id(1)), Duration::from_secs(1), quick, || true), None, "torn down meanwhile");
     }
 
     #[test]
     fn going_quiet_neither_names_nor_puts_back() {
         // P5: go-quiet always ends in teardown_av_layer, which removes the name; a put-back seconds before it
         // would have carplayd dial the old phone only to be killed.
-        let early = EarlyName { phone: B, before: Some(A) };
+        let early = EarlyName { phone: B, before: Some(A_HANDED) };
         let seen = Seen { named: Some(B), carplay: None, connected: false };
         assert_eq!(at_session_end(early, false, seen, true), AtEnd::Quiet);
-        assert_eq!(at_session_start(Some(B), true, Some(A), false, true), AtStart::Leave);
+        assert_eq!(at_session_start(Some(B), true, Some(A_HANDED), IDLE, true), AtStart::Leave);
+    }
+
+    #[test]
+    fn the_name_stays_while_carplayd_holds_the_named_phones_connection() {
+        // P7: B was dialled and connected, and its Bluetooth session ended before its SETUP published it.
+        let early = EarlyName { phone: B, before: Some(A_HANDED) };
+        let seen = Seen { named: Some(B), carplay: None, connected: true };
+        assert_eq!(at_session_end(early, false, seen, false), AtEnd::Connected);
+        assert_eq!(at_session_end(early, true, seen, false), AtEnd::Leave, "a handoff leaves it as ever");
     }
 
     #[test]

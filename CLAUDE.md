@@ -199,7 +199,7 @@ list** — that leaves every non-IW416 unit with callers naming scripts it does 
 the exact failure the seam exists to fix.
 
 The seam is `ccpa/rootfs/script/radio_detect.sh` (read-only detection, emits `/tmp/radio_caps`)
-and `radio_hal.sh` (verbs `probe|status|wifi_ap_on|wifi_ap_off|bt_on|bt_off|preload`). It **adopts the
+and `radio_hal.sh` (verbs `probe|status|wifi_ap_on|wifi_ap_off|wifi_ap_prep|bt_on|bt_off|preload`). It **adopts the
 vendor's mapping, not their mechanism**: the per-chip `insmod` lines come from the unit's own
 `init_bluetooth_wifi.sh` and the attach command plus ordering constraint from its
 `attach_bluetooth.sh`, but neither dispatcher is ever executed — they fork BT attach and return
@@ -226,8 +226,8 @@ Three things that will bite:
 3. **The interface name is an insmod parameter**, not a constant (`if2name=sta0`,
    `iface_name=sta`; on Broadcom `wlan0` does not exist until explicitly created). Enumerate
    `/sys/class/net/*/wireless`; never assume `wlan0`. The Rust side still hardcodes it
-   (`av.rs:63` — note `:66` is `AP_IP`, an address, not an interface name — plus `box_identity.rs:15`,
-   `message.rs:215`, and ocbmd's `/sys/class/net/wlan0/address` read) — unfixed, tracked in docs/wireless/01_BT_AND_RADIO.md.
+   (`av.rs` `WLAN_IFACE` — the `AP_IP` beside it is an address, not an interface name — plus `box_identity.rs`
+   `SOURCES`, iap2-core's `message.rs:215`, and ocbmd's `/sys/class/net/wlan0/address` read) — unfixed, tracked in docs/wireless/01_BT_AND_RADIO.md.
 
 **Disassembly and on-hardware experiments are the last resort, not the first.** Over 2026-07-22 → 07-25
 this project burned several sessions — six disassembly passes and multiple deploy-test-revert hardware

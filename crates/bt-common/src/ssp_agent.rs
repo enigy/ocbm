@@ -773,6 +773,19 @@ fn refuse_pairing(bdaddr: &[u8; 6]) {
     let _ = std::fs::write(crate::rfcomm::PAIR_REJECTED_FLAG, fmt_bdaddr_tail(bdaddr));
 }
 
+/// mgmt's connectable setting off (and with it discoverable), for btd's armed bring-up: Bluetooth powered between
+/// host sessions, but nothing may see it or connect to it. Sent while the controller is still down, it is a flag
+/// change and nothing more, so the kernel's own work when the controller is next opened (its `powered_update_hci`,
+/// which writes Scan_Enable from these flags) enables no scan at all; on a controller already up the kernel writes
+/// Scan_Enable "none" for it. The armed bring-up then writes "none" itself and reads the controller's own scan mode
+/// back (`hci::read_scan_enable`); this only shuts the window before that. A session's agent ([`run`]) sets
+/// connectable and the pairing state again, as at every session start. Best effort: a rejection is logged.
+pub fn clear_connectable(controller_index: u16) -> std::io::Result<()> {
+    let mut sock = open_mgmt_socket()?;
+    apply_setting(&mut sock, OP_SET_CONNECTABLE, controller_index, &[0], "SET_CONNECTABLE=0 (armed: invisible)");
+    Ok(())
+}
+
 /// Bring `controller_index` (typically 0 for `hci0`) up with SSP enabled and IO capability set to
 /// force Just Works, then poll until `shutdown` is set. Best-effort: each setup command's failure is
 /// logged, not fatal -- `bt_bringup::bring_up`'s own `hciconfig` calls may have already configured

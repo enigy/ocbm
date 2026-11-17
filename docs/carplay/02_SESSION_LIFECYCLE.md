@@ -954,6 +954,12 @@ ARMs (carplayd `OCBM_FWD_ENC=1` + rx-connect) or TEARs DOWN to the holding patte
 up so the iPhone remains an enumerated accessory with CarPlay not running. GONE teardown also powers
 BT off (`hciconfig hci0 down`, not just noscan) to drop the iPhone's BT connection to an app-less box;
 the wired iap2d holding pattern is the sanctioned exception, since no radio is involved.
+*(Corrected 16 Nov 2026, the owner's decision of that day:)* once that teardown is over, the supervisor now ARMS
+Bluetooth for the next host: powered again, but with page and inquiry scan off, no connection and nothing paging, a
+btd waiting for the host's arrival as its go; the phone is still dropped by the teardown, and nothing can see or reach
+an app-less box. The AP stays down (its configuration is written ahead, nothing is raised). Switched off by
+`/script/radio_arm_off`, it is 2.6.0's powered-down state again. The state, its proof and every case:
+[../wireless/01_BT_AND_RADIO.md](../wireless/01_BT_AND_RADIO.md), "Between host sessions: armed".
 
 Because ocbmd applies its grace before moving `/tmp/host_present`, a heartbeat blip shorter than
 `HEARTBEAT_GRACE` never reaches the actor — no teardown/re-ARM cycle occurs. A clean `CT_STOP` is the

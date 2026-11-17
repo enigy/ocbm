@@ -223,28 +223,14 @@ impl Drop for MfiLock {
 }
 
 impl MfiSigner for LocalMfiSigner {
-    /// CopyCertificate: reg 0x30 = length (2 BE), reg 0x31 = cert bytes (the genuine ~945-byte cert).
+    /// CopyCertificate: the boot's cached certificate (`mfi_i2c_local::cert_cache`, the tunnel's, shared since A4 with
+    /// btd too: MFI-CACHE-SCOPE), else the chip's under the lock, held for the whole 0x30→0x31 transaction and no longer
+    /// ([`LocalMfiSigner::chip_certificate`]), cached when it is one DER certificate. Signing always goes to the chip.
     fn copy_certificate(&mut self) -> io::Result<Vec<u8>> {
-        let asked = std::time::Instant::now();
-        let lock = MfiLock::acquire()?; // held for the whole 0x30→0x31 transaction
-        let held = std::time::Instant::now();
-        let mut lb = [0u8; 2];
-        if !self.rd(0x30, &mut lb) {
-            return Err(io::Error::other("MFi cert length read failed"));
-        }
-        let n = ((lb[0] as usize) << 8) | lb[1] as usize;
-        if n == 0 || n > 2048 {
-            return Err(io::Error::other(format!("MFi cert length {n} out of range")));
-        }
-        let mut cert = vec![0u8; n];
-        if !self.rd(0x31, &mut cert) {
-            return Err(io::Error::other("MFi cert read failed"));
-        }
-        let under = held.elapsed();
-        drop(lock); // released as the read ends, as before; the time is told after
-        eprintln!("{}", mfi_cert_line(cert.len(), under, held.duration_since(asked)));
-        receiver::startup::chip(receiver::startup::Chip::Cert, under.as_millis() as u64);
-        Ok(cert)
+        let f = mfi_i2c_local::cert_cache::fetch(CERT_CACHE, MfiLock::acquire, || self.chip_certificate())?;
+        eprintln!("{}", mfi_fetched_line(&f));
+        receiver::startup::chip(receiver::startup::Chip::Cert, f.under.as_millis() as u64);
+        Ok(f.cert)
     }
 
     /// CreateSignature over a 20-byte SHA-1 digest: write challenge (0x20 len / 0x21 data), trigger
@@ -322,10 +308,58 @@ impl MfiSigner for LocalMfiSigner {
     }
 }
 
+impl LocalMfiSigner {
+    /// The chip's certificate, read under the lock the caller holds: reg 0x30 = length (2 BE), reg 0x31 = cert bytes
+    /// (the genuine ~945-byte cert).
+    fn chip_certificate(&self) -> io::Result<Vec<u8>> {
+        let mut lb = [0u8; 2];
+        if !self.rd(0x30, &mut lb) {
+            return Err(io::Error::other("MFi cert length read failed"));
+        }
+        let n = ((lb[0] as usize) << 8) | lb[1] as usize;
+        if n == 0 || n > 2048 {
+            return Err(io::Error::other(format!("MFi cert length {n} out of range")));
+        }
+        let mut cert = vec![0u8; n];
+        if !self.rd(0x31, &mut cert) {
+            return Err(io::Error::other("MFi cert read failed"));
+        }
+        Ok(cert)
+    }
+}
+
+/// The boot's cached MFi certificate (`mfi_i2c_local::cert_cache`). `cfg(test)`: a path of its own.
+#[cfg(not(test))]
+const CERT_CACHE: &str = mfi_i2c_local::cert_cache::PATH;
+#[cfg(test)]
+const CERT_CACHE: &str = "/tmp/carplayd_selftest_cert.der";
+
 /// auth-setup's certificate read, for the log (and the connect timeline's cert2_ms): its bytes and time under the
 /// lock, and the wait for the lock.
 fn mfi_cert_line(bytes: usize, under: Duration, waited: Duration) -> String {
     format!("[carplayd] mfi: cert {bytes} B in {} ms under the lock, {} ms waiting for it", under.as_millis(), waited.as_millis())
+}
+
+/// auth-setup's certificate as fetched, for the log: from the boot's cache, or the chip's read ([`mfi_cert_line`]), and
+/// whether that was cached.
+fn mfi_fetched_line(f: &mfi_i2c_local::cert_cache::Fetched) -> String {
+    use mfi_i2c_local::cert_cache::Source;
+    match f.from {
+        Source::Cache => format!("[carplayd] mfi: cert {} B from the boot's cache, no chip read", f.cert.len()),
+        Source::Chip { cached: true } => mfi_cert_line(f.cert.len(), f.under, f.waited),
+        Source::Chip { cached: false } => {
+            format!("{}; not one DER certificate: sent, not cached", mfi_cert_line(f.cert.len(), f.under, f.waited))
+        }
+    }
+}
+
+/// A control connection ended (A4): the phone verifies auth-setup's certificate and signature before its next request,
+/// and gives up on a connection whose certificate it cannot verify (`ControlServer::auth_unconfirmed`), so the cached
+/// certificate at `path` is forgotten then and the next session of any chip user reads the chip, as the tunnel does
+/// on its 0xAA04. True when one was cached, and is gone. A connection that ended there for another reason costs one
+/// chip read.
+fn forget_cert_after(auth_unconfirmed: bool, path: &str) -> bool {
+    auth_unconfirmed && mfi_i2c_local::cert_cache::forget(path)
 }
 
 /// auth-setup's signature, for the log (and the timeline's chip2_ms): the chip's time from go to status ready (the
@@ -566,9 +600,14 @@ fn arm_keepalive(stream: &std::net::TcpStream) -> io::Result<()> {
             Ok(())
         }
     }
+    // Linux's idle option; Darwin's is TCP_KEEPALIVE, for carplayd's tests on a developer's Mac.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const TCP_KEEPIDLE: libc::c_int = libc::TCP_KEEPIDLE;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    const TCP_KEEPIDLE: libc::c_int = libc::TCP_KEEPALIVE;
     unsafe {
         set(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1)?;
-        set(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, 3)?; // Linux idle seconds (Darwin: TCP_KEEPALIVE)
+        set(fd, libc::IPPROTO_TCP, TCP_KEEPIDLE, 3)?; // Linux idle seconds (Darwin: TCP_KEEPALIVE)
         set(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, 3)?; // probe interval
         set(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT, 3)?; // probe count
     }
@@ -1633,10 +1672,11 @@ fn run_pairing_server() -> io::Result<()> {
     // listening. It is handed the identity rather than re-deriving it: the advertised deviceid/pi
     // must equal the ones `Identity` above verifies with, and two processes reading the same env
     // vars was the only thing that ever kept them in step.
-    // The one phone this carplayd serves (`phone_gate`): btd names it at each Wi-Fi handoff, and as a bonded
-    // phone's Bluetooth session starts while no CarPlay session is up. Discovery dials it when the name
-    // changes, and leaves alone a phone refused at SETUP; the accept thread drops its connections, and does not let
-    // another address preempt the named phone's session.
+    // The one phone this carplayd serves (`phone_gate`): btd names it as a bonded phone's Bluetooth session starts
+    // while no CarPlay session is up, and at its Wi-Fi handoff (0x5703) with the mark that lets discovery dial it. Before
+    // any phone is named (carplayd starts with btd's host session, A2) nobody is served or dialled. Discovery dials the
+    // named phone when the name changes or its mark comes, and leaves alone a phone refused at SETUP; the accept thread
+    // drops its connections, and does not let another address preempt the named phone's session.
     let gate = std::sync::Arc::new(phone_gate::PhoneGate::from_env());
     if gate.armed() {
         println!("[carplayd] phone gate armed: serving only the phone btd names");
@@ -1690,9 +1730,16 @@ fn run_pairing_server() -> io::Result<()> {
                         let _ = stream.shutdown(std::net::Shutdown::Both);
                         continue;
                     }
+                    phone_gate::Admit::Unnamed => {
+                        eprintln!("[carplayd] phone gate: btd has named no phone yet; dropping a connection from {peer}");
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                        continue;
+                    }
                 }
             }
             generation += 1;
+            // Open until it ends (`unregister`) or is superseded unserved: discovery's retries wait for none (carplayd-1).
+            accept_gate.connection_opened(generation);
             {
                 let mut cur = plock(&accept_current);
                 if let Some((_, s)) = cur.as_ref() {
@@ -1727,6 +1774,7 @@ fn run_pairing_server() -> io::Result<()> {
         while let Ok((newer_gen, newer)) = rx.try_recv() {
             let _ = stream.shutdown(std::net::Shutdown::Both);
             eprintln!("[carplayd] hijack: superseded a queued control connection with a newer one");
+            gate.session_ended(generation); // never served: it is open no more
             generation = newer_gen;
             stream = newer;
         }
@@ -1784,6 +1832,12 @@ fn run_pairing_server() -> io::Result<()> {
             .display_width(dev.display_width as u32)
             .session(session);
         let result = serve_connection(stream, &mut server);
+        if forget_cert_after(server.auth_unconfirmed(), CERT_CACHE) {
+            eprintln!(
+                "[carplayd] mfi: the phone asked nothing after auth-setup: the cached certificate is forgotten, the next \
+                 session reads the chip"
+            );
+        }
         unregister(generation);
         clear_transport_flag();
         clear_phone_ident_from(ident_before);
@@ -1901,6 +1955,40 @@ mod tests {
         let mut tunnel = vec![0u8; 3 + ocbm_proto::MAX_INPUT_TUNNEL];
         tunnel[0] = ocbm_proto::INPUT_TUNNEL;
         assert!(input_sub_frame_fits(&tunnel));
+    }
+
+    /// A certificate's shape: `30 82` and a length that is the rest of it (945 bytes for 941).
+    fn der(body: usize) -> Vec<u8> {
+        let mut c = vec![0x30, 0x82, (body >> 8) as u8, body as u8];
+        c.extend(std::iter::repeat(0x3c).take(body));
+        c
+    }
+
+    /// A4 in auth-setup: the first certificate of a boot comes from the chip and is cached, every later one from the
+    /// cache with no chip read; a read that isn't one DER certificate is sent once and not cached; a connection the
+    /// phone left after auth-setup without a request forgets the cache, one that went on keeps it.
+    #[test]
+    fn auth_setup_serves_the_cached_certificate_by_the_tunnels_rules() {
+        use mfi_i2c_local::cert_cache::{fetch, Source};
+        let path = std::env::temp_dir().join(format!("carplayd_cert_cache_{}.der", std::process::id()));
+        let p = path.to_str().unwrap();
+        let _ = std::fs::remove_file(&path);
+        let lock = || -> io::Result<()> { Ok(()) };
+        let bad = fetch(p, lock, || Ok(vec![0xffu8; 945])).unwrap();
+        assert!(mfi_fetched_line(&bad).ends_with("; not one DER certificate: sent, not cached"), "{}", mfi_fetched_line(&bad));
+        let first = fetch(p, lock, || Ok(der(941))).unwrap();
+        assert_eq!(first.from, Source::Chip { cached: true });
+        assert!(mfi_fetched_line(&first).starts_with("[carplayd] mfi: cert 945 B in "));
+        let again = fetch(p, lock, || -> io::Result<Vec<u8>> { panic!("cached: no chip read") }).unwrap();
+        assert_eq!(mfi_fetched_line(&again), "[carplayd] mfi: cert 945 B from the boot's cache, no chip read");
+        assert_eq!(again.under, Duration::ZERO, "the timeline's cert2_ms near zero");
+        assert!(!forget_cert_after(false, p), "the phone went on after auth-setup: kept");
+        assert!(path.exists());
+        assert!(forget_cert_after(true, p), "it asked nothing after auth-setup: forgotten");
+        assert!(!path.exists(), "so the next session reads the chip");
+        assert!(!forget_cert_after(true, p), "nothing left to forget");
+        let busy = fetch(p, || Err::<(), _>(io::Error::other("MFi lock busy")), || Ok(der(941)));
+        assert!(busy.is_err(), "no lock: the error, and nothing read");
     }
 
     /// auth-setup's chip times, as logged (the connect timeline's chip2_ms and cert2_ms come from the same numbers).

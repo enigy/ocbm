@@ -35,6 +35,145 @@ said() { grep -qF -- "$2" "$1.out"; }
 untold() { ! grep -qF -- "$2" "$1.out"; }   # the key is never logged
 rest() { [ "$(grep -v '^wpa_passphrase=' "$1/etc/hostapd.conf")" = "$(printf 'interface=wlan0\nssid=CarLink-fd6c\nchannel=36')" ]; }
 
+# ap_configure's cases (16 Nov 2026). A scratch adapter as a session's first AP start finds it: hostapd.conf on wlan0
+# under an older name, udhcpd.conf's pool on NCM's subnet, the box's name kept, and the AP interface sta0.
+adapter() {  # $1 dir
+  rm -rf "$1"; mkdir -p "$1/etc/ocbm" "$1/tmp" "$1/sys/class/net/sta0"
+  printf 'interface=wlan0\nssid=ccpa-fe01\nwpa_passphrase=%s\nhw_mode=a\nchannel=36\nht_capab=[HT40+]\n' "$PW" > "$1/etc/hostapd.conf"
+  printf 'start 192.168.50.100\nend 192.168.50.200\ninterface wlan0\nlease_file /var/lib/udhcpd.leases\n' > "$1/etc/udhcpd.conf"
+  echo "CarLink-fd6c" > "$1/etc/carplay_ident"
+  echo "02:00:00:00:fe:01" > "$1/sys/class/net/sta0/address"
+}
+# ap_configure then ap_stamp under shell $1 on adapter $2 for interface $3, as PREP runs them; what it said in $2.out.
+conf() {
+  OCBM_TEST_PATH="${OCBM_TEST_PATH:-$SED_SHIM}" RADIO_AP_UP_FUNCS=1 IF="$3" \
+    "$1" -c '. "$1" && ap_configure "$2" && ap_stamp "$2"' sh "$AP" "$2" > "$2.out" 2>&1
+}
+# ap_prepared_ok under shell $1 on adapter $2 for interface $3 (the seam's name for the box in $4): "NAME WLANIP ch".
+prepared() {
+  OCBM_TEST_PATH="${OCBM_TEST_PATH:-$SED_SHIM}" RADIO_AP_UP_FUNCS=1 IF="$3" RADIO_BOX_NAME="${4:-}" \
+    "$1" -c '. "$1" && ap_prepared_ok "$2" && echo "$NAME $WLANIP $ch"' sh "$AP" "$2"
+}
+# Every file of adapter $1 back to 2020, and a mark at 2021 that nothing_newer measures against.
+age() { find "$1/etc" -type f -exec touch -t 202001010000 {} +; touch -t 202101010000 "$1.mark"; }
+nothing_newer() { [ -z "$(find "$1/etc" -type f -newer "$1.mark")" ]; }
+
+# The AP's DHCP server stopped and seen gone (the release review of resident-bt, A3-1): stand-in servers, real
+# processes, whose command lines carry this run's own tag, so nothing else on this host can match. A host's ps lists
+# only its terminal's processes, BusyBox's all of them: a stand-in ps lists all (tools/busybox_suites.sh runs
+# BusyBox's own). HAL is the seam; both scripts carry ap_dhcp_stop.
+HAL="$REPO/ccpa/rootfs/script/radio_hal.sh"
+TAG="ocbmtest$$"
+MATCH="udhcpd .*$TAG/etc/udhcpd.conf"
+mkdir -p "$T/fake" "$T/psbin" "$T/$TAG/etc" "$T/$TAG/tmp"
+cat > "$T/fake/udhcpd" <<'EOF'
+#!/bin/sh
+# A stand-in AP DHCP server. $1: slow (exits 1 s after SIGTERM, as a lease file written to slow flash), quick (0.3 s
+# after it) or deaf (ignores SIGTERM; only SIGKILL ends it).
+case "$1" in slow) trap 'sleep 1; exit 0' TERM ;; quick) trap 'sleep 0.3; exit 0' TERM ;; deaf) trap '' TERM ;; esac
+while :; do sleep 0.1; done
+EOF
+chmod 755 "$T/fake/udhcpd"
+cat > "$T/psbin/ps" <<'EOF'
+#!/bin/sh
+exec /bin/ps -A -o pid= -o command=
+EOF
+chmod 755 "$T/psbin/ps"
+PSPATH="${OCBM_TEST_PATH:-$T/psbin}"
+STANDINS=""
+standin() {  # $1 slow|deaf, $2 config path: one stand-in server, detached (so it is reaped as it exits); its pid echoed
+  ( "$T/fake/udhcpd" "$1" -f "$2" </dev/null >/dev/null 2>&1 & echo $! )
+}
+gone() { ! kill -0 "$1" 2>/dev/null; }
+# Every stand-in so far ended and seen gone, so that one an earlier case failed to stop is no later case's.
+standins_ended() {
+  for p in $STANDINS; do kill -9 "$p" 2>/dev/null; done
+  for p in $STANDINS; do _n=0; while ! gone "$p" && [ "$_n" -lt 20 ]; do _n=$((_n + 1)); sleep 0.1; done; done
+  STANDINS=""
+}
+# ap_dhcp_stop from script $2 under shell $1 ($3: that script's functions-only switch); what it said in $T/dstop.out.
+dstop() {
+  env OCBM_TEST_PATH="$PSPATH" AP_DHCP_MATCH="$MATCH" "$3=1" "$1" -c '. "$1" && ap_dhcp_stop' sh "$2" > "$T/dstop.out" 2>&1
+}
+trap 'for p in $STANDINS; do kill -9 "$p" 2>/dev/null; done; rm -rf "$T"' EXIT
+
+# The whole start, its commands stood in for (the second review of resident-bt, item 5): radio_ap_up.sh runs against a
+# scratch adapter (AP_ROOT, AP_PROC, AP_BOXLOG) with these first on its PATH. Each keeps its state in $S. hostapd and
+# the AP's udhcpd are processes, as on the adapter; setsid execs (so $! is the server's own pid, as there).
+S="$T/stubs"; mkdir -p "$S"
+printf '#!/bin/sh\nexec "$@"\n' > "$S/setsid"
+cat > "$S/ifconfig" <<EOF
+#!/bin/sh
+# ifconfig IF ADDR ...: kept for IF; ifconfig IF: shown, as BusyBox's shows an address.
+if [ \$# -ge 2 ]; then echo "\$2" > "$S/if.\$1"; exit 0; fi
+a=\$(cat "$S/if.\$1" 2>/dev/null); [ -n "\$a" ] && echo "          inet addr:\$a  Mask:255.255.255.0"
+exit 0
+EOF
+cat > "$S/pidof" <<EOF
+#!/bin/sh
+# pidof hostapd: the stand-in's, while it runs.
+p=\$(cat "$S/hostapd.pid" 2>/dev/null)
+[ -n "\$p" ] && kill -0 "\$p" 2>/dev/null && { echo "\$p"; exit 0; }
+exit 1
+EOF
+cat > "$S/hostapd" <<EOF
+#!/bin/sh
+# A stand-in hostapd: its pid for pidof, its AP-ENABLED half a second in (its stdout is the box log), then running.
+echo \$\$ > "$S/hostapd.pid"
+sleep 0.5; echo "sta0: AP-ENABLED "
+while :; do sleep 0.1; done
+EOF
+cat > "$S/busybox" <<EOF
+#!/bin/sh
+# busybox udhcpd ...: a stand-in for the server the start launches, its /proc stat under AP_PROC. It notes whether the
+# last AP's server (OLD_DHCP) still ran as it started; with $S/udhcpd.exit there it exits at once (as one that could not
+# bind), its stat left a zombie's.
+mkdir -p "\$AP_PROC/\$\$"; echo "\$\$ (busybox) S 1 \$\$" > "\$AP_PROC/\$\$/stat"; echo \$\$ > "$S/udhcpd.pid"
+if [ -n "\${OLD_DHCP:-}" ] && kill -0 "\$OLD_DHCP" 2>/dev/null; then echo "old there"; else echo "old gone"; fi > "$S/udhcpd.start"
+[ -e "$S/udhcpd.exit" ] && { echo "\$\$ (busybox) Z 1 \$\$" > "\$AP_PROC/\$\$/stat"; exit 1; }
+while :; do sleep 0.1; done
+EOF
+cat > "$S/ps" <<EOF
+#!/bin/sh
+# ps, and with $S/ps.extra there a line more: a listing that names an AP DHCP server this start did not launch.
+"$PSPATH/ps" "\$@"; cat "$S/ps.extra" 2>/dev/null; exit 0
+EOF
+chmod 755 "$S"/*
+# radio_ap_up.sh (PREP when $2 says so) under shell $1 on adapter $R, OLD_DHCP passed on; its output in $R.out and its
+# status in $R.rc. The servers and hostapd it leaves running are this run's to end (ended).
+start_ap() {
+  env OCBM_TEST_PATH="$S:$PSPATH${SED_SHIM:+:$SED_SHIM}" AP_ROOT="$R" AP_PROC="$R/proc" AP_BOXLOG="$R/tmp/box.log" \
+    AP_DHCP_MATCH="$MATCH" RADIO_WLAN_IF=sta0 OLD_DHCP="${OLD_DHCP:-}" "$1" "$AP" ${2:-} > "$R.out" 2>&1
+  echo $? > "$R.rc"
+}
+ended() {  # the stand-in hostapd and udhcpd a start left, ended, and their records gone
+  for _f in "$S/hostapd.pid" "$S/udhcpd.pid"; do [ -s "$_f" ] && kill -9 "$(cat "$_f")" 2>/dev/null; done
+  rm -f "$S/hostapd.pid" "$S/udhcpd.pid" "$S/udhcpd.start"
+}
+trap 'ended; for p in $STANDINS; do kill -9 "$p" 2>/dev/null; done; rm -rf "$T"' EXIT
+
+# BusyBox's and GNU sed edit in place with a bare -i; a BSD sed (a Mac's) takes -i with a suffix. On such a host the
+# AP layer's sed -i is given a stand-in that does the same edit with this host's sed. tools/busybox_suites.sh and the
+# cross builder run the real thing.
+SED_SHIM=""
+echo a > "$T/sedtest"
+if [ -z "${OCBM_TEST_PATH:-}" ] && { ! sed -i 's/a/b/' "$T/sedtest" 2>/dev/null || [ "$(cat "$T/sedtest")" != b ]; }; then
+  mkdir -p "$T/shim"
+  _realsed="$(command -v sed)"
+  cat > "$T/shim/sed" <<EOF
+#!/bin/sh
+if [ "\$1" = -i ]; then
+  shift; _s=\$1; shift
+  for _f in "\$@"; do "$_realsed" "\$_s" "\$_f" > "\$_f.shim" && cat "\$_f.shim" > "\$_f"; rm -f "\$_f.shim"; done
+else
+  exec "$_realsed" "\$@"
+fi
+EOF
+  chmod 755 "$T/shim/sed"
+  SED_SHIM="$T/shim"
+  echo "== this host's sed takes -i with a suffix: the AP layer's in-place edits run through a stand-in"
+fi
+
 . "$HERE/test_shells.sh"
 for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   command -v "$sh" >/dev/null 2>&1 || { echo "== $sh: not installed, skipped"; continue; }
@@ -73,5 +212,174 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   else
     echo "  (skipped: a new random key needs md5sum, which this host lacks)"
   fi
+
+  # ---- the AP's configuration (ap_configure), and the stamp the armed state's PREP leaves (16 Nov 2026) ----------
+  echo "== $sh: ap_configure, the configuration written ahead, and its stamp"
+  R="$T/cfg"; adapter "$R"
+  conf "$sh" "$R" sta0
+  check 'grep -qx "ssid=CarLink-fd6c" "$R/etc/hostapd.conf" && grep -qx "interface=sta0" "$R/etc/hostapd.conf" && grep -qx "channel=36" "$R/etc/hostapd.conf"' \
+    "hostapd.conf: the box's name, the AP interface, its channel"
+  check 'grep -q "^start[[:space:]]*192\.168\.43\.100" "$R/etc/udhcpd.conf" && grep -q "^end[[:space:]]*192\.168\.43\.200" "$R/etc/udhcpd.conf"' \
+    "udhcpd.conf: the pool moved off NCM's 192.168.50 onto the AP's subnet"
+  check 'grep -qx "interface	sta0" "$R/etc/udhcpd.conf" && grep -qx "lease_file	/var/lib/udhcpd.leases" "$R/etc/udhcpd.conf" && grep -qx "pidfile	/var/run/udhcpd.pid" "$R/etc/udhcpd.conf" && grep -qx "auto_time	60" "$R/etc/udhcpd.conf"' \
+    "udhcpd.conf: the interface and BusyBox's three keys"
+  check '[ "$(cat "$R/etc/wifi_name")" = CarLink-fd6c ] && [ "$(key "$R")" = "$PW" ]' "the name kept for the vendor's readers; a good key untouched"
+  check '[ "$(head -1 "$R/tmp/.radio_ap_prepared")" = "sta0 CarLink-fd6c 192.168.43.1 36 0" ] && [ "$(sed -n 2p "$R/tmp/.radio_ap_prepared" | wc -w)" -eq 8 ]' \
+    "the stamp: interface, name, address, channel, 2.4 GHz flag, then a checksum for each of the four watched files there"
+  # Again, unchanged: nothing written (the arm runs this at every host departure, and /etc is flash).
+  age "$R"
+  conf "$sh" "$R" sta0
+  check 'nothing_newer "$R"' "a second configuration with nothing changed writes no file"
+  check '[ "$(grep -c . "$R/etc/udhcpd.conf")" = 6 ]' "and adds no key twice"
+  # The stamp is trusted for the interface it names while what it was written from holds what it held: by content,
+  # never by date. The release review of resident-bt (A3-2): the boot's arm writes the stamp under the 2020 clock the
+  # adapter keeps until a host sets it, and the files carry dates a 2026 clock gave them.
+  touch -t 202001020000 "$R/tmp/.radio_ap_prepared"; find "$R/etc" -type f -exec touch -t 202611161200 {} +
+  check 'prepared "$sh" "$R" sta0 >"$R.p" && [ "$(cat "$R.p")" = "CarLink-fd6c 192.168.43.1 36" ]' \
+    "files dated after the stamp, their contents as they were: trusted, the name, address and channel from it"
+  check '! prepared "$sh" "$R" wlan0 >/dev/null' "not for another interface"
+  check '! prepared "$sh" "$R" sta0 CarLink-0000 >/dev/null' "not when the seam names the box otherwise"
+  cp -p "$R/etc/hostapd.conf" "$R/hostapd.keep"
+  sed 's/^channel=36$/channel=40/' "$R/hostapd.keep" > "$R/etc/hostapd.conf"; touch -t 201901010000 "$R/etc/hostapd.conf"
+  check '! prepared "$sh" "$R" sta0 >/dev/null' "not once hostapd.conf holds something else, however old its date"
+  cp -p "$R/hostapd.keep" "$R/etc/hostapd.conf"
+  check 'prepared "$sh" "$R" sta0 >/dev/null' "(trusted again with hostapd.conf as it was)"
+  printf '10.1.2.1\n' > "$R/etc/wifi_ip"
+  check '! prepared "$sh" "$R" sta0 >/dev/null' "not once /etc/wifi_ip is there"
+  rm "$R/etc/wifi_ip"
+  touch -t 202001010000 "$R/etc/wifi_use_24G"
+  check '! prepared "$sh" "$R" sta0 >/dev/null' "not once the 2.4 GHz flag is there, however old"
+  rm "$R/etc/wifi_use_24G"; echo "CarLink-beef" > "$R/etc/carplay_ident"
+  check '! prepared "$sh" "$R" sta0 >/dev/null' "not once /etc/carplay_ident names the box otherwise"
+  echo "CarLink-fd6c" > "$R/etc/carplay_ident"
+  check 'prepared "$sh" "$R" sta0 >/dev/null' "(trusted again with the name as it was)"
+  { echo "sta0 CarLink-fd6c 192.168.43.1 x 0"; sed -n 2p "$R/tmp/.radio_ap_prepared"; } > "$R.st"; mv "$R.st" "$R/tmp/.radio_ap_prepared"
+  check '! prepared "$sh" "$R" sta0 >/dev/null' "not a stamp with a channel that is no number"
+  head -1 "$R/tmp/.radio_ap_prepared" | sed 's/ x / 36 /' > "$R.st"; mv "$R.st" "$R/tmp/.radio_ap_prepared"
+  check '! prepared "$sh" "$R" sta0 >/dev/null' "not a stamp of one line (an older one, without the checksums)"
+  # A changed input is configured afresh: the 2.4 GHz flag moves the AP to channel 6 in g.
+  : > "$R/etc/wifi_use_24G"
+  conf "$sh" "$R" sta0
+  check 'grep -qx "channel=6" "$R/etc/hostapd.conf" && grep -qx "hw_mode=g" "$R/etc/hostapd.conf" && [ "$(head -1 "$R/tmp/.radio_ap_prepared")" = "sta0 CarLink-fd6c 192.168.43.1 6 1" ]' \
+    "the 2.4 GHz flag: channel 6, hw_mode g, and the stamp says so"
+  check 'prepared "$sh" "$R" sta0 >/dev/null' "and that stamp is trusted"
+  # Never 192.168.50.x: an /etc/wifi_ip that reads as NCM's subnet (octal here) is refused, as before.
+  printf '192.168.062.1\n' > "$R/etc/wifi_ip"
+  conf "$sh" "$R" sta0
+  check 'grep -q "192\.168\.43\.100" "$R/etc/udhcpd.conf" && said "$R" "not a plain IPv4 address"' "an octal 192.168.062.1 is refused, the AP stays on .43"
+
+  echo "== $sh: the AP's DHCP server, stopped and seen gone (both scripts), and this AP's own asked after"
+  for which in "$HAL RADIO_HAL_FUNCS" "$AP RADIO_AP_UP_FUNCS"; do
+    set -- $which; script=$1; hook=$2; name=$(basename "$script")
+    slow=$(standin slow "$T/$TAG/etc/udhcpd.conf"); ncm=$(standin slow "$T/$TAG/tmp/udhcpd_ncm.conf")
+    STANDINS="$STANDINS $slow $ncm"; sleep 0.3
+    t0=$(date +%s); dstop "$sh" "$script" "$hook"; t1=$(date +%s)
+    check 'gone "$slow" && ! grep -q SIGKILL "$T/dstop.out" && [ $((t1 - t0)) -le 3 ]' \
+      "$name: a server that takes a second over its lease file is waited for, not killed"
+    check '! gone "$ncm"' "$name: the NCM server (its own config) is never touched"
+    kill -9 "$ncm" 2>/dev/null
+    deaf=$(standin deaf "$T/$TAG/etc/udhcpd.conf"); STANDINS="$STANDINS $deaf"; sleep 0.3
+    dstop "$sh" "$script" "$hook"
+    check 'gone "$deaf" && grep -q "3 s after SIGTERM" "$T/dstop.out"' "$name: one still there 3 s after SIGTERM is SIGKILLed, and gone"
+    dstop "$sh" "$script" "$hook"
+    check '[ ! -s "$T/dstop.out" ]' "$name: none there: nothing to do, nothing said"
+  done
+  check 'echo "  321 root  1408 S  busybox udhcpd -f -a 250 /etc/udhcpd.conf" | grep -q "udhcpd .*etc/udhcpd.conf" && ! echo "  322 root  1408 S  busybox udhcpd -f /tmp/udhcpd_ncm.conf" | grep -q "udhcpd .*etc/udhcpd.conf"' \
+    "the pattern both scripts use by default finds the AP's server and never the NCM one"
+  check '[ "$(RADIO_AP_UP_FUNCS=1 "$sh" -c ". \"\$1\"; echo \"\$AP_DHCP_MATCH\"" sh "$AP")" = "udhcpd .*etc/udhcpd.conf" ] && [ "$(RADIO_HAL_FUNCS=1 "$sh" -c ". \"\$1\"; echo \"\$AP_DHCP_MATCH\"" sh "$HAL")" = "udhcpd .*etc/udhcpd.conf" ]' \
+    "(and it is the default in both)"
+  # This AP's own server, by the pid this start kept: alive through the confirmation, or the AP is not serving.
+  mkdir -p "$T/proc/777"
+  serving() { env OCBM_TEST_PATH="$PSPATH" AP_DHCP_MATCH="$1" AP_PROC="$T/proc" RADIO_AP_UP_FUNCS=1 _dhcpd="${2:-}" "$sh" -c '. "$1" && ap_dhcp_serving' sh "$AP"; }
+  echo "777 (busybox) S 1 777" > "$T/proc/777/stat"
+  check 'serving "$MATCH" 777' "the server this start launched, running: serving"
+  echo "777 (busybox) Z 1 777" > "$T/proc/777/stat"
+  check '! serving "$MATCH" 777' "it exited (a zombie this start has not reaped): not serving, whatever else is listed"
+  rm "$T/proc/777/stat"
+  check '! serving "$MATCH" 777' "gone altogether: not serving"
+  echo "777 (setsid) Z 1 777" > "$T/proc/777/stat"; alive=$(standin slow "$T/$TAG/etc/udhcpd.conf"); STANDINS="$STANDINS $alive"; sleep 0.3
+  check 'serving "$MATCH" 777 && ! serving "udhcpd .*nothing-$TAG" 777' "the pid setsid's, not the server's: asked by config path, as before"
+  check 'serving "$MATCH" "" && ! serving "udhcpd .*nothing-$TAG" ""' "none launched by this start (an AP already up): by config path, as before"
+  kill -9 "$alive" 2>/dev/null
+
+  # The whole start (the second review of resident-bt, item 5): the stop on a launch, the server it starts and the pid
+  # it keeps, so that a start which counted any AP DHCP server listed by config path (the A3-1 bug) fails here.
+  echo "== $sh: the whole start, its commands stood in for: the last AP's DHCP server is never this one's"
+  R="$T/ap/$TAG"; adapter "$R"; mkdir -p "$R/sys/class/net/sta0/wireless" "$R/proc"
+  standins_ended; ended; rm -f "$S"/if.* "$S/udhcpd.exit" "$S/ps.extra"
+  start_ap "$sh" PREP
+  check '[ "$(cat "$R.rc")" = 0 ] && grep -q "configured ahead: ssid=CarLink-fd6c ip=192.168.43.1 ch=36 if=sta0 (nothing raised)" "$R.out" && [ ! -e "$S/hostapd.pid" ] && [ ! -e "$S/udhcpd.pid" ]' \
+    "PREP, as the arm runs it: configured, and nothing raised"
+  # The bench's bad wake: the last AP's server still over its lease file as the next AP starts.
+  old=$(standin quick "$T/$TAG/etc/udhcpd.conf"); ncm=$(standin quick "$T/$TAG/tmp/udhcpd_ncm.conf")
+  STANDINS="$STANDINS $old $ncm"; sleep 0.3
+  OLD_DHCP=$old; start_ap "$sh"; OLD_DHCP=""
+  check '[ "$(cat "$R.rc")" = 0 ] && grep -q "configured ahead (/tmp/.radio_ap_prepared)" "$R.out" && grep -q "AP up: ssid=CarLink-fd6c ip=192.168.43.1 ch=36 if=sta0 dhcp=yes" "$R.out"' \
+    "the configuration written ahead trusted, and the AP up"
+  check 'gone "$old" && ! grep -q "after SIGTERM" "$R.out" && [ "$(cat "$S/udhcpd.start" 2>/dev/null)" = "old gone" ] && kill -0 "$(cat "$S/udhcpd.pid")" 2>/dev/null' \
+    "the last AP's server, still exiting: waited for, gone before this AP's own started, and that one serving"
+  check '! gone "$ncm" && grep -qx "\[radio\] hostapd starting on sta0" "$R/tmp/box.log"' \
+    "the NCM server untouched; the start's own line in the box log (its AP-ENABLED comes after it)"
+  kill -9 "$ncm" 2>/dev/null
+  # This AP's own server exits at once while the listing still names another (here a pid with no process, so the stop
+  # has nothing to wait for): only the server this start launched counts. 12 s: the converge step runs to its bound.
+  ended; : > "$S/udhcpd.exit"
+  ph=$(sh -c 'echo $$')
+  echo "$ph busybox udhcpd -f -a 250 $T/$TAG/etc/udhcpd.conf" > "$S/ps.extra"
+  start_ap "$sh"
+  check '[ "$(cat "$R.rc")" = 1 ] && grep -q "the AP DHCP server is not running (the one started here, pid $(cat "$S/udhcpd.pid"), exited)" "$R.out"' \
+    "this AP's own server gone, another still listed: not up, and the one started here named"
+  ended; rm -f "$S/udhcpd.exit" "$S/ps.extra"
+  # The last AP's server deaf to SIGTERM at a start: SIGKILLed after the start's 1 s, not the teardown's 3 (the wlan
+  # lock this holds is what btd's 0x5702 reply waits on, 5 s at most).
+  old=$(standin deaf "$T/$TAG/etc/udhcpd.conf"); STANDINS="$STANDINS $old"; sleep 0.3
+  OLD_DHCP=$old; start_ap "$sh"; OLD_DHCP=""
+  check '[ "$(cat "$R.rc")" = 0 ] && grep -q "still there 1 s after SIGTERM" "$R.out" && gone "$old" && [ "$(cat "$S/udhcpd.start" 2>/dev/null)" = "old gone" ]' \
+    "one deaf to SIGTERM: SIGKILLed after the start's own 1 s, then this AP's server, and the AP up"
+  ended
+
+  # do_wifi_ap_off itself, its commands stood in for (the second review, item 5): the AP's server seen gone before it
+  # returns, so that a teardown which killed and went on (2.6.1's) fails here.
+  echo "== $sh: do_wifi_ap_off: the AP's DHCP server gone before it returns"
+  D="$T/off"; rm -rf "$D"; mkdir -p "$D"; printf 'RADIO_WIRELESS=yes\nRADIO_BACKEND=mapped\n' > "$D/caps"
+  standins_ended
+  slow=$(standin slow "$T/$TAG/etc/udhcpd.conf"); ncm=$(standin slow "$T/$TAG/tmp/udhcpd_ncm.conf")
+  STANDINS="$STANDINS $slow $ncm"; sleep 0.3
+  env OCBM_TEST_PATH="$PSPATH" AP_DHCP_MATCH="$MATCH" RADIO_HAL_FUNCS=1 "$sh" -c '. "$1"
+    _t_d=$2; CAPS="$_t_d/caps"; WLAN_STATE="$_t_d/wlan_state"
+    killall() { echo "killall $*" >> "$_t_d/calls"; }
+    ifconfig() { echo "ifconfig $*" >> "$_t_d/calls"; }
+    wlan_iface() { echo sta0; }
+    ap_running() { return 1; }
+    do_wifi_ap_off; echo "rc=$?"' sh "$HAL" "$D" > "$D.out" 2>&1
+  check 'grep -qx "rc=0" "$D.out" && gone "$slow" && ! grep -q SIGKILL "$D.out" && grep -q "wifi AP down" "$D.out"' \
+    "a server a second over its lease file: gone when do_wifi_ap_off returns, waited for, not killed"
+  check '! gone "$ncm" && grep -qx "killall hostapd" "$D/calls" && grep -qx "ifconfig sta0 down" "$D/calls"' \
+    "the NCM server untouched; hostapd stopped and the interface down, as before"
+  kill -9 "$ncm" 2>/dev/null
+
+  # hostapd's AP-ENABLED: one after this start's own line in the box log (the second review of resident-bt, item 3). A
+  # box log ocbmd emptied at its cap took that line with it, and every AP-ENABLED in it then is this hostapd's.
+  echo "== $sh: hostapd's AP-ENABLED, after the start's own line, through a box log emptied at its cap"
+  B="$T/box.log"; M="[radio] hostapd starting on sta0"
+  seen() {  # "seen" or "waiting", the start's own line $1 (M when not given)
+    env AP_BOXLOG="$B" RADIO_AP_UP_FUNCS=1 _ae_mark="${1-$M}" "$sh" -c '. "$1"; if ap_enabled_seen; then echo seen; else echo waiting; fi' sh "$AP"
+  }
+  printf '%s\nsta0: AP-ENABLED \n%s\nx\nsta0: AP-ENABLED \n%s\ny\n' "$M" "$M" "$M" > "$B"
+  check '[ "$(seen)" = waiting ]' "two earlier starts and their AP-ENABLED, then this start's line: not yet"
+  echo "sta0: AP-ENABLED " >> "$B"
+  check '[ "$(seen)" = seen ]' "one after this start's own line: this hostapd's"
+  printf 'x\nsta0: AP-ENABLED \n%s\n' "$M" > "$B"
+  check '[ "$(seen)" = waiting ]' "one AP-ENABLED before the start's line (a count's baseline of 1): not yet"
+  : > "$B"
+  check '[ "$(seen)" = waiting ]' "the log emptied at its cap: waiting"
+  echo "sta0: AP-ENABLED " >> "$B"
+  check '[ "$(seen)" = seen ]' "emptied, then this hostapd's AP-ENABLED, the count back at that baseline: seen (the count missed it)"
+  printf '[log] rotated 262200 bytes (not streamed)\nsta0: AP-ENABLED \n' > "$B"
+  check '[ "$(seen)" = seen ]' "emptied by the idle rotation, its own line first: seen"
+  rm -f "$B"
+  check '[ "$(seen)" = waiting ]' "no box log at all: waiting"
+  printf 'sta0: AP-ENABLED \n' > "$B"
+  check '[ "$(seen "")" = waiting ]' "no line of its own (its write failed): never seen, the wait runs to its bound"
 done
 [ "$fails" -eq 0 ] && echo "radio_ap_up_test: all passed" || { echo "radio_ap_up_test: $fails failed"; exit 1; }

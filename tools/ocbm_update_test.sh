@@ -209,6 +209,37 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   update "$sh" "$d"; restart "$d"; touch "$d/run/ocbmd_answered" "$d/run/radio_off"; boot "$sh" "$d" BTD_UP=false
   check 'waitfor "is_new \"$d\"" 8' "with the radios off on purpose, btd is not waited for: committed"
 
+  # The commit's own check (BTD_UP left to its default, btd_session_up), a btd process always there (BTD_RUNNING): a
+  # btd only ARMED between host sessions (16 Nov 2026: up and invisible, waiting for a host) is no btd serving one (the
+  # release review of resident-bt, A1-3). It names itself in /tmp/.btd_armed and has published no phase.
+  d="$T/$sh-armedonly"; make_box "$d" final; make_pkg "$d/run/ocbm-update.tgz" dispatch
+  update "$sh" "$d"; restart "$d"; touch "$d/run/ocbmd_answered"
+  echo 4242 > "$d/run/.btd_armed"; mkdir -p "$d/proc/4242"
+  boot "$sh" "$d" BTD_UP= BTD_RUNNING=true
+  check 'waitfor "is_old \"$d\" && [ -e \"$d/rebooted\" ]" 12 && result_is "$d" "rolled_back $NEW: btd never came up"' \
+    "a btd only armed, never serving the host: not up, the old version back"
+  # The same with a phase file beside it (one an earlier btd left, which every arm now removes): the armed pid alone
+  # decides this one (the second review of resident-bt, item 4; without a phase the check before it already says no).
+  d="$T/$sh-armedphase"; make_box "$d" final; make_pkg "$d/run/ocbm-update.tgz" dispatch
+  update "$sh" "$d"; restart "$d"; touch "$d/run/ocbmd_answered" "$d/run/bt_phase"
+  echo 4244 > "$d/run/.btd_armed"; mkdir -p "$d/proc/4244"
+  boot "$sh" "$d" BTD_UP= BTD_RUNNING=true
+  check 'waitfor "is_old \"$d\" && [ -e \"$d/rebooted\" ]" 12 && result_is "$d" "rolled_back $NEW: btd never came up"' \
+    "a phase file beside a live armed btd: still not up, the old version back"
+  d="$T/$sh-session"; make_box "$d" final; make_pkg "$d/run/ocbm-update.tgz" dispatch
+  update "$sh" "$d"; restart "$d"; touch "$d/run/ocbmd_answered" "$d/run/bt_phase"
+  boot "$sh" "$d" BTD_UP= BTD_RUNNING=true
+  check 'waitfor "is_new \"$d\"" 8 && grep -q "btd is up, serving the host" "$d/run/box.log"' \
+    "a btd serving the host (its phase published, none armed): committed"
+  d="$T/$sh-stalearmed"; make_box "$d" final; make_pkg "$d/run/ocbm-update.tgz" dispatch
+  update "$sh" "$d"; restart "$d"; touch "$d/run/ocbmd_answered" "$d/run/bt_phase"; echo 4243 > "$d/run/.btd_armed"
+  boot "$sh" "$d" BTD_UP= BTD_RUNNING=true
+  check 'waitfor "is_new \"$d\"" 8' "an armed file naming no live process (a crashed armed btd's): the session btd counts"
+  d="$T/$sh-noproc"; make_box "$d" final; make_pkg "$d/run/ocbm-update.tgz" dispatch
+  update "$sh" "$d"; restart "$d"; touch "$d/run/ocbmd_answered" "$d/run/bt_phase"
+  boot "$sh" "$d" BTD_UP= BTD_RUNNING=false
+  check 'waitfor "is_old \"$d\" && [ -e \"$d/rebooted\" ]" 12' "a phase file a dead btd left, no btd running: not up"
+
   echo "== $sh: an update whose self-test fails goes back to the version it replaced"
   d="$T/$sh-fail"; make_box "$d" final; make_pkg "$d/run/ocbm-update.tgz" dispatch
   update "$sh" "$d"; restart "$d"; touch "$d/st.fail"; boot "$sh" "$d"

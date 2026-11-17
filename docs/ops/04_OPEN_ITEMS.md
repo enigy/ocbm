@@ -262,7 +262,8 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
      no CarPlay session is up and btd is not going quiet (`av::name_at_session_start`), and puts the
      earlier name back when that session ends without a 0x5703, unless the phone's own CarPlay is live,
      `carplayd` holds a control connection, or btd is going quiet (`av::put_back`). `discovery` reads the
-     name once a second; when it changes it forgets the newly named phone's dialled addresses, stops and
+     name once a second (since A2, 16 Nov, branch `carplayd-early`: it is woken by inotify on the name file, and
+     nothing polls); when it changes it forgets the newly named phone's dialled addresses, stops and
      starts the `_carplay-ctrl` browse (even when the stop is refused), dials what the new browse replays
      from mdns-sd's cache for two rounds at most, then a record it held for that phone that the cache did
      not replay; a browse that ends is started again. The gate keeps a live session across a name change,
@@ -303,9 +304,33 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
 
 - **Two phones, left for 2.6.x or later (the Mac's reviews for 2.6.0, 15 Nov; not in 2.6.0).**
   - `carplayd-1`: a capped rename-path dial that misses has no retry and waits for the 90 s never-reached
-    end (`Control::carplay_never_reached`).
-  - `carplayd-2`: fresh resolves read inside `rename()`'s replay loop get `RENAME_ROUNDS`.
-  - `carplayd-3`: `forget_phone` can repeat a dial made moments earlier under the new name.
+    end (`Control::carplay_never_reached`). **Fixed 16 Nov on branch `carplayd-early` (A2):** a dial that tried
+    every round and missed is tried again 2, 4 and 8 s after (two rounds each), while its record stands and its
+    phone is still the one to dial, and never while a control connection is open (`discovery::Retries`).
+  - `carplayd-2`: fresh resolves read inside `rename()`'s replay loop get `RENAME_ROUNDS`. **Fixed 16 Nov, same
+    branch:** the rounds follow the news, wherever the record is read: one resolved as discovery last saw it
+    (mdns-sd sends nothing for an unchanged record, so that is its cache replaying) gets `RENAME_ROUNDS`, anything new
+    or changed `FRESH_ROUNDS` (`Held::rounds_for`).
+  - `carplayd-3`: `forget_phone` can repeat a dial made moments earlier under the new name. **Fixed 16 Nov, same
+    branch:** each dial carries the naming's epoch it was made under (`PhoneGate::dial`), and a rename forgets only
+    the newly named phone's dials from an earlier naming.
+  - The three above, **benched 16 Nov with one phone** (the dev adapter on A2 and A4 merged with the resident btd, an
+    iPhone on iOS 15, 12 wakes and a cold boot, all connected; the numbers are in
+    [../wireless/00_WIRELESS_CARPLAY.md](../wireless/00_WIRELESS_CARPLAY.md) §2.3). Still open: their two-phone
+    cases (a switch, a no-handoff exit, a rename while a record is held) and `/tmp/bench_dial_early` on a current
+    iPhone (iOS 15 accepted the dial before its 0x5703 3 times of 3). The release review's four fixes after that
+    bench, on the same branch, NOT benched: A2-1, a 0x5703 mark (or a name) that lands while a browse restarts is
+    acted on at once, not at the next unrelated wake, and `dial_ok` is noted once per naming, never after its dial;
+    A2-2, the same phone back on Bluetooth is named afresh without the mark of its earlier session unless its own
+    CarPlay session is up or connecting (the owner's rule: no dial before this Bluetooth session's 0x5703); A2-3, a
+    teardown beside the wired carplayd no longer waits 2 s for it; A2-4, the early start waits for what
+    `box_identity::derive` reads first. The second review's (17 Nov), same branch, NOT benched: its MEDIUM, a mark
+    lost and back ("A wifi", "A", "A wifi") or a name put back (A, B, A) within one browse restart read as no change,
+    and the phone was not dialled until it resolved again; discovery now tells a naming by the gate's epoch
+    (`PhoneGate::naming`, `Held::change_to`). Its LOW, left as known: A2-2's rule holds at a Bluetooth session's start
+    only, so a phone whose own CarPlay was up or connecting then keeps its earlier mark, and is dialled on it if that
+    CarPlay ends before the session's 0x5703: a reconnect dial, as 2.6.0 made; closing it would take the mark away
+    under a live session or need a watch on CarPlay's end in `bt_driver` (the reason in `av::at_session_start`).
   - `btd-p1-carlink-1`: `put_back`'s Connected should be provisional.
   - `e2e-4`: the same phone back within ~5 s while its own dead session is held is never re-checked
     (backstop: `carplay_never_reached` at 90 s).
@@ -313,7 +338,21 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
   - `btd-5` and `btd-6`, from the Mac's round 5 review.
 
 - **`MFI-CACHE-SCOPE`: btd's Bluetooth iAP2 and carplayd's AirPlay auth-setup still read the MFi chip each
-  session.** 2.6.0's once-per-boot certificate cache serves only the CarPlay session's iAP2 link.
+  session.** 2.6.0's once-per-boot certificate cache serves only the CarPlay session's iAP2 link. **Closed in code
+  16 Nov on branch `carplayd-early` (A4); benched 16 Nov with one phone** (`cert1_ms` and `cert2_ms` 0, auth-setup
+  1.68 s against 1.83 s; its two-phone cases still open): the tunnel's cache (`mfi_i2c_local::cert_cache`,
+  `/tmp/carplay_mfi_cert.der`) now serves all three, through one implementation of its rules: only one DER
+  certificate is cached or served; a read that isn't one is sent once and not cached; the cache is looked at again
+  once the lock is held and written after it is let go, so the lock is held no longer than the chip read; signatures
+  always go to the chip. A phone reporting a failed authentication drops it: the tunnel on its 0xAA04, as before;
+  btd when a Bluetooth session that sent the certificate ends without its handoff (0xAA04 ends the session there; btd
+  sees it in `bt_driver`, whose code is not this change's, so the session's end is the signal, and one that ended
+  early for another reason costs one chip read); carplayd when the phone asks nothing after auth-setup's answer
+  (`ControlServer::auth_unconfirmed`). btd fills the cache as a host session begins when it is empty (the first
+  session of a boot), in the background and under the lock, before any phone is connected. Expected: `cert1_ms` and
+  `cert2_ms` 0 from the first session of a boot on (were 112-163 ms each). No wake read at session start: no chip
+  log line shows a refusal after idle (the bench's 112-163 ms reads, every time; the tunnel's 23 of 23 first-read NAKs
+  came right after auth-setup's own reads, not after idle, and that read is served from the cache since 2.6.0).
 
 - **The doubled `[update]` lines in box.log (ocbmd's `start_update`).** Not in 2.6.0.
 
@@ -826,6 +865,28 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
 ---
 
 ### Radios, box identity & bring-up
+
+- **The armed state (Bluetooth powered but invisible between host sessions, the AP configured ahead): benched
+  16 Nov 2026, one wake open.** On the dev adapter 12 wakes and a cold boot connected from the armed state
+  (`page_start` about 100 ms, `ap_enabled` about 1.16 s after the host), the no-host state read as built, arming
+  about 1.0 s faster than without, and the forced fallback completed its connect. **Open:** the first wake about 90 s
+  after an update was committed took 24.8 s, of two delays; neither repeated after a reboot. The first, a late join,
+  has no cause yet: `AP-ENABLED` came 4.5 s before the 0x5703, and the phone authenticated about 7 s after it
+  (`AP-STA-CONNECTED` 8.6 s after RFCOMM); it may be the phone's. The second, about 6.7 s with no DHCP server (no
+  `udhcpd: started`, no `sending ACK`, the phone on its old address), has a likely cause, fixed since on `resident-bt`:
+  the last AP's udhcpd still writing its lease file to flash slowed by the commit's garbage collection, taken by the
+  next AP start for its own (the same exposure is in 2.6.0 and 2.6.1). Not proven by a repeat. If it recurs, capture
+  right after it what docs/wireless/01_BT_AND_RADIO.md, "Open: one bad wake", lists, the phone's log archive for the
+  late join among it. Still read
+  only: that the 3.14 kernel's power-on writes no scan once mgmt's connectable flag is cleared (the arm writes "none"
+  and reads it back either way). Bench and revert conditions: docs/ops/02_TESTING.md, "The armed path". Source:
+  docs/wireless/01_BT_AND_RADIO.md, "Between host sessions: armed".
+
+- **hostapd's own 0.86 s to `AP-ENABLED` (its `COUNTRY_UPDATE`, then the `HT_SCAN` that `[HT40+]` brings) is left as
+  it is.** `noscan=1` skips the scan in a hostapd that knows it and stops one that does not from starting (an unknown
+  configuration item is an error), and the adapter's hostapd is packed, so its version cannot be read off the file.
+  Decide on `/usr/sbin/hostapd -v` from a bench; the other way to drop the scan, `[HT40+]` off, halves the AP's
+  channel width and is the owner's call. Source: docs/wireless/01_BT_AND_RADIO.md, "The AP, written ahead".
 
 - **Broadcom and NXP mappings are refused, not resolved — those units report `unsupported` and get no
   wireless.** Closing it means slicing the dispatcher to the unit's own SDIO branch and resolving

@@ -19,7 +19,7 @@ and `../CLAUDE.md` before pushing any radio file by hand.
 |---|---|
 | `script/ocbm_boot.sh` | OCBM appliance boot: pure-accessory gadget + `ocbmd` + session supervisor |
 | `script/radio_detect.sh` | **chipset-neutral seam** — read-only detection of THIS unit's WLAN/BT platform → `/tmp/radio_caps` |
-| `script/radio_hal.sh` | **chipset-neutral seam** — the radio verbs everything above calls: `probe`, `status`, `wifi_ap_on`, `wifi_ap_off`, `bt_on`, `bt_off`, `preload`. `session_supervisor.sh` uses these, not the scripts below |
+| `script/radio_hal.sh` | **chipset-neutral seam** — the radio verbs everything above calls: `probe`, `status`, `wifi_ap_on`, `wifi_ap_off`, `wifi_ap_prep`, `bt_on`, `bt_off`, `preload`. `session_supervisor.sh` uses these, not the scripts below |
 | `script/radio_ap_up.sh` | **chipset-neutral seam** — the owned SoftAP layer, deliberately NOT named `start_bluetooth_wifi.sh` (every unit already ships a *vendor* file at that path) |
 | `script/wlan_on.sh` / `wlan_off.sh` | IW416-only WiFi AP up/down — **reference only, never installed**; reached only as `radio_hal.sh`'s `backend=owned` path on a unit that already has them |
 | `script/bt_on.sh` / `bt_off.sh` | IW416-only BT up/down — **reference only, never installed** (same `backend=owned` path) |

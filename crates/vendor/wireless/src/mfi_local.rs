@@ -7,6 +7,8 @@
 //! One MFi chip, shared with `iap2d` — but the session arbiter guarantees only one transport is
 //! active at a time, so wired and wireless never drive the chip concurrently.
 
+use mfi_i2c_local::cert_cache::{Fetched, Source};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -177,12 +179,23 @@ fn i2c_wr(reg: u8, data: &[u8]) -> bool {
     false
 }
 
-/// Fetch the accessory certificate. CopyCertificate: reg `0x30` len (2 BE), reg `0x31` cert. Same
-/// return shape as `carplay_iap2_core::mfi::cert()` (the auth op `0x01`), fed to iAP2 0xAA01.
+/// Fetch the accessory certificate for the phone's 0xAA00, fed to iAP2 0xAA01: the boot's cached one when there is
+/// one, else the chip's (CopyCertificate: reg `0x30` len (2 BE), reg `0x31` cert, under the lock), cached when it is
+/// one DER certificate (`mfi_i2c_local::cert_cache::fetch`). Same return shape as `carplay_iap2_core::mfi::cert()` (the auth op `0x01`).
+///
+/// The cache is the tunnel's (`mfi_i2c_local::cert_cache`), shared since A4 (MFI-CACHE-SCOPE): btd fills it as a host
+/// session begins ([`warm_cert_cache`]), so from the first session of a boot btd's certificate costs no chip read. A
+/// session that sent a certificate and ended without handing off drops it ([`session_over`]).
 pub fn cert() -> Option<Vec<u8>> {
-    let asked = Instant::now();
-    let lock = MfiLock::acquire()?; // serialize vs iap2d for the whole cert read (#109)
-    let held = Instant::now();
+    let f = certificate(CERT_CACHE, MfiLock::acquire, chip_cert)?; // the lock serializes vs iap2d (#109)
+    eprintln!("{}", fetched_line(&f));
+    crate::startup::duration("cert1_ms", ms(f.under));
+    CERT_SENT.store(true, Ordering::Relaxed);
+    Some(f.cert)
+}
+
+/// The chip's certificate, read under the lock the caller holds: reg `0x30` its length (2 BE), reg `0x31` its bytes.
+fn chip_cert() -> Option<Vec<u8>> {
     let mut lb = [0u8; 2];
     if !i2c_rd(0x30, &mut lb) {
         return None;
@@ -195,11 +208,84 @@ pub fn cert() -> Option<Vec<u8>> {
     if !i2c_rd(0x31, &mut o) {
         return None;
     }
-    let under = held.elapsed();
-    drop(lock); // released as the read ends, as before; the time is told after
-    eprintln!("{}", cert_line(o.len(), under, held.duration_since(asked)));
-    crate::startup::duration("cert1_ms", ms(under));
     Some(o)
+}
+
+/// The boot's cached certificate, the tunnel's (`mfi_i2c_local::cert_cache`). `cfg(test)`: a path of its own.
+#[cfg(not(test))]
+const CERT_CACHE: &str = mfi_i2c_local::cert_cache::PATH;
+#[cfg(test)]
+const CERT_CACHE: &str = "/tmp/btd_mfi_local_selftest_cert.der";
+
+/// Whether this Bluetooth session sent the phone a certificate ([`cert`]); read and cleared as it ends ([`session_over`]).
+/// One slot: one Bluetooth session runs at a time (`control::SessionClaim`).
+static CERT_SENT: AtomicBool = AtomicBool::new(false);
+
+/// A certificate's log line (and the timeline's cert1_ms is its time under the lock).
+fn fetched_line(f: &Fetched) -> String {
+    match f.from {
+        Source::Cache => format!("[mfi-local] cert: {} B from the boot's cache, no chip read", f.cert.len()),
+        Source::Chip { cached } => {
+            let line = cert_line(f.cert.len(), f.under, f.waited);
+            if cached {
+                line
+            } else {
+                format!("{line}; not one DER certificate: sent, not cached")
+            }
+        }
+    }
+}
+
+/// The certificate by the cache's rules, shared with the tunnel and carplayd (`mfi_i2c_local::cert_cache::fetch`): the
+/// one cached at `path`, else the chip's (`read`) with the lock held (`lock`, None when it cannot be had), cached after
+/// the lock is let go when it is one DER certificate.
+fn certificate<L>(path: &str, lock: impl FnOnce() -> Option<L>, read: impl FnOnce() -> Option<Vec<u8>>) -> Option<Fetched> {
+    mfi_i2c_local::cert_cache::fetch(path, || lock().ok_or(()), || read().ok_or(())).ok()
+}
+
+/// What a Bluetooth session's end does with the cache ([`session_over`]): drop it when the session sent a certificate
+/// and did not hand off.
+fn drop_cache_at_end(sent: bool, handed_off: bool) -> bool {
+    sent && !handed_off
+}
+
+/// A Bluetooth session ended (`bt_driver::run`, through `av::put_back`); `handed_off` when it sent its 0x5703. One that
+/// sent a certificate and did not hand off may have had it refused: the phone reports a failed authentication with
+/// 0xAA04, which ends the session there, so the cache is dropped and the next session of any chip user reads the chip,
+/// as the tunnel does on its 0xAA04 (A4). A session that ended without a handoff for another reason costs that one read.
+pub(crate) fn session_over(handed_off: bool) {
+    let sent = CERT_SENT.swap(false, Ordering::Relaxed);
+    if drop_cache_at_end(sent, handed_off) && mfi_i2c_local::cert_cache::forget(CERT_CACHE) {
+        eprintln!(
+            "[mfi-local] the session sent the certificate and ended without a handoff: the cached certificate is \
+             forgotten, the next session reads the chip"
+        );
+    }
+}
+
+/// A host session begins (`av::session_starting`): when no certificate is cached yet (the first session of a boot), read
+/// it once in the background so the phone's 0xAA00 finds it. No phone is connected yet and carplayd has no control
+/// connection, so no signature can be waiting for the lock; the read holds it no longer than any certificate read.
+pub(crate) fn warm_cert_cache() {
+    if mfi_i2c_local::cert_cache::read(CERT_CACHE).is_some() {
+        return;
+    }
+    let spawned = std::thread::Builder::new().name("mfi-warm".into()).spawn(|| {
+        for attempt in 1..=3u32 {
+            match certificate(CERT_CACHE, MfiLock::acquire, chip_cert) {
+                Some(f) if f.from == Source::Cache => return,
+                Some(f) => {
+                    eprintln!("{} (the session's start: the boot's first read)", fetched_line(&f));
+                    return;
+                }
+                None if attempt < 3 => std::thread::sleep(Duration::from_millis(20)),
+                None => eprintln!("[mfi-local] cert: the session's-start read failed 3 times; the phone's 0xAA00 reads the chip"),
+            }
+        }
+    });
+    if let Err(e) = spawned {
+        eprintln!("[mfi-local] cert: no read at the session's start ({e}); the phone's 0xAA00 reads the chip");
+    }
 }
 
 /// Sign a challenge digest. CreateSignature: write challenge (`0x20` len, `0x21` data), go
@@ -295,6 +381,84 @@ fn sign_line(ready: Duration, under: Duration, waited: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    /// A certificate's shape: `30 82` and a length that is the rest of it (945 bytes for 941).
+    fn der(body: usize) -> Vec<u8> {
+        let mut c = vec![0x30, 0x82, (body >> 8) as u8, body as u8];
+        c.extend(std::iter::repeat(0x5a).take(body));
+        c
+    }
+
+    fn cache_path(tag: &str) -> String {
+        let p = std::env::temp_dir().join(format!("btd_cert_cache_{tag}_{}.der", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        p.to_str().unwrap().to_string()
+    }
+
+    /// A4: the first certificate of a boot comes from the chip under the lock and is cached; every later one comes from
+    /// the cache with neither the lock nor the chip.
+    #[test]
+    fn the_boots_first_read_is_cached_and_served_after_without_the_chip() {
+        let path = cache_path("served");
+        let (locks, reads) = (Cell::new(0), Cell::new(0));
+        let lock = || {
+            locks.set(locks.get() + 1);
+            Some(())
+        };
+        let f = certificate(&path, lock, || {
+            reads.set(reads.get() + 1);
+            Some(der(941))
+        })
+        .unwrap();
+        assert_eq!((f.cert.len(), f.from), (945, Source::Chip { cached: true }));
+        let again = certificate(&path, lock, || -> Option<Vec<u8>> { panic!("the chip is not read again") }).unwrap();
+        assert_eq!(fetched_line(&again), "[mfi-local] cert: 945 B from the boot's cache, no chip read");
+        assert_eq!((again.cert, again.from, again.under), (der(941), Source::Cache, Duration::ZERO));
+        assert_eq!((locks.get(), reads.get()), (1, 1), "the lock and the chip once, for the first read only");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// CS-3's rule in btd: a read that isn't one DER certificate goes to this phone and is not cached.
+    #[test]
+    fn a_read_that_is_not_a_certificate_is_sent_once_and_not_cached() {
+        let path = cache_path("bad");
+        let f = certificate(&path, || Some(()), || Some(vec![0u8; 945])).unwrap();
+        assert_eq!(f.from, Source::Chip { cached: false });
+        assert_eq!(f.cert, vec![0u8; 945], "sent as read");
+        assert!(fetched_line(&f).ends_with("; not one DER certificate: sent, not cached"), "{}", fetched_line(&f));
+        assert!(!std::path::Path::new(&path).exists());
+        let next = certificate(&path, || Some(()), || Some(der(941))).unwrap();
+        assert_eq!(next.from, Source::Chip { cached: true }, "the next session reads the chip again");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A cache another chip user filled while this one waited for the lock is served, and the chip is not read; no lock,
+    /// no certificate (as before: the caller's retry).
+    #[test]
+    fn the_cache_is_looked_at_again_once_the_lock_is_held() {
+        let path = cache_path("filled");
+        let fill = || {
+            assert!(mfi_i2c_local::cert_cache::keep(&path, &der(941)), "another user caches it as we wait");
+            Some(())
+        };
+        let f = certificate(&path, fill, || -> Option<Vec<u8>> { panic!("filled meanwhile: no chip read") }).unwrap();
+        assert_eq!(f.from, Source::Cache);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(certificate(&path, || None::<()>, || Some(der(941))), None, "the lock not had: no certificate");
+        assert!(!std::path::Path::new(&path).exists(), "and nothing read or cached");
+        assert_eq!(certificate(&path, || Some(()), || None), None, "the chip did not answer");
+    }
+
+    /// A Bluetooth session that sent the certificate and ended without its handoff drops the cache: the phone reports a
+    /// failed authentication with 0xAA04, which ends it there. A handoff proves the phone took it.
+    #[test]
+    fn a_session_that_sent_the_certificate_and_did_not_hand_off_drops_the_cache() {
+        assert!(drop_cache_at_end(true, false), "a refused certificate ends the session before its handoff");
+        assert!(!drop_cache_at_end(true, true), "handed off: the phone authenticated us");
+        assert!(!drop_cache_at_end(false, false), "no certificate sent (a phone that never asked): left as it is");
+        assert!(!drop_cache_at_end(false, true));
+    }
 
     #[test]
     fn the_chip_times_read_as_they_are_logged() {
