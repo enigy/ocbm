@@ -533,7 +533,7 @@ ap_ip_of() { ifconfig "$1" 2>/dev/null | sed -n 's/.*inet addr:\([0-9.]*\).*/\1/
 # (/var/lib/udhcpd.leases, on the jffs2 root) as it exits on SIGTERM; with flash slow (garbage collection just after an
 # update's commit removed its .prev binaries) the server outlived the teardown, the next AP start took it for its own and
 # started none, and once it had gone the AP had no DHCP (the release review of resident-bt, A3-1; radio_ap_up.sh keeps
-# the same functions for its start). AP_DHCP_MATCH is a test hook.
+# the same functions for its start, whose stop takes 1.5 s at most). AP_DHCP_MATCH is a test hook.
 AP_DHCP_MATCH=${AP_DHCP_MATCH:-udhcpd .*etc/udhcpd.conf}
 ap_dhcp_pids() { ps 2>/dev/null | grep -v grep | grep "$AP_DHCP_MATCH" | awk '{print $1}'; }
 ap_pids_live() { for _apl in "$@"; do kill -0 "$_apl" 2>/dev/null && return 0; done; return 1; }

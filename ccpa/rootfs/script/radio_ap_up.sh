@@ -277,29 +277,34 @@ ap_prepared_ok() {
   return 0
 }
 # ---- the AP's DHCP server: the last AP's never counts as this one's ------------------------------
-# The release review of resident-bt (A3-1), the likely cause of the 16 Nov bench's one bad wake (no "sending ACK" in
-# 60 s, the phone back on its old address): BusyBox udhcpd writes its lease file (/var/lib/udhcpd.leases, on the jffs2
-# root) as it exits on SIGTERM, and with flash slow (garbage collection just after an update's commit removed its .prev
-# binaries) the last AP's server was still in the process list when the next AP started. That start took it for its
-# own and started none, and when it had gone the AP had no DHCP. radio_hal.sh's teardown now waits for it (its own
-# copy of ap_dhcp_stop), and a start that launches hostapd stops any left and keeps the pid of the one it starts.
-# Found by config path, never by name: the NCM server, `busybox udhcpd -f /tmp/udhcpd_ncm.conf`, is never one of
-# them. AP_DHCP_MATCH and AP_PROC are test hooks.
+# The release review of resident-bt (A3-1), the likely cause of the second of the 16 Nov bench's bad wake's two delays
+# (no "sending ACK" for about 6.7 s, the phone on its old address; the first, the phone's late join, is open): BusyBox
+# udhcpd writes its lease file (/var/lib/udhcpd.leases, on the jffs2 root) as it exits on SIGTERM, and with flash slow
+# (garbage collection just after an update's commit removed its .prev binaries) the last AP's server was still in the
+# process list when the next AP started. That start took it for its own and started none, and when it had gone the AP
+# had no DHCP. radio_hal.sh's teardown now waits for it (its own copy of ap_dhcp_stop), and a start that launches
+# hostapd stops any left and keeps the pid of the one it starts. Found by config path, never by name: the NCM server,
+# `busybox udhcpd -f /tmp/udhcpd_ncm.conf`, is never one of them. AP_DHCP_MATCH and AP_PROC are test hooks.
 AP_DHCP_MATCH=${AP_DHCP_MATCH:-udhcpd .*etc/udhcpd.conf}
 AP_PROC=${AP_PROC:-/proc}
 ap_dhcp_pids() { ps 2>/dev/null | grep -v grep | grep "$AP_DHCP_MATCH" | awk '{print $1}'; }
 ap_pids_live() { for _apl in "$@"; do kill -0 "$_apl" 2>/dev/null && return 0; done; return 1; }
-# SIGTERM to every AP DHCP server, up to 3 s for them to go (the lease file), then SIGKILL and up to 1 s more. 1 when
-# one survived even that (a kernel wait): a server started now may not bind.
+# SIGTERM to every AP DHCP server, then up to $1 looks 0.2 s apart for them to go (their lease file: 15 when not given,
+# 3 s), then SIGKILL and up to $2 looks 0.1 s apart (10, 1 s). 1 when one survived even that (a kernel wait): a server
+# started now may not bind. The start gives 5 and 5, 1.5 s at most (the second review of resident-bt, item 7): this
+# wait holds the wlan lock, which btd's reply to the phone's 0x5702 waits on for 5 s at most (wifi_handoff::AP_WAIT),
+# and the teardown has given the last AP's server its 3 s already; one still there at a start is stuck or was never
+# torn down.
 ap_dhcp_stop() {
+  _adt=${1:-15}; _adk=${2:-10}
   _ads=$(ap_dhcp_pids)
   [ -n "$_ads" ] || return 0
   for _adp in $_ads; do kill "$_adp" 2>/dev/null; done
-  _adn=0; while [ "$_adn" -lt 15 ] && ap_pids_live $_ads; do _adn=$((_adn + 1)); sleep 0.2; done
+  _adn=0; while [ "$_adn" -lt "$_adt" ] && ap_pids_live $_ads; do _adn=$((_adn + 1)); sleep 0.2; done
   ap_pids_live $_ads || return 0
-  echo "$L the last AP's DHCP server is still there 3 s after SIGTERM (its lease file on flash?) - SIGKILL"
+  echo "$L the last AP's DHCP server is still there $((_adt / 5)) s after SIGTERM (its lease file on flash?) - SIGKILL"
   for _adp in $_ads; do kill -9 "$_adp" 2>/dev/null; done
-  _adn=0; while [ "$_adn" -lt 10 ] && ap_pids_live $_ads; do _adn=$((_adn + 1)); sleep 0.1; done
+  _adn=0; while [ "$_adn" -lt "$_adk" ] && ap_pids_live $_ads; do _adn=$((_adn + 1)); sleep 0.1; done
   ap_pids_live $_ads || return 0
   echo "$L the last AP's DHCP server survived SIGKILL (a kernel wait?): this AP's may not bind"
   return 1
@@ -319,30 +324,40 @@ ap_dhcp_serving() {
   fi
 }
 # ---- hostapd's own word ---------------------------------------------------------------------------
-# Its AP-ENABLED: one more in the box log than when it was launched (_ae0, counted then). A count BELOW that is a box
-# log ocbmd emptied at its cap in between (the release review of resident-bt, A3-3): every line in it is new, so the
-# baseline goes to 0, where it would otherwise never be passed and the wait would run to its bound holding the wlan lock
-# btd's 0x5703 reply waits on. AP_BOXLOG is a test hook; hostapd writes the box log itself.
+# Its AP-ENABLED: one after this start's own line in the box log, "[radio] hostapd starting on <if>" (_ae_mark),
+# written just before hostapd's launch. By that line, not by a count: ocbmd empties the box log at its cap with an
+# ftruncate in place (the same inode, so an inode says nothing either), and a count taken at the launch missed this
+# hostapd's line when the log was emptied and the line written within one look (the second review of resident-bt,
+# item 3; the release review's A3-3 had reset the count only when it fell). With this start's line gone the log was
+# emptied after the launch, so every AP-ENABLED in it is this hostapd's. One window is left: the line written and the
+# log emptied before the next look (100 ms). The wait then runs to its 2 s bound holding the wlan lock btd's 0x5703
+# reply waits on, and a hostapd still running counts, as before 16 Nov. No line of its own (the write failed): never
+# seen, the bound. One fork a look, as the count was. AP_BOXLOG is a test hook; hostapd writes the box log itself.
 AP_BOXLOG=${AP_BOXLOG:-/tmp/box.log}
 ap_enabled_seen() {
-  _ae=$(grep -c "AP-ENABLED" "$AP_BOXLOG" 2>/dev/null)
-  case "$_ae" in ''|*[!0-9]*) _ae=0 ;; esac
-  [ "$_ae" -lt "$_ae0" ] && _ae0=0
-  [ "$_ae" -gt "$_ae0" ]
+  [ -n "${_ae_mark:-}" ] || return 1
+  _ae_out=$(grep -F -e "$_ae_mark" -e "AP-ENABLED" "$AP_BOXLOG" 2>/dev/null)
+  case "$_ae_out" in *"$_ae_mark"*) _ae_out=${_ae_out##*"$_ae_mark"} ;; esac
+  case "$_ae_out" in *AP-ENABLED*) return 0 ;; esac
+  return 1
 }
 [ "${RADIO_AP_UP_FUNCS:-}" = 1 ] && return 0
+
+# The root the start works under, "" on the adapter, beside AP_PROC (above): a test hook. tools/radio_ap_up_test.sh runs
+# the whole start against a scratch adapter with its commands stood in for (the second review of resident-bt, item 5).
+AP_ROOT=${AP_ROOT:-}
 
 # The connect timeline's ap_start and ap_up (crates/box-common/src/timeline.rs): `t <key> <uptime ms>` appended to btd's
 # record. One append, no fork; a failed one is ignored.
 tl_stamp() {
   _tls_up=""
-  read -r _tls_up _tls_idle 2>/dev/null </proc/uptime
-  case "$_tls_up" in *.*) echo "t $1 ${_tls_up%.*}${_tls_up#*.}0" 2>/dev/null >>/tmp/startup_marks ;; esac
+  read -r _tls_up _tls_idle 2>/dev/null <"$AP_PROC/uptime"
+  case "$_tls_up" in *.*) echo "t $1 ${_tls_up%.*}${_tls_up#*.}0" 2>/dev/null >>"$AP_ROOT/tmp/startup_marks" ;; esac
   return 0
 }
 
 IF=${RADIO_WLAN_IF:-wlan0}
-[ -e "/sys/class/net/$IF" ] || { echo "$L interface $IF does not exist - the driver must be up first"; exit 1; }
+[ -e "$AP_ROOT/sys/class/net/$IF" ] || { echo "$L interface $IF does not exist - the driver must be up first"; exit 1; }
 # AND IT MUST ACTUALLY BE A WIRELESS INTERFACE. Existence alone is not enough: this script
 # unconditionally reconfigures whatever it is handed, so `RADIO_WLAN_IF=ncm0` would sail through
 # the check above and then `ifconfig ncm0 192.168.43.1` - re-addressing the NCM management link
@@ -350,7 +365,7 @@ IF=${RADIO_WLAN_IF:-wlan0}
 # fail. The seam always passes an enumerated wireless interface, but "the caller is careful" is
 # exactly the guarantee this file refuses to accept from anyone else, so it does not accept it
 # for itself either. A cfg80211/wext netdev is identifiable without knowing the driver.
-if [ ! -e "/sys/class/net/$IF/wireless" ] && [ ! -e "/sys/class/net/$IF/phy80211" ]; then
+if [ ! -e "$AP_ROOT/sys/class/net/$IF/wireless" ] && [ ! -e "$AP_ROOT/sys/class/net/$IF/phy80211" ]; then
   echo "$L $IF is not a wireless interface - refusing to reconfigure it"; exit 1
 fi
 
@@ -363,10 +378,10 @@ fi
 # winner's lock on its way out; and make the signal trap EXIT, because in ash a trapped signal
 # runs the handler and then RESUMES - releasing the lock while the bring-up carries on is worse
 # than never having taken it.
-LOCK=/tmp/.radio_ap_lock
+LOCK=$AP_ROOT/tmp/.radio_ap_lock
 if ! mkdir "$LOCK" 2>/dev/null; then
   _holder=$(cat "$LOCK/pid" 2>/dev/null)
-  if { [ -n "$_holder" ] && [ ! -d "/proc/$_holder" ]; } \
+  if { [ -n "$_holder" ] && [ ! -d "$AP_PROC/$_holder" ]; } \
      || { [ -z "$_holder" ] && [ -n "$(find "$LOCK" -maxdepth 0 -mmin +20 2>/dev/null)" ]; }; then
     echo "$L lock held by ${_holder:-no live process} - reclaiming"
     rm -rf "$LOCK"
@@ -379,31 +394,31 @@ echo $$ > "$LOCK/pid" 2>/dev/null
 trap 'rm -rf "$LOCK"' EXIT
 trap 'rm -rf "$LOCK"; trap - EXIT; exit 143' INT TERM HUP
 
-[ -f /etc/hostapd.conf ] || { echo "$L /etc/hostapd.conf missing"; exit 1; }
+[ -f "$AP_ROOT/etc/hostapd.conf" ] || { echo "$L /etc/hostapd.conf missing"; exit 1; }
 
 # ---- configure, or trust the configuration written ahead ------------------------------------------
 # AP (the default): the AP's bring-up. PREP (the armed state between host sessions, radio_hal.sh wifi_ap_prep): the
 # configuration only, then the stamp, and nothing raised: no address, no hostapd, no udhcpd, no beacon.
 MODE=${1:-AP}
-if [ "$MODE" != PREP ] && ap_prepared_ok ""; then
+if [ "$MODE" != PREP ] && ap_prepared_ok "$AP_ROOT"; then
   echo "$L configured ahead ($AP_PREPARED): ssid=$NAME ip=$WLANIP ch=$ch if=$IF - launching"
 else
-  ap_configure ""
-  ap_stamp ""
+  ap_configure "$AP_ROOT"
+  ap_stamp "$AP_ROOT"
   # The binary staged where the vendor layout keeps it, as before (a copy in tmpfs, once per boot).
-  test -e /tmp/bin/hostapd || cp /usr/sbin/hostapd /tmp/bin/hostapd 2>/dev/null
+  test -e "$AP_ROOT/tmp/bin/hostapd" || cp "$AP_ROOT/usr/sbin/hostapd" "$AP_ROOT/tmp/bin/hostapd" 2>/dev/null
   if [ "$MODE" = PREP ]; then
     echo "$L configured ahead: ssid=$NAME ip=$WLANIP ch=$ch if=$IF (nothing raised)"
     exit 0
   fi
 fi
 
-echo 1 > "/proc/sys/net/ipv6/conf/$IF/disable_ipv6" 2>/dev/null
+echo 1 2>/dev/null > "$AP_PROC/sys/net/ipv6/conf/$IF/disable_ipv6"   # quiet where there is none (2> first)
 ifconfig "$IF" "$WLANIP" netmask 255.255.255.0 mtu 1500 up || {
   echo "$L could not configure $IF"; exit 1; }
 
 # ---- bring up ---------------------------------------------------------------------------------
-test -e /tmp/bin/hostapd || cp /usr/sbin/hostapd /tmp/bin/hostapd 2>/dev/null
+test -e "$AP_ROOT/tmp/bin/hostapd" || cp "$AP_ROOT/usr/sbin/hostapd" "$AP_ROOT/tmp/bin/hostapd" 2>/dev/null
 # Its output folds straight into the universal log. Not -B: daemonizing points stdout at /dev/null, so
 # the station events after start-up (AP-STA-CONNECTED, AP-STA-DISCONNECTED, and the IEEE 802.11 lines
 # that say why a phone left) never reached box.log, and the Mac's 12 Nov re-bench couldn't see why a
@@ -411,17 +426,15 @@ test -e /tmp/bin/hostapd || cp /usr/sbin/hostapd /tmp/bin/hostapd 2>/dev/null
 # appending (O_APPEND, for bound_logs' in-place truncate); the converge step waits for it.
 # Running already is asked of pidof (one fork, where `ps | grep | grep` took three ahead of the launch); it names a
 # process by its own name, so an editor holding /etc/hostapd.conf open no longer counts as the AP.
-echo "[radio] hostapd starting on $IF" >> /tmp/box.log
-_launched=0; _hapd=""; _ae0=0; _dhcpd=""
+# This start's own line, before the launch: the converge step waits for an AP-ENABLED after it (ap_enabled_seen).
+_ae_mark="[radio] hostapd starting on $IF"
+echo "$_ae_mark" 2>/dev/null >> "$AP_BOXLOG" || _ae_mark=""
+_launched=0; _hapd=""; _dhcpd=""
 if ! pidof hostapd >/dev/null 2>&1; then
-  setsid hostapd /etc/hostapd.conf </dev/null >>/tmp/box.log 2>&1 &
+  setsid hostapd "$AP_ROOT/etc/hostapd.conf" </dev/null >>"$AP_BOXLOG" 2>&1 &
   _hapd=$!
   tl_stamp ap_start
   _launched=1
-  # How many AP-ENABLED lines the box log held as it started (it prints its own a good half second in, at the
-  # earliest): the converge step waits for one more.
-  _ae0=$(grep -c "AP-ENABLED" "$AP_BOXLOG" 2>/dev/null)
-  case "$_ae0" in ''|*[!0-9]*) _ae0=0 ;; esac
 fi
 
 # The AP's DHCP server, explicitly scoped. The stock script masked this behind a global udhcpd
@@ -436,10 +449,11 @@ fi
 # contract for any caller that reads our output. `busybox udhcpd -f /etc/udhcpd.conf` still matches the
 # CONFIG-PATH patterns here and in radio_hal.sh, and it writes /var/run/udhcpd.pid for wlan_off.sh.
 # A new AP (hostapd launched just above): any AP DHCP server still listed is the last AP's on its way out, never this
-# one's (ap_dhcp_stop, above). An AP already up (hostapd running) keeps the one it has, as before.
+# one's (ap_dhcp_stop, above, given 1.5 s at most here). An AP already up (hostapd running) keeps the one it has, as
+# before.
 _dhcp_new=0
 if [ "$_launched" = 1 ]; then
-  ap_dhcp_stop
+  ap_dhcp_stop 5 5
   _dhcp_new=1
 elif [ -z "$(ap_dhcp_pids)" ]; then
   _dhcp_new=1
@@ -451,7 +465,7 @@ if [ "$_dhcp_new" = 1 ]; then
   # -a 250: the ARP probe before each offer waits 250 ms, not the default 2 s. It cost 1-1.9 s whenever a phone had
   # no lease (the Mac's 13 Nov brief, item 10); a short probe still catches an address in use. BusyBox 1.32.1's udhcpd
   # takes -a (the adapter's, checked on the Mac's bench); /usr/sbin/udhcpd is the vendor's v0.9.9-pre and is not this.
-  setsid busybox udhcpd -f -a 250 /etc/udhcpd.conf </dev/null >/tmp/radio_ap_dhcp.log 2>&1 &
+  setsid busybox udhcpd -f -a 250 "$AP_ROOT/etc/udhcpd.conf" </dev/null >"$AP_ROOT/tmp/radio_ap_dhcp.log" 2>&1 &
   _dhcpd=$!
 fi
 
@@ -474,7 +488,7 @@ ap_serving() {
 # it by name, so ap_serving alone would call it serving). Anything else, its being there included, is not "exited".
 hapd_exited() {
   _hx_name=""; _hx_state=""
-  read -r _hx_pid _hx_name _hx_state _hx_rest 2>/dev/null <"/proc/$_hapd/stat"
+  read -r _hx_pid _hx_name _hx_state _hx_rest 2>/dev/null <"$AP_PROC/$_hapd/stat"
   [ "$_hx_name" = "(hostapd)" ] && [ "$_hx_state" = Z ]
 }
 n=0
@@ -482,7 +496,7 @@ n=0
 while [ "$n" -lt 50 ]; do ap_serving && { tl_stamp ap_up; break; }; n=$((n+1)); sleep 0.2; done
 # CONFIRMED ON HOSTAPD'S OWN WORD (16 Nov 2026), not on a second. In the foreground hostapd is in the process list
 # before its start-up is through, so the loop above passes a hostapd that then refuses its configuration; this used
-# to sleep a fixed second and look again. Its AP-ENABLED, a line more in the box log than at its launch, says it took
+# to sleep a fixed second and look again. Its AP-ENABLED, in the box log after this start's own line, says it took
 # the configuration and the driver started the AP: a stronger answer, and sooner (about 0.65 s after ap_up on the
 # bench, where the second ended 1 s after it). The seam's wlan lock is held until this returns, and btd's 0x5703 reply
 # to the phone waits on that lock (wifi_handoff::wait_for_ap), so a fixed second was a second the reply could wait for
@@ -509,7 +523,7 @@ if ! ap_serving || { [ "$_launched" = 1 ] && hapd_exited; }; then
     || echo "$L   $IF does not hold $WLANIP"
   ap_dhcp_serving \
     || { echo "$L   the AP DHCP server is not running${_dhcpd:+ (the one started here, pid $_dhcpd, exited)} - a phone would associate and get no address"
-         tail -3 /tmp/radio_ap_dhcp.log 2>/dev/null | sed "s|^|$L     |" | tee -a /tmp/box.log; }
+         tail -3 "$AP_ROOT/tmp/radio_ap_dhcp.log" 2>/dev/null | sed "s|^|$L     |" | tee -a "$AP_BOXLOG"; }
   exit 1
 fi
 if [ -n "$_ae_ms" ]; then

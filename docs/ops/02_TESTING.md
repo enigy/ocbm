@@ -511,12 +511,16 @@ Bluetooth powered but invisible between host sessions, the host's arrival a go (
 and a cold boot from the armed state, `sup_radios` about 50 ms, `bt_armed=1`, `page_start` about 100 ms, `ap_enabled`
 about 1.16 s after the host's arrival; the no-host state as in step 1 below; arming about 1.0 s faster than
 `/tmp/bench_arm_off`; the forced fallback (step 4) as written. One bad wake, the first about 90 s after an update was
-committed: 24.8 s, the phone associated 8.6 s after RFCOMM (0.4 s otherwise), no `sending ACK` from udhcpd in 60 s
-though the phone ended up on its old IPv4 address, its service resolved 6.5 s after the join; not repeated after a
-reboot. Its likely cause is fixed (the last AP's DHCP server, slow over its lease file on flash the commit's garbage
-collection slowed, taken for the new AP's; docs/wireless/01_BT_AND_RADIO.md, "The AP, written ahead"). If it recurs,
-right after it: `/tmp/wlan.log`, `/tmp/radio_ap_dhcp.log`, `df /`, and the time of `[dispatch] update committed` in
-`/tmp/box.log`; then a wake soon after an update's commit is a case of its own on the next bench.
+committed: 24.8 s, of two delays (the Mac's second reading, 17 Nov). A late join, its cause open: `AP-ENABLED` 4.5 s
+before the 0x5703, yet the phone authenticated about 7 s after it (`AP-STA-CONNECTED` 8.6 s after RFCOMM, 0.4 s
+otherwise). Then about 6.7 s with no DHCP server: no `udhcpd: started` and no `sending ACK`, the phone on its old IPv4
+address, its service resolved 6.5 s after the join. Neither repeated after a reboot. Only the second has a likely cause,
+fixed since (the last AP's DHCP server, slow over its lease file on flash the commit's garbage collection slowed, taken
+for the new AP's; docs/wireless/01_BT_AND_RADIO.md, "The AP, written ahead"). If it recurs, right after it:
+`/tmp/wlan.log`, `/tmp/radio_ap_dhcp.log`, `/tmp/box.log` (hostapd's lines for the phone's join, and the time of
+`[dispatch] update committed`), `/tmp/startup_marks` and `df /`, and the phone's log archive for the join
+(docs/wireless/01_BT_AND_RADIO.md, "Open: one bad wake"); then a wake soon after an update's commit is a case of its own
+on the next bench.
 
 A smoke bench (about 30 min), on the dev adapter, wakes being the path it is for:
 
