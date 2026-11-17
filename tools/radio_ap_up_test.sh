@@ -58,6 +58,39 @@ prepared() {
 age() { find "$1/etc" -type f -exec touch -t 202001010000 {} +; touch -t 202101010000 "$1.mark"; }
 nothing_newer() { [ -z "$(find "$1/etc" -type f -newer "$1.mark")" ]; }
 
+# The AP's DHCP server stopped and seen gone (the release review of resident-bt, A3-1): stand-in servers, real
+# processes, whose command lines carry this run's own tag, so nothing else on this host can match. A host's ps lists
+# only its terminal's processes, BusyBox's all of them: a stand-in ps lists all (tools/busybox_suites.sh runs
+# BusyBox's own). HAL is the seam; both scripts carry ap_dhcp_stop.
+HAL="$REPO/ccpa/rootfs/script/radio_hal.sh"
+TAG="ocbmtest$$"
+MATCH="udhcpd .*$TAG/etc/udhcpd.conf"
+mkdir -p "$T/fake" "$T/psbin" "$T/$TAG/etc" "$T/$TAG/tmp"
+cat > "$T/fake/udhcpd" <<'EOF'
+#!/bin/sh
+# A stand-in AP DHCP server. $1: slow (exits 1 s after SIGTERM, as a lease file written to slow flash) or deaf (ignores
+# SIGTERM; only SIGKILL ends it).
+case "$1" in slow) trap 'sleep 1; exit 0' TERM ;; deaf) trap '' TERM ;; esac
+while :; do sleep 0.1; done
+EOF
+chmod 755 "$T/fake/udhcpd"
+cat > "$T/psbin/ps" <<'EOF'
+#!/bin/sh
+exec /bin/ps -A -o pid= -o command=
+EOF
+chmod 755 "$T/psbin/ps"
+PSPATH="${OCBM_TEST_PATH:-$T/psbin}"
+STANDINS=""
+standin() {  # $1 slow|deaf, $2 config path: one stand-in server, detached (so it is reaped as it exits); its pid echoed
+  ( "$T/fake/udhcpd" "$1" -f "$2" </dev/null >/dev/null 2>&1 & echo $! )
+}
+gone() { ! kill -0 "$1" 2>/dev/null; }
+# ap_dhcp_stop from script $2 under shell $1 ($3: that script's functions-only switch); what it said in $T/dstop.out.
+dstop() {
+  env OCBM_TEST_PATH="$PSPATH" AP_DHCP_MATCH="$MATCH" "$3=1" "$1" -c '. "$1" && ap_dhcp_stop' sh "$2" > "$T/dstop.out" 2>&1
+}
+trap 'for p in $STANDINS; do kill -9 "$p" 2>/dev/null; done; rm -rf "$T"' EXIT
+
 # BusyBox's and GNU sed edit in place with a bare -i; a BSD sed (a Mac's) takes -i with a suffix. On such a host the
 # AP layer's sed -i is given a stand-in that does the same edit with this host's sed. tools/busybox_suites.sh and the
 # cross builder run the real thing.
@@ -173,5 +206,39 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   printf '192.168.062.1\n' > "$R/etc/wifi_ip"
   conf "$sh" "$R" sta0
   check 'grep -q "192\.168\.43\.100" "$R/etc/udhcpd.conf" && said "$R" "not a plain IPv4 address"' "an octal 192.168.062.1 is refused, the AP stays on .43"
+
+  echo "== $sh: the AP's DHCP server, stopped and seen gone (both scripts), and this AP's own asked after"
+  for which in "$HAL RADIO_HAL_FUNCS" "$AP RADIO_AP_UP_FUNCS"; do
+    set -- $which; script=$1; hook=$2; name=$(basename "$script")
+    slow=$(standin slow "$T/$TAG/etc/udhcpd.conf"); ncm=$(standin slow "$T/$TAG/tmp/udhcpd_ncm.conf")
+    STANDINS="$STANDINS $slow $ncm"; sleep 0.3
+    t0=$(date +%s); dstop "$sh" "$script" "$hook"; t1=$(date +%s)
+    check 'gone "$slow" && ! grep -q SIGKILL "$T/dstop.out" && [ $((t1 - t0)) -le 3 ]' \
+      "$name: a server that takes a second over its lease file is waited for, not killed"
+    check '! gone "$ncm"' "$name: the NCM server (its own config) is never touched"
+    kill -9 "$ncm" 2>/dev/null
+    deaf=$(standin deaf "$T/$TAG/etc/udhcpd.conf"); STANDINS="$STANDINS $deaf"; sleep 0.3
+    dstop "$sh" "$script" "$hook"
+    check 'gone "$deaf" && grep -q "3 s after SIGTERM" "$T/dstop.out"' "$name: one still there 3 s after SIGTERM is SIGKILLed, and gone"
+    dstop "$sh" "$script" "$hook"
+    check '[ ! -s "$T/dstop.out" ]' "$name: none there: nothing to do, nothing said"
+  done
+  check 'echo "  321 root  1408 S  busybox udhcpd -f -a 250 /etc/udhcpd.conf" | grep -q "udhcpd .*etc/udhcpd.conf" && ! echo "  322 root  1408 S  busybox udhcpd -f /tmp/udhcpd_ncm.conf" | grep -q "udhcpd .*etc/udhcpd.conf"' \
+    "the pattern both scripts use by default finds the AP's server and never the NCM one"
+  check '[ "$(RADIO_AP_UP_FUNCS=1 "$sh" -c ". \"\$1\"; echo \"\$AP_DHCP_MATCH\"" sh "$AP")" = "udhcpd .*etc/udhcpd.conf" ] && [ "$(RADIO_HAL_FUNCS=1 "$sh" -c ". \"\$1\"; echo \"\$AP_DHCP_MATCH\"" sh "$HAL")" = "udhcpd .*etc/udhcpd.conf" ]' \
+    "(and it is the default in both)"
+  # This AP's own server, by the pid this start kept: alive through the confirmation, or the AP is not serving.
+  mkdir -p "$T/proc/777"
+  serving() { env OCBM_TEST_PATH="$PSPATH" AP_DHCP_MATCH="$1" AP_PROC="$T/proc" RADIO_AP_UP_FUNCS=1 _dhcpd="${2:-}" "$sh" -c '. "$1" && ap_dhcp_serving' sh "$AP"; }
+  echo "777 (busybox) S 1 777" > "$T/proc/777/stat"
+  check 'serving "$MATCH" 777' "the server this start launched, running: serving"
+  echo "777 (busybox) Z 1 777" > "$T/proc/777/stat"
+  check '! serving "$MATCH" 777' "it exited (a zombie this start has not reaped): not serving, whatever else is listed"
+  rm "$T/proc/777/stat"
+  check '! serving "$MATCH" 777' "gone altogether: not serving"
+  echo "777 (setsid) Z 1 777" > "$T/proc/777/stat"; alive=$(standin slow "$T/$TAG/etc/udhcpd.conf"); STANDINS="$STANDINS $alive"; sleep 0.3
+  check 'serving "$MATCH" 777 && ! serving "udhcpd .*nothing-$TAG" 777' "the pid setsid's, not the server's: asked by config path, as before"
+  check 'serving "$MATCH" "" && ! serving "udhcpd .*nothing-$TAG" ""' "none launched by this start (an AP already up): by config path, as before"
+  kill -9 "$alive" 2>/dev/null
 done
 [ "$fails" -eq 0 ] && echo "radio_ap_up_test: all passed" || { echo "radio_ap_up_test: $fails failed"; exit 1; }

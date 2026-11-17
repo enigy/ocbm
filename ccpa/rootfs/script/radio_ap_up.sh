@@ -276,6 +276,48 @@ ap_prepared_ok() {
   NAME=$_p_name; WLANIP=$_p_ip; ch=$_p_ch
   return 0
 }
+# ---- the AP's DHCP server: the last AP's never counts as this one's ------------------------------
+# The release review of resident-bt (A3-1), the likely cause of the 16 Nov bench's one bad wake (no "sending ACK" in
+# 60 s, the phone back on its old address): BusyBox udhcpd writes its lease file (/var/lib/udhcpd.leases, on the jffs2
+# root) as it exits on SIGTERM, and with flash slow (garbage collection just after an update's commit removed its .prev
+# binaries) the last AP's server was still in the process list when the next AP started. That start took it for its
+# own and started none, and when it had gone the AP had no DHCP. radio_hal.sh's teardown now waits for it (its own
+# copy of ap_dhcp_stop), and a start that launches hostapd stops any left and keeps the pid of the one it starts.
+# Found by config path, never by name: the NCM server, `busybox udhcpd -f /tmp/udhcpd_ncm.conf`, is never one of
+# them. AP_DHCP_MATCH and AP_PROC are test hooks.
+AP_DHCP_MATCH=${AP_DHCP_MATCH:-udhcpd .*etc/udhcpd.conf}
+AP_PROC=${AP_PROC:-/proc}
+ap_dhcp_pids() { ps 2>/dev/null | grep -v grep | grep "$AP_DHCP_MATCH" | awk '{print $1}'; }
+ap_pids_live() { for _apl in "$@"; do kill -0 "$_apl" 2>/dev/null && return 0; done; return 1; }
+# SIGTERM to every AP DHCP server, up to 3 s for them to go (the lease file), then SIGKILL and up to 1 s more. 1 when
+# one survived even that (a kernel wait): a server started now may not bind.
+ap_dhcp_stop() {
+  _ads=$(ap_dhcp_pids)
+  [ -n "$_ads" ] || return 0
+  for _adp in $_ads; do kill "$_adp" 2>/dev/null; done
+  _adn=0; while [ "$_adn" -lt 15 ] && ap_pids_live $_ads; do _adn=$((_adn + 1)); sleep 0.2; done
+  ap_pids_live $_ads || return 0
+  echo "$L the last AP's DHCP server is still there 3 s after SIGTERM (its lease file on flash?) - SIGKILL"
+  for _adp in $_ads; do kill -9 "$_adp" 2>/dev/null; done
+  _adn=0; while [ "$_adn" -lt 10 ] && ap_pids_live $_ads; do _adn=$((_adn + 1)); sleep 0.1; done
+  ap_pids_live $_ads || return 0
+  echo "$L the last AP's DHCP server survived SIGKILL (a kernel wait?): this AP's may not bind"
+  return 1
+}
+# This AP's DHCP server serving: the one this start launched ($_dhcpd), alive (its /proc stat not a zombie this shell
+# has not reaped) at each look, through the confirmation; or, when this start launched none, any by config path.
+ap_dhcp_serving() {
+  if [ -n "${_dhcpd:-}" ]; then
+    _adx=""; _adx_name=""
+    read -r _adx_pid _adx_name _adx _adx_rest 2>/dev/null <"$AP_PROC/$_dhcpd/stat"
+    # $! is the server's own pid (setsid does not fork for a job that leads no process group, which ours never do);
+    # were it setsid's, ask by config path as before rather than fail an AP that serves.
+    [ "$_adx_name" = "(setsid)" ] && { [ -n "$(ap_dhcp_pids)" ]; return; }
+    [ -n "$_adx" ] && [ "$_adx" != Z ]
+  else
+    [ -n "$(ap_dhcp_pids)" ]
+  fi
+}
 [ "${RADIO_AP_UP_FUNCS:-}" = 1 ] && return 0
 
 # The connect timeline's ap_start and ap_up (crates/box-common/src/timeline.rs): `t <key> <uptime ms>` appended to btd's
@@ -358,7 +400,7 @@ test -e /tmp/bin/hostapd || cp /usr/sbin/hostapd /tmp/bin/hostapd 2>/dev/null
 # Running already is asked of pidof (one fork, where `ps | grep | grep` took three ahead of the launch); it names a
 # process by its own name, so an editor holding /etc/hostapd.conf open no longer counts as the AP.
 echo "[radio] hostapd starting on $IF" >> /tmp/box.log
-_launched=0; _hapd=""; _ae0=0
+_launched=0; _hapd=""; _ae0=0; _dhcpd=""
 if ! pidof hostapd >/dev/null 2>&1; then
   setsid hostapd /etc/hostapd.conf </dev/null >>/tmp/box.log 2>&1 &
   _hapd=$!
@@ -381,7 +423,16 @@ fi
 # hang long after the script itself has finished, and would break the HAL's convergent-on-return
 # contract for any caller that reads our output. `busybox udhcpd -f /etc/udhcpd.conf` still matches the
 # CONFIG-PATH patterns here and in radio_hal.sh, and it writes /var/run/udhcpd.pid for wlan_off.sh.
-if ! ps | grep -v grep | grep -q "udhcpd .*etc/udhcpd.conf"; then
+# A new AP (hostapd launched just above): any AP DHCP server still listed is the last AP's on its way out, never this
+# one's (ap_dhcp_stop, above). An AP already up (hostapd running) keeps the one it has, as before.
+_dhcp_new=0
+if [ "$_launched" = 1 ]; then
+  ap_dhcp_stop
+  _dhcp_new=1
+elif [ -z "$(ap_dhcp_pids)" ]; then
+  _dhcp_new=1
+fi
+if [ "$_dhcp_new" = 1 ]; then
   # radio_ap_dhcp.log stays a small `>`-truncated status file: this udhcpd is a setsid-backgrounded
   # foreground process, so piping its own stdout to tee would change its lifecycle. Only the readback
   # below (on failure) is universal-logged.
@@ -389,6 +440,7 @@ if ! ps | grep -v grep | grep -q "udhcpd .*etc/udhcpd.conf"; then
   # no lease (the Mac's 13 Nov brief, item 10); a short probe still catches an address in use. BusyBox 1.32.1's udhcpd
   # takes -a (the adapter's, checked on the Mac's bench); /usr/sbin/udhcpd is the vendor's v0.9.9-pre and is not this.
   setsid busybox udhcpd -f -a 250 /etc/udhcpd.conf </dev/null >/tmp/radio_ap_dhcp.log 2>&1 &
+  _dhcpd=$!
 fi
 
 # ---- converge ---------------------------------------------------------------------------------
@@ -403,7 +455,7 @@ fi
 ap_serving() {
   ps | grep -v grep | grep -qw hostapd || return 1
   ifconfig "$IF" 2>/dev/null | grep -q "inet addr:$WLANIP" || return 1
-  ps | grep -v grep | grep -q "udhcpd .*etc/udhcpd.conf" || return 1
+  ap_dhcp_serving || return 1
   return 0
 }
 # The hostapd launched here has exited: its /proc entry is a zombie this shell has not reaped (ps and pidof still list
@@ -445,8 +497,8 @@ if ! ap_serving || { [ "$_launched" = 1 ] && hapd_exited; }; then
     || echo "$L   hostapd is not running"
   ifconfig "$IF" 2>/dev/null | grep -q "inet addr:$WLANIP" \
     || echo "$L   $IF does not hold $WLANIP"
-  ps | grep -v grep | grep -q "udhcpd .*etc/udhcpd.conf" \
-    || { echo "$L   the AP DHCP server is not running - a phone would associate and get no address"
+  ap_dhcp_serving \
+    || { echo "$L   the AP DHCP server is not running${_dhcpd:+ (the one started here, pid $_dhcpd, exited)} - a phone would associate and get no address"
          tail -3 /tmp/radio_ap_dhcp.log 2>/dev/null | sed "s|^|$L     |" | tee -a /tmp/box.log; }
   exit 1
 fi
