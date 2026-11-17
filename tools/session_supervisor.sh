@@ -31,6 +31,9 @@
 set -u
 export PATH=${OCBM_TEST_PATH:+$OCBM_TEST_PATH:}/usr/sbin:/usr/bin:/sbin:/bin:$PATH
 
+# tools/session_supervisor_test.sh sources this file for its functions alone (OCBM_SUP_FUNCS=1): no singleton lock,
+# no traps, and it returns before the main loop.
+if [ "${OCBM_SUP_FUNCS:-}" != 1 ]; then
 # S2 singleton guard: mirrors the mkdir test-and-set + PID-liveness reclaim idiom in
 # ccpa/rootfs/script/radio_hal.sh:84-99 (lock_take), so a second supervisor invocation (e.g. a
 # stray manual relaunch) never runs concurrently with a live one and races it over /tmp state.
@@ -52,6 +55,7 @@ trap 'woken=1' USR1
 echo $$ > "$_sup_lock/pid" 2>/dev/null
 trap 'rm -rf "$_sup_lock" 2>/dev/null' EXIT
 trap 'rm -rf "$_sup_lock" 2>/dev/null; trap - EXIT; exit 143' INT TERM HUP
+fi
 
 FLAG=${FLAG:-/tmp/host_present}
 AL=/tmp/carplayd.log
@@ -109,6 +113,16 @@ last_state=""          # signature of the last /tmp/carplay_state write (change-
 last_phase=""          # last published phase, for the transition ring (#30)
 
 now() { cut -d. -f1 /proc/uptime; }
+# The uptime without a fork, for the paths a host's arrival takes (each fork is about 15 ms on this CPU, and the
+# armed go has about 150 ms in all): _up_s whole seconds, _up_ms the ms to the 10 ms /proc/uptime gives. Empty when
+# unreadable.
+SUP_PROC=${SUP_PROC:-/proc}   # tools/session_supervisor_test.sh points these at scratch trees
+SUP_SYS=${SUP_SYS:-/sys}
+uptime_now() {
+  _up_raw=""; _up_s=""; _up_ms=""
+  read -r _up_raw _up_idle 2>/dev/null <"$SUP_PROC/uptime"
+  case "$_up_raw" in *.*) _up_s=${_up_raw%.*}; _up_ms="${_up_raw%.*}${_up_raw#*.}0" ;; esac
+}
 
 PHONE_FLAG=/tmp/phone_present     # phone-on-bus signal for ocbmd -> host SEV_PHONE_* (2026-07-12)
 phone_flag_state=""
@@ -122,8 +136,15 @@ phone_waiting=0
 # wireless-only session (the safety property preempt_wireless_for_wired relies on). Note: once a phone
 # role-switches into projection it stops enumerating as 05ac (projection_up.sh:17), so this matches a
 # FRESHLY-plugged cable — exactly the preempt trigger — not an already-projected wired session.
+# Read with the shell's own `read`, not `grep` (16 Nov 2026): the armed go asks it, and a fork is about 15 ms here.
+# The same answer: an idVendor holding 05ac anywhere in it.
 wired_iphone_on_usb() {
-  grep -q 05ac /sys/bus/usb/devices/*/idVendor 2>/dev/null
+  for _wiu_f in "$SUP_SYS"/bus/usb/devices/*/idVendor; do
+    _wiu_v=""
+    read -r _wiu_v 2>/dev/null <"$_wiu_f"
+    case "$_wiu_v" in *05ac*) return 0 ;; esac
+  done
+  return 1
 }
 
 # Is an iPhone attached to the phone-facing port? TWO modes (the role switch flips them):
@@ -157,7 +178,9 @@ phone_on_bus() {
 # exist, tore the radios down, restored them on the next tick, and that restart lost btd's switch hold.
 wired_phone_on_bus() {
   wired_iphone_on_usb && return 0
-  [ "$(cat /sys/class/android_usb/android0/state 2>/dev/null)" = "CONFIGURED" ]
+  _wpb_s=""
+  read -r _wpb_s 2>/dev/null <"$SUP_SYS/class/android_usb/android0/state"
+  [ "$_wpb_s" = "CONFIGURED" ]
 }
 
 # Publish the phone-presence flag atomically on transitions (ocbmd mirrors it to the host app so
@@ -196,8 +219,12 @@ write_state() {   # $1 = phase, $2 = reason
 # its control connection). The wired supervisor must NOT touch carplayd in that case — the
 # critical QC finding: the old unconditional kill SIGKILLed a healthy wireless projection the moment a
 # USB phone appeared, and the establishment-stall ladder then escalated to REBOOTING the box at it.
+CARPLAY_TRANSPORT_FLAG=${CARPLAY_TRANSPORT_FLAG:-/tmp/carplay_transport}
 wireless_owns_session() {
-  [ "$(cat /tmp/carplay_transport 2>/dev/null)" = "wireless" ]
+  # `read`, not `$(cat ...)`: no fork (the armed go asks it). btd and carplayd write the flag as one word.
+  _wos_t=""
+  read -r _wos_t 2>/dev/null <"$CARPLAY_TRANSPORT_FLAG"
+  [ "$_wos_t" = "wireless" ]
 }
 
 # A running carplayd is the WIRED arm's only while that arm is ARMED or carplayd says its peer is wired
@@ -616,7 +643,8 @@ wireless_enabled() { ! grep -qiE '^[[:space:]]*wireless:[[:space:]]*false' "$WIR
 # App-commanded radio inhibit (ocbmd CT_RADIO, docs/carplay/04_CAPABILITIES_AND_CONFIG.md radio gating): flag present = radios must be
 # OFF now. ocbmd owns the flag lifecycle (set/cleared by host CT_RADIO; cleared on fresh SUBSCRIBE,
 # app loss, and ocbmd startup) — this is an app-commanded surface, NOT an on-box lever.
-radio_off() { [ -f /tmp/radio_off ]; }
+RADIO_OFF_FLAG=${RADIO_OFF_FLAG:-/tmp/radio_off}
+radio_off() { [ -f "$RADIO_OFF_FLAG" ]; }
 # Hot-Handover (NON-STANDARD, opt-in): force a live wireless->wired switch when a cable is plugged into an
 # ACTIVE wireless session. DEFAULT OFF (= "Standard", spec-conformant): Apple's R14G17 selects transport
 # exactly ONCE at session start (wired-preferred) and never migrates a live session (CarPlayControlClient.c
@@ -633,7 +661,7 @@ wireless_running() { pgrep -f /usr/sbin/btd >/dev/null 2>&1; }
 # Mac's reviews of bbd29f3). 90 s caps one against a reused pid; before its pid is written, 15 s does.
 # wireless_up waits on it, so a host that comes back within the teardown neither finds the SIGTERMed btd and skips
 # its bring-up, nor starts a btd the teardown then kills with -9 (the Mac's review of 376c4ce, SUP-TEARDOWN-RACE).
-WL_TEARDOWN_MARK=/tmp/.wl_teardown
+WL_TEARDOWN_MARK=${WL_TEARDOWN_MARK:-/tmp/.wl_teardown}   # the teardown block below writes this path literally
 teardown_in_flight() {
   _tif=1
   for _tf in "$WL_TEARDOWN_MARK".*; do
@@ -697,11 +725,275 @@ pairing_mode() {
 # AP must be its own again: put the original back, once.
 restore_stock_hostapd() {
   [ -f /etc/hostapd.conf.stock ] || return 0
+  # The AP's configuration written ahead (radio_ap_up.sh PREP) no longer describes the file: write it again.
+  rm -f /tmp/.radio_ap_prepared
   mv -f /etc/hostapd.conf.stock /etc/hostapd.conf && sync \
     && echo "[sup] put back the adapter's own /etc/hostapd.conf (the bridge role's copy is retired)"
 }
 
+# --- Armed Bluetooth between host sessions (the owner's decision, 16 Nov 2026) -------------------------------------
+# Between host sessions Bluetooth may stay POWERED BUT INVISIBLE: page and inquiry scan off, no connection, nothing
+# paging (docs/wireless/01_BT_AND_RADIO.md, "Between host sessions: armed"). With no host here, once the last one's
+# teardown is over or the boot preload is done, this supervisor starts the NEXT host's btd early (OCBM_BTD_ARM=1,
+# crates/vendor/wireless/src/armed.rs): it brings the controller up as a session's bring-up would but with no scan,
+# and waits. The arm also writes the AP's configuration ahead (radio_hal.sh wifi_ap_prep): files only, no network,
+# nothing beaconing. The host's arrival is then a go (wireless_go): the session's inputs in a file and SIGUSR1, then
+# the AP from its configuration. btd proves the controller with one HCI round trip and answers; a failure, no answer
+# or no btd falls back to today's path (go_watch: wireless_up fallback, bt_on and a fresh btd). Off: the owner's
+# /script/radio_arm_off, or the bench hook /tmp/bench_arm_off; either restores the 2.6.0 behaviour (Bluetooth powered
+# down between sessions) from the next host's departure.
+BTD_ARMED_FILE=${BTD_ARMED_FILE:-/tmp/.btd_armed}      # the armed btd's pid, written by btd once armed
+BTD_GO_FILE=${BTD_GO_FILE:-/tmp/.btd_go}               # the go: pid=<the armed btd> and the session's inputs
+BTD_GO_RESULT=${BTD_GO_RESULT:-/tmp/.btd_go_result}    # btd's answer: "ok <uptime ms>" or "fail <why>"
+ARM_OFF_FILE=${ARM_OFF_FILE:-/script/radio_arm_off}    # the owner's off switch, on flash
+ARM_BENCH_OFF=${ARM_BENCH_OFF:-/tmp/bench_arm_off}     # the bench's (box_common::bench_flag's rule)
+STARTUP_MARKS=${STARTUP_MARKS:-/tmp/startup_marks}     # the connect timeline's record (box_common::timeline)
+RADIO_LOCKS=${RADIO_LOCKS:-/tmp}                       # radio_hal.sh's locks: <here>/.radio_lock_<subsystem>
+arm_pid=""      # the arm this supervisor started: its wrapper's pid, which becomes the armed btd's (exec, no fork)
+arm_since=""    # the uptime (s) it started at
+arm_next=1      # arm when no host is here: from the start (after the boot preload) and after each wireless session
+go_pending=0    # a go went out and btd's answer is awaited (go_watch)
+go_pid=""
+go_since=""
+
+# Is $1 a live btd? Its /proc stat's name and state, read with `read`: not a zombie waiting to be reaped.
+proc_live_btd() {
+  _plb_name=""; _plb_state=""
+  read -r _plb_pid _plb_name _plb_state _plb_rest 2>/dev/null <"$SUP_PROC/$1/stat"
+  [ "$_plb_name" = "(btd)" ] && [ -n "$_plb_state" ] && [ "$_plb_state" != Z ]
+}
+
+# Is the arm this supervisor started still there? A btd, or its wrapper (sh, before the exec) for 30 s at most.
+arm_alive() {
+  [ -n "$arm_pid" ] || return 1
+  proc_live_btd "$arm_pid" && return 0
+  _aa_state=""
+  read -r _aa_pid _aa_name _aa_state _aa_rest 2>/dev/null <"$SUP_PROC/$arm_pid/stat"
+  [ -n "$_aa_state" ] && [ "$_aa_state" != Z ] || return 1
+  uptime_now
+  [ -n "$_up_s" ] && [ -n "$arm_since" ] && [ $((_up_s - arm_since)) -lt 30 ]
+}
+
+# The armed btd ready for a go: it wrote its pid, the pid is this supervisor's arm, and it is a live btd. Sets _ap.
+btd_armed_ready() {
+  _ap=""
+  [ -n "$arm_pid" ] || return 1
+  read -r _ap 2>/dev/null <"$BTD_ARMED_FILE"
+  [ -n "$_ap" ] && [ "$_ap" = "$arm_pid" ] && proc_live_btd "$_ap"
+}
+
+# Armed Bluetooth switched off: the owner's file, or the bench hook (there, and not reading "off").
+arm_off() {
+  [ -e "$ARM_OFF_FILE" ] && return 0
+  [ -e "$ARM_BENCH_OFF" ] || return 1
+  _ao=""; read -r _ao 2>/dev/null <"$ARM_BENCH_OFF"
+  [ "$_ao" != off ]
+}
+
+# May the radios be armed now? Asked on ticks with no host here, cheapest first, so most ticks fork nothing.
+arm_gate() {
+  [ "$arm_next" = 1 ] && [ -z "$arm_pid" ] || return 1
+  if arm_off; then
+    arm_next=0
+    echo "[sup] Bluetooth not armed between sessions: switched off ($ARM_OFF_FILE or $ARM_BENCH_OFF)"
+    return 1
+  fi
+  # Attached already: an arm never attaches (at boot the preload does; without it, the first host's session does).
+  [ -d "$SUP_SYS/class/bluetooth/hci0" ] || return 1
+  # A seam bring-up under way (the boot preload holds both locks) goes first.
+  [ -d "$RADIO_LOCKS/.radio_lock_bt" ] && return 1
+  [ -d "$RADIO_LOCKS/.radio_lock_wlan" ] && return 1
+  teardown_in_flight && return 1
+  # A wired phone: the next host's session is wired, and the radios stay down for it (A2). Its Hot-Handover setting
+  # cannot be asked: the config left with the host.
+  wired_phone_on_bus && return 1
+  wireless_running && return 1
+  return 0
+}
+
+# Arm: the AP's configuration written ahead, then the next host's btd, armed. Detached, as a bring-up is; its body
+# names no A/V daemon and no AP daemon (the teardown's patterns: comments are argv too), only btd, whose teardown
+# pattern is meant to end an arm under way.
+arm_wireless() {
+  arm_next=0
+  # As wireless_up's clean slate: a stray A/V daemon, not a wired one, is reaped before the wireless A/V log restarts.
+  _ar=0
+  if ! pgrep -x carplayd >/dev/null 2>&1; then _ar=1; pkill -f carplayd 2>/dev/null; fi
+  restore_stock_hostapd
+  uptime_now
+  echo "[sup] no host: arming Bluetooth for the next one (powered, invisible) at uptime $_up_raw"
+  env OCBM_BTD_ARM=1 OCBM_WL_REAPED="$_ar" OCBM_AV_NAME=carplayd OCBM_AV_LOG=/tmp/carplayd_wl.log setsid sh -c '
+    # The AP configured ahead: its files only. No network and no beacon until a host is here.
+    sh /script/radio_hal.sh wifi_ap_prep >/tmp/wlan_prep.log 2>&1
+    if [ "$OCBM_WL_REAPED" = 1 ]; then
+      _i=0
+      while [ "$_i" -lt 25 ] && { pgrep -x "$OCBM_AV_NAME" || pgrep -x "/usr/sbin/$OCBM_AV_NAME"; } >/dev/null 2>&1; do
+        _i=$((_i + 1)); sleep 0.2
+      done
+    fi
+    : > "$OCBM_AV_LOG"
+    exec /usr/sbin/btd </dev/null >>/tmp/wl.log 2>&1
+  ' </dev/null >/dev/null 2>&1 &
+  arm_pid=$!
+  arm_since=$_up_s
+}
+
+# The arm, watched on ticks with no host here. Gone (the arm failed, a check gave the armed state up, or it crashed),
+# it may have left Bluetooth powered: down through the seam, as a teardown leaves it. Not armed again until a wireless
+# session has run, so the next host takes today's path.
+arm_watch() {
+  [ -n "$arm_pid" ] || return 0
+  arm_alive && return 0
+  echo "[sup] the armed btd ($arm_pid) has ended -- Bluetooth down as between sessions; the next host takes today's path"
+  arm_pid=""
+  wireless_down "the armed btd ended"
+}
+
+# An arm still under way when the host comes gets 3 s to finish arming: about a second from power-up to armed.
+arm_wait_ready() {
+  _aw=0
+  while [ "$_aw" -lt 30 ] && ! btd_armed_ready && arm_alive; do _aw=$((_aw + 1)); sleep 0.1; done
+  [ "$_aw" -gt 0 ] && echo "[sup] wireless_up waited $((_aw * 100)) ms for the arm under way"
+  return 0
+}
+
+# The host's config, read once for a go: wireless (1 unless `wireless: false`), Hot-Handover (1 only on `true`), the
+# pairing mode and whether it is interactive. The answers wireless_enabled, hot_handover_enabled, pairing_mode and
+# pairing_interactive give, from one awk instead of four greps (tools/session_supervisor_test.sh holds them to it).
+cfg_snapshot() {
+  _cs_wireless=1; _cs_hot=0; _cs_mode=just_works; _cs_inter=0
+  [ -f "$WIRELESS_CFG" ] || return 0
+  set -- $(awk '{ l = tolower($0) }
+    l ~ /^[[:space:]]*wireless:[[:space:]]*false/ { w = 1 }
+    l ~ /^[[:space:]]*hot_handover:[[:space:]]*true/ { h = 1 }
+    l ~ /^[[:space:]]*pairing:[[:space:]]*(numeric|numeric_comparison)/ { n = 1 }
+    l ~ /^[[:space:]]*pairing:[[:space:]]*numeric_comparison_interactive/ { i = 1 }
+    END { a = w ? 0 : 1; b = h ? 1 : 0; c = n ? "numeric" : "just_works"; d = i ? 1 : 0; print a, b, c, d }' \
+    "$WIRELESS_CFG" 2>/dev/null)
+  [ "$#" = 4 ] || return 0
+  _cs_wireless=$1; _cs_hot=$2; _cs_mode=$3; _cs_inter=$4
+}
+
+# The bench's btmon capture (CARPLAY_BTMON or /tmp/carplay_btmon), as the bring-up's wrapper starts it.
+btmon_lever() {
+  { [ -f /tmp/carplay_btmon ] || [ "${CARPLAY_BTMON:-0}" = 1 ]; } || return 0
+  if command -v btmon >/dev/null 2>&1; then
+    echo "[sup] btmon lever armed -- capturing to /tmp/box.log"
+    ( btmon 2>&1 | sed "s/^/[btmon] /" >> /tmp/box.log & )
+  else
+    echo "[sup] btmon lever armed but btmon not found on PATH -- skipping"
+  fi
+}
+
+# The host's arrival with an armed btd: the go. wireless_up's guards first (the inhibit, `wireless: false`, a wired
+# session owning the box), each of which puts the armed Bluetooth down instead of going; then the go, ahead of
+# everything else, and the AP after it. Before the signal nothing forks but the config's one awk.
+wireless_go() {  # $1 = the armed btd's pid
+  if radio_off; then
+    echo "[sup] radios inhibited (CT_RADIO off) — the armed Bluetooth goes down, no bring-up"
+    wireless_down "radios inhibited (CT_RADIO off)"
+    return
+  fi
+  cfg_snapshot
+  if [ "$_cs_wireless" != 1 ]; then
+    echo "[sup] wireless disabled by config (wireless: false) — wired-only; the armed Bluetooth goes down"
+    wireless_down
+    return
+  fi
+  if [ "$_cs_hot" != 1 ] && ! wireless_owns_session && wired_phone_on_bus; then
+    echo "[sup] wireless_up SUPPRESSED — a WIRED session owns the box (Hot-Handover off); the armed Bluetooth goes down"
+    wireless_down "WIRED session active + Hot-Handover OFF (radios yield to the cable)"
+    # A2's rising edge, taken here (its state may be a past session's): the cable's going restores the stack.
+    radios_yielded_to_wired=1; _a2_state=1
+    return
+  fi
+  : 2>/dev/null >"$BTD_GO_RESULT"   # no answer yet (a redirection, not rm: nothing forks before the signal)
+  printf 'pid=%s\nBT_PAIRING_MODE=%s\nBT_SSP_INTERACTIVE=%s\n' "$1" "$_cs_mode" "$_cs_inter" 2>/dev/null >"$BTD_GO_FILE"
+  usb_observe
+  uptime_now
+  # The connect timeline (box_common::timeline): the radios start now, and the host-facing USB link's last edge.
+  if [ -n "$_up_ms" ]; then
+    echo "t sup_radios $_up_ms" 2>/dev/null >>"$STARTUP_MARKS"
+    [ -n "$usb_configured_at" ] && echo "t usb_edge $usb_configured_at" 2>/dev/null >>"$STARTUP_MARKS"
+  fi
+  arm_pid=""
+  if kill -USR1 "$1" 2>/dev/null; then
+    go_pending=1; go_pid=$1; go_since=$_up_s
+  fi
+  # The AP from its configuration written at the arm (radio_hal.sh's fast path): hostapd is its first launch.
+  ( setsid sh /script/radio_hal.sh wifi_ap_on >/tmp/wlan.log 2>&1 & )
+  btmon_lever
+  echo "[sup] host PRESENT + wireless enabled -> armed go (btd $1, pairing=$_cs_mode) at uptime $_up_raw"
+  if [ "$go_pending" != 1 ]; then
+    echo "[sup] armed go: btd $1 did not take the signal -- falling back to bt_on and a fresh btd"
+    wireless_up fallback
+  fi
+}
+
+# Stop a btd that is not to go on: SIGTERM, which an armed btd answers at once, then -9 after a second.
+stop_btd() {
+  proc_live_btd "$1" || return 0
+  kill "$1" 2>/dev/null
+  _sb=0
+  while [ "$_sb" -lt 10 ] && proc_live_btd "$1"; do _sb=$((_sb + 1)); sleep 0.1; done
+  if proc_live_btd "$1"; then
+    kill -9 "$1" 2>/dev/null
+    _sb=0
+    while [ "$_sb" -lt 10 ] && proc_live_btd "$1"; do _sb=$((_sb + 1)); sleep 0.1; done
+  fi
+  proc_live_btd "$1" && echo "[sup] btd $1 survived SIGKILL (a kernel wait?)"
+  return 0
+}
+
+# The go's answer, asked each tick until there is one: btd writes it within milliseconds (its proof is one round
+# trip) and wakes this loop when it is a failure. A failure, no btd, or no answer within 3 s falls back to today's
+# path: the armed btd stopped, then wireless_up's bring-up (bt_on, a fresh btd), the go's stamps and AP kept.
+go_watch() {
+  [ "$go_pending" = 1 ] || return 0
+  _gw_r=""; read -r _gw_r 2>/dev/null <"$BTD_GO_RESULT"
+  case "$_gw_r" in
+    ok*)
+      go_pending=0
+      echo "[sup] armed go: btd $go_pid has the host's session ($_gw_r)"
+      return 0
+      ;;
+    fail*) _gw_why="btd: ${_gw_r#fail }" ;;
+    *)
+      if proc_live_btd "$go_pid"; then
+        uptime_now
+        if [ -n "$_up_s" ] && [ -n "$go_since" ] && [ $((_up_s - go_since)) -lt 3 ]; then return 0; fi
+        _gw_why="no answer from btd $go_pid in 3 s"
+      else
+        _gw_why="btd $go_pid is gone"
+      fi
+      ;;
+  esac
+  go_pending=0
+  echo "[sup] armed go failed ($_gw_why) -- falling back to bt_on and a fresh btd"
+  stop_btd "$go_pid"
+  if [ "${p:-0}" = 1 ]; then wireless_up fallback; fi
+}
+
 wireless_up() {
+  # $1 = fallback: today's path after an armed go that failed (go_watch, wireless_go). The go's timeline stamps and
+  # its AP went out already, so the bring-up skips its own (OCBM_GO_FALLBACK, in the wrapper below).
+  _wu_fb=0
+  [ "${1:-}" = fallback ] && _wu_fb=1
+  if [ "$_wu_fb" = 0 ] && [ -n "$arm_pid" ]; then
+    arm_wait_ready
+    if btd_armed_ready; then
+      wireless_go "$_ap"
+      return
+    fi
+    if arm_alive; then
+      echo "[sup] wireless_up: the arm is still under way after 3 s -- stopping it, bring-up deferred to the teardown's end"
+      wireless_down "an arm that did not finish"
+      wireless_rebring_at=$(( $(now) + 2 ))
+      rebring_after_teardown=1
+      return
+    fi
+    arm_pid=""   # the arm ended (it failed, or its checks gave the armed state up): today's path
+  fi
   if radio_off; then
     echo "[sup] radios inhibited (CT_RADIO off) — skipping wireless bring-up"
     return
@@ -760,7 +1052,11 @@ wireless_up() {
   mode=$(pairing_mode)
   restore_stock_hostapd
   usb_observe   # this instant's USB state, for the block's usb_edge stamp: the tick's reading may be a second old
-  echo "[sup] host PRESENT + wireless enabled -> CLEAN bring-up of wireless stack (detached, pairing=$mode) at uptime $(cut -d' ' -f1 /proc/uptime)"
+  if [ "$_wu_fb" = 1 ]; then
+    echo "[sup] host PRESENT + wireless enabled -> CLEAN bring-up of Bluetooth after the failed armed go (detached, pairing=$mode) at uptime $(cut -d' ' -f1 /proc/uptime)"
+  else
+    echo "[sup] host PRESENT + wireless enabled -> CLEAN bring-up of wireless stack (detached, pairing=$mode) at uptime $(cut -d' ' -f1 /proc/uptime)"
+  fi
   # Detached session: the Wi-Fi AP and the BT radio come up side by side, then the CarLink advertiser, each
   # redirected (not piped).
   # NO inner pgrep guard: the wrapper `sh -c` argv itself contains "/usr/sbin/btd", so an
@@ -769,7 +1065,7 @@ wireless_up() {
   # BT_PAIRING_MODE is inherited through setsid -> sh -c -> the exec'd btd. The body is single-quoted on
   # purpose, so values travel as env vars rather than by interpolating into the wrapper's argv.
   env BT_PAIRING_MODE="$mode" BT_SSP_INTERACTIVE="$(pairing_interactive)" OCBM_WL_REAPED="$_wl_reaped" \
-    OCBM_USB_EDGE="$usb_configured_at" setsid sh -c '
+    OCBM_USB_EDGE="$usb_configured_at" OCBM_GO_FALLBACK="$_wu_fb" setsid sh -c '
     # Radio bring-up goes through the chipset-neutral seam. It resolves this unit'"'"'s own
     # bring-up mapping at runtime, so the supervisor never names a chip, a module or an attach
     # helper. Exit codes: 0 converged / 1 failed / 2 already up / 3 unsupported on this variant.
@@ -782,6 +1078,8 @@ wireless_up() {
     # radio_hal.sh keeps them apart where they meet: separate wlan and bt locks, the WLAN driver load under its own
     # lock (wlan_driver_up), and a descriptor file per caller (radio_detect.sh).
     # The outer subshell returns at once, so the AP bring-up is no child of the btd exec below (which would never reap it).
+    # After a failed armed go (OCBM_GO_FALLBACK=1) the AP and these stamps went out with the go: Bluetooth only.
+    if [ "$OCBM_GO_FALLBACK" != 1 ]; then
     echo "[sup] radios starting at uptime $(cut -d" " -f1 /proc/uptime)" >> /tmp/box.log
     # The connect timeline (crates/box-common/src/timeline.rs): the radios start now, and the host-facing USB link
     # last came up at OCBM_USB_EDGE (empty: not known). One append each, no fork; a failed one is ignored.
@@ -790,6 +1088,9 @@ wireless_up() {
     case "$_tl_up" in *.*) echo "t sup_radios ${_tl_up%.*}${_tl_up#*.}0" 2>/dev/null >>/tmp/startup_marks ;; esac
     [ -n "$OCBM_USB_EDGE" ] && echo "t usb_edge $OCBM_USB_EDGE" 2>/dev/null >>/tmp/startup_marks
     ( sh /script/radio_hal.sh wifi_ap_on >/tmp/wlan.log 2>&1 & )
+    else
+    echo "[sup] radios after a failed armed go at uptime $(cut -d" " -f1 /proc/uptime): Bluetooth by bt_on and a fresh btd" >> /tmp/box.log
+    fi
     # bt.log stays the small truncated per-attempt status file that docs/wireless/01_BT_AND_RADIO.md
     # tells an operator to cat directly. This call is foreground (no trailing ampersand), so teeing
     # its combined stdout/stderr into the universal log costs nothing and changes no lifecycle.
@@ -847,6 +1148,10 @@ wireless_down() {
   # $1 = why, for the log only. Default keeps the historical host-presence wording; the wired-takeover
   # caller passes its own so the log never claims the app went away when it did not.
   _wd_why="${1:-host GONE (or wireless disabled)}"
+  # An arm or a go is over with this: the teardown below ends the btd behind either (an armed btd answers its SIGTERM
+  # at once). A pid file it could not remove names nobody now.
+  arm_pid=""; go_pending=0
+  rm -f "$BTD_ARMED_FILE" 2>/dev/null
   # COMPLETE wireless-stack teardown, tied to app presence: the advertiser (btd) AND its
   # setsid-detached A/V children (carplayd). pkill-ing ONLY the parent orphans the children,
   # and the next app-connect bring-up then collides with those orphans ("Address in use" on the
@@ -868,7 +1173,9 @@ wireless_down() {
     # Stop the CarLink advertiser + the A/V daemons + drop the AP (the WiFi beacon is the main drain).
     # BT end-state (docs/carplay/04_CAPABILITIES_AND_CONFIG.md radio gating): module stays ATTACHED (hciattach kept — re-attach is the
     # flaky part) but the radio is POWERED DOWN (noscan, then hci0 down at the end of this block) so
-    # an app-less box drops ACLs and answers nothing. SIGTERM first, brief settle, then SIGKILL only the A/V daemons (NOT the BT hci path
+    # an app-less box drops ACLs and answers nothing. Since 16 Nov 2026 the main loop then arms it for the next host
+    # once this block has ended (arm_gate): powered again, with no scan, no link and nothing paging.
+    # SIGTERM first, brief settle, then SIGKILL only the A/V daemons (NOT the BT hci path
     # — heavy -9 on BT bring-up is what wedges the IW416 controller).
     # SELF-MATCH FIX 2026-08-01: the patterns MUST use the `[x]`-char-class form. This block runs as
     # `setsid sh -c '<this text>'`, so its own argv literally contains "/usr/sbin/btd",
@@ -948,6 +1255,8 @@ wireless_down() {
   fi
 }
 
+[ "${OCBM_SUP_FUNCS:-}" = 1 ] && return 0   # sourced for its functions (tools/session_supervisor_test.sh)
+
 write_healthy 0
 echo "[sup] up; IDLE — gating the CarPlay session on $FLAG (waiting for a host app)"
 WIRELESS_RESTART_FLAG=/tmp/wireless_restart   # ocbmd touches this on the CCPA tab's Restart-wireless / Forget
@@ -960,7 +1269,14 @@ last_r=0                # tracks the CT_RADIO inhibit flag across ticks (docs/ca
 # last_p="" and never sees a 1->0 edge, so a crash between GONE and teardown would strand radios
 # ON with no app. If the app is absent but any radio state is up, reconcile once now. No-op on a
 # clean boot (boot chain raises no radios).
-if [ "$(cat "$FLAG" 2>/dev/null)" != 1 ]; then
+# An armed btd from before this supervisor (it was restarted): not this one's to go with, whatever the host. Down,
+# and armed again by this supervisor once no host is here; a host here meanwhile takes today's path after it.
+_left_armed=""
+read -r _left_armed 2>/dev/null <"$BTD_ARMED_FILE"
+if [ -n "$_left_armed" ] && proc_live_btd "$_left_armed"; then
+  echo "[sup] startup: an armed btd ($_left_armed) from before this supervisor -> wireless_down (armed again with no host)"
+  wireless_down "a restarted supervisor (an armed btd it did not start)"
+elif [ "$(cat "$FLAG" 2>/dev/null)" != 1 ]; then
   if wireless_running || pgrep -x hostapd >/dev/null 2>&1 || hciconfig hci0 2>/dev/null | grep -q "UP"; then
     echo "[sup] startup reconciliation: app absent but radio state up -> wireless_down (stranded by a prior crash)"
     wireless_down
@@ -970,15 +1286,19 @@ fi
 while :; do
   # Read presence, acting only on a DEFINITE 0/1 — an empty/partial read (or missing file) keeps the
   # last state rather than flapping. (ocbmd writes the flag atomically, so this is defensive.)
+  # With `read`, not `$(cat ...)`: the armed go counts its milliseconds from this read (ocbmd writes one character).
   woken=0
-  p=$(cat "$FLAG" 2>/dev/null)
+  p=""
+  read -r p 2>/dev/null <"$FLAG"
   # A host just came: bring wireless up FIRST, before the rest of this tick's checks, each a fork on this CPU. They
   # put about 1.3 s between the host and radio_hal.sh's first line (the Mac's 13 Nov brief, item 1).
   wl_edge_done=0
   if [ "$p" = 1 ] && [ "${last_p:-}" != 1 ]; then
-    echo "[sup] host PRESENT seen at uptime $(cut -d' ' -f1 /proc/uptime)"
+    uptime_now
+    echo "[sup] host PRESENT seen at uptime $_up_raw"
     wireless_up; wl_edge_done=1
   fi
+  go_watch      # an armed go's answer, while one is awaited (no fork)
   usb_observe   # the host-facing USB link, once a tick, after the host's edge (usb_observe: no fork)
 
   # docs/wireless/00_WIRELESS_CARPLAY.md #1.3 (extended, review finding 2026-07-24): `wireless_down`'s own branch already resets
@@ -1026,6 +1346,8 @@ while :; do
     echo "[sup] wireless restart requested (CCPA tab)"
     wireless_down
     wireless_rebring_at=$(( $(now) + 4 ))
+    # With no host here (a forget ocbmd finished after its host left), the restart is a fresh arm once it is down.
+    [ "${p:-0}" = 1 ] || arm_next=1
   fi
   # Deferred behind a teardown, it goes once none runs, never on its timer meanwhile: each firing blocked the tick ~4 s in
   # wireless_up and armed it again, so a long teardown left the loop asleep ~4 s of every 6, host edges and a wired
@@ -1071,6 +1393,9 @@ while :; do
         [ "$wl_edge_done" = 1 ] || wireless_up   # host appeared (normally done at the top of the tick)
       fi
       if [ "$p" = 0 ] && [ "$last_p" = 1 ]; then
+        # Armed Bluetooth for the next host once this teardown is over, when this host's session had wireless up (not
+        # one that was wired-only, inhibited or `wireless: false`, which keeps Bluetooth down between sessions).
+        if wireless_running; then arm_next=1; else arm_next=0; fi
         wireless_down    # host went away: idle the wireless radios (wired baseline stays ready)
       fi
       last_p="$p"
@@ -1243,6 +1568,10 @@ while :; do
     0)
       [ "$armed" = "1" ] && teardown
       apply_pending   # idle boundary — apply any deferred peer-store mutation (#25)
+      # Armed Bluetooth between host sessions: the arm watched, and started once its gate opens (arm_gate, cheapest
+      # check first; the teardown's end wakes this loop for it).
+      arm_watch
+      arm_gate && arm_wireless
       ;;
     *) : ;;  # empty/unexpected read -> keep last state
   esac

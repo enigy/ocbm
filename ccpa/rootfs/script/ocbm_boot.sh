@@ -89,7 +89,9 @@ touch /tmp/UDiskPassThroughMode
 
   # Boot radio preload, on unless /script/radio_preload_off (Scott, 13 Nov; it switches itself off after a preload
   # that never finished): drivers + BT attach into the between-sessions state while the head
-  # unit boots (radio_hal.sh do_preload has the why and the wedge guards). After ocbmd and the
+  # unit boots (radio_hal.sh do_preload has the why and the wedge guards). Once it is done the supervisor arms
+  # Bluetooth for the first host, powered but invisible (session_supervisor.sh, "Armed Bluetooth"); without a
+  # preload Bluetooth is not attached at boot, and nothing is armed until a host's session has attached it. After ocbmd and the
   # supervisor, backgrounded, so it can never delay the management link. A start with a self-test shares the boot
   # with nothing new until it passes: the dispatcher names its pass file in OCBM_PRELOAD_AFTER, and the preload
   # waits up to 120 s for it (a failure reverts or rolls back before then). Never on the legacy first-boot trial
