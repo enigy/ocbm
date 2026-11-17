@@ -831,11 +831,14 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
   16 Nov 2026, one wake open.** On the dev adapter 12 wakes and a cold boot connected from the armed state
   (`page_start` about 100 ms, `ap_enabled` about 1.16 s after the host), the no-host state read as built, arming
   about 1.0 s faster than without, and the forced fallback completed its connect. **Open:** the first wake about 90 s
-  after an update was committed took 24.8 s (the phone associated 8.6 s after RFCOMM, no `sending ACK` in 60 s, the
-  phone back on its old address; not repeated after a reboot). Likely cause, fixed since on `resident-bt`: the last
-  AP's udhcpd still writing its lease file to flash slowed by the commit's garbage collection, taken by the next AP
-  start for its own (the same exposure is in 2.6.0 and 2.6.1). Not proven by a repeat. If it recurs, capture right
-  after it `/tmp/wlan.log`, `/tmp/radio_ap_dhcp.log`, `df /` and the time of `[dispatch] update committed`. Still read
+  after an update was committed took 24.8 s, of two delays; neither repeated after a reboot. The first, a late join,
+  has no cause yet: `AP-ENABLED` came 4.5 s before the 0x5703, and the phone authenticated about 7 s after it
+  (`AP-STA-CONNECTED` 8.6 s after RFCOMM); it may be the phone's. The second, about 6.7 s with no DHCP server (no
+  `udhcpd: started`, no `sending ACK`, the phone on its old address), has a likely cause, fixed since on `resident-bt`:
+  the last AP's udhcpd still writing its lease file to flash slowed by the commit's garbage collection, taken by the
+  next AP start for its own (the same exposure is in 2.6.0 and 2.6.1). Not proven by a repeat. If it recurs, capture
+  right after it what docs/wireless/01_BT_AND_RADIO.md, "Open: one bad wake", lists, the phone's log archive for the
+  late join among it. Still read
   only: that the 3.14 kernel's power-on writes no scan once mgmt's connectable flag is cleared (the arm writes "none"
   and reads it back either way). Bench and revert conditions: docs/ops/02_TESTING.md, "The armed path". Source:
   docs/wireless/01_BT_AND_RADIO.md, "Between host sessions: armed".

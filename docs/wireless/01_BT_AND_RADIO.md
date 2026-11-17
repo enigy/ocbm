@@ -237,8 +237,12 @@ reaches flash within a minute of its ACK. Its lease file has another format: an 
 that restarted behind it), is ignored and rewritten; the NAK covers that case. Nothing in OCBM reads the
 vendor server's `/tmp/.dhcp_record` or `PHONE_P2PGC_ADDR`; the seam's teardown finds it by its config path and,
 since 16 Nov 2026, waits for it to go (up to 3 s, its lease file being written; then SIGKILL), no longer killing
-`/var/run/udhcpd.pid`'s pid blind (a stale pidfile can name any process). The IW416 overlay's `wlan_off.sh` still
-kills by that pidfile. A new AP never counts the last one's server as its own ("The AP, written ahead", below).
+`/var/run/udhcpd.pid`'s pid blind (a stale pidfile can name any process), and an AP `radio_ap_up.sh` starts never
+counts the last one's server as its own ("The AP, written ahead", below). **The owned backend keeps the old exposure
+at both ends** (the second review of `resident-bt`, item 6): the IW416 overlay's `wlan_off.sh` kills by that pidfile
+and does not wait, and its `start_bluetooth_wifi.sh` (through `wlan_on.sh`) starts no server while any AP udhcpd is
+listed, an exiting one included. Both are reference only, never installed: an installer-built unit takes
+`backend=mapped` and never runs them.
 
 ### 5. Hardware-validated results (RTL8822CS, 2026-08-15)
 
@@ -494,13 +498,20 @@ fallback, forced by freezing the armed btd (`kill -STOP`): `armed go failed (no 
 back`, `bt_armed=0`, and the connect completed by today's path. The bench plan:
 [../ops/02_TESTING.md](../ops/02_TESTING.md), "The armed path".
 
-**Open: one bad wake.** The first wake about 90 s after an update was committed took 24.8 s: the phone associated 8.6 s
-after RFCOMM (0.4 s otherwise), udhcpd logged no `sending ACK` in 60 s though the phone ended up on its old IPv4
-address, and its CarPlay service resolved 6.5 s after it joined. It did not repeat after a reboot. The likely cause,
-fixed since (the release review of `resident-bt`, A3-1; "The AP, written ahead" below): the last AP's udhcpd, still
-writing its lease file to flash slowed by the commit's garbage collection, was taken by the next AP start for its own
-DHCP server, and none was started. Should it recur, capture right after it: `/tmp/wlan.log`, `/tmp/radio_ap_dhcp.log`,
-`df /`, and the time of `[dispatch] update committed` in `/tmp/box.log`.
+**Open: one bad wake, of two delays.** The first wake about 90 s after an update was committed took 24.8 s, and two
+delays made it up (the Mac's second reading of its log, 17 Nov). *A late join, its cause open:* hostapd's `AP-ENABLED`
+came 0.53 s after its start and 4.5 s before the 0x5703, yet the phone authenticated about 7 s after the 0x5703
+(`AP-STA-CONNECTED` 8.6 s after RFCOMM, 0.4 s on the other wakes). hostapd logs that before any DHCP, so a missing DHCP
+server does not explain it; it may be the phone's. *No DHCP server, about 6.7 s:* no `udhcpd: started` and no
+`sending ACK` for that session; the phone went on with its old IPv4 address, and its CarPlay service resolved 6.5 s
+after it joined. Only this second delay has a likely cause, fixed since (the release review of `resident-bt`, A3-1;
+"The AP, written ahead" below): the last AP's udhcpd, still writing its lease file to flash slowed by the commit's
+garbage collection, was taken by the next AP start for its own DHCP server, and none was started. Neither repeated
+after a reboot. Should it recur, capture right after it: `/tmp/wlan.log`, `/tmp/radio_ap_dhcp.log`, `/tmp/box.log`
+(hostapd's lines for the phone's authentication and association, and the time of `[dispatch] update committed`),
+`/tmp/startup_marks` and `df /`; for the late join, the phone's own log archive too (`idevicesyslog archive`, its
+`wifid` lines; [../carplay/02_SESSION_LIFECYCLE.md](../carplay/02_SESSION_LIFECYCLE.md) §6), pulled on the Mac
+afterwards.
 
 The owner's decision of 16 Nov 2026: between host sessions Bluetooth may stay **powered but invisible**. "Invisible"
 is hard: with no host here the controller has page scan and inquiry scan off, pages nobody and holds no connection,
@@ -617,12 +628,23 @@ never by date** (corrected 16 Nov 2026, the release review's A3-2): the adapter'
 sets it, so a stamp the boot's arm wrote was dated before files a 2026 clock had written, and the first build's date
 comparison (`-nt`) never trusted it, so the fast path did nothing on the first connect after every power-up.
 **The AP's DHCP server** (the release review's A3-1): BusyBox udhcpd writes its lease file to flash as it exits on
-SIGTERM, so the teardown waits for it (`ap_dhcp_stop`: 3 s, then SIGKILL), and a start that launches hostapd stops any
-AP DHCP server still listed, starts its own and keeps its pid: the convergence asks after that process, a zombie not
-counted, through the confirmation. Before, a server still on its way out was taken for the new AP's and none was
-started (the bench's bad wake, above). **The confirmation's count** (A3-3): `AP-ENABLED` lines are counted against the
-box log as it was at hostapd's launch; a count below that is a box log ocbmd emptied at its cap, and the baseline then
-goes to 0 instead of holding the wait to its 2 s bound. Its own 0.86 s to `AP-ENABLED`
+SIGTERM, so the teardown waits for it (`ap_dhcp_stop`: 3 s, then SIGKILL and 1 s more), and a start that launches
+hostapd stops any AP DHCP server still listed, starts its own and keeps its pid: the convergence asks after that
+process, a zombie not counted, through the confirmation. Before, a server still on its way out was taken for the new
+AP's and none was started (the second delay of the bench's bad wake, above). The start's stop is shorter, 1 s and then
+SIGKILL, 1.5 s at most (the second review of `resident-bt`, item 7): it holds the wlan lock, which btd's reply to a
+0x5702 waits on for 5 s at most (past that the phone asks again), and the teardown has already given the last AP's
+server its 3 s, so one still listed at a start is stuck or was never torn down. A server killed there loses its lease
+write: the file keeps its last save (`auto_time`, at most a minute old) or, cut mid-write, the whole records before the
+cut (BusyBox reads whole records only), and a phone whose lease went with it is NAKed and takes a fresh address within
+a second. **The confirmation, by the start's own line** (the second review's item 3,
+after A3-3's count): just before hostapd's launch the start writes `[radio] hostapd starting on <if>` to the box log,
+and waits for an `AP-ENABLED` after it. ocbmd empties the box log at its cap with an `ftruncate` in place, the same
+inode, so neither an inode nor a count taken at the launch tells; with the start's line gone the log was emptied after
+the launch, and every `AP-ENABLED` in it is this hostapd's. A3-3's count, reset only when it fell, missed the line when
+the log was emptied and the line written within one look (100 ms). One window is left and documented: the line written
+and the log emptied before the next look; the wait then runs to its 2 s bound with the lock held, and a hostapd still
+running counts, as before 16 Nov. Its own 0.86 s to `AP-ENABLED`
 (`COUNTRY_UPDATE`, then `HT_SCAN` for `[HT40+]`, in its log) is the AP's, not ours: hostapd skips that scan only on
 `noscan=1`, which a hostapd that lacks it refuses as an unknown item (and so fails to start), and this one is packed
 so its version cannot be read off the file; it is left alone (see docs/ops/04_OPEN_ITEMS.md). Every `ap_configure`
