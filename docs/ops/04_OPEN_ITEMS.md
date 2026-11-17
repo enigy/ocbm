@@ -827,13 +827,18 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
 
 ### Radios, box identity & bring-up
 
-- **The armed state (Bluetooth powered but invisible between host sessions, the AP configured ahead) is built and
-  NOT benched** (branch `resident-bt`, 16 Nov 2026). Its smoke bench and its revert conditions:
-  docs/ops/02_TESTING.md, "The armed path". Unproven until then: the go's latency on the box (the target is
-  `page_start` within about 150 ms of the host, `ap_enabled` within about 1.3 s); that the 3.14 kernel's power-on
-  writes no scan once mgmt's connectable flag is cleared (the arm writes "none" and reads it back either way); BusyBox
-  ash running the new supervisor paths (the shell suites ran under bash's sh and dash on the Mac, BusyBox absent).
-  Source: docs/wireless/01_BT_AND_RADIO.md, "Between host sessions: armed".
+- **The armed state (Bluetooth powered but invisible between host sessions, the AP configured ahead): benched
+  16 Nov 2026, one wake open.** On the dev adapter 12 wakes and a cold boot connected from the armed state
+  (`page_start` about 100 ms, `ap_enabled` about 1.16 s after the host), the no-host state read as built, arming
+  about 1.0 s faster than without, and the forced fallback completed its connect. **Open:** the first wake about 90 s
+  after an update was committed took 24.8 s (the phone associated 8.6 s after RFCOMM, no `sending ACK` in 60 s, the
+  phone back on its old address; not repeated after a reboot). Likely cause, fixed since on `resident-bt`: the last
+  AP's udhcpd still writing its lease file to flash slowed by the commit's garbage collection, taken by the next AP
+  start for its own (the same exposure is in 2.6.0 and 2.6.1). Not proven by a repeat. If it recurs, capture right
+  after it `/tmp/wlan.log`, `/tmp/radio_ap_dhcp.log`, `df /` and the time of `[dispatch] update committed`. Still read
+  only: that the 3.14 kernel's power-on writes no scan once mgmt's connectable flag is cleared (the arm writes "none"
+  and reads it back either way). Bench and revert conditions: docs/ops/02_TESTING.md, "The armed path". Source:
+  docs/wireless/01_BT_AND_RADIO.md, "Between host sessions: armed".
 
 - **hostapd's own 0.86 s to `AP-ENABLED` (its `COUNTRY_UPDATE`, then the `HT_SCAN` that `[HT40+]` brings) is left as
   it is.** `noscan=1` skips the scan in a hostapd that knows it and stops one that does not from starting (an unknown
