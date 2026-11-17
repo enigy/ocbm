@@ -600,9 +600,14 @@ fn arm_keepalive(stream: &std::net::TcpStream) -> io::Result<()> {
             Ok(())
         }
     }
+    // Linux's idle option; Darwin's is TCP_KEEPALIVE, for carplayd's tests on a developer's Mac.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const TCP_KEEPIDLE: libc::c_int = libc::TCP_KEEPIDLE;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    const TCP_KEEPIDLE: libc::c_int = libc::TCP_KEEPALIVE;
     unsafe {
         set(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1)?;
-        set(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, 3)?; // Linux idle seconds (Darwin: TCP_KEEPALIVE)
+        set(fd, libc::IPPROTO_TCP, TCP_KEEPIDLE, 3)?; // Linux idle seconds (Darwin: TCP_KEEPALIVE)
         set(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, 3)?; // probe interval
         set(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT, 3)?; // probe count
     }
