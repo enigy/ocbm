@@ -152,6 +152,46 @@ phone joins the AP → AirPlay runs over WiFi.**
   sends its `wlan0` IP:port over the iAP2 channel and the phone connects directly. (Our AP already
   runs WPA3-capable `wpa=3`.)
 
+**What OCBM does (A2, 16 Nov 2026, branch `carplayd-early`, NOT benched).** The box advertises `_airplay._tcp`
+and dials the phone's `_carplay-ctrl` (`GET /ctrl-int/1/connect`, `ccpa/carplayd/src/discovery.rs`); the phone
+then opens RTSP to `:5000`. carplayd used to be spawned when the phone asked for the Wi-Fi details (0x5702,
+`av::ensure_av_layer`), so it had to start, advertise and find the phone after the handoff: 0.4-1.2 s from
+`carplayd_start` to `svc_seen` on the 16 Nov bench, 2.0-2.5 s after the phone had its lease. Now:
+
+- **carplayd starts as btd's host session begins** (`av::session_starting`, the one call in `wireless/src/main.rs`),
+  in the background, once a Wi-Fi interface exists: the per-box identity it is handed is derived from the Wi-Fi
+  driver's address (`box_identity.rs`), so on a cold start it waits for the driver (15 s at most, then the 0x5703
+  starts it as before). At the 0x5703 the identity is derived again, and a carplayd started with another one is
+  restarted before it may dial. `ensure_av_layer` stays the idempotent fallback ("AV layer already existing"), and
+  btd's "wireless" transport claim still waits for the 0x5703, so the wired supervisor is not held off for a phone
+  that has not agreed to Wi-Fi. A carplayd that never gets a phone idles and goes with the supervisor's
+  `wireless_down` or btd's go-quiet teardown, as one spawned at a 0x5703 does.
+- **Who it serves and when it dials.** btd names the phone in `/tmp/carplay_expect_phone` when its Bluetooth session
+  starts (its address alone) and at its 0x5703 (the address and ` wifi`: the Wi-Fi details went to that phone); a
+  session that ends without a 0x5703 puts the earlier name back with its mark. Until a phone is named carplayd serves
+  and dials nobody. It serves only the named phone (`phone_gate.rs`), and dials it only with the mark: a record that
+  resolves before then is held and dialled the moment the mark comes (`dial_ok` in the timeline). The bench lever
+  `/tmp/bench_dial_early` dials at the first resolve instead (docs/ops/02_TESTING.md, "Bench hooks").
+- **Before the AP has its address.** Every socket carplayd binds is a wildcard or the loopback (`[::]:5000`,
+  `127.0.0.1:9110`/`:9112`, the per-session `[::]:0`), so none needs the AP. mdns-sd does: it reads the host's
+  interfaces when its daemon starts and then every 30 s (`IP_CHECK_INTERVAL_MILLIS`). An address watch (NETLINK_ROUTE,
+  `discovery/watch.rs`) wakes discovery when an address or link comes up; it then has mdns-sd read the interfaces at
+  once (`enable_interface`), announce `_airplay._tcp` again (`register`) and start the browse again, so its query goes
+  out on the AP. On a wake the AP interface keeps 192.168.43.1 while down, and only the link coming up is seen.
+- **Finding the phone.** Discovery relies on the phone's own announcement and the browse's own queries: mdns-sd caches
+  an unsolicited announcement and resolves it with no query outstanding, a phone joining a network announces its
+  records once it has probed them (RFC 6762 §8.1, §8.3), and it answers nothing for them while it probes, so a query
+  cadence would only spend packets and wake the phone. The browse started again at an address or a name change
+  replays mdns-sd's cache and queries at once, then 1, 2, 4 ... s later.
+- **Nothing polls.** Discovery sleeps until mDNS, btd's name file (inotify on its directory) or the address watch
+  wakes it; without inotify it reads the name every second, as 2.6.0 did, and without netlink it looks at the
+  addresses every second until the advertised one is up, for 5 minutes at most.
+
+Expected on the 16 Nov wake (ms after host present): `carplayd_start` about 1.2 s (was 4.85), `svc_seen` when the
+phone has announced, `dial_ok` and `dial` at `wifi_rsp` (4.77 s, about 4.6 s with A4's cached certificate shortening
+the Bluetooth authentication), `auth_in` about 0.11 s after (was 5.56 s): about 0.2 s after `sign1_end`, 0.08 s of it
+the phone's own identification and 0x5702 before the 0x5703 the dial waits for.
+
 #### 2.4 The two ways to start wireless CarPlay (WWDC 2017-717, authoritative)
 
 There are **two distinct pairing/initiation methods**. Both converge on the same steady state (iAP2

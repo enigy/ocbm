@@ -26,4 +26,7 @@ bt-common = { path = "../../bt-common" }
 # The single definition of the SoftAP gateway address (`net::AP_IP`), so `av.rs` references the
 # constant rather than repeating the literal.
 box-common = { path = "../../box-common" }
+# The boot's cached MFi certificate only (`cert_cache`, A4): btd's chip access stays its own `mfi_local.rs`, and the
+# cache's rules are one implementation for its three users (btd, carplayd's auth-setup, the tunnel).
+mfi-i2c-local = { path = "../mfi-i2c-local" }
 

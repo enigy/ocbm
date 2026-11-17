@@ -343,6 +343,12 @@ can write but not delete, so it clears one by writing `off`. From a debug build:
   next host's departure on; `off` (or no file) arms again, from the departure after that. An armed btd already
   running stays until then. The owner's switch for the same, on flash, is `/script/radio_arm_off`. With either, the
   next connects take today's path, so A against B on one bench is: a few connects, the file, a few more.
+- `/tmp/bench_dial_early`: carplayd dials the phone btd names at its first resolve, before btd has sent that phone
+  its 0x5703 (by default it waits for the name file's ` wifi` mark, A2), and says so per dial with a `[bench]
+  dial_early` line. For one experiment: does the phone accept a dial before its Wi-Fi handoff? Still never another
+  phone, nor before a phone is named. Read at each dial decision. Its answer is in the timeline (`dial` before
+  `dial_ok`) and in `/tmp/carplayd_wl.log`: a connect-out the phone refused is tried again (carplayd-1), one it
+  accepted with no control connection after it is not, and leaves the session to btd's 90 s backstop.
 - `/tmp/bench_update_any_version`: `ocbm_update.sh` places a package whose VERSION is the same as or older than
   `installed_version` (bench builds keep the last published version with new code), so the bench flashes by update
   instead of the stick. Every other check stands: the sums, product, chip, mode, FROM_MIN, room and the journal; a
@@ -361,7 +367,7 @@ Right after `[startup]`, the wireless carplayd prints one more line at the first
 (`/tmp/carplayd_wl.log`, CH_LOG source `airplayd-wl`), so it reaches Carlink's drive log the same way. Every
 critical-path event of the connect, stamped where it happens:
 
-    [timeline] v1 sup_radios=406 bt_armed=0 bt_power=1246 btd_start=1276 bt_up=1286 page_start=1296 acl=1556 sdp=1716 rfcomm=1866 cert_req=1946 sign1_start=2066 sign1_end=2376 ident=2566 wifi_req=2666 wifi_rsp=2696 ap_start=1666 ap_up=1876 ap_enabled=2646 sta_assoc=3266 dhcp_ack=3566 carplayd_start=3166 svc_seen=3866 dial=3916 pv_done=4366 auth_in=4416 auth_out=4766 record_in=4846 record=5066 screen_setup=5116 first_frame=5466 chip1_ms=298 cert1_ms=41 chip2_ms=301 cert2_ms=40 usb_edge_s=11
+    [timeline] v1 sup_radios=406 bt_armed=0 bt_power=1246 btd_start=1276 bt_up=1286 page_start=1296 acl=1556 sdp=1716 rfcomm=1866 cert_req=1946 sign1_start=2066 sign1_end=2376 ident=2566 wifi_req=2666 wifi_rsp=2696 ap_start=1666 ap_up=1876 ap_enabled=2646 sta_assoc=3266 dhcp_ack=3566 carplayd_start=3166 svc_seen=3866 dial_ok=3906 dial=3916 pv_done=4366 auth_in=4416 auth_out=4766 record_in=4846 record=5066 screen_setup=5116 first_frame=5466 chip1_ms=298 cert1_ms=41 chip2_ms=301 cert2_ms=40 usb_edge_s=11
 
 (the unit test's line, not a measurement). The grammar is the one Carlink stores, `^\[timeline\] v1( [a-z0-9_]+=(-|\d+))+$`;
 the keys come in this order always (`crates/box-common/src/timeline.rs`, which owns them). Every event is whole ms
@@ -376,7 +382,9 @@ start). On `335ef1d`: `bt_up` came 30-40 ms after `btd_start`, `record_in` 0-3 m
 each session in 2.2 to 4.6 s with all three lines seen on the wakes (`ap_enabled` is `-` on a cold start, as written
 below); `ap_enabled - ap_start` was 850-870 ms in all three wakes, `sta_assoc` 550-610 ms after `rfcomm`, `dhcp_ack`
 90-220 ms after `sta_assoc`. Not seen on the device yet: a session ending while its watch still runs, and a session
-with more than one control connection.
+with more than one control connection. `bt_armed` and the armed path (A1, A3), `dial_ok`, the certificate cache
+for all three users (A4) and carplayd's start with btd's host session (A2) came after those benches (16 Nov) and are
+not benched yet; A2 moves `carplayd_start` from just after `wifi_rsp` to just after `btd_start`.
 
 | Key | The event | Stamped in |
 |---|---|---|
@@ -398,8 +406,9 @@ with more than one control connection.
 | `ap_enabled` | the radio's own word: hostapd's `AP-ENABLED` (about 1 s after `ap_start` in earlier logs). Its timing: see the AP watch's buffering note | the AP watch, `wireless/src/ap_watch.rs` |
 | `sta_assoc` | a station associated and keyed: hostapd's `AP-STA-CONNECTED`, after the WPA2 handshake (a bare 802.11 association can come earlier and fail). Its timing: see the buffering note | the AP watch |
 | `dhcp_ack` | udhcpd's `sending ACK to`, as it sends | the AP watch |
-| `carplayd_start` | carplayd's `main` | `ccpa/carplayd/src/main.rs` |
-| `svc_seen` | the `_carplay-ctrl` of the phone btd names first resolved (or a record held from before it was named, as it is) | `discovery.rs` |
+| `carplayd_start` | carplayd's `main`: since A2 as btd's host session begins (`av::session_starting`, in the background, once a Wi-Fi interface exists), or at the 0x5703 when that start did not happen | `ccpa/carplayd/src/main.rs` |
+| `svc_seen` | the `_carplay-ctrl` of the phone btd names first resolved, dialled at once or held for its 0x5703 (or a record held from before it was named, as it is) | `discovery.rs` |
+| `dial_ok` | btd's 0x5703 signal reached carplayd: the name file's ` wifi` mark for the named phone, as discovery woke to it (or the phone named with it, at a handoff or a put-back). The signal the connection's dial went after; with `/tmp/bench_dial_early`, one that came after the dial; `-`: none had come | `discovery.rs` (`Loop::cleared`, `rename`), taken with `dial` as the connection begins |
 | `dial` | the last connect-out written before the control connection that produced the picture (`-`: the phone came by itself) | `discovery.rs` `connect_out`, taken as that connection begins |
 | `pv_done` | pair-verify OK, the control channel encrypted | `receiver/src/server.rs`, `feed` |
 | `auth_in`, `auth_out` | `POST /auth-setup` received; answered | `server.rs`, `handle` |
@@ -407,8 +416,8 @@ with more than one control connection.
 | `record` | RECORD answered (its handler waits for the event channel, up to about 5 s) | `server.rs`, `handle` |
 | `screen_setup` | the main screen's (type 110) SETUP | `session.rs`, `setup_phase2` |
 | `first_frame` | the first frame to the host, as `[startup]` | `receiver/src/startup.rs`, `first_frame` |
-| `chip1_ms`, `cert1_ms` | btd's signature (chip, go to ready) and certificate read (under the lock), ms | `wireless/src/mfi_local.rs` |
-| `chip2_ms`, `cert2_ms` | auth-setup's, the same two, in the control connection that produced the picture | carplayd's `LocalMfiSigner` |
+| `chip1_ms`, `cert1_ms` | btd's signature (chip, go to ready) and certificate read (under the lock), ms; `cert1_ms=0` when the certificate came from the boot's cache (A4) | `wireless/src/mfi_local.rs` |
+| `chip2_ms`, `cert2_ms` | auth-setup's, the same two, in the control connection that produced the picture; `cert2_ms=0` from the cache | carplayd's `LocalMfiSigner` |
 | `usb_edge_s` | whole seconds from the host-facing USB link's last edge into "configured" to the origin | the supervisor's `usb_observe` |
 
 **One clock.** Every stamp is the uptime on CLOCK_BOOTTIME, the clock `/proc/uptime` shows (the shell's stamps to its
@@ -423,7 +432,8 @@ for an event, `d <key> <ms>` for a duration. The first of a key stands: in btd's
 (kept in memory: it prints the line), in the process for `carplayd_start` and `svc_seen` and in the control connection
 for the rest. Each new control connection starts those afresh, auth-setup's chip times with them, so the line
 describes the connection that produced the picture, not a failed one before it; its `dial` is the last connect-out
-sent since the connection before it began. The shell's radio stamps are appended before btd begins a session, and btd
+sent since the connection before it began, and its `dial_ok` the 0x5703 signal that dial went after (a name change
+forgets the last phone's). The shell's radio stamps are appended before btd begins a session, and btd
 (with its own `t bt_armed`, the bring-up's too) carries them from the bring-up's `t sup_radios` on into each session under that bring-up: a phone switch keeps them, a
 radio restart brings new ones, an earlier host's are dropped. `ap_enabled` is carried with them (the AP's, not the
 phone's); `sta_assoc` and `dhcp_ack` are each session's own. The supervisor's USB edge rides along as `t usb_edge`. A
@@ -474,8 +484,19 @@ auth-setup's as `[carplayd] mfi: cert ...` and `[carplayd] mfi: sign: ...`. The 
 first frame, so it is a line of its own and no timeline value: `[mfi] tunnel sign 305 ms (chip 298 ms from go to
 ready, 0 ms waiting for the lock), cert 41 ms (chip)`, or `(cached)` for the boot's cached certificate.
 
-**Length.** At most 805 bytes: no value is printed wider than 13 digits (above), `bt_armed` is one digit, and the
-widest-line test builds the line with every value at that width; the one above is 490. ocbmd clips a forwarded line at 1024 bytes
+Since A4 (16 Nov) all three certificate users serve the boot's cached certificate (`mfi_i2c_local::cert_cache`,
+`/tmp/carplay_mfi_cert.der`), and btd reads it into the cache as a host session begins when none is there yet, so the
+chip is read once per boot: `[mfi-local] cert: 945 B in 112 ms under the lock, 0 ms waiting for it (the session's start:
+the boot's first read)` in `/tmp/wl.log`, then `[mfi-local] cert: 945 B from the boot's cache, no chip read` at each
+0xAA00 and `[carplayd] mfi: cert 945 B from the boot's cache, no chip read` at each auth-setup. A read that is not one
+DER certificate ends `; not one DER certificate: sent, not cached`. The cache is dropped, so the next session reads
+the chip, by btd when a Bluetooth session that sent the certificate ends without its handoff (`the session sent the
+certificate and ended without a handoff: the cached certificate is forgotten`), by carplayd when the phone asks nothing
+after auth-setup (`the phone asked nothing after auth-setup: the cached certificate is forgotten`), and by the tunnel
+on its 0xAA04. Signatures still go to the chip every time.
+
+**Length.** At most 827 bytes: no value is printed wider than 13 digits (above), `bt_armed` is one digit, and the
+widest-line test builds the line with every value at that width; the one above is 503. ocbmd clips a forwarded line at 1024 bytes
 (`LOG_MAX_LINE`), and Carlink clips nothing more: its CH_LOG parser takes each entry's length, and its drive log
 writes the text through `LogRedactor`, which only shortens MAC addresses. So one line, never two. (With 20-digit
 values, the u64's widest, the three keys added after the bench would have taken the line to 1029 bytes: the 13-digit

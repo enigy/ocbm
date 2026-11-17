@@ -94,6 +94,17 @@ pub struct ControlServer<'a, P: Pairings, S: MfiSigner> {
     /// here before parsing, so an incomplete request is buffered — not mis-parsed into a false
     /// mid-session teardown. Only used on the encrypted channel; reset per connection.
     ptx: Vec<u8>,
+    /// How far the phone took auth-setup ([`ControlServer::auth_unconfirmed`]).
+    auth: AuthSetup,
+}
+
+/// Where a connection stands with `/auth-setup`: not answered yet, answered (the certificate and signature went out
+/// in M2), or answered and the phone went on to another request, which it makes only once it has verified them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthSetup {
+    None,
+    Answered,
+    Confirmed,
 }
 
 impl<'a, P: Pairings, S: MfiSigner> ControlServer<'a, P, S> {
@@ -121,6 +132,7 @@ impl<'a, P: Pairings, S: MfiSigner> ControlServer<'a, P, S> {
             display_width: 0,
             rx: Vec::new(),
             ptx: Vec::new(),
+            auth: AuthSetup::None,
         }
     }
 
@@ -152,6 +164,14 @@ impl<'a, P: Pairings, S: MfiSigner> ControlServer<'a, P, S> {
     /// session's per-stream keys in the A/V phase).
     pub fn session_secret(&self) -> Option<[u8; 32]> {
         self.shared
+    }
+
+    /// Whether this connection answered `/auth-setup` and the phone made no request after it: what a phone that could
+    /// not verify the accessory's certificate does, as it gives up on the connection (it would SETUP next). carplayd
+    /// then forgets the boot's cached MFi certificate, so the next session reads the chip (`mfi_i2c_local::cert_cache`).
+    /// A connection that ends there for another reason (preempted, the phone gone) costs only that one chip read.
+    pub fn auth_unconfirmed(&self) -> bool {
+        self.auth == AuthSetup::Answered
     }
 
     /// Milliseconds since the last A/V data on this session, or `None` if no A/V has flowed yet. The
@@ -257,6 +277,10 @@ impl<'a, P: Pairings, S: MfiSigner> ControlServer<'a, P, S> {
 
     fn handle(&mut self, req: &Request) -> Result<Response, ServerError> {
         let route = Route::classify(&req.method, req.path());
+        // A request after auth-setup's answer: the phone verified the certificate and signature it was sent.
+        if self.auth == AuthSetup::Answered && route != Route::AuthSetup {
+            self.auth = AuthSetup::Confirmed;
+        }
         // Pre-encryption gate. Authority: the CURRENT Apple receiver (CarPlaySDK.framework in the 2026
         // CarPlay Simulator) refuses any non-pairing request before pair-verify with HTTP 401
         // ("### Unverified RTSP request denied"); R14G17 (2017) had no such gate, which is the hole this
@@ -350,6 +374,7 @@ impl<'a, P: Pairings, S: MfiSigner> ControlServer<'a, P, S> {
                 match self.sap.exchange(&req.body, &mut self.signer) {
                     Ok(body) => {
                         crate::startup::stage(crate::startup::Stage::AuthOut);
+                        self.auth = AuthSetup::Answered;
                         if self.verbose {
                             eprintln!("[receiver] auth-setup (MFi-SAP) OK → {} B M2", body.len());
                         }
@@ -721,6 +746,34 @@ mod tests {
             ),
             other => panic!("expected ServerError::Pairing, got {other:?}"),
         }
+    }
+
+    /// A plaintext `POST /auth-setup` with a well-formed MFi-SAP M1: version 1 and a peer key.
+    fn auth_setup_request() -> Vec<u8> {
+        let mut body = vec![1u8];
+        body.extend_from_slice(&[9u8; 32]);
+        let mut raw = format!("POST /auth-setup RTSP/1.0\r\nCSeq: 1\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes();
+        raw.extend_from_slice(&body);
+        raw
+    }
+
+    /// A4 (MFI-CACHE-SCOPE): the phone verifies auth-setup's certificate and signature before its next request, and a
+    /// phone that cannot gives up on the connection. Answered with no request after it is what carplayd takes as a
+    /// failed authentication.
+    #[test]
+    fn auth_setup_is_confirmed_by_the_phones_next_request() {
+        let identity = Identity::new(b"testdev".to_vec(), [7u8; 32]);
+        let mut srv = ControlServer::new(&identity, b"3939".to_vec(), DummyPeers, DummySigner, Vec::new());
+        assert!(!srv.auth_unconfirmed(), "no auth-setup yet");
+        let out = srv.feed(&auth_setup_request()).expect("auth-setup answered");
+        assert!(String::from_utf8_lossy(&out).starts_with("RTSP/1.0 200"));
+        assert!(srv.auth_unconfirmed(), "answered, and nothing asked since");
+        srv.feed(b"GET /info RTSP/1.0\r\nCSeq: 2\r\nContent-Length: 0\r\n\r\n").expect("info");
+        assert!(!srv.auth_unconfirmed(), "the phone went on: it verified them");
+        let mut again = ControlServer::new(&identity, b"3939".to_vec(), DummyPeers, DummySigner, Vec::new());
+        again.feed(&auth_setup_request()).expect("auth-setup answered");
+        again.feed(&auth_setup_request()).expect("asked again");
+        assert!(again.auth_unconfirmed(), "a second auth-setup confirms nothing");
     }
 
     #[test]

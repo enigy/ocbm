@@ -36,7 +36,7 @@ pub const USB_EDGE_KEY: &str = "usb_edge";
 
 /// The events, in the line's order: the radios, Bluetooth and iAP2 (btd), the Wi-Fi handoff and the AP, the AirPlay
 /// session (carplayd) and the first frame.
-pub const EVENTS: [&str; 29] = [
+pub const EVENTS: [&str; 30] = [
     "sup_radios",
     "bt_power",
     "btd_start",
@@ -58,6 +58,7 @@ pub const EVENTS: [&str; 29] = [
     "dhcp_ack",
     "carplayd_start",
     "svc_seen",
+    "dial_ok",
     "dial",
     "pv_done",
     "auth_in",
@@ -238,6 +239,7 @@ mod tests {
         let own = [
             ("carplayd_start", 64400),
             ("svc_seen", 65100),
+            ("dial_ok", 65140),
             ("dial", 65150),
             ("pv_done", 65600),
             ("auth_in", 65650),
@@ -255,7 +257,7 @@ mod tests {
             "[timeline] v1 sup_radios=406 bt_armed=0 bt_power=1246 btd_start=1276 bt_up=1286 page_start=1296 acl=1556 sdp=1716 \
              rfcomm=1866 cert_req=1946 sign1_start=2066 sign1_end=2376 ident=2566 wifi_req=2666 wifi_rsp=2696 \
              ap_start=1666 ap_up=1876 ap_enabled=2646 sta_assoc=3266 dhcp_ack=3566 carplayd_start=3166 svc_seen=3866 \
-             dial=3916 pv_done=4366 auth_in=4416 auth_out=4766 record_in=4846 record=5066 screen_setup=5116 \
+             dial_ok=3906 dial=3916 pv_done=4366 auth_in=4416 auth_out=4766 record_in=4846 record=5066 screen_setup=5116 \
              first_frame=5466 chip1_ms=298 cert1_ms=41 chip2_ms=301 cert2_ms=40 usb_edge_s=11"
         );
         assert!(is_line(&l));
@@ -337,7 +339,7 @@ mod tests {
         );
         assert!(l.contains(" bt_armed=1 "), "{l}");
         assert!(is_line(&l));
-        assert_eq!(l.len(), 805, "the bound the docs give");
+        assert_eq!(l.len(), 827, "the bound the docs give");
         assert!(l.len() < ocbm_proto::LOG_MAX_LINE, "{} bytes", l.len());
 
         let past = line(&format!("t host 0\nt acl {}\nd chip1_ms {}\n", MAX_VALUE + 1, u64::MAX), &[]);

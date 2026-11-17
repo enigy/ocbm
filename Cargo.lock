@@ -85,6 +85,7 @@ dependencies = [
  "bt-common",
  "carplay-iap2-core",
  "libc",
+ "mfi-i2c-local",
  "ocbm-proto",
  "sha2",
  "signal-hook",
@@ -113,10 +114,13 @@ dependencies = [
 name = "carplayd"
 version = "0.1.0"
 dependencies = [
+ "box-common",
  "carplay-iap2-core",
+ "flume",
  "libc",
  "mdns-sd",
  "mfi",
+ "mfi-i2c-local",
  "ocbm-proto",
  "pairing",
  "portable-atomic",

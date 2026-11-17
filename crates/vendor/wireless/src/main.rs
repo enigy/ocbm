@@ -138,6 +138,7 @@ fn run_active_session(
     // The connect timeline's AP events, for this session: hostapd's and udhcpd's lines as they land (ap_watch). It
     // ends at go-quiet below, or when this returns early.
     let ap_watch = ap_watch::start();
+    av::session_starting(); // carplayd and the MFi certificate cache, ready before the phone needs them (A2/A4)
     let accessory_name = carplay_iap2_core::message::accessory_name(ACCESSORY_BRAND);
     let up = match &from_armed {
         Some(armed_name) => bt_bringup::open_from_armed(HCI_DEV, &accessory_name, armed_name).inspect(|()| {

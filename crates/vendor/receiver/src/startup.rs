@@ -32,13 +32,16 @@ pub fn nudged(second: bool) {
 
 /// carplayd's own events for the `[timeline]` line (`box_common::timeline::EVENTS`). The first of each stands: in the
 /// process for `carplayd_start` and `svc_seen`, in the control connection for the rest ([`new_connection`]), so the
-/// line tells the connection that produced the picture. `dial` is the last connect-out sent before that connection.
+/// line tells the connection that produced the picture. `dial` is the last connect-out sent before that connection,
+/// and `dial_ok` the 0x5703 signal that dial went after ([`dial_ok`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
     /// carplayd started (main).
     CarplaydStart,
     /// The `_carplay-ctrl` of the phone btd names first resolved (discovery).
     SvcSeen,
+    /// btd's signal that it sent the named phone its 0x5703 reached carplayd (discovery, [`dial_ok`]).
+    DialOk,
     /// A connect-out (`GET /ctrl-int/1/connect`) sent (discovery).
     Dial,
     /// Pair-verify OK: the control channel encrypted.
@@ -58,9 +61,10 @@ pub enum Stage {
 }
 
 impl Stage {
-    const ALL: [Stage; 10] = [
+    const ALL: [Stage; 11] = [
         Stage::CarplaydStart,
         Stage::SvcSeen,
+        Stage::DialOk,
         Stage::Dial,
         Stage::PvDone,
         Stage::AuthIn,
@@ -87,6 +91,7 @@ impl Stage {
         match self {
             Stage::CarplaydStart => "carplayd_start",
             Stage::SvcSeen => "svc_seen",
+            Stage::DialOk => "dial_ok",
             Stage::Dial => "dial",
             Stage::PvDone => "pv_done",
             Stage::AuthIn => "auth_in",
@@ -125,25 +130,54 @@ const NOT_YET: AtomicU64 = AtomicU64::new(UNSET);
 
 /// carplayd's stamps, in memory ([`OWN`]; a test keeps its own).
 struct Stamps {
-    stages: [AtomicU64; 10],
+    stages: [AtomicU64; 11],
     chips: [AtomicU64; 2],
     /// The last connect-out sent: the `dial` of the connection after it.
     dial_sent: AtomicU64,
+    /// The 0x5703 signal for the phone named now, as it last reached carplayd ([`Stamps::dial_ok`]).
+    dial_ok_seen: AtomicU64,
+    /// [`Stamps::dial_ok_seen`] as it stood when the last connect-out went: the signal that dial went after.
+    dial_ok_at_dial: AtomicU64,
     /// When the current control connection began.
     connection_at: AtomicU64,
 }
 
 impl Stamps {
     const fn new() -> Self {
-        Stamps { stages: [NOT_YET; 10], chips: [NOT_YET; 2], dial_sent: NOT_YET, connection_at: NOT_YET }
+        Stamps {
+            stages: [NOT_YET; 11],
+            chips: [NOT_YET; 2],
+            dial_sent: NOT_YET,
+            dial_ok_seen: NOT_YET,
+            dial_ok_at_dial: NOT_YET,
+            connection_at: NOT_YET,
+        }
     }
 
     fn stage(&self, stage: Stage, ms: u64) {
-        if stage == Stage::Dial {
-            self.dial_sent.store(ms, Ordering::Relaxed);
-        } else {
-            let _ = self.stages[stage as usize].compare_exchange(UNSET, ms, Ordering::Relaxed, Ordering::Relaxed);
+        match stage {
+            Stage::Dial => {
+                self.dial_sent.store(ms, Ordering::Relaxed);
+                self.dial_ok_at_dial.store(self.dial_ok_seen.load(Ordering::Relaxed), Ordering::Relaxed);
+            }
+            Stage::DialOk => self.dial_ok(ms),
+            _ => {
+                let _ = self.stages[stage as usize].compare_exchange(UNSET, ms, Ordering::Relaxed, Ordering::Relaxed);
+            }
         }
+    }
+
+    /// The 0x5703 signal for the named phone reached carplayd at `ms`. It is the `dial_ok` of the connection whose dial
+    /// goes after it; a connection already begun without one (a dial the bench lever sent early, or the phone came by
+    /// itself) takes it as it comes.
+    fn dial_ok(&self, ms: u64) {
+        self.dial_ok_seen.store(ms, Ordering::Relaxed);
+        let _ = self.stages[Stage::DialOk as usize].compare_exchange(UNSET, ms, Ordering::Relaxed, Ordering::Relaxed);
+    }
+
+    /// btd named another phone: the signal seen for the last one is not this one's.
+    fn naming_changed(&self) {
+        self.dial_ok_seen.store(UNSET, Ordering::Relaxed);
     }
 
     fn chip(&self, chip: Chip, ms: u64) {
@@ -163,8 +197,11 @@ impl Stamps {
             Some(n) => self.connection_at.swap(n, Ordering::Relaxed),
             None => self.connection_at.load(Ordering::Relaxed),
         };
-        let dial = dial_for(self.dial_sent.load(Ordering::Relaxed), before);
+        let sent = self.dial_sent.load(Ordering::Relaxed);
+        let dial = dial_for(sent, before);
         self.stages[Stage::Dial as usize].store(dial, Ordering::Relaxed);
+        let ok = dial_ok_for(dial, self.dial_ok_at_dial.load(Ordering::Relaxed), self.dial_ok_seen.load(Ordering::Relaxed));
+        self.stages[Stage::DialOk as usize].store(ok, Ordering::Relaxed);
     }
 
     /// What is stamped, as the timeline line takes it.
@@ -185,6 +222,17 @@ fn dial_for(sent: u64, before: u64) -> u64 {
     }
 }
 
+/// A connection's `dial_ok`: the signal its dial went after (`at_dial`). A dial that went before any (the bench lever's
+/// early dial), or no dial at all, takes the signal for the phone named now (`seen`), which then came after it; UNSET
+/// when none has come yet.
+fn dial_ok_for(dial: u64, at_dial: u64, seen: u64) -> u64 {
+    if dial != UNSET && at_dial != UNSET {
+        at_dial
+    } else {
+        seen
+    }
+}
+
 static OWN: Stamps = Stamps::new();
 
 /// Stamp `stage` now, on the timeline's uptime clock ([`Stage`] says which first stands).
@@ -197,6 +245,16 @@ pub fn stage(stage: Stage) {
 /// Note how long one of auth-setup's chip calls took (ms): once per control connection, the first standing.
 pub fn chip(chip: Chip, ms: u64) {
     OWN.chip(chip, ms);
+}
+
+/// btd's signal that it sent the named phone its 0x5703 reached carplayd, now: the timeline's `dial_ok`.
+pub fn dial_ok() {
+    stage(Stage::DialOk);
+}
+
+/// btd named another phone (or none): a 0x5703 signal seen before is the last phone's, not the next connection's.
+pub fn naming_changed() {
+    OWN.naming_changed();
 }
 
 /// A new control connection (carplayd's serve loop): the line describes the one that produces the picture.
@@ -454,6 +512,41 @@ mod tests {
         assert_eq!(get(&st, "dial"), None, "none since the third began: the phone came by itself");
         assert_eq!(dial_for(UNSET, UNSET), UNSET);
         assert_eq!(dial_for(500, UNSET), 500, "the first connection takes any dial before it");
+    }
+
+    /// A2's `dial_ok`: the 0x5703 signal the connection's dial went after. One that came after the dial (the bench
+    /// lever's early dial) or during the connection is taken as it comes; a name change forgets the last phone's; the
+    /// phone that came by itself takes the signal seen for it.
+    #[test]
+    fn dial_ok_is_the_signal_the_connections_dial_went_after() {
+        let st = Stamps::new();
+        let get = |st: &Stamps, key: &str| st.own().iter().find(|(k, _)| *k == key).map(|&(_, v)| v);
+        st.dial_ok(1000);
+        st.stage(Stage::Dial, 1100);
+        st.new_connection(Some(1200));
+        assert_eq!((get(&st, "dial_ok"), get(&st, "dial")), (Some(1000), Some(1100)), "the signal, then the dial");
+
+        // Another phone is named; the bench lever dials it before its 0x5703, which comes before the connection.
+        st.naming_changed();
+        st.stage(Stage::Dial, 2000);
+        st.dial_ok(2100);
+        st.new_connection(Some(2200));
+        assert_eq!((get(&st, "dial"), get(&st, "dial_ok")), (Some(2000), Some(2100)), "dial before dial_ok");
+
+        // The same, the 0x5703 coming once the connection has begun.
+        st.naming_changed();
+        st.stage(Stage::Dial, 3000);
+        st.new_connection(Some(3100));
+        assert_eq!(get(&st, "dial_ok"), None, "none yet: not the last phone's");
+        st.dial_ok(3300);
+        assert_eq!(get(&st, "dial_ok"), Some(3300), "taken as it comes");
+        st.dial_ok(3400);
+        assert_eq!(get(&st, "dial_ok"), Some(3300), "the first in the connection stands");
+
+        // A connection the phone opened by itself: no dial, the signal seen for this phone.
+        st.new_connection(Some(3500));
+        assert_eq!((get(&st, "dial"), get(&st, "dial_ok")), (None, Some(3400)));
+        assert_eq!(dial_ok_for(UNSET, UNSET, UNSET), UNSET);
     }
 
     /// The timeline from carplayd's own stamps and btd's record: carplayd's by their uptime, btd's and the shell's from

@@ -7,38 +7,48 @@
 //! the switch dropped stays on the AP, the new carplayd dials it first, the requested phone's
 //! connection then hijacks it, and the two take the session from each other until neither projects.
 //!
-//! So `btd` names the phone it is serving: at each Wi-Fi handoff (0x5703) it writes that phone's BR/EDR
-//! address to `/tmp/carplay_expect_phone` (its `av::EXPECT_PHONE_FILE`), and passes that path to the
-//! carplayd it spawns ([`EXPECT_FILE_ENV`]). A FILE, not the address in the environment: within one
-//! `btd` session carplayd outlives a phone's Bluetooth link (the AV layer is latched), and the next phone
-//! to hand off must not be refused by a carplayd that was told about the last one. The file is re-read at each decision, and
-//! a new name forgets the refusals decided for the old one; the old phone's live session stops holding, and holds again
-//! if the name comes back to it. `btd` also names a bonded phone when its Bluetooth session starts, while no CarPlay
-//! session is up, and puts the earlier name back if that session ends without a 0x5703 (the Mac's 15 Nov bench: a phone
-//! that knows the AP was on it before its 0x5703, and was refused). Discovery asks again when the name changes.
+//! So `btd` names the phone it is serving in `/tmp/carplay_expect_phone` (its `av::EXPECT_PHONE_FILE`), and passes
+//! that path to the carplayd it spawns ([`EXPECT_FILE_ENV`]). A FILE, not the address in the environment: carplayd
+//! outlives a phone's Bluetooth link (since A2 it starts with btd's host session, before any phone is named), and the
+//! next phone must not be refused by a carplayd that was told about the last one. One line: the phone's BR/EDR
+//! address, then ` wifi` once btd has sent that phone its 0x5703 (its Wi-Fi details) in this naming. btd names a
+//! bonded phone when its Bluetooth session starts, while no CarPlay session is up (no mark yet), and again at its
+//! 0x5703 (with the mark); it puts the earlier name back, mark and all, if that session ends without a 0x5703 (the
+//! Mac's 15 Nov bench: a phone that knows the AP was on it before its 0x5703, and was refused). The file is re-read at
+//! each decision, and discovery is woken when it changes (inotify, `watch.rs`). A new name forgets the refusals decided
+//! for the old one; the old phone's live session stops holding, and holds again if the name comes back to it.
 //!
-//! With a phone named:
-//! - discovery dials only the phone whose `_carplay-ctrl` TXT `id` is that address ([`PhoneGate::wants`],
-//!   fix 1b); a TXT without an id is dialled as before; and not while that phone's session is live here
-//!   ([`PhoneGate::serving`]), however its record's addresses change;
+//! With the gate armed (the wireless spawn):
+//! - no phone named (no file): carplayd serves and dials nobody ([`Admit::Unnamed`], [`Dial::Unnamed`]);
+//! - discovery dials only the phone whose `_carplay-ctrl` TXT `id` is the named one (fix 1b); a TXT without an id is
+//!   dialled as before; never while that phone's session is live here ([`Dial::Live`]); and only once btd has sent
+//!   that phone its 0x5703 ([`Dial::Waiting`] until the mark), unless the bench lever [`BENCH_DIAL_EARLY`] is set;
 //! - a phase-1 SETUP whose `deviceID` is another phone is refused (HTTP 500, connection closed), before
 //!   the session publishes who the phone is, and that peer address is refused for the rest of this
 //!   name: its connections are dropped and discovery no longer dials it;
 //! - while the named phone's session is up, a control connection from another address is dropped
 //!   rather than preempting it; one from the named phone's own address still preempts, as before.
 //!
-//! No file, or no path in the environment (the wired supervisor's carplayd, or an older `btd`): no gate,
-//! everything as before. A SETUP without a `deviceID` is let through: it cannot be told apart.
+//! No path in the environment (the wired supervisor's carplayd): no gate, everything as before. A SETUP without a
+//! `deviceID` is let through while a phone is named: it cannot be told apart.
 
 use std::collections::HashSet;
 use std::net::{IpAddr, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use receiver::session::{phase1_device_id, AtomicU64, SessionDelegate, SetupError};
 
 /// The environment variable `btd` sets to the file that names the phone; absent = no gate.
 pub const EXPECT_FILE_ENV: &str = "CARPLAY_EXPECT_PHONE_FILE";
+
+/// The name file's mark: btd sent the named phone its 0x5703 (`av::WIFI_MARK` in btd).
+const WIFI_MARK: &str = "wifi";
+
+/// Bench lever (docs/ops/02_TESTING.md, "Bench hooks"): dial the named phone at its first resolve, before btd has sent
+/// it its 0x5703, for one experiment (does the phone accept it?). Set unless absent or "off" (`box_common::bench_flag`);
+/// nothing in a release writes it, and a reboot clears it.
+pub const BENCH_DIAL_EARLY: &str = "/tmp/bench_dial_early";
 
 /// What the accept thread does with a new control connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,21 +60,80 @@ pub enum Admit {
     /// Drop it: the named phone's session (from this address) holds, and a newcomer from another
     /// address does not preempt it.
     Holding(IpAddr),
+    /// Drop it: btd has named no phone yet.
+    Unnamed,
+}
+
+/// What a phase-1 SETUP may do ([`PhoneGate::on_setup`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Setup {
+    /// Go on.
+    Allow,
+    /// Refused: it names another phone than btd's, and its address is refused for this name.
+    Elsewhere,
+    /// Refused: btd has named no phone.
+    Unnamed,
+}
+
+/// What discovery does with a phone's `_carplay-ctrl` record ([`PhoneGate::dial`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dial {
+    /// Dial it.
+    Now,
+    /// Dial it: the named phone before its 0x5703, dialled by the bench lever ([`BENCH_DIAL_EARLY`]).
+    Early,
+    /// The named phone, its session already live here (bench 2026-11-02): never dialled again.
+    Live,
+    /// Another phone than btd names (fix 1b): held for when btd names it.
+    Elsewhere,
+    /// No phone named yet: held for when one is.
+    Unnamed,
+    /// The named phone, before btd has sent it its 0x5703: held until it has.
+    Waiting,
+}
+
+impl Dial {
+    /// Whether it is dialled now.
+    pub fn now(self) -> bool {
+        matches!(self, Dial::Now | Dial::Early)
+    }
+}
+
+/// The name file as read: the named phone, 12 lower-case hex digits, and whether btd sent it its 0x5703.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Named {
+    pub phone: String,
+    pub wifi: bool,
+}
+
+impl Named {
+    /// The file's text read; `None` when it names no phone.
+    fn parse(s: &str) -> Option<Named> {
+        let mut words = s.split_whitespace();
+        let phone = normalize(words.next()?)?;
+        Some(Named { phone, wifi: words.any(|w| w == WIFI_MARK) })
+    }
 }
 
 #[derive(Default)]
 struct State {
-    /// The named phone's address, 12 lower-case hex digits; `None` = no gate.
-    expected: Option<String>,
+    /// The named phone and its mark as last read; `None` = none.
+    expected: Option<Named>,
+    /// Moved on each time the named phone changes (to another, or to none), so discovery can tell a dial made under
+    /// this naming from one made under an earlier naming of the same phone (carplayd-3).
+    epoch: u64,
     refused: HashSet<IpAddr>,
     /// The session whose SETUP named the expected phone: its generation, peer address and phone. Kept across a
     /// name change until the session ends: it holds only while its phone is the one named, and is never dialled
     /// again, so a name put back to that phone finds its session as it was (the Mac's 15 Nov bench, R4).
     serving: Option<(u64, IpAddr, String)>,
+    /// The control connections being served or set up now, by generation (carplayd-1's retries wait for none).
+    open: HashSet<u64>,
 }
 
 pub struct PhoneGate {
     file: Option<PathBuf>,
+    bench: PathBuf,
     state: Mutex<State>,
 }
 
@@ -75,7 +144,12 @@ impl PhoneGate {
     }
 
     pub fn new(file: Option<PathBuf>) -> Self {
-        Self { file, state: Mutex::new(State::default()) }
+        Self::with_bench(file, PathBuf::from(BENCH_DIAL_EARLY))
+    }
+
+    /// With the bench lever at `bench` (a test's own).
+    pub fn with_bench(file: Option<PathBuf>, bench: PathBuf) -> Self {
+        Self { file, bench, state: Mutex::new(State::default()) }
     }
 
     /// Whether this carplayd gates at all: only the wireless spawn is handed the file's path.
@@ -83,83 +157,107 @@ impl PhoneGate {
         self.file.is_some()
     }
 
+    /// The name file, for the watch that wakes discovery when it changes.
+    pub fn file(&self) -> Option<&Path> {
+        self.file.as_deref()
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// The named phone now, read afresh; a different name than last time forgets every refusal decided for
-    /// the old one. The live session is kept (`State::serving`).
-    fn expected_now(&self, st: &mut State) -> Option<String> {
-        let now = self
-            .file
-            .as_ref()
-            .and_then(|f| std::fs::read_to_string(f).ok())
-            .and_then(|s| normalize(&s));
-        if now != st.expected {
+    /// The name file now, read afresh; another phone than last time (or none) forgets every refusal decided for the
+    /// old one and moves the epoch on. The live session is kept (`State::serving`).
+    fn expected_now(&self, st: &mut State) -> Option<Named> {
+        let now = self.file.as_ref().and_then(|f| std::fs::read_to_string(f).ok()).and_then(|s| Named::parse(&s));
+        if now.as_ref().map(|n| &n.phone) != st.expected.as_ref().map(|n| &n.phone) {
             if !st.refused.is_empty() {
                 eprintln!("[carplayd] phone gate: the phone btd serves changed; earlier refusals forgotten");
             }
             st.refused.clear();
-            st.expected = now.clone();
+            st.epoch += 1;
         }
+        st.expected = now.clone();
         now
     }
 
-    /// The phone btd names now (12 lower-case hex digits), read afresh; `None` = no gate. Discovery polls it
-    /// to see the name change (the Mac's 15 Nov bench, R1).
+    /// The phone btd names now (12 lower-case hex digits), read afresh; `None` = none. (Discovery reads
+    /// [`PhoneGate::named_state`] at each wake, for the mark too.)
+    #[cfg(test)]
     pub fn named(&self) -> Option<String> {
+        self.named_state().map(|n| n.phone)
+    }
+
+    /// The phone btd names now and its 0x5703 mark, read afresh.
+    pub fn named_state(&self) -> Option<Named> {
         let mut st = self.lock();
         self.expected_now(&mut st)
     }
 
+    /// The naming's epoch as of the last read ([`State::epoch`]).
+    pub fn epoch(&self) -> u64 {
+        self.lock().epoch
+    }
+
     /// A new control connection from `peer`, before it may preempt anything.
     pub fn on_connection(&self, peer: IpAddr) -> Admit {
-        let mut st = self.lock();
-        if self.expected_now(&mut st).is_none() {
+        if !self.armed() {
             return Admit::Accept;
         }
+        let mut st = self.lock();
+        let Some(expected) = self.expected_now(&mut st) else {
+            return Admit::Unnamed;
+        };
         if st.refused.contains(&peer) {
             return Admit::Refused;
         }
         // Only the named phone's session holds: after another phone's 0x5703 that phone takes over, as before.
         match &st.serving {
-            Some((_, served, phone)) if *served != peer && st.expected.as_ref() == Some(phone) => {
-                Admit::Holding(*served)
-            }
+            Some((_, served, phone)) if *served != peer && expected.phone == *phone => Admit::Holding(*served),
             _ => Admit::Accept,
         }
     }
 
+    /// The accept thread let control connection `generation` through: open until [`PhoneGate::session_ended`].
+    pub fn connection_opened(&self, generation: u64) {
+        self.lock().open.insert(generation);
+    }
+
+    /// Whether a control connection is being served or set up now.
+    pub fn connection_open(&self) -> bool {
+        !self.lock().open.is_empty()
+    }
+
     /// A phase-1 SETUP on session `generation` from `peer`, naming `device_id`: whether it may go on.
-    pub fn on_setup(
-        &self,
-        generation: u64,
-        peer: IpAddr,
-        device_id: Option<&str>,
-    ) -> bool {
+    pub fn on_setup(&self, generation: u64, peer: IpAddr, device_id: Option<&str>) -> Setup {
+        if !self.armed() {
+            return Setup::Allow;
+        }
         let mut st = self.lock();
         let Some(expected) = self.expected_now(&mut st) else {
-            return true;
+            return Setup::Unnamed;
         };
         match device_id.and_then(normalize) {
             None => {
                 eprintln!("[carplayd] phone gate: SETUP from {peer} names no phone; letting it through");
-                true
+                Setup::Allow
             }
-            Some(id) if id == expected => {
+            Some(id) if id == expected.phone => {
                 st.serving = Some((generation, peer, id));
-                true
+                Setup::Allow
             }
             Some(_) => {
                 st.refused.insert(peer);
-                false
+                Setup::Elsewhere
             }
         }
     }
 
-    /// Session `generation` ended: if it was the named phone's, a newcomer may preempt again.
+    /// Session `generation` ended (or was superseded before it was served): if it was the named phone's, a newcomer may
+    /// preempt again.
     pub fn session_ended(&self, generation: u64) {
         let mut st = self.lock();
+        st.open.remove(&generation);
         if st.serving.as_ref().map(|(g, _, _)| *g) == Some(generation) {
             st.serving = None;
         }
@@ -171,23 +269,44 @@ impl PhoneGate {
         self.expected_now(&mut st).is_some() && st.refused.contains(&ip)
     }
 
-    /// Whether discovery should dial a phone whose `_carplay-ctrl` TXT `id` is `txt_id`. The phone puts
-    /// its BR/EDR address there (bench 2026-11-01: `id=`, lower case with colons), the same address btd
-    /// names, so another phone is left alone before anything is dialled (fix 1b). No gate, or no readable
-    /// id: dial, and the SETUP check still applies.
-    pub fn wants(&self, txt_id: Option<&str>) -> bool {
-        let mut st = self.lock();
-        match (self.expected_now(&mut st), txt_id.and_then(normalize)) {
-            (Some(expected), Some(id)) => id == expected,
-            _ => true,
+    /// What discovery does with a `_carplay-ctrl` whose TXT `id` is `txt_id` ([`Dial`]), and the naming's epoch, from one
+    /// read of the name file. The phone puts its BR/EDR address in its TXT `id` (bench 2026-11-01: lower case with
+    /// colons), the same address btd names, so another phone is left alone before anything is dialled (fix 1b). No gate:
+    /// dial, as before.
+    pub fn dial(&self, txt_id: Option<&str>) -> (Dial, u64) {
+        if !self.armed() {
+            return (Dial::Now, 0);
         }
+        let mut st = self.lock();
+        let Some(expected) = self.expected_now(&mut st) else {
+            return (Dial::Unnamed, st.epoch);
+        };
+        let id = txt_id.and_then(normalize);
+        let verdict = match &id {
+            Some(id) if *id != expected.phone => Dial::Elsewhere,
+            Some(id) if st.serving.as_ref().is_some_and(|(_, _, phone)| phone == id) => Dial::Live,
+            _ if expected.wifi => Dial::Now,
+            _ if box_common::bench_flag(&self.bench.to_string_lossy()) => Dial::Early,
+            _ => Dial::Waiting,
+        };
+        (verdict, st.epoch)
+    }
+
+    /// Whether discovery may dial a phone whose `_carplay-ctrl` TXT `id` is `txt_id` at all, whatever its 0x5703: the
+    /// named phone's (or a TXT without a readable id) while one is named. No gate: yes. ([`PhoneGate::dial`] decides;
+    /// this is its first half, for the tests.)
+    #[cfg(test)]
+    pub fn wants(&self, txt_id: Option<&str>) -> bool {
+        !matches!(self.dial(txt_id).0, Dial::Elsewhere | Dial::Unnamed)
     }
 
     /// Whether the phone whose TXT `id` is `txt_id` already has its session here: its SETUP was let through
     /// as the named phone's, and that session has not ended. Discovery leaves it alone then. On the
     /// 2026-11-02 bench a live phone's record gained two addresses mid-session; discovery dialled one of
     /// them, the iPhone answered 200 OK, and the session that was showing video ended 29 s later. It holds
-    /// across a name change, so a name put back to that phone (R4) does not dial it again.
+    /// across a name change, so a name put back to that phone (R4) does not dial it again. ([`PhoneGate::dial`] gives
+    /// it as [`Dial::Live`]; this is for the tests.)
+    #[cfg(test)]
     pub fn serving(&self, txt_id: Option<&str>) -> bool {
         let mut st = self.lock();
         match (self.expected_now(&mut st), txt_id.and_then(normalize)) {
@@ -204,8 +323,8 @@ pub(crate) fn normalize(s: &str) -> Option<String> {
     (hex.len() == 12 && hex.bytes().all(|b| b.is_ascii_hexdigit())).then(|| hex.to_ascii_lowercase())
 }
 
-/// The session delegate behind the gate: a phase-1 SETUP from another phone is refused before the inner
-/// delegate sees it (so it never publishes that phone's identity), and its connection is closed.
+/// The session delegate behind the gate: a phase-1 SETUP from another phone, or with no phone named, is refused before
+/// the inner delegate sees it (so it never publishes that phone's identity), and its connection is closed.
 pub struct GatedSession {
     inner: Box<dyn SessionDelegate>,
     gate: Arc<PhoneGate>,
@@ -233,12 +352,16 @@ impl SessionDelegate for GatedSession {
 
     fn setup(&mut self, request_plist: &[u8]) -> Result<Vec<u8>, SetupError> {
         if let Some(id) = phase1_device_id(request_plist) {
-            if !self.gate.on_setup(self.generation, self.peer, id.as_deref()) {
-                eprintln!(
-                    "[carplayd] phone gate: SETUP from {} names another phone than btd serves; refused, and {} \
-                     is ignored until btd serves another phone",
-                    self.peer, self.peer
-                );
+            let refused = match self.gate.on_setup(self.generation, self.peer, id.as_deref()) {
+                Setup::Allow => None,
+                Setup::Elsewhere => Some(format!(
+                    "names another phone than btd serves; refused, and {} is ignored until btd serves another phone",
+                    self.peer
+                )),
+                Setup::Unnamed => Some("came before btd named any phone; refused".to_string()),
+            };
+            if let Some(why) = refused {
+                eprintln!("[carplayd] phone gate: SETUP from {} {why}", self.peer);
                 if let Some(s) = &self.stream {
                     let _ = s.shutdown(std::net::Shutdown::Both);
                 }
@@ -280,20 +403,26 @@ mod tests {
     const OWNER: &str = "02:00:00:00:00:0A";
     const OTHER: &str = "AA:BB:CC:00:6A:DE";
 
-    fn gate_naming(phone: Option<&str>) -> (PhoneGate, PathBuf) {
+    fn scratch(tag: &str) -> PathBuf {
         static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "carplayd_expect_test_{}_{}",
+        std::env::temp_dir().join(format!(
+            "carplayd_{tag}_test_{}_{}",
             std::process::id(),
             N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
+        ))
+    }
+
+    /// A gate whose file names `phone` with the 0x5703 mark (as btd writes it at a handoff), and a bench lever of its
+    /// own, off.
+    fn gate_naming(phone: Option<&str>) -> (PhoneGate, PathBuf) {
+        let path = scratch("expect");
         match phone {
-            Some(p) => std::fs::write(&path, p).unwrap(),
+            Some(p) => std::fs::write(&path, format!("{p} wifi")).unwrap(),
             None => {
                 let _ = std::fs::remove_file(&path);
             }
         }
-        (PhoneGate::new(Some(path.clone())), path)
+        (PhoneGate::with_bench(Some(path.clone()), scratch("bench")), path)
     }
 
     fn ip(last: u8) -> IpAddr {
@@ -305,18 +434,18 @@ mod tests {
         // 2026-11-01 bench: the dropped phone (.100) was dialled first, then the requested one joined (.101).
         let (gate, path) = gate_naming(Some(OWNER));
         assert_eq!(gate.on_connection(ip(100)), Admit::Accept, "nothing known about .100 yet");
-        assert!(!gate.on_setup(1, ip(100), Some(OTHER)), "another phone's SETUP is refused");
+        assert_eq!(gate.on_setup(1, ip(100), Some(OTHER)), Setup::Elsewhere, "another phone's SETUP is refused");
         assert!(gate.is_refused(ip(100)), "discovery leaves it alone");
         assert_eq!(gate.on_connection(ip(100)), Admit::Refused, "and its reconnects are dropped");
         assert_eq!(gate.on_connection(ip(101)), Admit::Accept);
-        assert!(gate.on_setup(2, ip(101), Some("02-00-00-00-00-0a")), "the named phone, in any spelling");
+        assert_eq!(gate.on_setup(2, ip(101), Some("02-00-00-00-00-0a")), Setup::Allow, "the named phone, in any spelling");
         let _ = std::fs::remove_file(path);
     }
 
     #[test]
     fn the_named_phones_session_is_not_preempted_from_another_address() {
         let (gate, path) = gate_naming(Some(OWNER));
-        assert!(gate.on_setup(7, ip(101), Some(OWNER)));
+        assert_eq!(gate.on_setup(7, ip(101), Some(OWNER)), Setup::Allow);
         assert_eq!(gate.on_connection(ip(102)), Admit::Holding(ip(101)), "a newcomer elsewhere does not hijack it");
         assert_eq!(gate.on_connection(ip(101)), Admit::Accept, "its own reconnect still preempts, as before");
         gate.session_ended(6);
@@ -330,24 +459,100 @@ mod tests {
     fn a_new_name_forgets_what_was_decided_for_the_old_one() {
         // One btd session, carplayd latched: the owner leaves, the other phone hands off next.
         let (gate, path) = gate_naming(Some(OWNER));
-        assert!(!gate.on_setup(1, ip(100), Some(OTHER)));
-        std::fs::write(&path, OTHER).unwrap();
+        assert_eq!(gate.on_setup(1, ip(100), Some(OTHER)), Setup::Elsewhere);
+        std::fs::write(&path, format!("{OTHER} wifi")).unwrap();
         assert!(!gate.is_refused(ip(100)));
         assert_eq!(gate.on_connection(ip(100)), Admit::Accept);
-        assert!(gate.on_setup(2, ip(100), Some(OTHER)));
+        assert_eq!(gate.on_setup(2, ip(100), Some(OTHER)), Setup::Allow);
         let _ = std::fs::remove_file(path);
     }
 
     #[test]
-    fn no_name_no_gate() {
-        let (gate, _) = gate_naming(None);
+    fn before_any_phone_is_named_an_armed_carplayd_serves_and_dials_nobody() {
+        // A2: carplayd starts with btd's host session, before a phone's Bluetooth session names it.
+        let (gate, path) = gate_naming(None);
         assert!(gate.armed(), "the wireless spawn, before btd has named a phone");
-        assert!(gate.on_setup(1, ip(100), Some(OTHER)));
-        assert_eq!(gate.on_connection(ip(101)), Admit::Accept);
+        assert_eq!(gate.on_connection(ip(101)), Admit::Unnamed, "a phone that comes by itself is dropped");
+        assert_eq!(gate.on_setup(1, ip(100), Some(OTHER)), Setup::Unnamed);
+        assert_eq!(gate.on_setup(1, ip(100), None), Setup::Unnamed, "even one that names no phone");
+        assert_eq!(gate.dial(Some(OWNER)).0, Dial::Unnamed);
+        assert_eq!(gate.dial(None).0, Dial::Unnamed, "nor a TXT without an id");
+        assert!(!gate.wants(Some(OWNER)));
+        assert!(!gate.is_refused(ip(100)), "nothing refused for later");
+        std::fs::write(&path, OWNER).unwrap();
+        assert_eq!(gate.on_connection(ip(101)), Admit::Accept, "named: its own connection is served");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn the_wired_carplayd_has_no_gate() {
         let wired = PhoneGate::new(None);
         assert!(!wired.armed());
-        assert!(wired.on_setup(1, ip(100), Some(OTHER)));
+        assert_eq!(wired.on_setup(1, ip(100), Some(OTHER)), Setup::Allow);
+        assert_eq!(wired.on_connection(ip(101)), Admit::Accept);
         assert!(!wired.is_refused(ip(100)));
+        assert_eq!(wired.dial(Some(OTHER)).0, Dial::Now, "dials as before");
+        assert!(!wired.serving(Some(OWNER)), "no gate: as before");
+    }
+
+    #[test]
+    fn the_dial_waits_for_the_named_phones_0x5703() {
+        // A2's ordering: the name comes as its Bluetooth session starts, the mark once btd has sent its 0x5703.
+        let (gate, path) = gate_naming(None);
+        assert_eq!(gate.dial(Some(OWNER)).0, Dial::Unnamed, "not named");
+        std::fs::write(&path, OWNER).unwrap();
+        assert_eq!(gate.dial(Some(OWNER)).0, Dial::Waiting, "named, no 0x5703 yet: held");
+        assert_eq!(gate.dial(None).0, Dial::Waiting, "a TXT without an id waits with it");
+        assert_eq!(gate.dial(Some(OTHER)).0, Dial::Elsewhere, "another phone, whatever the mark");
+        assert!(gate.wants(Some(OWNER)), "it is the phone to dial, once its 0x5703 is sent");
+        std::fs::write(&path, format!("{OWNER} wifi")).unwrap();
+        assert_eq!(gate.dial(Some(OWNER)).0, Dial::Now, "named and its 0x5703 sent: dial");
+        assert_eq!(gate.dial(None).0, Dial::Now);
+        assert_eq!(gate.dial(Some(OTHER)).0, Dial::Elsewhere);
+        assert_eq!(gate.on_setup(3, ip(101), Some(OWNER)), Setup::Allow);
+        assert_eq!(gate.dial(Some(OWNER)).0, Dial::Live, "its session is live: never again");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn the_bench_lever_dials_the_named_phone_before_its_0x5703_only() {
+        let (gate, path) = gate_naming(None);
+        let lever = gate.bench.clone();
+        std::fs::write(&lever, "").unwrap();
+        assert_eq!(gate.dial(Some(OWNER)).0, Dial::Unnamed, "the lever names nobody");
+        std::fs::write(&path, OWNER).unwrap();
+        assert_eq!(gate.dial(Some(OWNER)).0, Dial::Early, "named, no 0x5703: dialled under the lever");
+        assert!(gate.dial(Some(OWNER)).0.now());
+        assert_eq!(gate.dial(Some(OTHER)).0, Dial::Elsewhere, "never another phone");
+        std::fs::write(&lever, "off\n").unwrap();
+        assert_eq!(gate.dial(Some(OWNER)).0, Dial::Waiting, "\"off\" is off");
+        std::fs::write(&lever, "on").unwrap();
+        std::fs::write(&path, format!("{OWNER} wifi")).unwrap();
+        assert_eq!(gate.dial(Some(OWNER)).0, Dial::Now, "with the mark it is no early dial");
+        let _ = std::fs::remove_file(&lever);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_rename_mid_wait_moves_the_epoch_and_the_mark_goes_with_the_naming() {
+        let (gate, path) = gate_naming(None);
+        std::fs::write(&path, OWNER).unwrap();
+        let (_, e1) = gate.dial(Some(OWNER));
+        std::fs::write(&path, format!("{OWNER} wifi")).unwrap();
+        let (v, e2) = gate.dial(Some(OWNER));
+        assert_eq!((v, e2), (Dial::Now, e1), "the mark arriving is the same naming");
+        std::fs::write(&path, OTHER).unwrap();
+        let (v, e3) = gate.dial(Some(OTHER));
+        assert_eq!(v, Dial::Waiting, "another phone named while the first waited: it waits for its own 0x5703");
+        assert!(e3 > e2, "a new naming");
+        assert_eq!(gate.dial(Some(OWNER)).0, Dial::Elsewhere, "and the first is held");
+        std::fs::write(&path, format!("{OWNER} wifi")).unwrap();
+        let (v, e4) = gate.dial(Some(OWNER));
+        assert_eq!(v, Dial::Now, "put back with its mark (R4)");
+        assert!(e4 > e3);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(gate.dial(Some(OWNER)).0, Dial::Unnamed, "the file removed: nobody");
+        assert!(gate.epoch() > e4);
     }
 
     #[test]
@@ -358,10 +563,10 @@ mod tests {
         assert!(!gate.wants(Some(OTHER)), "another phone is never dialled");
         assert!(gate.wants(None), "no id: dial, and the SETUP check decides");
         assert!(gate.wants(Some("not a mac")));
-        std::fs::write(&path, OTHER).unwrap();
+        std::fs::write(&path, format!("{OTHER} wifi")).unwrap();
         assert!(gate.wants(Some(OTHER)), "follows the phone btd serves now");
         let _ = std::fs::remove_file(path);
-        assert!(gate.wants(Some(OWNER)), "no name, no gate");
+        assert!(!gate.wants(Some(OWNER)), "no name: nobody");
     }
 
     #[test]
@@ -369,42 +574,65 @@ mod tests {
         // 2026-11-02 bench: the record changed to [fe80::.., .100, .101] mid-session and .100 was dialled.
         let (gate, path) = gate_naming(Some(OWNER));
         assert!(!gate.serving(Some(OWNER)), "no session yet: dial it");
-        assert!(gate.on_setup(3, ip(101), Some(OWNER)));
+        assert_eq!(gate.on_setup(3, ip(101), Some(OWNER)), Setup::Allow);
         assert!(gate.serving(Some("02:00:00:00:00:0a")), "its session is live: leave it alone");
         assert!(!gate.serving(Some(OTHER)), "says nothing about another phone");
         assert!(!gate.serving(None), "nor about a TXT without an id");
         gate.session_ended(3);
         assert!(!gate.serving(Some(OWNER)), "once the session ends it may be dialled again");
         let _ = std::fs::remove_file(path);
-        assert!(!PhoneGate::new(None).serving(Some(OWNER)), "no gate: as before");
     }
 
     #[test]
     fn a_live_session_is_kept_across_a_name_and_its_put_back() {
         // The Mac's 15 Nov bench, R4: btd names another phone, then puts the earlier name back.
         let (gate, path) = gate_naming(Some(OWNER));
-        assert!(gate.on_setup(4, ip(101), Some(OWNER)));
+        assert_eq!(gate.on_setup(4, ip(101), Some(OWNER)), Setup::Allow);
         std::fs::write(&path, OTHER).unwrap();
         assert!(!gate.serving(Some(OTHER)), "the other phone has no session here");
         assert!(gate.serving(Some(OWNER)), "the owner's session is still live: never dialled again");
         assert_eq!(gate.on_connection(ip(102)), Admit::Accept, "with another phone named it does not hold, as before");
-        std::fs::write(&path, OWNER).unwrap();
+        std::fs::write(&path, format!("{OWNER} wifi")).unwrap();
         assert_eq!(gate.named().as_deref(), Some("02000000000a"));
         assert!(gate.serving(Some(OWNER)), "named again: still not dialled again");
+        assert_eq!(gate.dial(Some(OWNER)).0, Dial::Live);
         assert_eq!(gate.on_connection(ip(102)), Admit::Holding(ip(101)), "and it holds again");
         gate.session_ended(4);
         assert!(!gate.serving(Some(OWNER)));
         let _ = std::fs::remove_file(path);
-        assert_eq!(gate.named(), None, "no file, no gate");
+        assert_eq!(gate.named(), None, "no file, no phone");
     }
 
     #[test]
-    fn a_setup_naming_no_phone_is_let_through() {
+    fn a_setup_naming_no_phone_is_let_through_while_one_is_named() {
         let (gate, path) = gate_naming(Some(OWNER));
-        assert!(gate.on_setup(1, ip(100), None));
-        assert!(gate.on_setup(1, ip(100), Some("not a mac")));
+        assert_eq!(gate.on_setup(1, ip(100), None), Setup::Allow);
+        assert_eq!(gate.on_setup(1, ip(100), Some("not a mac")), Setup::Allow);
         assert_eq!(gate.on_connection(ip(101)), Admit::Accept, "not marked as the named phone's session");
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn open_connections_are_counted_until_they_end() {
+        let (gate, path) = gate_naming(Some(OWNER));
+        assert!(!gate.connection_open());
+        gate.connection_opened(5);
+        gate.connection_opened(6);
+        gate.session_ended(5);
+        assert!(gate.connection_open(), "6 is still open");
+        gate.session_ended(6);
+        assert!(!gate.connection_open());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn the_name_file_reads_as_btd_writes_it() {
+        assert_eq!(Named::parse("02:00:00:00:00:0A"), Some(Named { phone: "02000000000a".into(), wifi: false }));
+        assert_eq!(Named::parse("02:00:00:00:00:0A wifi\n"), Some(Named { phone: "02000000000a".into(), wifi: true }));
+        assert_eq!(Named::parse(" 02000000000A  wifi "), Some(Named { phone: "02000000000a".into(), wifi: true }));
+        assert_eq!(Named::parse("02:00:00:00:00:0A later"), Some(Named { phone: "02000000000a".into(), wifi: false }));
+        assert_eq!(Named::parse("wifi"), None);
+        assert_eq!(Named::parse(""), None);
     }
 
     #[test]
