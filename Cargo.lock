@@ -113,7 +113,9 @@ dependencies = [
 name = "carplayd"
 version = "0.1.0"
 dependencies = [
+ "box-common",
  "carplay-iap2-core",
+ "flume",
  "libc",
  "mdns-sd",
  "mfi",

@@ -1633,10 +1633,11 @@ fn run_pairing_server() -> io::Result<()> {
     // listening. It is handed the identity rather than re-deriving it: the advertised deviceid/pi
     // must equal the ones `Identity` above verifies with, and two processes reading the same env
     // vars was the only thing that ever kept them in step.
-    // The one phone this carplayd serves (`phone_gate`): btd names it at each Wi-Fi handoff, and as a bonded
-    // phone's Bluetooth session starts while no CarPlay session is up. Discovery dials it when the name
-    // changes, and leaves alone a phone refused at SETUP; the accept thread drops its connections, and does not let
-    // another address preempt the named phone's session.
+    // The one phone this carplayd serves (`phone_gate`): btd names it as a bonded phone's Bluetooth session starts
+    // while no CarPlay session is up, and at its Wi-Fi handoff (0x5703) with the mark that lets discovery dial it. Before
+    // any phone is named (carplayd starts with btd's host session, A2) nobody is served or dialled. Discovery dials the
+    // named phone when the name changes or its mark comes, and leaves alone a phone refused at SETUP; the accept thread
+    // drops its connections, and does not let another address preempt the named phone's session.
     let gate = std::sync::Arc::new(phone_gate::PhoneGate::from_env());
     if gate.armed() {
         println!("[carplayd] phone gate armed: serving only the phone btd names");
@@ -1690,9 +1691,16 @@ fn run_pairing_server() -> io::Result<()> {
                         let _ = stream.shutdown(std::net::Shutdown::Both);
                         continue;
                     }
+                    phone_gate::Admit::Unnamed => {
+                        eprintln!("[carplayd] phone gate: btd has named no phone yet; dropping a connection from {peer}");
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                        continue;
+                    }
                 }
             }
             generation += 1;
+            // Open until it ends (`unregister`) or is superseded unserved: discovery's retries wait for none (carplayd-1).
+            accept_gate.connection_opened(generation);
             {
                 let mut cur = plock(&accept_current);
                 if let Some((_, s)) = cur.as_ref() {
@@ -1727,6 +1735,7 @@ fn run_pairing_server() -> io::Result<()> {
         while let Ok((newer_gen, newer)) = rx.try_recv() {
             let _ = stream.shutdown(std::net::Shutdown::Both);
             eprintln!("[carplayd] hijack: superseded a queued control connection with a newer one");
+            gate.session_ended(generation); // never served: it is open no more
             generation = newer_gen;
             stream = newer;
         }
