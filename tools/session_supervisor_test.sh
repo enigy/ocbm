@@ -218,6 +218,7 @@ check "grep -qx \"t sup_radios 100500\" \"\$STARTUP_MARKS\"" "the timeline: sup_
 check "called \"setsid sh /script/radio_hal.sh wifi_ap_on\" || { sleep_real=1; i=0; while [ \$i -lt 20 ] && ! called \"setsid sh /script/radio_hal.sh wifi_ap_on\"; do i=\$((i+1)); command sleep 0.05; done; called \"setsid sh /script/radio_hal.sh wifi_ap_on\"; }" \
   "the AP launched after the signal"
 check "! called wireless_down && ! called \"OCBM_GO_FALLBACK=1\"" "no teardown, no fallback"
+check "[ \"\$wl_raised\" = 1 ]" "the radios raised: no teardown may take its early return until one has run"
 '
 
   run_case "$sh" '
@@ -259,6 +260,25 @@ FAKE_KILL_RC=1
 wireless_up; settle
 check "[ \"\$go_pending\" = 0 ] && called \"OCBM_GO_FALLBACK=1\"" "the signal failed: the fallback bring-up at once"
 check "called \"BT_PAIRING_MODE=just_works\" && called \"exec /usr/sbin/btd\"" "the fallback is today'"'"'s wrapper (bt_on, a fresh btd)"
+'
+
+  run_case "$sh" '
+# The release review of 3b38d37 (A1-2): after a go, a teardown runs even when nothing it looks at is up yet. The go
+# launched the AP detached; with its btd failed and the host gone before hostapd showed, the early return left the AP
+# coming up with no host. The real wireless_down here (sourced again over the stub), its commands stubbed.
+. "$2"
+hciconfig() { :; }
+now() { echo 100; }
+wireless_down; settle
+check "! called \"WL_TEARDOWN=\"" "nothing raised and nothing up: the early return, as before"
+wl_raised=1; : > "$CALLS"
+wireless_down; settle
+check "called \"WL_TEARDOWN=\" && [ \"\$wl_raised\" = 0 ]" "after a go with nothing up yet: the teardown runs, and it clears the flag"
+: > "$CALLS"; wireless_down; settle
+check "! called \"WL_TEARDOWN=\"" "a second, with nothing raised since: the early return again"
+mkdir "$RADIO_LOCKS/.radio_lock_wlan"; : > "$CALLS"
+wireless_down; settle
+check "called \"WL_TEARDOWN=\"" "an AP bring-up under way (its wlan lock held): the teardown runs"
 '
 
   run_case "$sh" '

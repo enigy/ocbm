@@ -755,6 +755,13 @@ arm_next=1      # arm when no host is here: from the start (after the boot prelo
 go_pending=0    # a go went out and btd's answer is awaited (go_watch)
 go_pid=""
 go_since=""
+# Radios a bring-up started (a go, or today's path), and no teardown block run since. wireless_down then never takes its
+# early return, which looks only at processes and hci0: the go launches the AP's bring-up detached, so if its btd failed
+# and the host left before hostapd was in the process list, nothing it looked at was up yet, and the AP came up with no
+# host (the release review of 3b38d37, A1-2). A teardown block clears it.
+wl_raised=0
+# An AP bring-up (or teardown) under way: radio_hal.sh holds its wlan lock from before it starts anything to after.
+ap_bringup_in_flight() { [ -d "$RADIO_LOCKS/.radio_lock_wlan" ]; }
 
 # Is $1 a live btd? Its /proc stat's name and state, read with `read`: not a zombie waiting to be reaped.
 proc_live_btd() {
@@ -917,6 +924,7 @@ wireless_go() {  # $1 = the armed btd's pid
     [ -n "$usb_configured_at" ] && echo "t usb_edge $usb_configured_at" 2>/dev/null >>"$STARTUP_MARKS"
   fi
   arm_pid=""
+  wl_raised=1
   if kill -USR1 "$1" 2>/dev/null; then
     go_pending=1; go_pid=$1; go_since=$_up_s
   fi
@@ -1064,6 +1072,7 @@ wireless_up() {
   # that left btd never started). The outer `wireless_running && return` above is the guard.
   # BT_PAIRING_MODE is inherited through setsid -> sh -c -> the exec'd btd. The body is single-quoted on
   # purpose, so values travel as env vars rather than by interpolating into the wrapper's argv.
+  wl_raised=1
   env BT_PAIRING_MODE="$mode" BT_SSP_INTERACTIVE="$(pairing_interactive)" OCBM_WL_REAPED="$_wl_reaped" \
     OCBM_USB_EDGE="$usb_configured_at" OCBM_GO_FALLBACK="$_wu_fb" setsid sh -c '
     # Radio bring-up goes through the chipset-neutral seam. It resolves this unit'"'"'s own
@@ -1162,7 +1171,9 @@ wireless_down() {
   # `carplayd_alive` not `pgrep -x carplayd`: BusyBox `-x` matches the FULL invoked path, so a bare
   # `-x carplayd` is BLIND to the wireless spawn form `/usr/sbin/carplayd` (device-proven, docs/wireless/00_WIRELESS_CARPLAY.md).
   # A stranded wireless carplayd would otherwise trip this early return and never be reaped.
-  if ! wireless_running && ! carplayd_alive \
+  # Not after a go or a bring-up that no teardown has followed (wl_raised), nor while an AP bring-up is under way: an AP
+  # still coming up is none of the things below yet.
+  if [ "$wl_raised" = 0 ] && ! ap_bringup_in_flight && ! wireless_running && ! carplayd_alive \
      && ! pgrep -x hostapd >/dev/null 2>&1 && ! { hciconfig hci0 2>/dev/null | grep -q "UP"; }; then
     return   # already fully down — processes dead AND radios actually powered off (docs/carplay/04_CAPABILITIES_AND_CONFIG.md: a
              # crashed stack can leave hostapd beaconing / hci0 UP with all three daemons gone;
@@ -1188,6 +1199,7 @@ wireless_down() {
     # never ran - hostapd kept beaconing and hci0 stayed up after every app disconnect. Never write
     # a pattern's plain word anywhere in the block.
     teardown_mark
+    wl_raised=0
     env WL_TEARDOWN="$_td" setsid sh -c '
       # Its pid in its own marker: wireless_up waits while this block lives.
       echo "$WL_TEARDOWN $$" > "/tmp/.wl_teardown.$WL_TEARDOWN.new" && mv -f "/tmp/.wl_teardown.$WL_TEARDOWN.new" "/tmp/.wl_teardown.$WL_TEARDOWN"
@@ -1235,6 +1247,7 @@ wireless_down() {
     # SELF-MATCH FIX 2026-08-01: `[/]usr/...` so this `sh -c` block doesn't SIGKILL itself before wlan_off
     # (see the COMPLETE-teardown branch above for the full rationale).
     teardown_mark
+    wl_raised=0
     env WL_TEARDOWN="$_td" setsid sh -c '
       # Its pid in its own marker: wireless_up waits while this block lives.
       echo "$WL_TEARDOWN $$" > "/tmp/.wl_teardown.$WL_TEARDOWN.new" && mv -f "/tmp/.wl_teardown.$WL_TEARDOWN.new" "/tmp/.wl_teardown.$WL_TEARDOWN"
