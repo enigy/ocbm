@@ -467,7 +467,12 @@ because BT attach waits for WLAN on this part, Bluetooth with it. Both forms now
   what `btd` advertises whenever `btd` brings Bluetooth up with `wlan0` present. Measured on the same
   adapter 1 Nov (installer 6affefc): `MGMT_INFO` read `CarLink-fd6c` with no `wlan0` and `hci0`
   down, and Carlink's pairing screen and Settings › Phones showed that name too. The seam's own name
-  and the BT-only role still differ.
+  and the BT-only role still differ. **16 Nov (A2, branch `carplayd-early`):** the chain now matters to carplayd's
+  start too. carplayd starts as btd's host session begins, and the identity it is handed (`box_identity::derive`)
+  changes when `wlan0` appears; so that start waits, by the seam's own test (an interface with `wireless/` or
+  `phy80211/`), for the Wi-Fi driver (15 s at most, a 250 ms settle when it had to wait), and the 0x5703 derives the
+  identity again and restarts a carplayd started with another one before it may dial (`av::expect_phone`). No
+  interface name is added to the Rust side.
 * The startup decode transient described in §6b.
 * **Broadcom is entirely untested** and is the known-hardest case: `wlan0` there does not exist
   until it is explicitly created on top of `sta0` (`iw dev sta0 interface add wlan0 type

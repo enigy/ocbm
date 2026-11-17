@@ -262,7 +262,8 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
      no CarPlay session is up and btd is not going quiet (`av::name_at_session_start`), and puts the
      earlier name back when that session ends without a 0x5703, unless the phone's own CarPlay is live,
      `carplayd` holds a control connection, or btd is going quiet (`av::put_back`). `discovery` reads the
-     name once a second; when it changes it forgets the newly named phone's dialled addresses, stops and
+     name once a second (since A2, 16 Nov, branch `carplayd-early`: it is woken by inotify on the name file, and
+     nothing polls); when it changes it forgets the newly named phone's dialled addresses, stops and
      starts the `_carplay-ctrl` browse (even when the stop is refused), dials what the new browse replays
      from mdns-sd's cache for two rounds at most, then a record it held for that phone that the cache did
      not replay; a browse that ends is started again. The gate keeps a live session across a name change,
@@ -303,9 +304,16 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
 
 - **Two phones, left for 2.6.x or later (the Mac's reviews for 2.6.0, 15 Nov; not in 2.6.0).**
   - `carplayd-1`: a capped rename-path dial that misses has no retry and waits for the 90 s never-reached
-    end (`Control::carplay_never_reached`).
-  - `carplayd-2`: fresh resolves read inside `rename()`'s replay loop get `RENAME_ROUNDS`.
-  - `carplayd-3`: `forget_phone` can repeat a dial made moments earlier under the new name.
+    end (`Control::carplay_never_reached`). **Fixed 16 Nov on branch `carplayd-early` (A2), NOT benched:** a dial
+    that tried every round and missed is tried again 2, 4 and 8 s after (two rounds each), while its record stands
+    and its phone is still the one to dial, and never while a control connection is open (`discovery::Retries`).
+  - `carplayd-2`: fresh resolves read inside `rename()`'s replay loop get `RENAME_ROUNDS`. **Fixed 16 Nov, same
+    branch, NOT benched:** the rounds follow the news, wherever the record is read: one resolved as discovery last saw
+    it (mdns-sd sends nothing for an unchanged record, so that is its cache replaying) gets `RENAME_ROUNDS`, anything
+    new or changed `FRESH_ROUNDS` (`Held::rounds_for`).
+  - `carplayd-3`: `forget_phone` can repeat a dial made moments earlier under the new name. **Fixed 16 Nov, same
+    branch, NOT benched:** each dial carries the naming's epoch it was made under (`PhoneGate::dial`), and a rename
+    forgets only the newly named phone's dials from an earlier naming.
   - `btd-p1-carlink-1`: `put_back`'s Connected should be provisional.
   - `e2e-4`: the same phone back within ~5 s while its own dead session is held is never re-checked
     (backstop: `carplay_never_reached` at 90 s).
@@ -313,7 +321,20 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
   - `btd-5` and `btd-6`, from the Mac's round 5 review.
 
 - **`MFI-CACHE-SCOPE`: btd's Bluetooth iAP2 and carplayd's AirPlay auth-setup still read the MFi chip each
-  session.** 2.6.0's once-per-boot certificate cache serves only the CarPlay session's iAP2 link.
+  session.** 2.6.0's once-per-boot certificate cache serves only the CarPlay session's iAP2 link. **Closed in code
+  16 Nov on branch `carplayd-early` (A4), NOT benched:** the tunnel's cache (`mfi_i2c_local::cert_cache`,
+  `/tmp/carplay_mfi_cert.der`) now serves all three, through one implementation of its rules: only one DER
+  certificate is cached or served; a read that isn't one is sent once and not cached; the cache is looked at again
+  once the lock is held and written after it is let go, so the lock is held no longer than the chip read; signatures
+  always go to the chip. A phone reporting a failed authentication drops it: the tunnel on its 0xAA04, as before;
+  btd when a Bluetooth session that sent the certificate ends without its handoff (0xAA04 ends the session there; btd
+  sees it in `bt_driver`, whose code is not this change's, so the session's end is the signal, and one that ended
+  early for another reason costs one chip read); carplayd when the phone asks nothing after auth-setup's answer
+  (`ControlServer::auth_unconfirmed`). btd fills the cache as a host session begins when it is empty (the first
+  session of a boot), in the background and under the lock, before any phone is connected. Expected: `cert1_ms` and
+  `cert2_ms` 0 from the first session of a boot on (were 112-163 ms each). No wake read at session start: no chip
+  log line shows a refusal after idle (the bench's 112-163 ms reads, every time; the tunnel's 23 of 23 first-read NAKs
+  came right after auth-setup's own reads, not after idle, and that read is served from the cache since 2.6.0).
 
 - **The doubled `[update]` lines in box.log (ocbmd's `start_update`).** Not in 2.6.0.
 
