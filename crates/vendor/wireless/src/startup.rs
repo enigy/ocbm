@@ -283,6 +283,24 @@ mod tests {
         assert_eq!(carry_over(old, 2000, "host_present 2000\n"), "host_present 2000\nt sup_radios 5300\nt bt_power 5550\n");
     }
 
+    /// A connect from the armed state: the supervisor stamps `sup_radios` at the go, btd begins its record after it
+    /// and stamps `bt_armed` as its first session opens the scans. That flag is the bring-up's, so a later session
+    /// under it (a phone switch) carries it with the radio stamps, and its line still says `bt_armed=1 bt_power=-`.
+    #[test]
+    fn the_armed_flag_is_carried_with_the_bring_up() {
+        let prev = "host_present 2000\npreload done\nt host 61234\nt btd_start 61290\nt sup_radios 61270\nt usb_edge 49700\n\
+                    t bt_armed 61300\nt bt_up 61301\nt page_start 61310\nt ap_start 61400\nt ap_up 61600\n";
+        let fresh = "host_present 2000\npreload done\nt host 61234\nt btd_start 90100\n";
+        let rec = carry_over(prev, 2000, fresh);
+        assert_eq!(
+            rec,
+            format!("{fresh}t sup_radios 61270\nt usb_edge 49700\nt bt_armed 61300\nt ap_start 61400\nt ap_up 61600\n")
+        );
+        let line = timeline::line(&rec, &[]);
+        assert!(line.contains(" sup_radios=36 bt_armed=1 bt_power=- btd_start=28866 "), "{line}");
+        assert_eq!(timeline::find(&rec, STAMP, "page_start"), None, "the session's own stamps stay behind");
+    }
+
     /// btd's stamps and chip times: one whole line each, the first of a key standing, and none without a record.
     #[test]
     fn a_stamp_is_noted_once_and_only_in_a_record() {
