@@ -631,8 +631,8 @@ enum Early {
     /// A carplayd is running that this process did not start (the wired supervisor's, or one a dead btd left): left
     /// alone, to the 0x5703, which replaces or adopts it as before.
     Resident,
-    /// No Wi-Fi interface yet: the identity carplayd is handed is derived from the Wi-Fi driver's address, so the 0x5703
-    /// starts it, as before.
+    /// The identity's primary source is not there, or did not hold still: `box_identity::derive` falls back to the SoC
+    /// serial without it, which gives another identity than at the 0x5703, so the 0x5703 starts carplayd, as before.
     NoWifi,
 }
 
@@ -650,36 +650,47 @@ fn early_decision(torn_down: bool, up: bool, resident: bool, wifi: bool) -> Earl
     }
 }
 
-/// Whether this unit's Wi-Fi interface exists, whatever its name: the radio seam's own test (`radio_hal.sh`
-/// `wlan_iface`), a netdev with `wireless/` or `phy80211/` in sysfs. Once it does, `box_identity::derive` reads what it
-/// will read at the 0x5703.
-fn wifi_iface_present() -> bool {
-    std::fs::read_dir("/sys/class/net").is_ok_and(|dir| {
-        dir.flatten().any(|e| e.path().join("wireless").exists() || e.path().join("phy80211").exists())
-    })
-}
-
-/// How long the session's-start spawn waits for the Wi-Fi interface, in steps of [`WIFI_STEP`]: on a cold start the
-/// driver can load beside the Bluetooth attach (the supervisor brings both up at once). One it had to wait for is given
-/// [`WIFI_SETTLE`] more: a driver can create its interfaces one after another (the IW416 dev adapter has `sta0` and
-/// `wlan0`), and the identity reads one of them.
+/// How long the session's-start spawn waits for the identity's primary source, looking every [`WIFI_STEP`]: on a cold
+/// start the Wi-Fi driver can load beside the Bluetooth attach (the supervisor brings both up at once).
 const WIFI_WAIT: Duration = Duration::from_secs(15);
 const WIFI_STEP: Duration = Duration::from_millis(100);
-const WIFI_SETTLE: Duration = Duration::from_millis(250);
+
+/// The identity carplayd may be handed at the session's start (A2-4): what `box_identity::derive_primary` gives, the
+/// same on two looks in a row, `step` apart (a driver can create its interfaces one after another, and give one an
+/// address after it is created), within `wait`; `None` past it, or when `stop` says the session was torn down.
+/// `look` is `derive_primary` (a test's own); `None` from it is the primary source not there yet.
+fn steady_identity(
+    mut look: impl FnMut() -> Option<(String, String, String)>,
+    wait: Duration,
+    step: Duration,
+    stop: impl Fn() -> bool,
+) -> Option<(String, String, String)> {
+    let t0 = std::time::Instant::now();
+    let mut last = look();
+    loop {
+        if stop() || t0.elapsed() >= wait {
+            return None;
+        }
+        std::thread::sleep(step);
+        let now = look();
+        if now.is_some() && now == last {
+            return now;
+        }
+        last = now;
+    }
+}
+
+/// The identity as `box_identity::derive_primary` gives it: only while derive reads its primary source.
+fn primary_identity() -> Option<(String, String, String)> {
+    crate::box_identity::derive_primary().map(|id| (id.device_id, id.pi, id.ed_seed_hex))
+}
 
 /// The session's-start spawn, on its own thread ([`session_starting`]): `session` is [`AV_SESSION`] as the session began.
 fn early_start(session: u64) {
     let t0 = std::time::Instant::now();
     let torn_down = || AV_SESSION.load(Ordering::Acquire) != session;
-    // A short bounded wait for the Wi-Fi driver, by its sysfs entry (no event exists for it there), off the lock.
-    let mut waited = false;
-    while !wifi_iface_present() && t0.elapsed() < WIFI_WAIT && !torn_down() {
-        std::thread::sleep(WIFI_STEP);
-        waited = true;
-    }
-    if waited && wifi_iface_present() {
-        std::thread::sleep(WIFI_SETTLE);
-    }
+    // A short bounded wait, off the lock, for the identity to come from what derive reads first and to hold still.
+    let id = steady_identity(primary_identity, WIFI_WAIT, WIFI_STEP, torn_down);
     let _guard = AV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let carplayd = env_or("AIRPLAYD_BIN", AIRPLAYD_BIN_DEFAULT);
     let mut up = AV_LAYER_UP.load(Ordering::Acquire);
@@ -691,10 +702,9 @@ fn early_start(session: u64) {
         *SPAWNED_ID.lock().unwrap_or_else(|e| e.into_inner()) = None;
         up = false;
     }
-    let decision = early_decision(torn_down(), up, !up && running(&carplayd), wifi_iface_present());
-    match decision {
-        Early::Start => {
-            let id = identity_now();
+    let decision = early_decision(torn_down(), up, !up && running(&carplayd), id.is_some());
+    match (decision, id) {
+        (Early::Start, Some(id)) => {
             if spawn_carplayd(&carplayd, &id, true) {
                 latch(&carplayd, id);
                 log(&format!("carplayd started at the session's start in {} ms (it dials no phone until its 0x5703)", t0.elapsed().as_millis()));
@@ -702,12 +712,12 @@ fn early_start(session: u64) {
                 log("carplayd did not start at the session's start; the 0x5703 starts it, as before");
             }
         }
-        Early::TornDown | Early::Up => {}
-        Early::Resident => log("a carplayd this btd did not start is running: left to the 0x5703, as before"),
-        Early::NoWifi => log(&format!(
-            "no Wi-Fi interface {} s into the session: carplayd waits for the 0x5703, as before",
+        (Early::Resident, _) => log("a carplayd this btd did not start is running: left to the 0x5703, as before"),
+        (Early::NoWifi, _) => log(&format!(
+            "the box identity's primary source was not there and steady within {} s: carplayd waits for the 0x5703, as before",
             WIFI_WAIT.as_secs()
         )),
+        _ => {}
     }
 }
 
@@ -1120,6 +1130,38 @@ mod tests {
             "the identity comes from the Wi-Fi driver's address: not before it is there"
         );
         assert_eq!(early_decision(true, true, true, false), Early::TornDown, "the teardown wins");
+    }
+
+    fn id(n: u8) -> (String, String, String) {
+        (format!("02:00:00:00:00:{n:02X}"), format!("pi-{n}"), format!("{n:064x}"))
+    }
+
+    /// A2-4: the early start takes the identity only from what derive reads first, once it holds still on two looks.
+    #[test]
+    fn the_session_start_spawn_waits_for_a_steady_primary_identity() {
+        let quick = Duration::from_millis(1);
+        let never = || false;
+        let looks = |seq: Vec<Option<(String, String, String)>>| {
+            let mut it = seq.into_iter();
+            move || it.next().flatten()
+        };
+        assert_eq!(steady_identity(looks(vec![Some(id(1)), Some(id(1))]), Duration::from_secs(1), quick, never), Some(id(1)));
+        assert_eq!(
+            steady_identity(looks(vec![None, None, Some(id(1)), Some(id(1))]), Duration::from_secs(1), quick, never),
+            Some(id(1)),
+            "the Wi-Fi driver came up: its address, held still"
+        );
+        assert_eq!(
+            steady_identity(looks(vec![Some(id(1)), Some(id(2)), Some(id(2))]), Duration::from_secs(1), quick, never),
+            Some(id(2)),
+            "an address that changed once: the one that held"
+        );
+        assert_eq!(
+            steady_identity(|| None, Duration::from_millis(20), quick, never),
+            None,
+            "never there (derive falls back to the serial): the 0x5703 starts carplayd"
+        );
+        assert_eq!(steady_identity(|| Some(id(1)), Duration::from_secs(1), quick, || true), None, "torn down meanwhile");
     }
 
     #[test]

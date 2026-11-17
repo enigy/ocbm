@@ -6,15 +6,15 @@
 
 use sha2::{Digest, Sha256};
 
+/// The hardware ids [`hardware_id`] reads, in order. The first, wlan0's MAC, is primary ([`derive_primary`]).
+const SOURCES: [&str; 2] = ["/sys/class/net/wlan0/address", "/sys/devices/soc0/serial_number"];
+
 /// First available hardware-unique id. wlan0's MAC is primary — it's per-box and wlan0 is always up by
 /// the time the A/V layer starts (the AP is running); the SoC OTP serial and `/proc/cpuinfo` Serial are
 /// fallbacks. A box with none readable falls back to a fixed marker (degenerate, effectively the old
 /// single-identity behavior).
 fn hardware_id() -> String {
-    for path in [
-        "/sys/class/net/wlan0/address",
-        "/sys/devices/soc0/serial_number",
-    ] {
+    for path in SOURCES {
         if let Ok(s) = std::fs::read_to_string(path) {
             let t = s.trim();
             if !t.is_empty() {
@@ -56,9 +56,21 @@ pub struct BoxIdentity {
 
 /// Derive the per-box identity. Deterministic: same box → same identity across reboots.
 pub fn derive() -> BoxIdentity {
-    let hwid = hardware_id();
+    from_hwid(&hardware_id())
+}
 
-    let d = digest(&hwid, "device-id");
+/// [`derive`], only while it reads its primary source, wlan0's MAC ([`SOURCES`]): `None` while that is not there yet
+/// and `derive` would fall back to the SoC serial, which gives another identity than the one it gives once the Wi-Fi
+/// driver is up. carplayd's start with btd's host session waits for it (A2, `av::early_start`); nothing else reads it.
+pub fn derive_primary() -> Option<BoxIdentity> {
+    let s = std::fs::read_to_string(SOURCES[0]).ok()?;
+    let t = s.trim();
+    (!t.is_empty()).then(|| from_hwid(t))
+}
+
+/// The identity of hardware id `hwid`.
+fn from_hwid(hwid: &str) -> BoxIdentity {
+    let d = digest(hwid, "device-id");
     // Format 6 bytes as a MAC; force a valid unicast Locally-Administered Address (set bit1, clear bit0
     // of the first octet) so it never collides with a real OUI or looks like a multicast address.
     let b0 = (d[0] & 0xFE) | 0x02;
@@ -67,13 +79,13 @@ pub fn derive() -> BoxIdentity {
         b0, d[1], d[2], d[3], d[4], d[5]
     );
 
-    let p = digest(&hwid, "pi");
+    let p = digest(hwid, "pi");
     let pi = format!(
         "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
         p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15]
     );
 
-    let seed = digest(&hwid, "ed-seed");
+    let seed = digest(hwid, "ed-seed");
     let ed_seed_hex = seed.iter().map(|b| format!("{b:02x}")).collect();
 
     BoxIdentity {
@@ -100,5 +112,21 @@ mod tests {
         // Locally-administered unicast: first octet has bit1 set, bit0 clear.
         let b0 = u8::from_str_radix(&a.device_id[0..2], 16).unwrap();
         assert_eq!(b0 & 0x03, 0x02, "device_id first octet is unicast LAA");
+    }
+
+    /// A2-4: `derive_primary` is `derive` while the primary source is there, and nothing while it would fall back.
+    #[test]
+    fn the_primary_derivation_is_derive_from_its_first_source() {
+        match derive_primary() {
+            Some(p) => {
+                let d = derive();
+                assert_eq!((p.device_id, p.pi, p.ed_seed_hex), (d.device_id, d.pi, d.ed_seed_hex));
+            }
+            None => assert!(std::fs::read_to_string(SOURCES[0]).map_or(true, |s| s.trim().is_empty())),
+        }
+        let a = from_hwid("02:00:00:00:00:0a");
+        let b = from_hwid("02:00:00:00:00:0b");
+        assert_ne!(a.device_id, b.device_id, "another source, another identity");
+        assert_eq!(a.device_id, from_hwid("02:00:00:00:00:0a").device_id);
     }
 }
