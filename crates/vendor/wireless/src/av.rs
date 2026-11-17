@@ -553,10 +553,12 @@ pub fn teardown_av_layer() {
 }
 
 /// Wait (bounded) for the carplayd just signalled to be gone: by its pid when this process started it (a `/proc` read,
-/// no process-table scan), else by `pgrep`. SIGKILL after a second. carplayd installs no SIGTERM handler, so it is
-/// normally gone within milliseconds.
+/// no process-table scan), else by `pgrep -x` of the full path alone, the form its callers' `pkill -x <path>` and the
+/// SIGKILL here signal. [`running`] also matches the bare name, and so the wired supervisor's carplayd, which none of
+/// them signals: every teardown beside one waited its whole 2 s (A2-3). SIGKILL after a second. carplayd installs no
+/// SIGTERM handler, so it is normally gone within milliseconds.
 fn wait_gone(pid: u32, carplayd: &str) {
-    let alive = || if pid != 0 { pid_alive(pid, carplayd) } else { running(carplayd) };
+    let alive = || if pid != 0 { pid_alive(pid, carplayd) } else { pgrep_exact(carplayd) };
     let step = if pid != 0 { Duration::from_millis(10) } else { Duration::from_millis(100) };
     let started = std::time::Instant::now();
     let mut killed = false;
