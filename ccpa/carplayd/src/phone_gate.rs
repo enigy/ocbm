@@ -120,8 +120,10 @@ impl Named {
 struct State {
     /// The named phone and its mark as last read; `None` = none.
     expected: Option<Named>,
-    /// Moved on each time the named phone changes (to another, or to none), so discovery can tell a dial made under
-    /// this naming from one made under an earlier naming of the same phone (carplayd-3).
+    /// Moved on each time the named phone changes (to another, or to none) and each time the same phone loses its mark
+    /// (named afresh, A2-2), whoever read it: so discovery can tell a dial made under this naming from one made under
+    /// an earlier naming of the same phone (carplayd-3), and a naming it has not acted on from the one it has, even when
+    /// the file reads the same ([`PhoneGate::naming`]).
     epoch: u64,
     refused: HashSet<IpAddr>,
     /// The session whose SETUP named the expected phone: its generation, peer address and phone. Kept across a
@@ -186,16 +188,20 @@ impl PhoneGate {
     }
 
     /// The phone btd names now (12 lower-case hex digits), read afresh; `None` = none. (Discovery reads
-    /// [`PhoneGate::named_state`] at each wake, for the mark too.)
+    /// [`PhoneGate::naming`] at each wake, for the mark and the epoch too.)
     #[cfg(test)]
     pub fn named(&self) -> Option<String> {
-        self.named_state().map(|n| n.phone)
+        self.naming().0.map(|n| n.phone)
     }
 
-    /// The phone btd names now and its 0x5703 mark, read afresh.
-    pub fn named_state(&self) -> Option<Named> {
+    /// The phone btd names now and its 0x5703 mark, read afresh, and the naming's epoch, from one read. Discovery acts
+    /// on a naming by its epoch: the file can read as it did at discovery's last look after another naming in between
+    /// that the gate read (the same phone named afresh and its mark back, another phone named and the first put back),
+    /// and that is a new naming all the same (A2-1, the second review).
+    pub fn naming(&self) -> (Option<Named>, u64) {
         let mut st = self.lock();
-        self.expected_now(&mut st)
+        let now = self.expected_now(&mut st);
+        (now, st.epoch)
     }
 
     /// The naming's epoch as of the last read ([`State::epoch`]).

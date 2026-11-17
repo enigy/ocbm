@@ -320,7 +320,9 @@ fn txt_line<'a>(props: impl Iterator<Item = (&'a str, &'a str)>) -> String {
 enum Change {
     None,
     /// Another phone named, or none, or the same phone named afresh (its mark gone: btd names a phone back on
-    /// Bluetooth without the mark of its earlier session, A2-2).
+    /// Bluetooth without the mark of its earlier session, A2-2): any naming since discovery last acted on the name,
+    /// by the gate's epoch, even one that reads as it did then ("A wifi", "A", "A wifi" or A, B, A, the gate having
+    /// read the one in between: the second review).
     Renamed,
     /// The same phone, and btd has now sent it its 0x5703: its held records may be dialled.
     Cleared,
@@ -336,6 +338,8 @@ struct Held {
     named: Option<String>,
     /// Whether btd had sent the named phone its 0x5703 when discovery last acted on the name.
     wifi: bool,
+    /// The gate's naming epoch when discovery last acted on the name ([`PhoneGate::naming`]).
+    epoch: u64,
     /// Whether the connect timeline's `dial_ok` was noted for this naming ([`Loop::note_mark`]).
     mark_noted: bool,
     /// Each held record, and the rounds its dial gets.
@@ -346,10 +350,11 @@ struct Held {
 
 impl Held {
     fn new(gate: &PhoneGate) -> Self {
-        let now = gate.named_state();
+        let (now, epoch) = gate.naming();
         Self {
             wifi: now.as_ref().is_some_and(|n| n.wifi),
             named: now.map(|n| n.phone),
+            epoch,
             mark_noted: false,
             records: HashMap::new(),
             seen: HashMap::new(),
@@ -366,28 +371,32 @@ impl Held {
 
     /// How the name changed since the last call ([`Change`]), and the name noted as acted on.
     fn check(&mut self, gate: &PhoneGate) -> Change {
-        let (phone, wifi) = Self::read(gate);
-        let change = self.change_to(&phone, wifi);
+        let (phone, wifi, epoch) = Self::read(gate);
+        let change = self.change_to(&phone, wifi, epoch);
         self.named = phone;
         self.wifi = wifi;
+        self.epoch = epoch;
         change
     }
 
     /// What [`Held::check`] would say now, the name not noted: for a wake read inside a browse's restart, where only the
     /// mark is acted on at once and a rename is left to the loop ([`Loop::rebrowse`]).
     fn peek(&self, gate: &PhoneGate) -> Change {
-        let (phone, wifi) = Self::read(gate);
-        self.change_to(&phone, wifi)
+        let (phone, wifi, epoch) = Self::read(gate);
+        self.change_to(&phone, wifi, epoch)
     }
 
-    fn read(gate: &PhoneGate) -> (Option<String>, bool) {
-        let now = gate.named_state();
+    fn read(gate: &PhoneGate) -> (Option<String>, bool, u64) {
+        let (now, epoch) = gate.naming();
         let wifi = now.as_ref().is_some_and(|n| n.wifi);
-        (now.map(|n| n.phone), wifi)
+        (now.map(|n| n.phone), wifi, epoch)
     }
 
-    fn change_to(&self, phone: &Option<String>, wifi: bool) -> Change {
-        if *phone != self.named || (self.wifi && !wifi) {
+    /// The gate moves its epoch on at every naming it reads, whoever reads it: another phone, none, or the same phone
+    /// without its mark. So a naming this loop has not acted on is a rename even when the name reads as it did at its
+    /// last look. The phone and a lost mark are compared as well, so a rename never rests on the epoch alone.
+    fn change_to(&self, phone: &Option<String>, wifi: bool, epoch: u64) -> Change {
+        if epoch != self.epoch || *phone != self.named || (self.wifi && !wifi) {
             Change::Renamed
         } else if wifi && !self.wifi {
             Change::Cleared
@@ -1014,7 +1023,7 @@ impl Loop<'_> {
         let (events, resolved, _) = self.rebrowse(b, old)?;
         due.retain(|(c, _)| !resolved.contains(&c.fullname));
         for (c, _) in due {
-            println!("[rx] {}: resolved while btd named another phone; dialling it now", c.who());
+            println!("[rx] {}: held from an earlier naming; dialling it now", c.who());
             // `svc_seen` for a record held from before its phone was named: it is the named phone's from now.
             receiver::startup::stage(receiver::startup::Stage::SvcSeen);
             self.dial(&c, RENAME_ROUNDS);
@@ -1979,6 +1988,61 @@ mod tests {
         });
         run_loop(&fake, &gate, &mut d, &mut Net::off(), NEVER);
         assert_eq!(*dials.borrow(), [at(101), at(101)], "once per Bluetooth session's 0x5703");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The second review (17 Nov), its trace: A put back with its mark, and inside that rename's browse restart A's
+    /// Bluetooth session starts (named afresh, no mark: A2-2), its record replays and is held, and its 0x5703 lands.
+    /// The name then reads as discovery last acted on it; only the gate's epoch tells the naming is new. A is dialled
+    /// at the restart that follows (this fake's cache is empty there, so from the held record).
+    #[test]
+    fn a_mark_lost_and_back_within_a_rebrowse_is_a_new_naming() {
+        let (gate, path) = gate_with(PHONE_B);
+        let fake = FakeBrowse::new(
+            &path,
+            false,
+            vec![
+                vec![Step::Name(handed(PHONE_A))],
+                vec![
+                    Step::Name(PHONE_A.to_string()),
+                    resolved("A", PHONE_A, 101),
+                    Step::Name(handed(PHONE_A)),
+                    Step::Quiet,
+                ],
+                vec![Step::Quiet],
+            ],
+        );
+        let dials = Rc::new(RefCell::new(Vec::new()));
+        let mut d = dialer(&dials, |_| true);
+        run_loop(&fake, &gate, &mut d, &mut Net::off(), NEVER);
+        assert_eq!(*dials.borrow(), [at(101)], "A dialled once, after this session's 0x5703");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The second review: A named, then B named and A put back (a Bluetooth session that ended without a 0x5703), both
+    /// inside one browse restart, A's record held as another phone's between the two. A new naming of A by the gate's
+    /// epoch, though the name reads as it did: A is dialled, as a put-back dials it (R4).
+    #[test]
+    fn a_name_put_back_within_a_rebrowse_is_a_new_naming() {
+        let (gate, path) = gate_with(PHONE_B);
+        let fake = FakeBrowse::new(
+            &path,
+            false,
+            vec![
+                vec![Step::Name(handed(PHONE_A))],
+                vec![
+                    Step::Name(PHONE_B.to_string()),
+                    resolved("A", PHONE_A, 101),
+                    Step::Name(handed(PHONE_A)),
+                    Step::Quiet,
+                ],
+                vec![Step::Quiet],
+            ],
+        );
+        let dials = Rc::new(RefCell::new(Vec::new()));
+        let mut d = dialer(&dials, |_| true);
+        run_loop(&fake, &gate, &mut d, &mut Net::off(), NEVER);
+        assert_eq!(*dials.borrow(), [at(101)], "A dialled once, as its put-back's naming");
         let _ = std::fs::remove_file(path);
     }
 
