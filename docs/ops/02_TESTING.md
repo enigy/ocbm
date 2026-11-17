@@ -502,10 +502,23 @@ writes the text through `LogRedactor`, which only shortens MAC addresses. So one
 values, the u64's widest, the three keys added after the bench would have taken the line to 1029 bytes: the 13-digit
 cap is what keeps the bound.)
 
-### The armed path (16 Nov 2026; not benched yet)
+### The armed path (16 Nov 2026; benched the same day)
 
 Bluetooth powered but invisible between host sessions, the host's arrival a go (docs/wireless/01_BT_AND_RADIO.md,
-"Between host sessions: armed"). A smoke bench first (about 30 min), on the dev adapter, wakes being the path it is for:
+"Between host sessions: armed").
+
+**The first bench** (16 Nov, the dev adapter, `resident-bt` merged with `carplayd-early` as a local `round2`): 12 wakes
+and a cold boot from the armed state, `sup_radios` about 50 ms, `bt_armed=1`, `page_start` about 100 ms, `ap_enabled`
+about 1.16 s after the host's arrival; the no-host state as in step 1 below; arming about 1.0 s faster than
+`/tmp/bench_arm_off`; the forced fallback (step 4) as written. One bad wake, the first about 90 s after an update was
+committed: 24.8 s, the phone associated 8.6 s after RFCOMM (0.4 s otherwise), no `sending ACK` from udhcpd in 60 s
+though the phone ended up on its old IPv4 address, its service resolved 6.5 s after the join; not repeated after a
+reboot. Its likely cause is fixed (the last AP's DHCP server, slow over its lease file on flash the commit's garbage
+collection slowed, taken for the new AP's; docs/wireless/01_BT_AND_RADIO.md, "The AP, written ahead"). If it recurs,
+right after it: `/tmp/wlan.log`, `/tmp/radio_ap_dhcp.log`, `df /`, and the time of `[dispatch] update committed` in
+`/tmp/box.log`; then a wake soon after an update's commit is a case of its own on the next bench.
+
+A smoke bench (about 30 min), on the dev adapter, wakes being the path it is for:
 
 1. **No host, after boot.** Once the preload is done: box.log `[sup] no host: arming Bluetooth for the next one`; wl.log
    `[armed] armed as "…": Bluetooth powered, scan 0x00 (page and inquiry off), 0 connection(s)`; `/tmp/.btd_armed`

@@ -235,8 +235,10 @@ leases on that timer and at SIGTERM, not at each ACK, and a drive ends in a powe
 reaches flash within a minute of its ACK. Its lease file has another format: an 8-byte timestamp, then
 36-byte records. A vendor-format file, or one older than 12 hours by the box's clock (including a clock
 that restarted behind it), is ignored and rewritten; the NAK covers that case. Nothing in OCBM reads the
-vendor server's `/tmp/.dhcp_record` or `PHONE_P2PGC_ADDR`; the teardown paths kill it by its config path
-and `/var/run/udhcpd.pid`, which BusyBox writes too.
+vendor server's `/tmp/.dhcp_record` or `PHONE_P2PGC_ADDR`; the seam's teardown finds it by its config path and,
+since 16 Nov 2026, waits for it to go (up to 3 s, its lease file being written; then SIGKILL), no longer killing
+`/var/run/udhcpd.pid`'s pid blind (a stale pidfile can name any process). The IW416 overlay's `wlan_off.sh` still
+kills by that pidfile. A new AP never counts the last one's server as its own ("The AP, written ahead", below).
 
 ### 5. Hardware-validated results (RTL8822CS, 2026-08-15)
 
@@ -488,8 +490,22 @@ because BT attach waits for WLAN on this part, Bluetooth with it. Both forms now
 
 ## Between host sessions: armed (Bluetooth powered, invisible)
 
-**Status: built 16 Nov 2026 (branch `resident-bt`), NOT benched.** Unit tests and the shell suites only; the bench
-plan is in [../ops/02_TESTING.md](../ops/02_TESTING.md), "The armed path".
+**Status: built and benched 16 Nov 2026** (branch `resident-bt` merged with `carplayd-early` into a local `round2`,
+on the dev adapter, IW416). 12 wakes and a cold boot connected from the armed state: `sup_radios` about 50 ms,
+`bt_armed=1`, `page_start` about 100 ms and `ap_enabled` about 1.16 s after the host's arrival. With no host the armed
+state read over the console as built: `hci0` `UP RUNNING` with neither `PSCAN` nor `ISCAN`, no link, no hostapd, udhcpd
+or carplayd, the AP interface (`sta0`) down. Against `/tmp/bench_arm_off` arming saved about 1.0 s per connect. The
+fallback, forced by freezing the armed btd (`kill -STOP`): `armed go failed (no answer from btd N in 3 s) -- falling
+back`, `bt_armed=0`, and the connect completed by today's path. The bench plan:
+[../ops/02_TESTING.md](../ops/02_TESTING.md), "The armed path".
+
+**Open: one bad wake.** The first wake about 90 s after an update was committed took 24.8 s: the phone associated 8.6 s
+after RFCOMM (0.4 s otherwise), udhcpd logged no `sending ACK` in 60 s though the phone ended up on its old IPv4
+address, and its CarPlay service resolved 6.5 s after it joined. It did not repeat after a reboot. The likely cause,
+fixed since (the release review of `resident-bt`, A3-1; "The AP, written ahead" below): the last AP's udhcpd, still
+writing its lease file to flash slowed by the commit's garbage collection, was taken by the next AP start for its own
+DHCP server, and none was started. Should it recur, capture right after it: `/tmp/wlan.log`, `/tmp/radio_ap_dhcp.log`,
+`df /`, and the time of `[dispatch] update committed` in `/tmp/box.log`.
 
 The owner's decision of 16 Nov 2026: between host sessions Bluetooth may stay **powered but invisible**. "Invisible"
 is hard: with no host here the controller has page scan and inquiry scan off, pages nobody and holds no connection,
@@ -550,7 +566,11 @@ or an arm still under way 3 s after the host came: the supervisor stops that btd
 today's wrapper unchanged (`bt_on`, a fresh btd) except that it skips the AP launch and the timeline stamps, which
 went out with the go. An arm under way at the host's arrival gets those 3 s to finish (it takes about one: the AP
 written ahead, then the DOWN→UP); a host back within a teardown finds no armed btd (none is started while a teardown
-runs) and takes today's path, the teardown first, as in 2.6.0.
+runs) and takes today's path, the teardown first, as in 2.6.0. After a go, `wireless_down` never takes its early
+return (nothing running) until a teardown has run (`wl_raised`, set by a go and by today's bring-up, cleared by each
+teardown block), nor while an AP bring-up holds the wlan lock: the go launches the AP detached, so a btd that failed
+its proof and a host gone before hostapd showed would otherwise have left the AP coming up with no host (the release
+review's A1-2).
 
 **The session's inputs, each as it reaches the btd that serves the host.**
 
@@ -578,7 +598,11 @@ they go through today's path (`wireless_down`, then today's bring-up); one that 
 *Pairing a new phone:* armed, the box is neither discoverable nor connectable; at the go the session's SSP agent
 applies the pairing window as always (discoverable inside it, or while no phone is bonded). *An update:* it is
 placed with a host here (a session btd) and restarts the adapter; the new version's boot preload then precedes its
-arm. The update trial's commit (`ocbm_dispatch.sh` `btd_settles`) sees an armed btd as a running btd. *ocbmd
+arm. The update trial's commit (`ocbm_dispatch.sh` `btd_settles`) waits for a btd serving a host's session (a btd
+process, its phase published in `/tmp/bt_phase`, none armed in `/tmp/.btd_armed`), never one only armed (corrected
+16 Nov 2026, the release review's A1-3: the first build counted any btd process). An armed btd publishes no phase
+before its go, and every arm removes one a previous btd left (the teardown that leaves a wired `carplayd` running
+does not), so a phase never stands beside a btd only armed. *ocbmd
 restarting:* with a host here it drops presence, a teardown, then an arm or today's path; with none here nothing
 changes. *The supervisor restarting:* an armed btd it did not start is torn down at its start; it arms its own.
 *btd crashing while armed:* its controller is left powered and scan-off; `arm_watch` sees the btd gone and powers it
@@ -589,10 +613,21 @@ was ours: `radio_hal.sh` reading its descriptor, the driver step (already loaded
 name and rewriting `hostapd.conf`, `udhcpd.conf` and `/etc/wifi_name` on flash, about 45 forks and 7 flash writes
 before hostapd. The arm's wrapper now runs `radio_hal.sh wifi_ap_prep` (`radio_ap_up.sh PREP`: the configuration
 only, nothing raised: no address, no hostapd, no udhcpd, no beacon), which leaves `/tmp/.radio_ap_prepared`
-(`<interface> <name> <address> <channel> <2.4 GHz flag>`). At the go, `wifi_ap_on`'s fast path skips the descriptor
-and the driver step, and `radio_ap_up.sh` trusts the stamp while nothing it was written from is newer than it, the
-2.4 GHz flag is as it was and `/etc/carplay_ident` (or the seam) still names the box the same (all `test`/`read`, no
-fork): the address goes on the interface, then hostapd is the first thing launched. Its own 0.86 s to `AP-ENABLED`
+(`<interface> <name> <address> <channel> <2.4 GHz flag>`, then a checksum of each file the configuration lives in or is
+written from). At the go, `wifi_ap_on`'s fast path skips the descriptor and the driver step, and `radio_ap_up.sh`
+trusts the stamp while those files hold what they held (one `md5sum` over `hostapd.conf`, `udhcpd.conf`,
+`carplay_ident`, `wifi_ip` and `wifi_name`), the 2.4 GHz flag is as it was and `/etc/carplay_ident` (or the seam) still
+names the box the same: the address goes on the interface, then hostapd is the first thing launched. **By content,
+never by date** (corrected 16 Nov 2026, the release review's A3-2): the adapter's clock reads 2020-01-02 until a host
+sets it, so a stamp the boot's arm wrote was dated before files a 2026 clock had written, and the first build's date
+comparison (`-nt`) never trusted it, so the fast path did nothing on the first connect after every power-up.
+**The AP's DHCP server** (the release review's A3-1): BusyBox udhcpd writes its lease file to flash as it exits on
+SIGTERM, so the teardown waits for it (`ap_dhcp_stop`: 3 s, then SIGKILL), and a start that launches hostapd stops any
+AP DHCP server still listed, starts its own and keeps its pid: the convergence asks after that process, a zombie not
+counted, through the confirmation. Before, a server still on its way out was taken for the new AP's and none was
+started (the bench's bad wake, above). **The confirmation's count** (A3-3): `AP-ENABLED` lines are counted against the
+box log as it was at hostapd's launch; a count below that is a box log ocbmd emptied at its cap, and the baseline then
+goes to 0 instead of holding the wait to its 2 s bound. Its own 0.86 s to `AP-ENABLED`
 (`COUNTRY_UPDATE`, then `HT_SCAN` for `[HT40+]`, in its log) is the AP's, not ours: hostapd skips that scan only on
 `noscan=1`, which a hostapd that lacks it refuses as an unknown item (and so fails to start), and this one is packed
 so its version cannot be read off the file; it is left alone (see docs/ops/04_OPEN_ITEMS.md). Every `ap_configure`

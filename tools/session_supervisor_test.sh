@@ -24,7 +24,7 @@ passes=0
 cat > "$T/prelude.sh" <<'EOF'
 R="$1"
 export SUP_PROC="$R/proc" SUP_SYS="$R/sys" CARPLAY_CFG_FILE="$R/cfg.yaml" FLAG="$R/host_present"
-export BTD_ARMED_FILE="$R/btd_armed" BTD_GO_FILE="$R/btd_go" BTD_GO_RESULT="$R/btd_go_result"
+export BTD_ARMED_FILE="$R/btd_armed" BTD_GO_FILE="$R/btd_go" BTD_GO_RESULT="$R/btd_go_result" BT_PHASE_FILE="$R/bt_phase"
 export ARM_OFF_FILE="$R/radio_arm_off" ARM_BENCH_OFF="$R/bench_arm_off" STARTUP_MARKS="$R/startup_marks"
 export RADIO_LOCKS="$R/locks" WL_TEARDOWN_MARK="$R/wl_teardown" CARPLAY_TRANSPORT_FLAG="$R/carplay_transport"
 export RADIO_OFF_FLAG="$R/radio_off" OCBM_SUP_FUNCS=1
@@ -186,8 +186,10 @@ check "! arm_gate && [ \"\$arm_next\" = 0 ]" "switched off: closed, and not aske
 
   run_case "$sh" '
 arm_next=1
+echo 7 > "$BT_PHASE_FILE"
 arm_wireless; settle
 check "[ \"\$arm_next\" = 0 ] && [ -n \"\$arm_pid\" ] && [ \"\$arm_since\" = 100 ]" "the arm: started once, its pid and time kept"
+check "[ ! -e \"\$BT_PHASE_FILE\" ]" "a phase a previous btd left is gone before the armed one starts (none while armed)"
 check "called \"env OCBM_BTD_ARM=1\"" "btd started armed (OCBM_BTD_ARM=1)"
 check "called \"radio_hal.sh wifi_ap_prep\" && called \"exec /usr/sbin/btd\"" "the AP configured ahead, then btd"
 check "[ -s \"\$R/body\" ] && ! grep -q -e carplayd -e hostapd \"\$R/body\" && grep -q /usr/sbin/btd \"\$R/body\"" \
@@ -218,6 +220,7 @@ check "grep -qx \"t sup_radios 100500\" \"\$STARTUP_MARKS\"" "the timeline: sup_
 check "called \"setsid sh /script/radio_hal.sh wifi_ap_on\" || { sleep_real=1; i=0; while [ \$i -lt 20 ] && ! called \"setsid sh /script/radio_hal.sh wifi_ap_on\"; do i=\$((i+1)); command sleep 0.05; done; called \"setsid sh /script/radio_hal.sh wifi_ap_on\"; }" \
   "the AP launched after the signal"
 check "! called wireless_down && ! called \"OCBM_GO_FALLBACK=1\"" "no teardown, no fallback"
+check "[ \"\$wl_raised\" = 1 ]" "the radios raised: no teardown may take its early return until one has run"
 '
 
   run_case "$sh" '
@@ -262,6 +265,25 @@ check "called \"BT_PAIRING_MODE=just_works\" && called \"exec /usr/sbin/btd\"" "
 '
 
   run_case "$sh" '
+# The release review of 3b38d37 (A1-2): after a go, a teardown runs even when nothing it looks at is up yet. The go
+# launched the AP detached; with its btd failed and the host gone before hostapd showed, the early return left the AP
+# coming up with no host. The real wireless_down here (sourced again over the stub), its commands stubbed.
+. "$2"
+hciconfig() { :; }
+now() { echo 100; }
+wireless_down; settle
+check "! called \"WL_TEARDOWN=\"" "nothing raised and nothing up: the early return, as before"
+wl_raised=1; : > "$CALLS"
+wireless_down; settle
+check "called \"WL_TEARDOWN=\" && [ \"\$wl_raised\" = 0 ]" "after a go with nothing up yet: the teardown runs, and it clears the flag"
+: > "$CALLS"; wireless_down; settle
+check "! called \"WL_TEARDOWN=\"" "a second, with nothing raised since: the early return again"
+mkdir "$RADIO_LOCKS/.radio_lock_wlan"; : > "$CALLS"
+wireless_down; settle
+check "called \"WL_TEARDOWN=\"" "an AP bring-up under way (its wlan lock held): the teardown runs"
+'
+
+  run_case "$sh" '
 # The go'"'"'s answer.
 go_pending=1; go_pid=340; go_since=100; proc 340 btd S; p=1
 wireless_up() { echo "wireless_up ${1:-}" >> "$CALLS"; }
@@ -301,6 +323,7 @@ check "! called \"kill -USR1\"" "and no go to a btd that never armed"
 arm_pid=360; arm_since=10
 wireless_up; settle
 check "[ -z \"\$arm_pid\" ] && called \"OCBM_GO_FALLBACK=0\" && ! called \"kill -USR1\"" "no armed btd: today'"'"'s bring-up"
+check "[ \"\$wl_raised\" = 1 ]" "today'"'"'s bring-up raised the radios too: no early return until a teardown has run"
 '
 done
 [ "$fails" -eq 0 ] && echo "session_supervisor_test: all passed ($passes checks)" || { echo "session_supervisor_test: $fails failed"; exit 1; }

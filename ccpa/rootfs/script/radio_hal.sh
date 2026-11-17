@@ -528,6 +528,29 @@ do_wifi_ap_on() {
 
 ap_ip_of() { ifconfig "$1" 2>/dev/null | sed -n 's/.*inet addr:\([0-9.]*\).*/\1/p' | head -1; }
 
+# The AP's DHCP server(s), by config path (never the NCM server, `busybox udhcpd -f /tmp/udhcpd_ncm.conf`), and their
+# stop: SIGTERM, up to 3 s for them to go, then SIGKILL and up to 1 s more. BusyBox udhcpd writes its lease file
+# (/var/lib/udhcpd.leases, on the jffs2 root) as it exits on SIGTERM; with flash slow (garbage collection just after an
+# update's commit removed its .prev binaries) the server outlived the teardown, the next AP start took it for its own and
+# started none, and once it had gone the AP had no DHCP (the release review of resident-bt, A3-1; radio_ap_up.sh keeps
+# the same functions for its start). AP_DHCP_MATCH is a test hook.
+AP_DHCP_MATCH=${AP_DHCP_MATCH:-udhcpd .*etc/udhcpd.conf}
+ap_dhcp_pids() { ps 2>/dev/null | grep -v grep | grep "$AP_DHCP_MATCH" | awk '{print $1}'; }
+ap_pids_live() { for _apl in "$@"; do kill -0 "$_apl" 2>/dev/null && return 0; done; return 1; }
+ap_dhcp_stop() {
+  _ads=$(ap_dhcp_pids)
+  [ -n "$_ads" ] || return 0
+  for _adp in $_ads; do kill "$_adp" 2>/dev/null; done
+  _adn=0; while [ "$_adn" -lt 15 ] && ap_pids_live $_ads; do _adn=$((_adn + 1)); sleep 0.2; done
+  ap_pids_live $_ads || return 0
+  log "the AP's DHCP server is still there 3 s after SIGTERM (its lease file on flash?) - SIGKILL"
+  for _adp in $_ads; do kill -9 "$_adp" 2>/dev/null; done
+  _adn=0; while [ "$_adn" -lt 10 ] && ap_pids_live $_ads; do _adn=$((_adn + 1)); sleep 0.1; done
+  ap_pids_live $_ads || return 0
+  log "the AP's DHCP server survived SIGKILL (a kernel wait?)"
+  return 1
+}
+
 do_wifi_ap_off() {
   caps || true
   # Chipset-neutral teardown. Deliberately NO module unload: whether rmmod is safe (and whether
@@ -544,10 +567,10 @@ do_wifi_ap_off() {
   # the management link - on a box with no UART that is the only way in, and it is exactly what
   # the vendor's close_bluetooth_wifi.sh does. Identify it by its CONFIG PATH, which is
   # unambiguous: the NCM server runs `busybox udhcpd -f /tmp/udhcpd_ncm.conf`.
-  for _p in $(ps 2>/dev/null | grep -v grep | grep "udhcpd .*etc/udhcpd.conf" | awk '{print $1}'); do
-    kill "$_p" 2>/dev/null
-  done
-  [ -e /var/run/udhcpd.pid ] && kill "$(cat /var/run/udhcpd.pid 2>/dev/null)" 2>/dev/null
+  # And see it GONE (ap_dhcp_stop): one still writing its lease file was the next AP's DHCP server
+  # that never was. Its pidfile's pid is no longer killed blind: the server is found by its config path
+  # as above, and a stale pidfile can name any process.
+  ap_dhcp_stop
   _i=$(wlan_iface 2>/dev/null) && ifconfig "$_i" down 2>/dev/null
   _n=0; while [ "$_n" -lt 25 ] && ap_running; do _n=$((_n+1)); sleep 0.2; done
   ap_running && { log "hostapd still running after teardown"; publish "$WLAN_STATE" "result=fail" "detail=ap-survived"; return 1; }
@@ -911,6 +934,7 @@ do_bt_off() {
 }
 
 # =============================================================================================
+[ "${RADIO_HAL_FUNCS:-}" = 1 ] && return 0   # sourced for its functions (tools/radio_ap_up_test.sh)
 case "$VERB" in
   probe)
     caps || exit 3
