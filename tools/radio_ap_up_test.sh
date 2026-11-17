@@ -35,6 +35,51 @@ said() { grep -qF -- "$2" "$1.out"; }
 untold() { ! grep -qF -- "$2" "$1.out"; }   # the key is never logged
 rest() { [ "$(grep -v '^wpa_passphrase=' "$1/etc/hostapd.conf")" = "$(printf 'interface=wlan0\nssid=CarLink-fd6c\nchannel=36')" ]; }
 
+# ap_configure's cases (16 Nov 2026). A scratch adapter as a session's first AP start finds it: hostapd.conf on wlan0
+# under an older name, udhcpd.conf's pool on NCM's subnet, the box's name kept, and the AP interface sta0.
+adapter() {  # $1 dir
+  rm -rf "$1"; mkdir -p "$1/etc/ocbm" "$1/tmp" "$1/sys/class/net/sta0"
+  printf 'interface=wlan0\nssid=ccpa-fe01\nwpa_passphrase=%s\nhw_mode=a\nchannel=36\nht_capab=[HT40+]\n' "$PW" > "$1/etc/hostapd.conf"
+  printf 'start 192.168.50.100\nend 192.168.50.200\ninterface wlan0\nlease_file /var/lib/udhcpd.leases\n' > "$1/etc/udhcpd.conf"
+  echo "CarLink-fd6c" > "$1/etc/carplay_ident"
+  echo "02:00:00:00:fe:01" > "$1/sys/class/net/sta0/address"
+}
+# ap_configure then ap_stamp under shell $1 on adapter $2 for interface $3, as PREP runs them; what it said in $2.out.
+conf() {
+  OCBM_TEST_PATH="${OCBM_TEST_PATH:-$SED_SHIM}" RADIO_AP_UP_FUNCS=1 IF="$3" \
+    "$1" -c '. "$1" && ap_configure "$2" && ap_stamp "$2"' sh "$AP" "$2" > "$2.out" 2>&1
+}
+# ap_prepared_ok under shell $1 on adapter $2 for interface $3 (the seam's name for the box in $4): "NAME WLANIP ch".
+prepared() {
+  OCBM_TEST_PATH="${OCBM_TEST_PATH:-$SED_SHIM}" RADIO_AP_UP_FUNCS=1 IF="$3" RADIO_BOX_NAME="${4:-}" \
+    "$1" -c '. "$1" && ap_prepared_ok "$2" && echo "$NAME $WLANIP $ch"' sh "$AP" "$2"
+}
+# Every file of adapter $1 back to 2020, and a mark at 2021 that nothing_newer measures against.
+age() { find "$1/etc" -type f -exec touch -t 202001010000 {} +; touch -t 202101010000 "$1.mark"; }
+nothing_newer() { [ -z "$(find "$1/etc" -type f -newer "$1.mark")" ]; }
+
+# BusyBox's and GNU sed edit in place with a bare -i; a BSD sed (a Mac's) takes -i with a suffix. On such a host the
+# AP layer's sed -i is given a stand-in that does the same edit with this host's sed. tools/busybox_suites.sh and the
+# cross builder run the real thing.
+SED_SHIM=""
+echo a > "$T/sedtest"
+if [ -z "${OCBM_TEST_PATH:-}" ] && { ! sed -i 's/a/b/' "$T/sedtest" 2>/dev/null || [ "$(cat "$T/sedtest")" != b ]; }; then
+  mkdir -p "$T/shim"
+  _realsed="$(command -v sed)"
+  cat > "$T/shim/sed" <<EOF
+#!/bin/sh
+if [ "\$1" = -i ]; then
+  shift; _s=\$1; shift
+  for _f in "\$@"; do "$_realsed" "\$_s" "\$_f" > "\$_f.shim" && cat "\$_f.shim" > "\$_f"; rm -f "\$_f.shim"; done
+else
+  exec "$_realsed" "\$@"
+fi
+EOF
+  chmod 755 "$T/shim/sed"
+  SED_SHIM="$T/shim"
+  echo "== this host's sed takes -i with a suffix: the AP layer's in-place edits run through a stand-in"
+fi
+
 . "$HERE/test_shells.sh"
 for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   command -v "$sh" >/dev/null 2>&1 || { echo "== $sh: not installed, skipped"; continue; }
@@ -73,5 +118,50 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   else
     echo "  (skipped: a new random key needs md5sum, which this host lacks)"
   fi
+
+  # ---- the AP's configuration (ap_configure), and the stamp the armed state's PREP leaves (16 Nov 2026) ----------
+  echo "== $sh: ap_configure, the configuration written ahead, and its stamp"
+  R="$T/cfg"; adapter "$R"
+  conf "$sh" "$R" sta0
+  check 'grep -qx "ssid=CarLink-fd6c" "$R/etc/hostapd.conf" && grep -qx "interface=sta0" "$R/etc/hostapd.conf" && grep -qx "channel=36" "$R/etc/hostapd.conf"' \
+    "hostapd.conf: the box's name, the AP interface, its channel"
+  check 'grep -q "^start[[:space:]]*192\.168\.43\.100" "$R/etc/udhcpd.conf" && grep -q "^end[[:space:]]*192\.168\.43\.200" "$R/etc/udhcpd.conf"' \
+    "udhcpd.conf: the pool moved off NCM's 192.168.50 onto the AP's subnet"
+  check 'grep -qx "interface	sta0" "$R/etc/udhcpd.conf" && grep -qx "lease_file	/var/lib/udhcpd.leases" "$R/etc/udhcpd.conf" && grep -qx "pidfile	/var/run/udhcpd.pid" "$R/etc/udhcpd.conf" && grep -qx "auto_time	60" "$R/etc/udhcpd.conf"' \
+    "udhcpd.conf: the interface and BusyBox's three keys"
+  check '[ "$(cat "$R/etc/wifi_name")" = CarLink-fd6c ] && [ "$(key "$R")" = "$PW" ]' "the name kept for the vendor's readers; a good key untouched"
+  check '[ "$(cat "$R/tmp/.radio_ap_prepared")" = "sta0 CarLink-fd6c 192.168.43.1 36 0" ]' \
+    "the stamp: interface, name, address, channel, 2.4 GHz flag"
+  # Again, unchanged: nothing written (the arm runs this at every host departure, and /etc is flash).
+  age "$R"
+  conf "$sh" "$R" sta0
+  check 'nothing_newer "$R"' "a second configuration with nothing changed writes no file"
+  check '[ "$(grep -c . "$R/etc/udhcpd.conf")" = 6 ]' "and adds no key twice"
+  # The stamp is trusted for the interface it names while nothing it was written from has changed since.
+  age "$R"; touch -t 202101010000 "$R/tmp/.radio_ap_prepared"
+  check 'prepared "$sh" "$R" sta0 >"$R.p" && [ "$(cat "$R.p")" = "CarLink-fd6c 192.168.43.1 36" ]' \
+    "trusted: the name, address and channel from the stamp"
+  check '! prepared "$sh" "$R" wlan0 >/dev/null' "not for another interface"
+  check '! prepared "$sh" "$R" sta0 CarLink-0000 >/dev/null' "not when the seam names the box otherwise"
+  touch -t 202201010000 "$R/etc/hostapd.conf"
+  check '! prepared "$sh" "$R" sta0 >/dev/null' "not once hostapd.conf is newer than the stamp"
+  age "$R"; touch -t 202101010000 "$R/tmp/.radio_ap_prepared"
+  check 'prepared "$sh" "$R" sta0 >/dev/null' "(trusted again with hostapd.conf as old as before)"
+  touch -t 202001010000 "$R/etc/wifi_use_24G"
+  check '! prepared "$sh" "$R" sta0 >/dev/null' "not once the 2.4 GHz flag is there, however old"
+  rm "$R/etc/wifi_use_24G"; echo "CarLink-beef" > "$R/etc/carplay_ident"; touch -t 202001010000 "$R/etc/carplay_ident"
+  check '! prepared "$sh" "$R" sta0 >/dev/null' "not once /etc/carplay_ident names the box otherwise"
+  echo "CarLink-fd6c" > "$R/etc/carplay_ident"; touch -t 202001010000 "$R/etc/carplay_ident"
+  echo "sta0 CarLink-fd6c 192.168.43.1 x 0" > "$R/tmp/.radio_ap_prepared"; touch -t 202101010000 "$R/tmp/.radio_ap_prepared"
+  check '! prepared "$sh" "$R" sta0 >/dev/null' "not a stamp with a channel that is no number"
+  # A changed input is configured afresh: the 2.4 GHz flag moves the AP to channel 6 in g.
+  : > "$R/etc/wifi_use_24G"
+  conf "$sh" "$R" sta0
+  check 'grep -qx "channel=6" "$R/etc/hostapd.conf" && grep -qx "hw_mode=g" "$R/etc/hostapd.conf" && [ "$(cat "$R/tmp/.radio_ap_prepared")" = "sta0 CarLink-fd6c 192.168.43.1 6 1" ]' \
+    "the 2.4 GHz flag: channel 6, hw_mode g, and the stamp says so"
+  # Never 192.168.50.x: an /etc/wifi_ip that reads as NCM's subnet (octal here) is refused, as before.
+  printf '192.168.062.1\n' > "$R/etc/wifi_ip"
+  conf "$sh" "$R" sta0
+  check 'grep -q "192\.168\.43\.100" "$R/etc/udhcpd.conf" && said "$R" "not a plain IPv4 address"' "an octal 192.168.062.1 is refused, the AP stays on .43"
 done
 [ "$fails" -eq 0 ] && echo "radio_ap_up_test: all passed" || { echo "radio_ap_up_test: $fails failed"; exit 1; }
