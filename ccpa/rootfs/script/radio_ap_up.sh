@@ -233,34 +233,46 @@ ap_configure() {
 }
 
 # ---- the configuration written ahead: its stamp ---------------------------------------------------
-# One line in $1/tmp/.radio_ap_prepared (tmpfs: a power cut forgets it), written after ap_configure:
-# "<interface> <name> <address> <channel> <2.4 GHz flag 0|1>". A later start on the same interface trusts it, and
-# skips ap_configure, while nothing ap_configure read or wrote is newer than it, the 2.4 GHz flag is as it was, and
-# the box's name is still the one it holds. Every check is the shell's own (test, read): this is the start a host's
-# arrival waits on. On success sets NAME, WLANIP and ch from it.
+# Two lines in $1/tmp/.radio_ap_prepared (tmpfs: a power cut forgets it), written after ap_configure:
+# "<interface> <name> <address> <channel> <2.4 GHz flag 0|1>", then the checksums of the files the configuration lives
+# in and is written from (ap_sums). A later start on the same interface trusts it, and skips ap_configure, while those
+# files hold what they held, the 2.4 GHz flag is as it was, and the box's name is still the one it holds. On success
+# sets NAME, WLANIP and ch from the stamp.
+# BY CONTENT, NEVER BY DATE (the release review of resident-bt, A3-2). The adapter's clock reads 2020-01-02 until a host
+# sets it, so a stamp the boot's arm wrote was dated before files a 2026 clock had written, a date comparison never
+# trusted it, and the fast path did nothing on the first connect after every power-up. One md5sum over five small files
+# is the one fork this costs a start. The passphrase's sources (/etc/ocbm/wifi_psk, /etc/wifi_password) are not
+# watched: ap_passphrase reads them only for a hostapd.conf without a good key, and hostapd.conf is watched.
 AP_PREPARED=/tmp/.radio_ap_prepared
+AP_WATCHED="hostapd.conf udhcpd.conf carplay_ident wifi_ip wifi_name"
+# The watched files' checksums under root $1, on one line, into _ap_sums. A file that is not there has none, so its
+# coming or going changes the line too.
+ap_sums() {
+  _ap_raw=$(cd "$1/etc" 2>/dev/null && md5sum $AP_WATCHED 2>/dev/null)
+  set -- $_ap_raw
+  _ap_sums="$*"
+}
 ap_stamp() {
   _s24=0; [ -e "$1/etc/wifi_use_24G" ] && _s24=1
-  echo "$IF $NAME $WLANIP $ch $_s24" 2>/dev/null >"$1$AP_PREPARED"
+  ap_sums "$1"
+  { echo "$IF $NAME $WLANIP $ch $_s24"; echo "$_ap_sums"; } 2>/dev/null >"$1$AP_PREPARED"
   return 0
 }
 ap_prepared_ok() {
   _st="$1$AP_PREPARED"
-  _p_if=""; _p_name=""; _p_ip=""; _p_ch=""; _p_24=""
-  read -r _p_if _p_name _p_ip _p_ch _p_24 _p_rest 2>/dev/null <"$_st"
-  [ -n "$_p_24" ] && [ "$_p_if" = "$IF" ] || return 1
+  _p_if=""; _p_name=""; _p_ip=""; _p_ch=""; _p_24=""; _p_sums=""
+  { read -r _p_if _p_name _p_ip _p_ch _p_24 _p_rest; read -r _p_sums; } 2>/dev/null <"$_st"
+  [ -n "$_p_24" ] && [ -n "$_p_sums" ] && [ "$_p_if" = "$IF" ] || return 1
   case "$_p_ch" in ''|*[!0-9]*) return 1 ;; esac
   _p_24now=0; [ -e "$1/etc/wifi_use_24G" ] && _p_24now=1
   [ "$_p_24" = "$_p_24now" ] || return 1
   [ -f "$1/etc/hostapd.conf" ] || return 1
-  for _pf in "$1/etc/hostapd.conf" "$1/etc/udhcpd.conf" "$1/etc/carplay_ident" "$1/etc/wifi_ip" "$1/etc/wifi_name" \
-             "$1/etc/wifi_password" "$1/etc/ocbm/wifi_psk" "$1/etc/wifi_use_24G"; do
-    [ -e "$_pf" ] && [ "$_pf" -nt "$_st" ] && return 1
-  done
   # The name: the seam's when it passes one, else the one /etc/carplay_ident holds (a name it would derive afresh, as
   # with no file, is not trusted from the stamp).
   _p_id=""; read -r _p_id 2>/dev/null <"$1/etc/carplay_ident"
   [ "$_p_name" = "${RADIO_BOX_NAME:-$_p_id}" ] || return 1
+  ap_sums "$1"
+  [ "$_ap_sums" = "$_p_sums" ] || return 1
   NAME=$_p_name; WLANIP=$_p_ip; ch=$_p_ch
   return 0
 }

@@ -130,35 +130,45 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   check 'grep -qx "interface	sta0" "$R/etc/udhcpd.conf" && grep -qx "lease_file	/var/lib/udhcpd.leases" "$R/etc/udhcpd.conf" && grep -qx "pidfile	/var/run/udhcpd.pid" "$R/etc/udhcpd.conf" && grep -qx "auto_time	60" "$R/etc/udhcpd.conf"' \
     "udhcpd.conf: the interface and BusyBox's three keys"
   check '[ "$(cat "$R/etc/wifi_name")" = CarLink-fd6c ] && [ "$(key "$R")" = "$PW" ]' "the name kept for the vendor's readers; a good key untouched"
-  check '[ "$(cat "$R/tmp/.radio_ap_prepared")" = "sta0 CarLink-fd6c 192.168.43.1 36 0" ]' \
-    "the stamp: interface, name, address, channel, 2.4 GHz flag"
+  check '[ "$(head -1 "$R/tmp/.radio_ap_prepared")" = "sta0 CarLink-fd6c 192.168.43.1 36 0" ] && [ "$(sed -n 2p "$R/tmp/.radio_ap_prepared" | wc -w)" -eq 8 ]' \
+    "the stamp: interface, name, address, channel, 2.4 GHz flag, then a checksum for each of the four watched files there"
   # Again, unchanged: nothing written (the arm runs this at every host departure, and /etc is flash).
   age "$R"
   conf "$sh" "$R" sta0
   check 'nothing_newer "$R"' "a second configuration with nothing changed writes no file"
   check '[ "$(grep -c . "$R/etc/udhcpd.conf")" = 6 ]' "and adds no key twice"
-  # The stamp is trusted for the interface it names while nothing it was written from has changed since.
-  age "$R"; touch -t 202101010000 "$R/tmp/.radio_ap_prepared"
+  # The stamp is trusted for the interface it names while what it was written from holds what it held: by content,
+  # never by date. The release review of resident-bt (A3-2): the boot's arm writes the stamp under the 2020 clock the
+  # adapter keeps until a host sets it, and the files carry dates a 2026 clock gave them.
+  touch -t 202001020000 "$R/tmp/.radio_ap_prepared"; find "$R/etc" -type f -exec touch -t 202611161200 {} +
   check 'prepared "$sh" "$R" sta0 >"$R.p" && [ "$(cat "$R.p")" = "CarLink-fd6c 192.168.43.1 36" ]' \
-    "trusted: the name, address and channel from the stamp"
+    "files dated after the stamp, their contents as they were: trusted, the name, address and channel from it"
   check '! prepared "$sh" "$R" wlan0 >/dev/null' "not for another interface"
   check '! prepared "$sh" "$R" sta0 CarLink-0000 >/dev/null' "not when the seam names the box otherwise"
-  touch -t 202201010000 "$R/etc/hostapd.conf"
-  check '! prepared "$sh" "$R" sta0 >/dev/null' "not once hostapd.conf is newer than the stamp"
-  age "$R"; touch -t 202101010000 "$R/tmp/.radio_ap_prepared"
-  check 'prepared "$sh" "$R" sta0 >/dev/null' "(trusted again with hostapd.conf as old as before)"
+  cp -p "$R/etc/hostapd.conf" "$R/hostapd.keep"
+  sed 's/^channel=36$/channel=40/' "$R/hostapd.keep" > "$R/etc/hostapd.conf"; touch -t 201901010000 "$R/etc/hostapd.conf"
+  check '! prepared "$sh" "$R" sta0 >/dev/null' "not once hostapd.conf holds something else, however old its date"
+  cp -p "$R/hostapd.keep" "$R/etc/hostapd.conf"
+  check 'prepared "$sh" "$R" sta0 >/dev/null' "(trusted again with hostapd.conf as it was)"
+  printf '10.1.2.1\n' > "$R/etc/wifi_ip"
+  check '! prepared "$sh" "$R" sta0 >/dev/null' "not once /etc/wifi_ip is there"
+  rm "$R/etc/wifi_ip"
   touch -t 202001010000 "$R/etc/wifi_use_24G"
   check '! prepared "$sh" "$R" sta0 >/dev/null' "not once the 2.4 GHz flag is there, however old"
-  rm "$R/etc/wifi_use_24G"; echo "CarLink-beef" > "$R/etc/carplay_ident"; touch -t 202001010000 "$R/etc/carplay_ident"
+  rm "$R/etc/wifi_use_24G"; echo "CarLink-beef" > "$R/etc/carplay_ident"
   check '! prepared "$sh" "$R" sta0 >/dev/null' "not once /etc/carplay_ident names the box otherwise"
-  echo "CarLink-fd6c" > "$R/etc/carplay_ident"; touch -t 202001010000 "$R/etc/carplay_ident"
-  echo "sta0 CarLink-fd6c 192.168.43.1 x 0" > "$R/tmp/.radio_ap_prepared"; touch -t 202101010000 "$R/tmp/.radio_ap_prepared"
+  echo "CarLink-fd6c" > "$R/etc/carplay_ident"
+  check 'prepared "$sh" "$R" sta0 >/dev/null' "(trusted again with the name as it was)"
+  { echo "sta0 CarLink-fd6c 192.168.43.1 x 0"; sed -n 2p "$R/tmp/.radio_ap_prepared"; } > "$R.st"; mv "$R.st" "$R/tmp/.radio_ap_prepared"
   check '! prepared "$sh" "$R" sta0 >/dev/null' "not a stamp with a channel that is no number"
+  head -1 "$R/tmp/.radio_ap_prepared" | sed 's/ x / 36 /' > "$R.st"; mv "$R.st" "$R/tmp/.radio_ap_prepared"
+  check '! prepared "$sh" "$R" sta0 >/dev/null' "not a stamp of one line (an older one, without the checksums)"
   # A changed input is configured afresh: the 2.4 GHz flag moves the AP to channel 6 in g.
   : > "$R/etc/wifi_use_24G"
   conf "$sh" "$R" sta0
-  check 'grep -qx "channel=6" "$R/etc/hostapd.conf" && grep -qx "hw_mode=g" "$R/etc/hostapd.conf" && [ "$(cat "$R/tmp/.radio_ap_prepared")" = "sta0 CarLink-fd6c 192.168.43.1 6 1" ]' \
+  check 'grep -qx "channel=6" "$R/etc/hostapd.conf" && grep -qx "hw_mode=g" "$R/etc/hostapd.conf" && [ "$(head -1 "$R/tmp/.radio_ap_prepared")" = "sta0 CarLink-fd6c 192.168.43.1 6 1" ]' \
     "the 2.4 GHz flag: channel 6, hw_mode g, and the stamp says so"
+  check 'prepared "$sh" "$R" sta0 >/dev/null' "and that stamp is trusted"
   # Never 192.168.50.x: an /etc/wifi_ip that reads as NCM's subnet (octal here) is refused, as before.
   printf '192.168.062.1\n' > "$R/etc/wifi_ip"
   conf "$sh" "$R" sta0
