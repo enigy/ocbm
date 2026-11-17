@@ -18,6 +18,7 @@
 
 mod ap_watch;
 mod arbiter_client;
+mod armed;
 mod av;
 mod box_identity;
 mod bt_bringup;
@@ -122,11 +123,14 @@ fn just_opened() -> bool {
 /// Run one active wireless session: bring Bluetooth up discoverable, serve SSP + SDP + RFCOMM/iAP2,
 /// and hold until either the arbiter preempts us (wired claimed) or SIGTERM. `arbiter` is the claim
 /// connection when a real arbiter granted us; `None` in standalone mode (no arbiter server present).
+/// `from_armed` is the name the armed bring-up wrote, for this btd's first session after a go
+/// (`armed::run`): its controller is up already, so the session's bring-up is only the step the arm left for the go.
 fn run_active_session(
     shutdown: &Arc<AtomicBool>,
     arbiter: Option<BufReader<UnixStream>>,
     ctrl: &Arc<control::Control>,
     session_active: &Arc<AtomicBool>,
+    from_armed: Option<String>,
 ) {
     // Per-device name derived once per session (reads the Wi-Fi MAC / SoC serial). Used for the EIR
     // Complete Local Name (what the iPhone shows) and the wireless iAP2 identify.
@@ -135,7 +139,14 @@ fn run_active_session(
     // ends at go-quiet below, or when this returns early.
     let ap_watch = ap_watch::start();
     let accessory_name = carplay_iap2_core::message::accessory_name(ACCESSORY_BRAND);
-    if let Err(e) = bt_bringup::bring_up(HCI_DEV, &accessory_name, just_opened()) {
+    let up = match &from_armed {
+        Some(armed_name) => bt_bringup::open_from_armed(HCI_DEV, &accessory_name, armed_name).inspect(|()| {
+            // The connect timeline: this connect started from the armed state (`bt_armed=1`; `bt_power` is `-`).
+            startup::stamp(box_common::timeline::ARMED_KEY);
+        }),
+        None => bt_bringup::bring_up(HCI_DEV, &accessory_name, just_opened()),
+    };
+    if let Err(e) = up {
         log(&format!("Bluetooth bring-up failed: {e} -- retrying"));
         // Chunked so SIGTERM isn't stuck behind the full 5s retry delay.
         for _ in 0..5 {
@@ -353,6 +364,28 @@ fn main() {
     log("starting -- wireless CarPlay (Phase A1: Bluetooth discoverable + pairing + SDP)");
     log_radio_caps();
 
+    // ARMED (tools/session_supervisor.sh, "Armed Bluetooth"): started between host sessions, this btd brings the
+    // controller up invisible and waits for the next host's go (armed.rs). Nothing below runs before the go, so
+    // everything this process builds for a session is built when the host is here, as in a btd started at its
+    // arrival. A btd started at the host's arrival (today's path, and the fallback) skips this.
+    let mut from_armed = None;
+    if armed::requested() {
+        // Taken now and spent: its "opened" word (radio_hal.sh's bt_on) is never this btd's, whose arm opens the
+        // controller itself, so a later session's bring-up does its DOWN/UP.
+        let _ = just_opened();
+        let name = carplay_iap2_core::message::accessory_name(ACCESSORY_BRAND);
+        match armed::run(&shutdown, HCI_DEV, &name) {
+            armed::Outcome::Go { armed_name } => from_armed = Some(armed_name),
+            armed::Outcome::Exit(0) => return,
+            armed::Outcome::Exit(code) => std::process::exit(code),
+        }
+    }
+
+    // ===== A host session begins here (after go) =====
+    // From this line on the process is the host session's: at its start for a btd the supervisor started at the
+    // host's arrival, after the go for an armed one. Anything that belongs to "a host session begins" goes here,
+    // once per process, before the control port and the claim loop.
+
     // A fresh process asserts idle (audit 3.3): `/tmp/bt_phase` survives a crash/restart of this
     // daemon, so without this the previous process's deepest phase would be read as ours.
     bt_driver::publish_bt_phase(ocbm_proto::BTP_IDLE);
@@ -382,14 +415,14 @@ fn main() {
         match arbiter_client::try_claim(ARBITER_SOCK) {
             Ok(arbiter_client::ClaimResult::Granted(reader)) => {
                 denied_logged = false;
-                run_active_session(&shutdown, Some(reader), &ctrl, &session_active);
+                run_active_session(&shutdown, Some(reader), &ctrl, &session_active, from_armed.take());
             }
             Ok(arbiter_client::ClaimResult::GrantedStandalone) => {
                 if !standalone_logged {
                     log("no arbiter present -- running standalone (single-transport) until it is wired in");
                     standalone_logged = true;
                 }
-                run_active_session(&shutdown, None, &ctrl, &session_active);
+                run_active_session(&shutdown, None, &ctrl, &session_active, from_armed.take());
             }
             Ok(arbiter_client::ClaimResult::Denied) => {
                 if !denied_logged {

@@ -3,7 +3,9 @@
 //! Write_Scan_Enable, sent as a raw command rather than through `hciconfig piscan`/`noscan`, whose HCISETSCAN
 //! ioctl loses its wake-up on the CCPA's 3.14 kernel (see [`write_scan_enable`]); Write_Page_Timeout for btd's
 //! paging ([`write_page_timeout`]); and bring-up's identity writes ([`write_identity`]). Only the down/up is still
-//! `hciconfig`.
+//! `hciconfig`. For btd's armed state (Bluetooth powered but invisible between host sessions): the scan mode written
+//! and confirmed, read back from the controller, and the connections the kernel holds ([`write_scan_enable_waited`],
+//! [`read_scan_enable`], [`connections`]).
 //!
 //! Not the mgmt API: mgmt owns EIR and the discoverable flag, and on 3.14 `SET_DISCOVERABLE` is a
 //! no-op when the flag already holds the asked-for value — so the scan mode is written here too.
@@ -16,6 +18,7 @@ const BTPROTO_HCI: libc::c_int = 1;
 const HCI_CHANNEL_RAW: u16 = 0;
 
 // HCI opcode, OGF 0x03 (Host Controller & Baseband). opcode = (ogf << 10) | ocf.
+const OP_READ_SCAN_ENABLE: u16 = 0x0C19;
 const OP_WRITE_SCAN_ENABLE: u16 = 0x0C1A;
 const OP_WRITE_PAGE_TIMEOUT: u16 = 0x0C18;
 const OP_WRITE_LOCAL_NAME: u16 = 0x0C13;
@@ -177,6 +180,12 @@ impl HciSocket {
     /// any other status or on no answer. Needs [`HciSocket::receive_command_events`] first. Matched by opcode alone: a Complete
     /// for the same opcode the kernel had queued could end the wait early, which only skips this check for that write.
     fn cmd_waited(&self, opcode: u16, params: &[u8], wait: std::time::Duration) -> io::Result<()> {
+        self.cmd_answered(opcode, params, wait).map(|_| ())
+    }
+
+    /// [`HciSocket::cmd_waited`], returning the Command Complete's return parameters after its status byte (none for a
+    /// Command Status).
+    fn cmd_answered(&self, opcode: u16, params: &[u8], wait: std::time::Duration) -> io::Result<Vec<u8>> {
         self.cmd(opcode, params)?;
         let until = std::time::Instant::now() + wait;
         let mut buf = [0u8; 260];
@@ -203,9 +212,9 @@ impl HciSocket {
             if n < 0 {
                 return Err(io::Error::last_os_error());
             }
-            match command_status(&buf[..n as usize], opcode) {
-                Some(0) => return Ok(()),
-                Some(status) => {
+            match command_answer(&buf[..n as usize], opcode) {
+                Some((0, rest)) => return Ok(rest.to_vec()),
+                Some((status, _)) => {
                     return Err(io::Error::new(io::ErrorKind::Other, format!("HCI 0x{opcode:04x} failed: status 0x{status:02x}")));
                 }
                 None => {} // another command's answer
@@ -317,7 +326,14 @@ pub fn write_identity(dev: u16, class: u32, name: &str, eir: &[u8]) -> io::Resul
 
 /// The status an event packet `[0x04][event][len][params]` gives `opcode`: Command Complete `[ncmd][opcode][status]...`
 /// or Command Status `[status][ncmd][opcode]`; None for anything else, or another command's.
+#[cfg(test)]
 fn command_status(pkt: &[u8], opcode: u16) -> Option<u8> {
+    command_answer(pkt, opcode).map(|(status, _)| status)
+}
+
+/// [`command_status`], with the return parameters after the status: a Command Complete's (`[status][return...]`), none
+/// for a Command Status.
+fn command_answer(pkt: &[u8], opcode: u16) -> Option<(u8, &[u8])> {
     let (&kind, rest) = pkt.split_first()?;
     let (&event, rest) = rest.split_first()?;
     let (&len, params) = rest.split_first()?;
@@ -325,12 +341,75 @@ fn command_status(pkt: &[u8], opcode: u16) -> Option<u8> {
     if kind != HCI_EVENT_PKT {
         return None;
     }
-    let (op, status) = match event {
-        EVT_CMD_COMPLETE => (params.get(1..3)?, *params.get(3)?),
-        EVT_CMD_STATUS => (params.get(2..4)?, *params.first()?),
+    let (op, status, rest) = match event {
+        EVT_CMD_COMPLETE => (params.get(1..3)?, *params.get(3)?, params.get(4..)?),
+        EVT_CMD_STATUS => (params.get(2..4)?, *params.first()?, &params[..0]),
         _ => return None,
     };
-    (u16::from_le_bytes([op[0], op[1]]) == opcode).then_some(status)
+    (u16::from_le_bytes([op[0], op[1]]) == opcode).then_some((status, rest))
+}
+
+// ---- The armed controller (btd between host sessions: powered, invisible) ---------------------------------------
+
+/// Write_Scan_Enable as [`write_scan_enable`] does, then wait up to `wait` for its Command Complete: an error on a
+/// failed status or no answer. For btd's armed bring-up, which must KNOW the controller took "no scan".
+pub fn write_scan_enable_waited(dev: u16, scan: u32, wait: std::time::Duration) -> io::Result<()> {
+    let s = HciSocket::open_bound(dev)?;
+    s.receive_command_events()?;
+    s.cmd_waited(OP_WRITE_SCAN_ENABLE, &[scan as u8], wait)
+}
+
+/// Read_Scan_Enable: the scan mode the CONTROLLER holds ([`SCAN_NONE`], 1 inquiry only, [`SCAN_PAGE`],
+/// [`SCAN_PAGE_AND_INQUIRY`]), one real round trip under `wait`. Not the kernel's HCI_PSCAN/HCI_ISCAN flags, which
+/// only mirror the last command it saw: this is the chip's own answer, so it both proves the controller responsive
+/// and says whether anything can see it (btd's armed checks and its go).
+pub fn read_scan_enable(dev: u16, wait: std::time::Duration) -> io::Result<u8> {
+    let s = HciSocket::open_bound(dev)?;
+    s.receive_command_events()?;
+    let ret = s.cmd_answered(OP_READ_SCAN_ENABLE, &[], wait)?;
+    ret.first()
+        .copied()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Read_Scan_Enable answered with no scan mode"))
+}
+
+/// HCIGETCONNLIST: `_IOR('H', 212, int)`.
+const HCIGETCONNLIST: libc::c_ulong = 0x8004_48d4;
+/// How many connections one HCIGETCONNLIST asks for: more than the box ever holds (one phone, maybe two).
+const CONN_LIST_MAX: usize = 8;
+/// `struct hci_conn_list_req { u16 dev_id; u16 conn_num; struct hci_conn_info conn_info[]; }`: the list starts at 4,
+/// each `hci_conn_info` 16 bytes (handle @0, bdaddr @2, type @8, out @9, state @10, link_mode @12).
+const CONN_LIST_HEAD: usize = 4;
+const CONN_INFO_SIZE: usize = 16;
+
+/// One of the controller's connections: its handle and link type (1 ACL, 0 SCO, 2 eSCO).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Conn {
+    pub handle: u16,
+    pub link_type: u8,
+}
+
+/// The connections the kernel holds on controller `dev` (HCIGETCONNLIST, what `hcitool con` lists): btd's armed
+/// checks require none, since an armed controller may hold no link to anything.
+pub fn connections(dev: u16) -> io::Result<Vec<Conn>> {
+    let s = HciSocket::open()?;
+    let mut req = [0u8; CONN_LIST_HEAD + CONN_INFO_SIZE * CONN_LIST_MAX];
+    req[0..2].copy_from_slice(&dev.to_ne_bytes());
+    req[2..4].copy_from_slice(&(CONN_LIST_MAX as u16).to_ne_bytes());
+    // SAFETY: the buffer holds the request head and CONN_LIST_MAX hci_conn_info, as many as it asks the kernel for.
+    let rc = unsafe { libc::ioctl(s.0, HCIGETCONNLIST as _, req.as_mut_ptr()) };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(parse_conn_list(&req))
+}
+
+/// The connections in a HCIGETCONNLIST reply buffer: `conn_num` of them, at most as many as the buffer holds.
+fn parse_conn_list(reply: &[u8]) -> Vec<Conn> {
+    let Some(n) = reply.get(2..4).map(|b| u16::from_ne_bytes([b[0], b[1]]) as usize) else { return Vec::new() };
+    (0..n)
+        .map_while(|i| reply.get(CONN_LIST_HEAD + i * CONN_INFO_SIZE..CONN_LIST_HEAD + (i + 1) * CONN_INFO_SIZE))
+        .map(|c| Conn { handle: u16::from_ne_bytes([c[0], c[1]]), link_type: c[8] })
+        .collect()
 }
 
 /// Class of Device: 3 bytes, little-endian.
@@ -471,5 +550,67 @@ mod tests {
     fn disconnect_is_link_control_0x0006() {
         assert_eq!(OP_DISCONNECT, (0x01u16 << 10) | 0x0006);
         assert_eq!(BT_CONNECTED, 1);
+    }
+
+    /// The armed checks read the controller's own scan mode: Read_Scan_Enable's Command Complete is
+    /// `[ncmd][opcode][status][scan_enable]`, and its return parameter is what the scan mode is.
+    #[test]
+    fn read_scan_enable_s_answer_carries_the_scan_mode() {
+        assert_eq!(OP_READ_SCAN_ENABLE, (0x03u16 << 10) | 0x0019);
+        let op = OP_READ_SCAN_ENABLE.to_le_bytes();
+        let answer = [0x04, 0x0E, 0x05, 0x01, op[0], op[1], 0x00, 0x02];
+        assert_eq!(command_answer(&answer, OP_READ_SCAN_ENABLE), Some((0, &[0x02u8][..])), "page scan on");
+        let none = [0x04, 0x0E, 0x05, 0x01, op[0], op[1], 0x00, 0x00];
+        assert_eq!(command_answer(&none, OP_READ_SCAN_ENABLE), Some((0, &[0x00u8][..])));
+        let refused = [0x04, 0x0F, 0x04, 0x01, 0x01, op[0], op[1]];
+        assert_eq!(command_answer(&refused, OP_READ_SCAN_ENABLE), Some((0x01, &[][..])), "a Command Status has no scan mode");
+        assert_eq!(command_answer(&none, OP_WRITE_SCAN_ENABLE), None, "another command's");
+        assert_eq!(command_answer(&[0x04, 0x0E, 0x09, 0x01, op[0], op[1], 0x00], OP_READ_SCAN_ENABLE), None, "short");
+    }
+
+    /// The list HCIGETCONNLIST writes back: `conn_num` entries of 16 bytes after a 4-byte head, against the kernel's
+    /// structs mirrored as `#[repr(C)]` (as the HCIGETCONNINFO test does).
+    #[test]
+    fn the_conn_list_is_read_as_the_kernel_lays_it_out() {
+        #[allow(dead_code)]
+        #[derive(Default)]
+        #[repr(C)]
+        struct HciConnInfo {
+            handle: u16,
+            bdaddr: [u8; 6],
+            kind: u8,
+            out: u8,
+            state: u16,
+            link_mode: u32,
+        }
+        #[allow(dead_code)]
+        #[derive(Default)]
+        #[repr(C)]
+        struct HciConnListReq {
+            dev_id: u16,
+            conn_num: u16,
+            conn_info: [HciConnInfo; 2],
+        }
+        let r = HciConnListReq::default();
+        let base = &r as *const HciConnListReq as usize;
+        assert_eq!(&r.conn_info as *const _ as usize - base, CONN_LIST_HEAD);
+        assert_eq!(std::mem::size_of::<HciConnInfo>(), CONN_INFO_SIZE);
+        assert_eq!(&r.conn_info[0].kind as *const u8 as usize - base, CONN_LIST_HEAD + 8, "the link type");
+        assert_eq!(HCIGETCONNLIST, HCIGETCONNINFO - 1, "_IOR('H', 212, int), one before HCIGETCONNINFO's 213");
+
+        let mut reply = [0u8; CONN_LIST_HEAD + CONN_INFO_SIZE * CONN_LIST_MAX];
+        assert!(parse_conn_list(&reply).is_empty(), "conn_num 0: no connection");
+        reply[2..4].copy_from_slice(&2u16.to_ne_bytes());
+        reply[4..6].copy_from_slice(&0x000cu16.to_ne_bytes());
+        reply[4 + 8] = ACL_LINK;
+        reply[20..22].copy_from_slice(&0x0101u16.to_ne_bytes());
+        reply[20 + 8] = 0;
+        assert_eq!(
+            parse_conn_list(&reply),
+            vec![Conn { handle: 0x000c, link_type: ACL_LINK }, Conn { handle: 0x0101, link_type: 0 }]
+        );
+        reply[2..4].copy_from_slice(&200u16.to_ne_bytes());
+        assert_eq!(parse_conn_list(&reply).len(), CONN_LIST_MAX, "never past the buffer");
+        assert!(parse_conn_list(&[0u8; 3]).is_empty());
     }
 }

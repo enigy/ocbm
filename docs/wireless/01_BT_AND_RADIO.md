@@ -2,7 +2,7 @@
 
 > **STATUS:** CURRENT · single owner for this topic. Consolidated 2026-08-31 from pre-consolidation docs 57, 51, 41, 40; the originals are in git history and in the 2026-08-31 backup. Correct this file in place — do not add a sibling.
 
-**Contents:** the chipset-agnostic radio HAL → accessory-initiated reconnect → the HCI event-mask regression → the bring-up race and its health check.
+**Contents:** the chipset-agnostic radio HAL → between host sessions: armed (Bluetooth powered, invisible) → accessory-initiated reconnect → the HCI event-mask regression → the bring-up race and its health check.
 
 ## Radio HAL — chipset-agnostic bring-up
 
@@ -35,7 +35,10 @@ is never examined. Those four sites now call `radio_hal.sh` (`session_supervisor
 branches); the old paths survive only in comments recording why they changed. Since 13 Nov 2026 `wifi_ap_on`
 runs in the background beside `bt_on` (Bluetooth is the critical path), and `btd` starts once `bt_on` is done. Its
 0x5703 reply reads the AP's SSID and passphrase, so a 0x5702 that arrives while `wifi_ap_on` still holds the wlan lock
-waits for it, up to 5 s (`wifi_handoff::wait_for_ap`); past that btd stays silent and the phone asks again. They share only the WLAN driver load, which
+waits for it, up to 5 s (`wifi_handoff::wait_for_ap`); past that btd stays silent and the phone asks again. Since 16 Nov
+2026 `radio_ap_up.sh` holds that lock until hostapd's own `AP-ENABLED` (2 s at most past the AP serving, then a
+hostapd still running counts), not a fixed second after the AP serves: the reply waits for an AP that is up, never
+for a timer. From the armed state (below) the AP's bring-up is a launch from its configuration written ahead. They share only the WLAN driver load, which
 `wlan_driver_up` serialises under its own lock, and `radio_detect.sh` writes its descriptor through a
 per-caller temporary file. `caps()` detects once per boot and reuses a descriptor that found wireless.
 ocbmd logs each HELLO and a host's first frames after 5 s of silence with the uptime, to place a stalled open. They
@@ -175,10 +178,11 @@ rewrite; an unknown SDIO id refuses both lines.
 
 #### `ccpa/rootfs/script/radio_hal.sh` — the seam
 
-Verbs `probe | status | wifi_ap_on | wifi_ap_off | bt_on | bt_off | preload`.
+Verbs `probe | status | wifi_ap_on | wifi_ap_off | wifi_ap_prep | bt_on | bt_off | preload`.
 Exit `0` converged now · `1` ran and failed · `2` already converged · `3` unsupported on this
 unit. Single-flight `mkdir` locks per subsystem; state published atomically to
-`/tmp/.radio_wlan_state` and `/tmp/.radio_bt_state`.
+`/tmp/.radio_wlan_state` and `/tmp/.radio_bt_state`. `wifi_ap_prep` (16 Nov 2026) writes the AP's
+configuration ahead and raises nothing; the armed state below runs it.
 
 Three contract clauses, each bought with a real failure:
 
@@ -474,6 +478,126 @@ because BT attach waits for WLAN on this part, Bluetooth with it. Both forms now
   managed`). No Broadcom hardware is available to this project. RTL8733BS and SD8987 are
   likewise unexercised — the seam resolves them on paper from their own dispatchers, which is
   the whole design claim, but that claim is only measured on 0xc822 so far.
+
+---
+
+## Between host sessions: armed (Bluetooth powered, invisible)
+
+**Status: built 16 Nov 2026 (branch `resident-bt`), NOT benched.** Unit tests and the shell suites only; the bench
+plan is in [../ops/02_TESTING.md](../ops/02_TESTING.md), "The armed path".
+
+The owner's decision of 16 Nov 2026: between host sessions Bluetooth may stay **powered but invisible**. "Invisible"
+is hard: with no host here the controller has page scan and inquiry scan off, pages nobody and holds no connection,
+so nothing can see it or connect to it and it reaches out to nobody. Until then the teardown left it attached and
+powered down, and each connect paid `radio_hal.sh bt_on` (0.75 s) and btd's start and bring-up (0.16 s) before its
+first page: `page_start` 1.17 s after the host on the dev adapter's 16 Nov wake bench (IW416). About 90% of this
+owner's connects are wakes (the adapter stayed powered), so that is the path this is for.
+
+**One fresh btd per host session still holds; the next host's starts early.** With no host here, once the last
+teardown is over (or the boot preload is done), `tools/session_supervisor.sh` starts btd with `OCBM_BTD_ARM=1`
+(`arm_gate`, `arm_wireless`). That btd (`crates/vendor/wireless/src/armed.rs`) runs `bt_bringup::arm` under the
+seam's Bluetooth lock, writes its pid to `/tmp/.btd_armed`, and waits in `poll()` on a self-pipe its SIGUSR1 and
+SIGTERM handlers write to. Nothing else of a btd's start runs before the host's go: the control port, `Control` (the
+policy file, the switch hold it takes up), `/tmp/bt_phase`, the `[startup]` record and every session thread start
+after it, as in a btd started at the host's arrival, so every per-process assumption (first-arm-wins caches,
+per-session state) is unchanged. The gate, cheapest first: armed Bluetooth not switched off, a wireless session ran
+since the last arm (or this is the supervisor's start), `hci0` attached (an arm never attaches: at boot the preload
+does, without it the first host's session does), no seam lock (the preload holds both), no teardown in flight (the
+2.6.0 ordering), no wired phone on the bus (its session would be wired, and the radios stay down for it), no btd.
+
+**Invisible: the state, and its proof.** The arm, in order:
+1. mgmt `SET_CONNECTABLE=0` while the controller is down (`ssp_agent::clear_connectable`): a flag change only, so the
+   kernel's own power-on (its `powered_update_hci`, which writes Scan_Enable from those flags) enables no scan;
+2. the DOWN→UP cycle a session's bring-up does (`hci_dev_do_open`: the SSP event mask), the controller reset on the
+   way down, so its Scan_Enable is the spec default, none;
+3. the identity writes (Simple Pairing, class, name, EIR), each waited for, as a session's;
+4. Write_Scan_Enable `0x00`, waited for its Command Complete (`hci::write_scan_enable_waited`);
+5. the proof: Read_Scan_Enable answers `0x00` from the chip itself (`hci::read_scan_enable`, not the kernel's
+   PSCAN/ISCAN mirror) and HCIGETCONNLIST lists no connection (`hci::connections`); otherwise the arm fails.
+
+Nothing pages (no reconnect thread), nothing listens (no SDP server, no RFCOMM listener, no SSP agent) and nothing
+turns LE on. Every 180 s the armed btd checks again (one Read_Scan_Enable round trip and the connection list): a
+controller found visible or holding a link is hidden again (scan none, each link disconnected), three times at most;
+one that does not answer is asked again 2 s later, and only the fifth miss in a row gives the armed state up, as
+`bt_responsive_confirmed` does. A check never resets anything: btd exits, and the supervisor (`arm_watch`) powers
+Bluetooth down through the seam (`bt_off`), the between-sessions state of 2.6.0, so the next host takes today's path.
+On a bench: `hciconfig hci0` reads `UP RUNNING` with neither `PSCAN` nor `ISCAN`; `hcitool con` lists nothing; a
+phone that scans never finds the box, and a bonded one shows it "Not Connected"; `/tmp/wl.log` carries `[armed] armed as
+"CarLink-…": Bluetooth powered, scan 0x00 (page and inquiry off), 0 connection(s), …` and no `[reconnect]`,
+`[ssp-agent]` or `[sdp…]` line until `[armed] go: …`.
+
+**The go.** ocbmd raises `/tmp/host_present` and wakes the supervisor. `wireless_up` finds its armed btd ready
+(`btd_armed_ready`: the file names the btd it started, a live one, not a zombie) and calls `wireless_go`: the inhibit
+(`/tmp/radio_off`), `wireless: false` and a wired session owning the box each put the armed Bluetooth down instead,
+as each keeps today's bring-up from starting; otherwise the go file `/tmp/.btd_go` (`pid=`, `BT_PAIRING_MODE`,
+`BT_SSP_INTERACTIVE`), the timeline stamps, SIGUSR1, and then the AP. No fork before the signal but one `awk` over
+the host's config (`cfg_snapshot`, held to the four functions it stands in for by
+`tools/session_supervisor_test.sh`). btd takes the inputs into its environment (no other thread runs yet), proves
+the controller with one Read_Scan_Enable round trip (150 ms, a second try), answers `ok <uptime ms>` in
+`/tmp/.btd_go_result`, and goes on as a btd started at the host's arrival. Its first session's bring-up is what the
+arm left: the conflicting daemons stopped, the identity rewritten if the session's name differs from the arm's (it
+derives from wlan0's MAC, which may have appeared since), and page plus inquiry scan on (`bring_up`'s last step; the
+SSP agent narrows it to the pairing window at once, as at every session start). A later session in the same process
+(a phone switch) runs `bring_up`'s DOWN→UP as before.
+
+**The fallback is today's path.** A failed proof (`fail …`, and btd wakes the supervisor), no answer in 3 s, no btd,
+or an arm still under way 3 s after the host came: the supervisor stops that btd and runs `wireless_up fallback`,
+today's wrapper unchanged (`bt_on`, a fresh btd) except that it skips the AP launch and the timeline stamps, which
+went out with the go. An arm under way at the host's arrival gets those 3 s to finish (it takes about one: the AP
+written ahead, then the DOWN→UP); a host back within a teardown finds no armed btd (none is started while a teardown
+runs) and takes today's path, the teardown first, as in 2.6.0.
+
+**The session's inputs, each as it reaches the btd that serves the host.**
+
+| Input | Today's path (at the host's arrival) | Armed |
+|---|---|---|
+| `BT_PAIRING_MODE`, `BT_SSP_INTERACTIVE` (the host YAML's `pairing:`) | btd's environment, from `wireless_up` | the go file, read at the go into btd's environment before the SSP agent reads them |
+| the A/V reap and the wireless A/V log's truncation (`OCBM_WL_REAPED`) | the wrapper, before btd | the arm's wrapper, before btd; nothing starts an A/V daemon between the arm and the go |
+| `t sup_radios`, `t usb_edge` (the timeline) | the wrapper | the supervisor at the go |
+| `CARPLAY_BTMON` / `/tmp/carplay_btmon` | the wrapper | the supervisor at the go (`btmon_lever`) |
+| the supervisor's own environment (PATH, bench levers) | inherited | inherited at the arm, from the same supervisor process; a restarted supervisor tears an armed btd it did not start down and arms its own |
+| btd's per-process state: control port, `Control`'s policy and switch hold, `/tmp/bt_phase` | at btd's start | after the go |
+| the session's record, its name, the bonds, the pairing window | at the session's start | at the session's start, after the go |
+| `/tmp/.radio_bt_warm` ("opened") | read by btd's first bring-up | spent at the arm, unread: the arm opens the controller itself |
+
+**Each case.** *The 30 s display-off cycle:* the teardown (≈2 s), then the arm (≈1 s), then the go. *Host back within
+the teardown:* today's path, unchanged. *The boot preload:* the arm follows it once `hci0` is attached and its locks
+are free; a self-test wait, the legacy first-boot trial (no preload) and a preload its guard switched off all leave
+`hci0` unattached, so there is no arm until a host's session has attached it; a preload that starts after an arm
+(its self-test passed late) finds the controller up, answering, and leaves it (its rc 2). *`/tmp/radio_off`:*
+ocbmd clears it on every SUBSCRIBE and on the host's loss, so it is never set while armed; set at the arrival it puts
+the armed Bluetooth down. *`wireless: false`:* down at the arrival; a session ended without wireless is not followed
+by an arm. *A wired session* (Hot-Handover off): down at the arrival with A2's restore owed, so the cable's going
+restores the stack; no arm while a wired phone is plugged in. *Restart wireless and Forget phone:* with the host here
+they go through today's path (`wireless_down`, then today's bring-up); one that lands while no host is here re-arms.
+*Pairing a new phone:* armed, the box is neither discoverable nor connectable; at the go the session's SSP agent
+applies the pairing window as always (discoverable inside it, or while no phone is bonded). *An update:* it is
+placed with a host here (a session btd) and restarts the adapter; the new version's boot preload then precedes its
+arm. The update trial's commit (`ocbm_dispatch.sh` `btd_settles`) sees an armed btd as a running btd. *ocbmd
+restarting:* with a host here it drops presence, a teardown, then an arm or today's path; with none here nothing
+changes. *The supervisor restarting:* an armed btd it did not start is torn down at its start; it arms its own.
+*btd crashing while armed:* its controller is left powered and scan-off; `arm_watch` sees the btd gone and powers it
+down through the seam, and the next host takes today's path.
+
+**The AP, written ahead (A3).** The 0.94 s between the radios starting and hostapd's launch on the 16 Nov wake bench
+was ours: `radio_hal.sh` reading its descriptor, the driver step (already loaded), then `radio_ap_up.sh` deriving the
+name and rewriting `hostapd.conf`, `udhcpd.conf` and `/etc/wifi_name` on flash, about 45 forks and 7 flash writes
+before hostapd. The arm's wrapper now runs `radio_hal.sh wifi_ap_prep` (`radio_ap_up.sh PREP`: the configuration
+only, nothing raised: no address, no hostapd, no udhcpd, no beacon), which leaves `/tmp/.radio_ap_prepared`
+(`<interface> <name> <address> <channel> <2.4 GHz flag>`). At the go, `wifi_ap_on`'s fast path skips the descriptor
+and the driver step, and `radio_ap_up.sh` trusts the stamp while nothing it was written from is newer than it, the
+2.4 GHz flag is as it was and `/etc/carplay_ident` (or the seam) still names the box the same (all `test`/`read`, no
+fork): the address goes on the interface, then hostapd is the first thing launched. Its own 0.86 s to `AP-ENABLED`
+(`COUNTRY_UPDATE`, then `HT_SCAN` for `[HT40+]`, in its log) is the AP's, not ours: hostapd skips that scan only on
+`noscan=1`, which a hostapd that lacks it refuses as an unknown item (and so fails to start), and this one is packed
+so its version cannot be read off the file; it is left alone (see docs/ops/04_OPEN_ITEMS.md). Every `ap_configure`
+write now happens only where a file differs (the arm runs it at every host departure), so a configuration written
+by either path also stays current for the next. The fast path works without the arm too, whenever the stamp is
+current.
+
+**Off.** `/script/radio_arm_off` (the owner's, on flash) or the bench hook `/tmp/bench_arm_off` (`box_common::bench_flag`'s
+rule; Carlink writes `off` to clear it) keeps Bluetooth powered down between sessions, as in 2.6.0, from the next host
+departure on; an armed btd already running stays until then.
 
 ---
 

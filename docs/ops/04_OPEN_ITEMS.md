@@ -827,6 +827,20 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
 
 ### Radios, box identity & bring-up
 
+- **The armed state (Bluetooth powered but invisible between host sessions, the AP configured ahead) is built and
+  NOT benched** (branch `resident-bt`, 16 Nov 2026). Its smoke bench and its revert conditions:
+  docs/ops/02_TESTING.md, "The armed path". Unproven until then: the go's latency on the box (the target is
+  `page_start` within about 150 ms of the host, `ap_enabled` within about 1.3 s); that the 3.14 kernel's power-on
+  writes no scan once mgmt's connectable flag is cleared (the arm writes "none" and reads it back either way); BusyBox
+  ash running the new supervisor paths (the shell suites ran under bash's sh and dash on the Mac, BusyBox absent).
+  Source: docs/wireless/01_BT_AND_RADIO.md, "Between host sessions: armed".
+
+- **hostapd's own 0.86 s to `AP-ENABLED` (its `COUNTRY_UPDATE`, then the `HT_SCAN` that `[HT40+]` brings) is left as
+  it is.** `noscan=1` skips the scan in a hostapd that knows it and stops one that does not from starting (an unknown
+  configuration item is an error), and the adapter's hostapd is packed, so its version cannot be read off the file.
+  Decide on `/usr/sbin/hostapd -v` from a bench; the other way to drop the scan, `[HT40+]` off, halves the AP's
+  channel width and is the owner's call. Source: docs/wireless/01_BT_AND_RADIO.md, "The AP, written ahead".
+
 - **Broadcom and NXP mappings are refused, not resolved — those units report `unsupported` and get no
   wireless.** Closing it means slicing the dispatcher to the unit's own SDIO branch and resolving
   that branch's literal `var=value` assignments. Emitting the raw text instead is the documented

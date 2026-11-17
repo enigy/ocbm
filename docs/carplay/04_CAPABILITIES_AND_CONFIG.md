@@ -37,6 +37,12 @@ Issued by the owner on 2026-08-10 (EV-telematics research session):
    nothing a phone can see — so the first connect after power-up skips the driver and firmware
    load. The AP and a discoverable radio still come up only on app command. Mechanism and wedge
    guards: `radio_hal.sh` `do_preload`.
+   **Second exception (owner decision 2026-11-16; off with `/script/radio_arm_off`):** between host sessions
+   (after the preload, and after each session's teardown) Bluetooth may stay POWERED BUT INVISIBLE: page and inquiry
+   scan off, no connection, nothing paging, a btd armed for the next host's go. Still nothing a phone can see or
+   reach, the AP still down (its configuration only is written ahead), and paging, a connectable or discoverable
+   radio and the AP still come only with the app. Mechanism, proof and fallbacks:
+   [../wireless/01_BT_AND_RADIO.md](../wireless/01_BT_AND_RADIO.md), "Between host sessions: armed".
 4. **Box placement is earned, never designed-in.** The only path for functionality onto the box:
    implement app-driven first → it demonstrably FAILS under excessive testing → the owner explicitly
    approves the move. (Box-driven SETUP is the one placement made the other way, by decision: the

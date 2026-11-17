@@ -174,8 +174,19 @@ fn stamp(t0: std::time::Instant, what: &str) {
 
 /// Bring the controller up as a discoverable/connectable CarPlay-style accessory: set class, name,
 /// EIR, then enable page+inquiry scan (discoverable + connectable, no timeout).
+///
+/// Since 16 Nov 2026 in two steps, [`prepare`] and [`open_scans`], so the armed state (between host sessions,
+/// [`arm`]) can run the first ahead of the host and the second at its go ([`open_from_armed`]). This path runs both
+/// at once, exactly as before.
 pub fn bring_up(hci_dev: &str, name: &str, just_opened: bool) -> std::io::Result<()> {
     let t0 = std::time::Instant::now();
+    prepare(hci_dev, name, just_opened, t0)?;
+    open_scans(hci_dev, name, t0)
+}
+
+/// Everything [`bring_up`] does before the scan mode: the conflicting daemons stopped, the DOWN->UP cycle (unless
+/// `just_opened`), and the identity writes (Simple Pairing, class, name, EIR).
+fn prepare(hci_dev: &str, name: &str, just_opened: bool, t0: std::time::Instant) -> std::io::Result<()> {
     stamp(t0, "start");
     // Name the real fault at its source rather than letting it surface as an unexplained EINVAL.
     // Deliberately a LOG, not an early return: this is diagnostic, the controller may already be
@@ -247,12 +258,107 @@ pub fn bring_up(hci_dev: &str, name: &str, just_opened: bool) -> std::io::Result
         run(&[hci_dev, "inqdata", &eir_hex(name)])?;
     }
     stamp(t0, "sspmode, class, name, EIR");
+    Ok(())
+}
+
+/// [`bring_up`]'s last step: page and inquiry scan on, as a session starts. The SSP agent narrows it to the pairing
+/// window's state moments later (`ssp_agent::apply_pairing_state`: page scan only, unless the window is open or no
+/// phone is bonded), as it always has.
+fn open_scans(hci_dev: &str, name: &str, t0: std::time::Instant) -> std::io::Result<()> {
     // NOT `hciconfig piscan`: its HCISETSCAN ioctl loses its wake-up on this 3.14 kernel about one
     // bring-up in three and sleeps the full 10 s request timeout (`hci::write_scan_enable`).
     crate::hci::write_scan_enable(crate::hci::dev_id(hci_dev)?, crate::hci::SCAN_PAGE_AND_INQUIRY)?;
     stamp(t0, "class, name, EIR, piscan set");
     eprintln!("[btd] HCI bring-up OK dev={hci_dev} name={name}");
     Ok(())
+}
+
+// ---- The armed state: Bluetooth powered between host sessions, but invisible (owner decision, 16 Nov 2026) ----
+
+/// How long the armed bring-up waits for each command it must know the controller took.
+const ARMED_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// What an armed controller looks like from the inside: its own scan mode ([`crate::hci::read_scan_enable`]) and the
+/// connections the kernel holds on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Audit {
+    pub scan: u8,
+    pub conns: usize,
+}
+
+impl Audit {
+    /// Nothing can see it (no inquiry scan), nothing can connect to it (no page scan), and it holds no link.
+    pub fn invisible(self) -> bool {
+        self.scan == crate::hci::SCAN_NONE as u8 && self.conns == 0
+    }
+}
+
+/// One real round trip to the controller and a look at its links: [`Audit`]. An error when the controller does not
+/// answer within `wait`.
+pub fn audit(hci_dev: &str, wait: std::time::Duration) -> std::io::Result<Audit> {
+    let dev = crate::hci::dev_id(hci_dev)?;
+    let scan = crate::hci::read_scan_enable(dev, wait)?;
+    let conns = crate::hci::connections(dev)?.len();
+    Ok(Audit { scan, conns })
+}
+
+/// Make an armed controller invisible again after an [`audit`] found it otherwise: scan "none", waited for, and every
+/// link it holds disconnected. Nothing in the armed state turns a scan on or makes a link, so this is a repair of
+/// something outside btd, and the next audit says whether it held.
+pub fn hide(hci_dev: &str) -> std::io::Result<()> {
+    let dev = crate::hci::dev_id(hci_dev)?;
+    crate::hci::write_scan_enable_waited(dev, crate::hci::SCAN_NONE, ARMED_WAIT)?;
+    for c in crate::hci::connections(dev)? {
+        let _ = crate::hci::disconnect(dev, c.handle);
+    }
+    Ok(())
+}
+
+/// The armed bring-up: the controller up and set up as a session's [`bring_up`] leaves it (its DOWN->UP cycle, so the
+/// kernel's event mask is set, and the identity writes), but with page and inquiry scan OFF, and proved so by the
+/// controller's own answer. Nothing pages and nothing listens: no SDP server, no RFCOMM listener, no SSP agent until
+/// a host's go ([`open_from_armed`]).
+///
+/// Order is the invisibility argument. mgmt's connectable flag goes off first, while the controller is down (a flag
+/// change only), so the kernel's own power-on writes no scan; the controller is reset on the way down and up (its
+/// scan default is none); "none" is then written and waited for; and [`audit`] reads it back from the chip and finds
+/// no link. An error at any step fails the arm: btd exits, and the next host takes today's path.
+pub fn arm(hci_dev: &str, name: &str) -> std::io::Result<Audit> {
+    let t0 = std::time::Instant::now();
+    let dev = crate::hci::dev_id(hci_dev)?;
+    if let Err(e) = crate::ssp_agent::clear_connectable(dev) {
+        eprintln!("[bt-bringup] armed: mgmt connectable not cleared ({e}) -- the scan is still written off and read back");
+    }
+    prepare(hci_dev, name, false, t0)?;
+    crate::hci::write_scan_enable_waited(dev, crate::hci::SCAN_NONE, ARMED_WAIT)?;
+    let seen = audit(hci_dev, ARMED_WAIT)?;
+    stamp(t0, &format!("armed: scan 0x{:02x}, {} connection(s)", seen.scan, seen.conns));
+    if !seen.invisible() {
+        return Err(std::io::Error::other(format!(
+            "the controller reads scan 0x{:02x} with {} connection(s) after \"none\" was written",
+            seen.scan, seen.conns
+        )));
+    }
+    Ok(seen)
+}
+
+/// From the armed state into a session, at the host's go: what [`bring_up`] does that the arm left for now. The
+/// conflicting daemons stopped again, the identity rewritten when the session's name is not the one the arm wrote
+/// (`armed_name`: the name derives from wlan0's MAC, which may have appeared since), then [`open_scans`].
+pub fn open_from_armed(hci_dev: &str, name: &str, armed_name: &str) -> std::io::Result<()> {
+    let t0 = std::time::Instant::now();
+    stamp(t0, "from armed: start");
+    stop_conflicting_daemons();
+    if name != armed_name {
+        eprintln!("[bt-bringup] from armed: the name is {name} now, not {armed_name} -- rewriting the identity");
+        let dev = crate::hci::dev_id(hci_dev)?;
+        if let Err(e) = crate::hci::write_identity(dev, CLASS_OF_DEVICE, name, &eir_bytes(name)) {
+            eprintln!("[bt-bringup] raw identity writes failed ({e}) -- by hciconfig");
+            run(&[hci_dev, "name", name])?;
+            run(&[hci_dev, "inqdata", &eir_hex(name)])?;
+        }
+    }
+    open_scans(hci_dev, name, t0)
 }
 
 /// Stop being discoverable/connectable -- used when the arbiter preempts this session in favor of
