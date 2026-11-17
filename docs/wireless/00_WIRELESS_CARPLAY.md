@@ -173,10 +173,14 @@ then opens RTSP to `:5000`. carplayd used to be spawned when the phone asked for
   session that ends without a 0x5703 puts the earlier name back with its mark. The mark is this Bluetooth session's
   (the owner's rule, A2-2): the same phone back on Bluetooth is named afresh without it, unless its own CarPlay
   session is up or connecting (outliving its Bluetooth link: then nothing changes, and a live session is never
-  dialled). Until a phone is named carplayd serves and dials nobody. It serves only the named phone
-  (`phone_gate.rs`), and dials it only with the mark: a record that resolves before then is held and dialled the
-  moment the mark comes (`dial_ok` in the timeline), a mark that lands while a browse restarts included (A2-1). The
-  bench lever `/tmp/bench_dial_early` dials at the first resolve instead (docs/ops/02_TESTING.md, "Bench hooks").
+  dialled). The rule holds at the session's start only: if that CarPlay then ends before this session's 0x5703, the
+  phone may be dialled on the earlier mark, a reconnect dial as 2.6.0 made (known, `av::at_session_start`). Until a
+  phone is named carplayd serves and dials nobody. It serves only the named phone (`phone_gate.rs`), and dials it
+  only with the mark: a record that resolves before then is held and dialled the moment the mark comes (`dial_ok` in
+  the timeline), a mark that lands while a browse restarts included (A2-1). Discovery tells a naming by the gate's
+  epoch, not the file's text, so one that reads as the last ("A wifi", "A", "A wifi", or A, B, A within one restart)
+  is still a new naming. The bench lever `/tmp/bench_dial_early` dials at the first resolve instead
+  (docs/ops/02_TESTING.md, "Bench hooks").
 - **Before the AP has its address.** Every socket carplayd binds is a wildcard or the loopback (`[::]:5000`,
   `127.0.0.1:9110`/`:9112`, the per-session `[::]:0`), so none needs the AP. mdns-sd does: it reads the host's
   interfaces when its daemon starts and then every 30 s (`IP_CHECK_INTERVAL_MILLIS`). An address watch (NETLINK_ROUTE,

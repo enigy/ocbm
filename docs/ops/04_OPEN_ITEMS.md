@@ -324,7 +324,13 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
     A2-2, the same phone back on Bluetooth is named afresh without the mark of its earlier session unless its own
     CarPlay session is up or connecting (the owner's rule: no dial before this Bluetooth session's 0x5703); A2-3, a
     teardown beside the wired carplayd no longer waits 2 s for it; A2-4, the early start waits for what
-    `box_identity::derive` reads first.
+    `box_identity::derive` reads first. The second review's (17 Nov), same branch, NOT benched: its MEDIUM, a mark
+    lost and back ("A wifi", "A", "A wifi") or a name put back (A, B, A) within one browse restart read as no change,
+    and the phone was not dialled until it resolved again; discovery now tells a naming by the gate's epoch
+    (`PhoneGate::naming`, `Held::change_to`). Its LOW, left as known: A2-2's rule holds at a Bluetooth session's start
+    only, so a phone whose own CarPlay was up or connecting then keeps its earlier mark, and is dialled on it if that
+    CarPlay ends before the session's 0x5703: a reconnect dial, as 2.6.0 made; closing it would take the mark away
+    under a live session or need a watch on CarPlay's end in `bt_driver` (the reason in `av::at_session_start`).
   - `btd-p1-carlink-1`: `put_back`'s Connected should be provisional.
   - `e2e-4`: the same phone back within ~5 s while its own dead session is held is never re-checked
     (backstop: `carplay_never_reached` at 90 s).
