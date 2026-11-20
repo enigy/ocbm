@@ -710,6 +710,8 @@ directory, which the one-file installer makes (a unit without it keeps nothing a
 updates keep it, and the key notices a new `radio_detect.sh`; a revert keeps it for a retry, whose boot the key checks;
 the full way back to stock removes it, since its name is outside `is_radio()`'s `radio_*`. Not `/script`, where the
 preload's flags are: `is_radio()` keeps every `radio_*` file there through every deletion unless a remover names it.
+A start with a self-test (every trial start, an update's first) gains nothing from it: the self-test's own detection
+fills `/tmp/radio_caps` first, and nothing is kept from it; a final adapter's starts are the ones it serves.
 
 **2. The order: the Bluetooth firmware beside the Wi-Fi driver.** `RADIO_BT_AFTER_WLAN` is read off the whole attach
 script, so another branch's wait loop set it on the IW416. In Carlinkit's 2025.10.15.1127 scripts only the 0xc822

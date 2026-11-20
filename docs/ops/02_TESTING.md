@@ -599,7 +599,11 @@ set-up, the boot line. On the dev adapter, then the truck. **Every boot here is 
 cable (it is powered from it) or switch its port, and give it power again. Never `reboot`: the IW416 keeps its firmware
 through one, so a restart skips both downloads and times nothing of a cold boot (20 Nov); the line tells them apart
 ("The boot's radio line", above). Before each power cut, save the box log (Carlink's Save Logs, or `/tmp/box.log` over
-the console): `/tmp` goes with the power. Read the boot line with `grep '^\[radio-boot\]' /tmp/box.log`.
+the console): `/tmp` goes with the power. Read the boot line with `grep '^\[radio-boot\]' /tmp/box.log`. **On a final
+adapter** (`cat /script/ocbm_mode`): in a trial (and on an update's first start) the dispatcher runs the self-test at
+every start, whose `radio_detect.sh` fills `/tmp/radio_caps` (the boot line then reads `caps=detected`, and nothing is
+kept), and holds the preload until it passes, so neither the kept descriptor nor the early start shows there; the
+order does. After an update, step 1 is the first cold boot once the update has been committed.
 
 1. **The first power-up on this build, no host** (Carlink closed or the display off): the descriptor detected and kept.
    Box log `descriptor: kept on flash (/etc/ocbm/kept_radio_caps)`, the boot line `caps=detected`. Over the console:
