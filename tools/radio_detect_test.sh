@@ -4,7 +4,10 @@
 # prefix, so the test runs a copy with those paths moved into a scratch tree. Cases: an NXP IW416
 # unit whose init_bluetooth_wifi.sh is Carlinkit's own 2025.10.15.1127 text (unquoted STA gate) and
 # one with lvalen's NCM-image text (quoted), each with and without the STA-mode gate file; and a
-# branch with three assignments, which is not closed-form and must stay refused.
+# branch with three assignments, which is not closed-form and must stay refused. Since 20 Nov 2026,
+# under each POSIX shell found: the order read off the unit's own attach branch (RADIO_BT_TOGETHER,
+# against an attach script shaped like Carlinkit's), and the key a kept descriptor is checked
+# against (radio_detect_key): unchanged by post-load facts, changed by each input it covers.
 #
 #   tools/radio_detect_test.sh
 set -u
@@ -47,14 +50,16 @@ EOF
   printf '\twhile [ ! -e /sys/class/net/wlan0/address ]; do sleep 1; done\n\t\thciattach /dev/ttymxc2 any 3000000 flow\n' \
     > "$R/script/attach_bluetooth.sh"
 }
-detect() {  # $1 dir: run the path-moved copy, print RADIO_WLAN_INSMOD
+detect() {  # $1 dir: run the path-moved copy (at the path the script hashes itself by), print RADIO_WLAN_INSMOD
   local R="$1"
+  mkdir -p "$R/script"
   sed -e "s#/sys/#@R@/sys/#g; s#/lib/firmware#@R@/lib/firmware#g; s#/usr/sbin/#@R@/usr/sbin/#g" \
       -e "s#/script/#@R@/script/#g; s#/proc/uptime#@R@/proc/uptime#g; s#@R@#$R#g" \
-      "$REPO/ccpa/rootfs/script/radio_detect.sh" > "$R/radio_detect.sh"
-  RADIO_CAPS="$R/caps" sh "$R/radio_detect.sh" >/dev/null 2>&1
+      "$REPO/ccpa/rootfs/script/radio_detect.sh" > "$R/script/radio_detect.sh"
+  RADIO_CAPS="$R/caps" "${RD_SH:-sh}" "$R/script/radio_detect.sh" >/dev/null 2>&1
   sed -n 's/^RADIO_WLAN_INSMOD=//p' "$R/caps"
 }
+cap() { sed -n "s/^RADIO_$2=//p" "$1/caps" | tr -d '"'; }   # $1 dir, $2 key: the descriptor's value
 want_dflt='"insmod /tmp/mlan.ko;insmod /tmp/moal.ko mod_para=nxp/wifi_mod_para.conf;"'
 want_alt='"insmod /tmp/mlan.ko;insmod /tmp/moal.ko mod_para=nxp/wifi_mod_para_p2psta.conf;"'
 
@@ -75,6 +80,107 @@ d="$T/three"; make_unit "$d" 'if [ $supportStaMode -eq 1 ]; then' '	nxpWiFiConfi
 got="$(detect "$d")"
 check '[ "$got" = "\"insmod /tmp/mlan.ko;\"" ]' "three assignments are not closed-form: moal.ko stays refused ($got)"
 
+# ---- the order, read off this unit's own attach branch (20 Nov 2026) ----------------------------------------------
+# An attach script shaped like Carlinkit's 2025.10.15.1127 one (its structure, not its text): a Realtek branch whose
+# 0xc822 case waits for the Wi-Fi interface, an SD8987 branch that waits, and an IW416 branch that pushes its firmware
+# and attaches without waiting. The whole file waits (BT_AFTER_WLAN=1 for all); RADIO_BT_TOGETHER only for 0x9159.
+# Its paths carry the scratch root, as the path-moved radio_detect.sh looks for them.
+attach_dispatch() {  # $1 dir, $2 extra lines at the top of the IW416 branch
+  local R="$1"
+  cat > "$R/script/attach_bluetooth.sh" <<EOF
+attach_bluetooth() {
+	sdioCardID=\`cat /sys/bus/sdio/devices/mmc0:0001:1/device\`
+	if [ "\$sdioCardID" == "0xb822" ] || [ "\$sdioCardID" == "0xc822" ]; then
+		if [ "\$sdioCardID" == "0xc822" ]; then
+			while [ ! -e $R/sys/class/net/wlan0/address ]; do
+				sleep 0.1
+			done
+		fi
+		rtk_hciattach -s 115200 ttymxc2 rtk_h5
+		hciconfig hci0 scomtu 240:32
+	elif [ "\$sdioCardID" == "0x9149" ] || [ "\$sdioCardID" == "0x9141" ]; then
+		while [ ! -e $R/sys/class/net/wlan0/address ]; do
+			sleep 0.1
+		done
+		if [ -e $R/sys/class/net/wlan0/address ]; then
+			hciattach /dev/ttymxc2 any 3000000 flow
+			hciconfig hci0 scomtu 240:32
+		fi
+	elif [ "\$sdioCardID" == "0x9159" ]; then
+$2
+		fw_loader_linux /dev/ttymxc2 115200 1 /lib/firmware/nxp/uartiw416_bt_v0.bin 3000000
+		if [ -e $R/usr/sbin/hciattach ]; then
+			hciattach /dev/ttymxc2 any 3000000 flow
+			hciconfig hci0 scomtu 240:32
+			# route sco data to hci
+			hcitool -i hci0 cmd 0x3f 0x1d 0x00
+		fi
+	fi
+}
+EOF
+}
+. "$HERE/test_shells.sh"
+for RD_SH in ${SHELLS:-$(distinct_shells sh dash)}; do
+  echo "== radio_detect.sh under $RD_SH: the order, by this unit's own attach branch"
+  d="$T/order.$RD_SH"; make_unit "$d" 'if [ $supportStaMode -eq 1 ]; then' ""; attach_dispatch "$d" ""
+  detect "$d" >/dev/null
+  check '[ "$(cap "$d" BT_AFTER_WLAN)" = 1 ] && [ "$(cap "$d" BT_TOGETHER)" = 1 ]' \
+    "IW416 (0x9159): the file waits, its own branch does not, and it pushes its firmware: together"
+  check '[ -n "$(cap "$d" BT_PRELOAD_CMD)" ] && [ "$(cap "$d" BT_ATTACH_CMD)" = "hciattach /dev/ttymxc2 any 3000000 flow" ]' \
+    "  (its preload and attach lines, as before)"
+  for id in 0x9149 0xc822 0xb822 0x1234; do
+    echo "$id" > "$d/sys/bus/sdio/devices/mmc0:0001:1/device"
+    detect "$d" >/dev/null
+    check '[ "$(cap "$d" BT_AFTER_WLAN)" = 1 ] && [ "$(cap "$d" BT_TOGETHER)" = 0 ]' "$id: today's order (BT_TOGETHER=0)"
+  done
+  echo 0x9159 > "$d/sys/bus/sdio/devices/mmc0:0001:1/device"
+  attach_dispatch "$d" "		while [ ! -e $d/sys/class/net/sta0/address ]; do sleep 0.1; done"
+  detect "$d" >/dev/null
+  check '[ "$(cap "$d" BT_TOGETHER)" = 0 ]' "an IW416 branch of its own that waits: today's order"
+  printf '\twhile [ ! -e %s/sys/class/net/wlan0/address ]; do sleep 1; done\n\t\thciattach /dev/ttymxc2 any 3000000 flow\n' "$d" \
+    > "$d/script/attach_bluetooth.sh"
+  detect "$d" >/dev/null
+  check '[ "$(cap "$d" BT_AFTER_WLAN)" = 1 ] && [ "$(cap "$d" BT_TOGETHER)" = 0 ]' "a one-branch attach script that waits: today's order"
+  printf '\tfw_loader_linux /dev/ttymxc2 115200 1 /x.bin 3000000\n\thciattach /dev/ttymxc2 any 3000000 flow\n' > "$d/script/attach_bluetooth.sh"
+  detect "$d" >/dev/null
+  check '[ "$(cap "$d" BT_AFTER_WLAN)" = 0 ] && [ "$(cap "$d" BT_TOGETHER)" = 0 ]' "one that never waits (the owned rewrite's shape): nothing to change, 0"
+
+  # ---- the key a kept copy is checked against (radio_detect_key) ---------------------------------------------------
+  echo "== radio_detect.sh under $RD_SH: the key"
+  d="$T/key.$RD_SH"; make_unit "$d" 'if [ $supportStaMode -eq 1 ]; then' ""; attach_dispatch "$d" ""
+  detect "$d" >/dev/null; k0=$(cap "$d" DETECT_KEY)
+  check '[ -n "$k0" ] && [ "$k0" != unkeepable ] && [ "$(cap "$d" CAPS_FROM)" = detected ]' "a detection carries its key (${k0%% sums=*} ...)"
+  detect "$d" >/dev/null
+  check '[ "$(cap "$d" DETECT_KEY)" = "$k0" ]' "the same unit, detected again: the same key"
+  rm -f "$d/caps"
+  fkey=$(RADIO_DETECT_FUNCS=1 RADIO_CAPS="$d/caps" "$RD_SH" -c '. "$1" && radio_detect_key' sh "$d/script/radio_detect.sh" 2>/dev/null)
+  check '[ "$fkey" = "$k0" ] && [ ! -e "$d/caps" ]' "the function alone, sourced as radio_hal.sh sources it (RADIO_DETECT_FUNCS=1), gives it too, and detects nothing"
+  mkdir -p "$d/sys/class/net/sta0/wireless" "$d/sys/class/bluetooth/hci0"; echo 02:00:00:00:00:01 > "$d/sys/class/net/sta0/address"
+  detect "$d" >/dev/null
+  check '[ "$(cap "$d" DETECT_KEY)" = "$k0" ] && [ "$(cap "$d" WLAN_IF)" = sta0 ]' "an interface and hci0 up since (post-load facts): the same key"
+  kchanged() {  # $1 what changed: the key differs from k0, then the change is undone by the caller
+    detect "$d" >/dev/null; [ "$(cap "$d" DETECT_KEY)" != "$k0" ]
+  }
+  cp "$d/script/init_bluetooth_wifi.sh" "$T/disp.keep"; echo "# a reflash" >> "$d/script/init_bluetooth_wifi.sh"
+  check 'kchanged' "the dispatcher's text changed: another key"; cp "$T/disp.keep" "$d/script/init_bluetooth_wifi.sh"
+  cp "$d/script/attach_bluetooth.sh" "$T/att.keep"; echo "# a reflash" >> "$d/script/attach_bluetooth.sh"
+  check 'kchanged' "the attach script's text: another key"; cp "$T/att.keep" "$d/script/attach_bluetooth.sh"
+  cp "$d/lib/firmware/nxp/iw416_ko.tar.gz" "$T/ko.keep"; (cd "$d/ko" && : > extra.ko && tar -czf "$d/lib/firmware/nxp/iw416_ko.tar.gz" mlan.ko moal.ko hci_uart.ko extra.ko)
+  check 'kchanged' "the driver tarball's contents: another key"; cp "$T/ko.keep" "$d/lib/firmware/nxp/iw416_ko.tar.gz"
+  echo 0x9149 > "$d/sys/bus/sdio/devices/mmc0:0001:1/device"
+  check 'kchanged' "another SDIO id: another key"; echo 0x9159 > "$d/sys/bus/sdio/devices/mmc0:0001:1/device"
+  mkdir "$d/lib/firmware/rtlbt"; check 'kchanged' "a firmware tree more: another key"; rmdir "$d/lib/firmware/rtlbt"
+  rm "$d/usr/sbin/fw_loader_linux"; check 'kchanged' "a helper gone: another key"; : > "$d/usr/sbin/fw_loader_linux"; chmod 755 "$d/usr/sbin/fw_loader_linux"
+  : > "$d/usr/sbin/wpa_supplicant"; check 'kchanged' "the dispatcher's gate file there (its STA mode): another key"; rm "$d/usr/sbin/wpa_supplicant"
+  echo "# a newer radio_detect.sh" >> "$d/script/radio_detect.sh"
+  fkey=$(RADIO_DETECT_FUNCS=1 "$RD_SH" -c '. "$1" && radio_detect_key' sh "$d/script/radio_detect.sh" 2>/dev/null)
+  check '[ -n "$fkey" ] && [ "$fkey" != "$k0" ]' "radio_detect.sh's own text: another key"
+  detect "$d" >/dev/null
+  check '[ "$(cap "$d" DETECT_KEY)" = "$k0" ]' "everything back as it was: the first key again"
+
+
+done
+RD_SH=sh
 
 # radio_hal.sh's box_name, the one name for Wi-Fi and Bluetooth: btd's CarLink-<wlan0's last 4 hex> (Scott,
 # 12 Nov: the dev adapter's Wi-Fi said ccpa-fe01, from the AP interface sta0, beside Bluetooth's CarLink-fd6c).
