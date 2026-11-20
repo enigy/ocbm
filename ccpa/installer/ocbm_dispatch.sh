@@ -465,8 +465,12 @@ fi
 # waits until the self-test has passed (and a confirmed start's finish is done). A failure never gets that far.
 rm -f "$RUN/ocbm_selftest_passed"
 if [ "$mode" != final ] || [ "$update_trial" = 1 ]; then OCBM_PRELOAD_AFTER="$RUN/ocbm_selftest_passed"; export OCBM_PRELOAD_AFTER; fi
+# The stock GPIO set-up pulses the Bluetooth reset line. Its end is marked: ocbm_boot.sh then starts the boot radio
+# preload at once, which touches the chip only after the mark (radio_hal.sh gpio_wait; a pulse under a loading Wi-Fi
+# driver wedged the kernel, 19 Oct 2026). The mark comes whether or not the stock script is there.
+OCBM_GPIO_DONE="$RUN/ocbm_gpio_done"; rm -f "$OCBM_GPIO_DONE"; export OCBM_GPIO_DONE
 "$S/ocbm_boot.sh"   # gadget as the OCBM accessory, ocbmd, session supervisor; returns at once
-[ -x "$S/init_gpio.sh" ] && "$S/init_gpio.sh" >/dev/null 2>&1 &   # stock: Bluetooth reset line, quick-charge pins
+{ [ -x "$S/init_gpio.sh" ] && "$S/init_gpio.sh"; : > "$OCBM_GPIO_DONE"; } </dev/null >/dev/null 2>&1 &   # stock: Bluetooth reset line, quick-charge pins
 respawn "$S/run_ocbmd.sh" </dev/null >/dev/null 2>&1 &
 respawn "$S/run_supervisor.sh" </dev/null >/dev/null 2>&1 &
 # A stick report a restart interrupted; then what a stick in at this start asks for (an update, or in

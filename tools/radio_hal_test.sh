@@ -557,11 +557,56 @@ case_locks() {
   check '[ -d "$R/tmp/.radio_lock_wlan" ]' "lock_drop_own leaves a lock another process holds"
 }
 
+case_boot() {
+  # ---- where ocbm_boot.sh starts the preload ---------------------------------------------------------------------------
+  # ocbm_boot.sh itself, its paths moved into $R and the stubs first on its PATH: a gadget whose sysfs is already
+  # there, ocbmd, the supervisor and the preload (radio_hal.sh) stand-ins that write when they start.
+  echo "== $SH: where ocbm_boot.sh starts the preload"
+  boot_run() {  # $1: the dispatcher's mark asked for (1) or not (0)
+    unit
+    mkdir -p "$R/sys/class/android_usb_accessory/android0" "$R/dev" "$R/usr/sbin"
+    : > "$R/sys/class/android_usb_accessory/android0/enable"; : > "$R/dev/usb_accessory"; : > "$R/tmp/g_android_accessory.ko"
+    printf '#!/bin/sh\necho "ocbmd" >> "%s/calls"\n' "$R" > "$R/usr/sbin/ocbmd"
+    printf '#!/bin/sh\necho "supervisor" >> "%s/calls"\n' "$R" > "$R/script/session_supervisor.sh"
+    printf '#!/bin/sh\necho "preload $1 gpio=${OCBM_GPIO_DONE:-}" >> "%s/calls"\n' "$R" > "$R/script/radio_hal.sh"
+    chmod 755 "$R/usr/sbin/ocbmd" "$R/script/session_supervisor.sh" "$R/script/radio_hal.sh"
+    printf '#!/bin/sh\nexit 0\n' > "$S/pkill"; chmod 755 "$S/pkill"
+    rewrite "$REPO/ccpa/rootfs/script/ocbm_boot.sh" "$R/ocbm_boot.0"
+    sed -e "s#export PATH=/usr/sbin#export PATH=$S:/usr/sbin#" -e "s#/dev/usb_accessory#$R/dev/usb_accessory#g" \
+      "$R/ocbm_boot.0" > "$R/script/ocbm_boot.sh"; chmod 755 "$R/script/ocbm_boot.sh"
+    if [ "$1" = 1 ]; then gd="$R/tmp/ocbm_gpio_done"; else gd=""; fi
+    env OCBM_GPIO_DONE="$gd" STUB_R="$R" "$SH" "$R/script/ocbm_boot.sh" </dev/null >/dev/null 2>&1
+    waitfor 'called "preload" && called "supervisor" && grep -q "remote login off" "$R/tmp/box.log"' 100
+  }
+  # The order ocbm_boot.sh starts things in is its own box log's (the preload runs on in the background beside them).
+  logged_before() { _l1=$(grep -nF -- "$1" "$R/tmp/box.log" | head -1 | cut -d: -f1); _l2=$(grep -nF -- "$2" "$R/tmp/box.log" | head -1 | cut -d: -f1)
+                    [ -n "$_l1" ] && [ -n "$_l2" ] && [ "$_l1" -lt "$_l2" ]; }
+  boot_run 1
+  check 'logged_before "radio preload starting" "gadget module:" && called "preload preload gpio=$R/tmp/ocbm_gpio_done"' \
+    "the dispatcher marks the GPIO set-up's end: the preload starts first, before the gadget and ocbmd, told where the mark is"
+  check '[ "$(count "preload preload")" = 1 ]' "  once"
+  boot_run 0
+  check 'logged_before "armed functions=" "radio preload starting" && [ "$(count "preload preload")" = 1 ]' \
+    "no mark (another start script): after ocbmd and the supervisor, as before"
+  # The same unit started again with the dispatcher's mark and /script/radio_preload_late on flash.
+  : > "$R/script/radio_preload_late"; : > "$R/calls"; : > "$R/tmp/box.log"
+  env OCBM_GPIO_DONE="$R/tmp/ocbm_gpio_done" STUB_R="$R" "$SH" "$R/script/ocbm_boot.sh" </dev/null >/dev/null 2>&1
+  waitfor 'called "preload" && grep -q "remote login off" "$R/tmp/box.log"' 100
+  check 'logged_before "armed functions=" "radio preload starting" && grep -q "radio preload starts after ocbmd and the supervisor (.*radio_preload_late)" "$R/tmp/box.log"' \
+    "/script/radio_preload_late: the old start, said so"
+  echo "guard: 2 together attaches in a row failed" > "$R/script/radio_together_off"; : > "$R/calls"; : > "$R/tmp/box.log"
+  env OCBM_GPIO_DONE="$R/tmp/ocbm_gpio_done" STUB_R="$R" "$SH" "$R/script/ocbm_boot.sh" </dev/null >/dev/null 2>&1
+  waitfor 'grep -q "remote login off" "$R/tmp/box.log"' 100
+  check 'grep -q "radio order: the Bluetooth firmware beside the Wi-Fi driver DISABLED by its guard (guard: 2" "$R/tmp/box.log"' \
+    "a guard's off file: said at every boot"
+  rm -f "$S/pkill"
+}
+
 . "$HERE/test_shells.sh"
 for SH in ${SHELLS:-$(distinct_shells sh dash)}; do
   command -v "$SH" >/dev/null 2>&1 || { echo "== $SH: not installed, skipped"; continue; }
   R="$T/$(basename "$SH").root"
-  for c in ${RH_ONLY:-kept order switches fallback host gpio line unpack locks}; do "case_$c"; done
+  for c in ${RH_ONLY:-kept order switches fallback host gpio line unpack locks boot}; do "case_$c"; done
   reap
 done
 [ "$fails" -eq 0 ] && echo "radio_hal_test: all passed ($passes checks)" || { echo "radio_hal_test: $fails failed"; exit 1; }
