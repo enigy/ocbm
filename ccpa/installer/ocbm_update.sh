@@ -76,6 +76,14 @@ refuse() {
   exit 1
 }
 
+# A new version tries the radio order again: the guard's count, its in-flight mark and an off file it wrote ("guard:
+# ..."), never an owner's own off file (radio_hal.sh, "The order Bluetooth and the Wi-Fi driver come up in").
+together_guard_lift() {
+  rm -f "$S/.radio_together_inflight" "$S/.radio_together_failed"
+  grep -q '^guard' "$S/radio_together_off" 2>/dev/null && rm -f "$S/radio_together_off"
+  return 0
+}
+
 target() {  # where a package path lives on the adapter: once.sh installs the dispatcher as the start script
   case "$1" in script/ocbm_dispatch.sh) echo script/start_main_service.sh ;; *) echo "$1" ;; esac
 }
@@ -172,7 +180,8 @@ if [ ! -s "$list" ]; then   # a new version number with no new files
   [ -z "$bench_over" ] || log "$bench_over"
   result "committed $VER (from $have_line): no files changed"
   log "nothing to place: the adapter's files already match $VER"
-  rm -f "$S/radio_preload_off" "$S/.radio_preload_inflight" "$S/.radio_preload_unfinished"   # a new version starts it on
+  rm -f "$S/radio_preload_off" "$S/.radio_preload_inflight" "$S/.radio_preload_unfinished" "$S/radio_preload_late"   # a new version starts it on
+  together_guard_lift
   clean; unlock; exit 0
 fi
 if grep -q ' script/ocbm_dispatch.sh$' "$list"; then
@@ -221,8 +230,9 @@ if [ "$rc" != 0 ]; then   # no "placed" in the journal: the next start undoes wh
   sync; unlock; $REBOOT; exit 1
 fi
 echo placed >> "$U" && sync
-# A new version starts with the boot radio preload on: its guard counts afresh (radio_hal.sh do_preload).
-rm -f "$S/radio_preload_off" "$S/.radio_preload_inflight" "$S/.radio_preload_unfinished"
+# A new version starts with the boot radio preload on, and early: its guard counts afresh (radio_hal.sh do_preload).
+rm -f "$S/radio_preload_off" "$S/.radio_preload_inflight" "$S/.radio_preload_unfinished" "$S/radio_preload_late"
+together_guard_lift
 
 step restart
 result "trial $VER (from $have_line)"

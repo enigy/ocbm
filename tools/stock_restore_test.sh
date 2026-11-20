@@ -66,6 +66,10 @@ make_box() {  # $1 backup dir, $2 box dir: what the converted adapter looks like
   echo "radio hal"   > "$b/script/radio_hal.sh"
   : > "$b/script/radio_preload"; : > "$b/script/radio_preload_off"
   : > "$b/script/.radio_preload_inflight"; echo 1 > "$b/script/.radio_preload_unfinished"
+  # The radio order's switch and guard state, the preload's late start, the kept descriptor (20 Nov 2026): OCBM's too.
+  : > "$b/script/radio_preload_late"; echo "guard: 2" > "$b/script/radio_together_off"
+  : > "$b/script/.radio_together_inflight"; echo 1 > "$b/script/.radio_together_failed"
+  printf 'RADIO_WIRELESS=yes\nRADIO_KEPT_END=1\n' > "$b/etc/ocbm/kept_radio_caps"
   : > "$b/script/ncm_wifi"
   echo "old copy"    > "$b/script/start_main_service.sh.pre"
   blob "$b/etc/ocbm/identity.tgz" 4000
@@ -370,6 +374,9 @@ onefile_tests() {  # $1 shell
   # The boot radio preload's state (radio_hal.sh do_preload): a later install must start with the preload on.
   echo "guard: 2 unfinished in a row" > "$T/box/script/radio_preload_off"
   : > "$T/box/script/.radio_preload_inflight"; echo 1 > "$T/box/script/.radio_preload_unfinished"
+  : > "$T/box/script/radio_preload_late"; : > "$T/box/script/radio_together_off"
+  : > "$T/box/script/.radio_together_inflight"; echo 1 > "$T/box/script/.radio_together_failed"
+  printf 'RADIO_WIRELESS=yes\nRADIO_KEPT_END=1\n' > "$T/box/etc/ocbm/kept_radio_caps"
   before=$(tree_sum "$T/box")
   run_onefile "$SH1" plan "$T/box"; rc=$?
   check '[ $rc -eq 0 ] && grep -q RESTORE_PLAN_OK "$T/out" && grep -q "switch      :" "$T/out"' "plan succeeds and names the switch"
@@ -393,6 +400,8 @@ onefile_tests() {  # $1 shell
   check '[ ! -e "$T/box/script/radio_hal.sh" ] && [ ! -e "$T/box/script/radio_detect.sh" ] && [ ! -e "$T/box/script/radio_ap_up.sh" ]' "OCBM's radio seam goes with OCBM: stock has none"
   check '[ ! -e "$T/box/script/radio_preload_off" ] && [ ! -e "$T/box/script/.radio_preload_inflight" ] && [ ! -e "$T/box/script/.radio_preload_unfinished" ]' \
     "the boot radio preload's flag, marker and count go, so a later install starts with it on"
+  check '[ ! -e "$T/box/script/radio_preload_late" ] && [ ! -e "$T/box/script/radio_together_off" ] && [ ! -e "$T/box/script/.radio_together_inflight" ] && [ ! -e "$T/box/script/.radio_together_failed" ]' \
+    "the preload's late start and the radio order's switch, mark and count go too"
   check '[ -e "$T/box/lib/firmware/nxp/added_after.bin" ] && grep -q "1 kept by the radio guard" "$T/out"' "the radio guard still keeps the unit's own radio files"
   check '[ ! -e "$T/box/etc/carplay" ] && grep -q "/etc/carplay removed" "$T/out"' "/etc/carplay, OCBM's bond store, is removed"
   check 'grep -q "5/5 OCBM scripts and settings: [0-9]* removed, 0 kept by the radio guard" "$T/out"' \

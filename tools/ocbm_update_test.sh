@@ -141,9 +141,13 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   echo "== $sh: an update on a final adapter that passes its self-test"
   d="$T/$sh-pass"; make_box "$d" final; make_pkg "$d/run/ocbm-update.tgz" dispatch
   echo "guard: 2 unfinished in a row" > "$d/root/script/radio_preload_off"; echo 1 > "$d/root/script/.radio_preload_unfinished"
+  echo "guard: 2 together attaches in a row failed" > "$d/root/script/radio_together_off"; echo 1 > "$d/root/script/.radio_together_failed"
+  : > "$d/root/script/.radio_together_inflight"; : > "$d/root/script/radio_preload_late"
   update "$sh" "$d"; rc=$?
   check '[ $rc = 0 ] && [ -e "$d/rebooted" ] && grep -qx placed "$d/root/etc/ocbm/update_pending"' "placed, journalled, restarting"
   check '[ ! -e "$d/root/script/radio_preload_off" ] && [ ! -e "$d/root/script/.radio_preload_unfinished" ]' "the new version starts with the boot radio preload on"
+  check '[ ! -e "$d/root/script/radio_together_off" ] && [ ! -e "$d/root/script/.radio_together_failed" ] && [ ! -e "$d/root/script/.radio_together_inflight" ] && [ ! -e "$d/root/script/radio_preload_late" ]' \
+    "and early, and tries the radio order again: the guard's off file, its count and mark lifted"
   check '[ "$(content "$d" usr/sbin/ocbmd)" = new-ocbmd ] && [ "$(content "$d" usr/sbin/ocbmd.prev)" = old-ocbmd ]' \
     "the new ocbmd in place, the old one kept as .prev"
   check '! grep -q "usr/sbin/btd" "$d/root/etc/ocbm/update_pending"' "a file that did not change is left alone"
@@ -373,9 +377,12 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   d="$T/$sh-bump"; make_box "$d" final; NEW_SAVE="$NEW"; NEW="1.0.1 ocbm bump"
   w="$T/bump"; rm -rf "$w"; mkdir -p "$w"; old_tree "$T/bumptree"; sums_of "$T/bumptree" > "$w/SHA256SUMS"; rm -rf "$T/bumptree"
   echo "$NEW" > "$w/VERSION"; echo 1.0.0 > "$w/FROM_MIN"; (cd "$w" && tar -cf - .) | gzip -c > "$d/run/ocbm-update.tgz"
+  : > "$d/root/script/radio_together_off"; echo 1 > "$d/root/script/.radio_together_failed"   # the owner's switch, a count
   update "$sh" "$d"; rc=$?
   check '[ $rc = 0 ] && [ ! -e "$d/rebooted" ] && [ "$(content "$d" etc/ocbm/installed_version)" = "$NEW" ] && result_is "$d" "committed $NEW"' \
     "a new version with no new files: committed at once, no restart"
+  check '[ -e "$d/root/script/radio_together_off" ] && [ ! -e "$d/root/script/.radio_together_failed" ]' \
+    "an owner's own radio order switch stays through an update; the guard's count goes"
   NEW="$NEW_SAVE"
   d="$T/$sh-revert"; make_box "$d" trial; make_pkg "$d/run/ocbm-update.tgz" ""; update "$sh" "$d"
   env ROOT="$d/root" RUN="$d/run" REBOOT="touch $d/rebooted.revert" "$sh" "$d/root/script/ocbm_revert.sh" "Go back" > /dev/null 2>&1; rc=$?

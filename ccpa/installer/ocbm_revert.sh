@@ -107,8 +107,10 @@ sync
 
 rm -f "$MODE"; sync
 [ -e "$MODE" ] && { log "could not remove /script/ocbm_mode"; done_ 1; }
-# The boot radio preload's state is this install's: an install later starts it on (radio_hal.sh do_preload).
-rm -f "$S/radio_preload_off" "$S/.radio_preload_inflight" "$S/.radio_preload_unfinished"
+# The boot radio preload's state is this install's: an install later starts it on (radio_hal.sh do_preload). So is
+# the radio order's (its switch, its guard's count and in-flight mark): stock reads none of them.
+rm -f "$S/radio_preload_off" "$S/.radio_preload_inflight" "$S/.radio_preload_unfinished" "$S/radio_preload_late"
+rm -f "$S/radio_together_off" "$S/.radio_together_inflight" "$S/.radio_together_failed"
 rm -f "$EO/boot_attempts"; sync
 log "on stock from the next start"
 [ "$restart" = 1 ] && { sync; $REBOOT; }
