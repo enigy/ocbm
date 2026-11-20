@@ -2,7 +2,7 @@
 
 > **STATUS:** CURRENT · single owner for this topic. Consolidated 2026-08-31 from pre-consolidation docs 57, 51, 41, 40; the originals are in git history and in the 2026-08-31 backup. Correct this file in place — do not add a sibling.
 
-**Contents:** the chipset-agnostic radio HAL → between host sessions: armed (Bluetooth powered, invisible) → accessory-initiated reconnect → the HCI event-mask regression → the bring-up race and its health check.
+**Contents:** the chipset-agnostic radio HAL → between host sessions: armed (Bluetooth powered, invisible) → the cold boot (the descriptor kept, the Bluetooth firmware beside the Wi-Fi driver) → accessory-initiated reconnect → the HCI event-mask regression → the bring-up race and its health check.
 
 ## Radio HAL — chipset-agnostic bring-up
 
@@ -40,7 +40,9 @@ waits for it, up to 5 s (`wifi_handoff::wait_for_ap`); past that btd stays silen
 hostapd still running counts), not a fixed second after the AP serves: the reply waits for an AP that is up, never
 for a timer. From the armed state (below) the AP's bring-up is a launch from its configuration written ahead. They share only the WLAN driver load, which
 `wlan_driver_up` serialises under its own lock, and `radio_detect.sh` writes its descriptor through a
-per-caller temporary file. `caps()` detects once per boot and reuses a descriptor that found wireless.
+per-caller temporary file. `caps()` detects once per boot and reuses a descriptor that found wireless; since 20 Nov
+2026 it takes the descriptor kept on flash instead while its key holds, and the driver tarball is unpacked once a boot
+under its own lock ("The cold boot", below).
 ocbmd logs each HELLO and a host's first frames after 5 s of silence with the uptime, to place a stalled open. They
 are written before Carlink arms its log stream, so a drive log carries them only as thinned `[backfill]` replay: read
 them from Save Logs' box log or `/tmp/box.log` over the console, before a reboot (tmpfs) loses them.
@@ -331,7 +333,9 @@ real failure three phases before anything switched.
 > the `n_hci` line discipline is never registered and `hciattach` fails `EINVAL`. And the box's
 > `/tmp` is a **tmpfs on a USB-powered device**, so unplugging it to move it between bench and head
 > unit IS a power loss: `/tmp/radio_caps` and any extracted `.ko` vanish on every move. `radio_hal.sh`
-> now re-derives both, but any future step that caches into `/tmp` must assume it starts empty.
+> now re-derives both, but any future step that caches into `/tmp` must assume it starts empty. (Since 20 Nov 2026 the
+> descriptor is also kept on flash, `/etc/ocbm/kept_radio_caps`, and reused while its key holds; a missing, stale or
+> damaged copy falls back to detecting, as here. "The cold boot", below.)
 
 The narrow re-check: the supervisor names only `radio_hal.sh`, and `--full` now ships the seam. The
 generic assertion is still unwritten — see §7, and note that `tools/ocbm_push.sh` now warns when the
@@ -496,7 +500,8 @@ because BT attach waits for WLAN on this part, Bluetooth with it. Both forms now
 ## Between host sessions: armed (Bluetooth powered, invisible)
 
 **Status: built and benched 16 Nov 2026** (branch `resident-bt` merged with `carplayd-early` into a local `round2`,
-on the dev adapter, IW416). 12 wakes and a cold boot connected from the armed state: `sup_radios` about 50 ms,
+on the dev adapter, IW416). 12 wakes and a cold boot connected from the armed state (that boot a restart by `reboot`,
+which keeps the radio chip's firmware: no cold boot for radio timing, "The cold boot" below): `sup_radios` about 50 ms,
 `bt_armed=1`, `page_start` about 100 ms and `ap_enabled` about 1.16 s after the host's arrival. With no host the armed
 state read over the console as built: `hci0` `UP RUNNING` with neither `PSCAN` nor `ISCAN`, no link, no hostapd, udhcpd
 or carplayd, the AP interface (`sta0`) down. Against `/tmp/bench_arm_off` arming saved about 1.0 s per connect. The
@@ -661,6 +666,139 @@ current.
 **Off.** `/script/radio_arm_off` (the owner's, on flash) or the bench hook `/tmp/bench_arm_off` (`box_common::bench_flag`'s
 rule; Carlink writes `off` to clear it) keeps Bluetooth powered down between sessions, as in 2.6.0, from the next host
 departure on; an armed btd already running stays until then.
+
+---
+
+## The cold boot: the radios as early as the chip allows
+
+**Status: built 20 Nov 2026 on branch `cold-boot` (from OCBM 2.6.5, `801074f`), tested against stubbed hardware
+(`tools/radio_detect_test.sh`, `tools/radio_hal_test.sh`), NOT benched.** Bench plan and revert conditions:
+[../ops/02_TESTING.md](../ops/02_TESTING.md), "Cold boot: real power cycles".
+
+**Why.** In the owner's truck the adapter loses power 15 to 30 minutes after the truck is switched off, so most drives
+start with it booting: 22 of 26 display-on connects on 16-20 Nov found it just booted, and those reached the picture
+about 19 s after display on (7 clean samples, 17.4 to 21.7 s) against about 7 s from an adapter still powered. The
+host subscribes about 3 s into the boot, while the boot preload has just started (`[startup]`: "adapter up 3.0 s,
+preload running"), and its `bt_on` and `wifi_ap_on` wait on the preload's locks: `bt_power` landed 7.4 to 8.6 s after
+the host. Where the cold boot's time went (the dev adapter, one clean cold boot, uptime in s): `ocbm_boot.sh` 2.0;
+the gadget ready 2.37, enumerated 2.57; the preload 2.75-2.89; `radio_detect.sh` 2.89-3.90 (0.75 to 0.8 s a run, timed
+by hand); the Wi-Fi driver first 3.90-6.54 (insmod 4.08, firmware over 4.75, "WLAN FW is active" 6.00, `sta0` 6.54);
+the Bluetooth firmware 6.58-9.35 (`fw_loader_linux`'s own timer about 2.2 s); `hciattach` to `hci0` answering
+9.35-10.11; "preload: done rc=0 in 7.5 s" 10.44.
+
+**A cold boot is a power cut, never a `reboot`.** The IW416 keeps its firmware through a `reboot`, so a restart skips
+both firmware downloads (Wi-Fi and Bluetooth) and times nothing of a cold boot; and it cannot be put back into its boot
+loader from the adapter (a gpio1 pulse did not do it, 20 Nov). Only removing power gives a cold boot. The benches
+before 20 Nov that said "a cold boot" (the armed path's, above, among them) were restarts of that kind, by the
+coordinating session's reading of 20 Nov: their radio timings are a restart's.
+
+**1. The descriptor, kept across boots.** `/tmp` is empty at every power-up, so every boot ran `radio_detect.sh`
+again, though its answer changes only when what it reads changes. `radio_hal.sh` `caps` now keeps the last descriptor
+a detection gave that found wireless in `/etc/ocbm/kept_radio_caps`, without its post-load facts (interfaces,
+addresses) and its time, and the next boot takes it (`caps_from_kept`) while `radio_detect.sh`'s own key reads what
+it read then: `radio_detect_key`, at the head of that script so a new input there is a new term beside it, covers the
+SDIO ids, the firmware trees, the helpers and bring-up scripts present, each file test the dispatcher's gates make, and
+one md5 over the md5 of every file whose text or members are read (itself, the dispatcher, the attach script, the
+driver tarball): one hash, so the key stays short in btd's one-line log of the descriptor, which ocbmd clips at 1024
+bytes. Post-load facts are no input. The check is one awk, one grep and the md5s (the tarball's read the unpack right
+after finds cached), against the detection's dozens of forks; the boot line's `caps_ms` measures it. Reused only as
+`caps_check` reads it: `KEY=VALUE` lines nothing runs when sourced, the end mark last, wireless, a backend, an SDIO
+id, and on the mapped backend an insmod and an attach mapping; anything else, or another key, is detected, and the
+detection's result kept again. Written only after a detection and only where it differs (once per firmware or
+`radio_detect.sh` version), as its own file, synced, renamed over the old, synced. Why `/etc/ocbm`: OCBM's own state
+directory, which the one-file installer makes (a unit without it keeps nothing and detects every boot, as before);
+updates keep it, and the key notices a new `radio_detect.sh`; a revert keeps it for a retry, whose boot the key checks;
+the full way back to stock removes it, since its name is outside `is_radio()`'s `radio_*`. Not `/script`, where the
+preload's flags are: `is_radio()` keeps every `radio_*` file there through every deletion unless a remover names it.
+
+**2. The order: the Bluetooth firmware beside the Wi-Fi driver.** `RADIO_BT_AFTER_WLAN` is read off the whole attach
+script, so another branch's wait loop set it on the IW416. In Carlinkit's 2025.10.15.1127 scripts only the 0xc822
+branch and the SD8987 one (0x9149/0x9141) wait for the Wi-Fi interface; the IW416 branch (0x9159) pushes its firmware
+with `fw_loader_linux` and attaches without waiting, and that unit's dispatcher starts the attach script in the
+background before it loads the Wi-Fi driver. So the stock firmware loads the two side by side at every IW416 boot.
+`radio_detect.sh` section 4d reads this unit's own branch, as the SCO lines are read: `RADIO_BT_TOGETHER=1` where the
+whole file waits, this unit's branch does not, and that branch pushes its own firmware before an attach the script
+could extract (on the mapped backend, with a Wi-Fi mapping). No chipset table: of every attach script this project
+has read, the shape selects the IW416 branch alone, and an id the dispatcher never names has no branch, so 0. The
+dev adapter's bench (20 Nov, power really removed, the preload off, one trial each): Bluetooth first, no Wi-Fi driver
+loaded: `fw_loader_linux` 2.48 s, `hci0` present 0.12 s and answering 0.43 s after the attach began, then the Wi-Fi
+driver (insmod 2.13 s, `sta0` and `wlan0`, "WLAN FW is active"), `hci0` still answering, `wifi_ap_on` rc 0 with
+AP-ENABLED; both started at one instant: the Wi-Fi driver done 2.00 s on, `fw_loader_linux` 2.72 s (its own 2467 ms),
+`hci0` answering 3.24 s after the start, `wifi_ap_on` rc 0 afterwards and `hci0` still answering.
+
+`radio_hal.sh` `bt_order` picks the order at each attach: `together` (`RADIO_BT_TOGETHER=1` and not switched off),
+`wlan_first` (today's, where the attach waits) or `bt_alone` (today's, where it does not). Together
+(`bt_attach_together`): an in-flight mark on flash, the modules unpacked, the line discipline, then at one instant
+the Wi-Fi driver in a subshell of its own (under its lock, `wlan_driver_up`, its interface waited for) and the
+firmware push, then the attach, which does not wait for the interface; the Wi-Fi driver's load is joined before the
+verb returns (clause 1). Today's order (`bt_attach_mapped`) is the code of before, moved into a function, unchanged.
+
+- **Off** (today's order back): the owner's `/script/radio_together_off` on flash, or the bench's
+  `/tmp/bench_together_off` (`box_common::bench_flag`'s rule: set unless it reads `off`), read at each attach.
+  `ocbm_boot.sh` logs the owner's or the guard's file at every boot. The bench's file is in `/tmp`, so a power cut
+  clears it and the boot's own preload never sees it: a cold-boot A/B uses the owner's file.
+- **The fallback:** a together attach whose `hci0` never answers marks the boot (`/tmp/.radio_together_fell_back`)
+  and says so ("together gave no responsive hci0 - this boot's next attach is Wi-Fi first"). The tries left in that
+  bring-up (a `bt_on` has four, the preload one) take today's order from its start: the attach helper stopped (no
+  reset yet), the Wi-Fi interface first, the firmware pushed again, the attach; later attaches that boot are Wi-Fi first
+  (`off=fallback` on the boot line). A preload's failure leaves it to the host's `bt_on`, which the mark sends Wi-Fi
+  first.
+- **The guard**, as the preload's: a together attach is bracketed by `/script/.radio_together_inflight` (written and
+  synced before it, removed after), so one that never finished (power lost or the box hung inside it) is found at the
+  next attach; each failed or unfinished one counts in `/script/.radio_together_failed`, two in a row write the owner's
+  file with `guard:` in it, and the order is Wi-Fi first until the owner removes it. One that converges clears the
+  count. A together attach that gave Bluetooth but no Wi-Fi interface counts as well. An install, an update and every way
+  back to stock lift the guard's file and its count (a new version tries again), never an owner's own file (as the
+  armed path's switch); the restore's lists name all three (`radio_*` is `is_radio()`'s).
+
+**3. Where the preload starts, and the stock GPIO set-up.** The dispatcher runs Carlinkit's `init_gpio.sh` beside
+`ocbm_boot.sh` at every boot, and it pulses the Bluetooth reset line (gpio1) before setting the charge pins. Pulled
+under a live Wi-Fi driver that line wedged the kernel (19 Oct, radio_detect.sh's preload note). Until 20 Nov the
+preload started after the gadget, `ocbmd` and the supervisor and spent 0.8 s detecting before its first insmod, well
+behind the pulse; started early with the descriptor kept, it no longer would be. So the dispatcher marks that
+script's end (`OCBM_GPIO_DONE`, `/tmp/ocbm_gpio_done`, written whether or not the stock script is there), and
+`ocbm_boot.sh` then starts the preload first, beside the gadget's set-up, about 0.8 s sooner. The preload reads its
+descriptor and unpacks the modules (nothing touches the chip), then waits for the mark (`gpio_wait`, 3 s at most, said
+either way), then the chip. Where nothing marks that end (another start script), or with `/script/radio_preload_late`
+on flash (the bench's A/B, the owner's way back), it starts where it always did. **The cost, unmeasured:** on this one
+core the preload's descriptor read and unpack share the CPU with the gadget's set-up, which may be ready a little later
+than 2.37 s; the host's session waits on the radios, not on the link, so the radios first is the order that gives
+that session its Bluetooth soonest: even after this change Bluetooth answers about 2.5 to 3 s after a host's
+SUBSCRIBE at 3 s, so a link a little later costs the session nothing. The bench
+measures both (docs/ops/02_TESTING.md, "Cold boot: real power cycles", step 6).
+
+**4. The host's path: the trace.** Before (2.6.5): `ocbm_boot.sh` starts the preload after `ocbmd` and the supervisor;
+`radio_hal.sh preload` takes the wlan lock, then the bt lock, and holds both through `do_preload`: `radio_detect.sh`,
+the Wi-Fi driver first, the firmware, the attach. The host's SUBSCRIBE (about 3.0 s) wakes the supervisor
+(`wireless_up`, no arm: `arm_gate` wants `hci0` and no seam lock), whose wrapper starts `wifi_ap_on` in the background
+and `bt_on`; each waits in `lock_take` (a look every 0.5 s) until the preload ends (about 10.4 s); `bt_on` then finds
+`hci0` up and answering (rc 2, `bt_power`), btd starts, and `wifi_ap_on` configures and launches the AP (its
+configuration not written ahead at a cold boot). After: the preload starts at about 2.0 s with the kept descriptor;
+at the GPIO mark (about 2.3 s) the Wi-Fi driver and the firmware start together; once `sta0` is up the preload's
+Wi-Fi subshell lets the wlan lock go (`wlan_free`), so a waiting `wifi_ap_on` brings the AP up beside the firmware push,
+as on today's path when a host comes before the preload; `hci0` answers, the Wi-Fi load is joined, and the preload
+drops its locks at once, before its bookkeeping, only while they are still its own (`lock_drop_own`). `lock_take` looks
+every 0.2 s (no fork but the sleep). No double load: the modules are unpacked once (`ko_unpack`: its own lock and a
+stamp, where each caller used to untar on a missing file, so two side by side could insmod half a file), the Wi-Fi
+driver once (`wlan_driver_up`'s lock, `/proc/modules`), the firmware and the attach once (the bt lock). No deadlock:
+every process takes them in one order, wlan then bt then the driver's then the unpack's, the Wi-Fi subshell only the
+last two, and every wait is bounded. **The estimate (not a measurement):** `hci0` answering at about 5.8 to 6.4 s of
+uptime (the bench's 3.24 s from both loads' start, which the GPIO mark at about 2.3 s and the descriptor and unpack
+put at about 2.4 s, plus the CPU the host's own start-up takes then, plus up to 0.5 s of the attach's look), and
+`bt_power` about 0.4 s later (the name and SCO set, the preload's locks let go, the host's `bt_on` confirming): about
+3.2 to 3.9 s after a host at 3.0 s, against 7.4 to 8.6 s. The AP: the Wi-Fi driver up at about 4.4 to 4.9 s, the
+host's `wifi_ap_on` on at once, hostapd about 1 s on (the configuration is not written ahead at a cold boot) and
+AP-ENABLED about 0.9 s after that, 6.4 to 6.9 s, against about 12.6 s on the truck (17 Nov); well ahead of the phone's
+0x5702, which comes after btd's start, the page and the iAP2 set-up, several seconds after `bt_power`.
+
+**5. The boot line** (`[radio-boot] v1`, one per boot): its keys are documented beside the timeline's in
+[../ops/02_TESTING.md](../ops/02_TESTING.md), "The boot's radio line".
+
+**Not proven:** the together order on the truck's 2025.02.25 vendor scripts (the shape is read on the unit: the boot
+line's `order=` and `radio_hal.sh probe` say which it took); the AP's bring-up beside the firmware push from the
+preload (the bench brought it up after `hci0` answered; today's path does it beside the push when a host comes first);
+what the early start costs the gadget's enumeration; the SDIO card being enumerated by the time the preload starts at
+about 2.0 s (the self-test, which starts as early, has always found it); and every number in the estimate above.
 
 ---
 

@@ -866,8 +866,29 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
 
 ### Radios, box identity & bring-up
 
+- **The cold boot's radios: built 20 Nov 2026 (branch `cold-boot`, from 2.6.5), NOT benched.** Most of the truck's
+  drives start from a power-up (22 of 26 display-on connects, 16-20 Nov), whose picture came about 19 s after display
+  on against about 7 s from a powered adapter, and its Bluetooth 7.4 to 8.6 s after a host that subscribed at about 3 s.
+  Built: the descriptor kept across boots (`/etc/ocbm/kept_radio_caps`, reused while `radio_detect.sh`'s key holds:
+  the 0.8 s detection saved); the Bluetooth firmware beside the Wi-Fi driver on the IW416 (`RADIO_BT_TOGETHER`, read
+  off the unit's own attach branch: Carlinkit's own IW416 branch waits for nothing, and its dispatcher starts the attach
+  before the Wi-Fi driver), with an owner's and a bench's switch (`/script/radio_together_off`,
+  `/tmp/bench_together_off`), a fallback to today's order within the boot and a guard as the preload's; the preload
+  started first in `ocbm_boot.sh` and held behind the stock GPIO set-up's end, which the dispatcher now marks
+  (`OCBM_GPIO_DONE`; `/script/radio_preload_late` puts the old start back); the preload's wlan lock let go once the
+  Wi-Fi driver is up, so a host's AP starts beside the firmware push; the seam's lock looks every 0.2 s; the driver
+  tarball unpacked once a boot; one `[radio-boot] v1` line per boot. Estimated, not measured: Bluetooth for that host
+  about 3.2 to 3.9 s after it, its AP enabled at about 6.4 to 6.9 s of uptime (about 12.6 s on the truck, 17 Nov).
+  Open: the bench on real power cycles (docs/ops/02_TESTING.md, "Cold boot: real power cycles"), whose step 1 also
+  reads whether the truck's 2025.02.25 attach script has the same IW416 branch; the AP
+  brought up from the preload beside the firmware push (the 20 Nov bench raised it only after `hci0` answered; today's
+  path raises it beside the push when a host comes first); what the early start costs the gadget's enumeration;
+  `tools/radio_hal_test.sh` under BusyBox's sh (no busybox on the Mac that built it). Next, not in it: btd started the
+  moment `hci0` answers. Source: docs/wireless/01_BT_AND_RADIO.md, "The cold boot".
+
 - **The armed state (Bluetooth powered but invisible between host sessions, the AP configured ahead): benched
-  16 Nov 2026, one wake open.** On the dev adapter 12 wakes and a cold boot connected from the armed state
+  16 Nov 2026, one wake open.** On the dev adapter 12 wakes and a cold boot (a restart by `reboot`, which keeps the
+  radio chip's firmware: no cold boot for radio timing) connected from the armed state
   (`page_start` about 100 ms, `ap_enabled` about 1.16 s after the host), the no-host state read as built, arming
   about 1.0 s faster than without, and the forced fallback completed its connect. **Open:** the first wake about 90 s
   after an update was committed took 24.8 s, of two delays; neither repeated after a reboot. The first, a late join,
