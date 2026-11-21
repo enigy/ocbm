@@ -45,6 +45,20 @@ const SHELL_STEP_MS: u64 = 10;
 pub const BACKSTOP: Duration = Duration::from_millis(250);
 /// Between two looks with no watch (no inotify: a developer's host, or inotify refused): the looks are all there is.
 pub const TICK: Duration = Duration::from_millis(20);
+/// THE BOUND (21 Nov review I): a wait with neither a handover nor `bt_on`'s word this long (an `OCBM_BTD_WAIT=1` some
+/// environment passed on, or an early wrapper killed before it wrote its file) ends in today's full bring-up, its
+/// DOWN/UP and all ([`Go::Bound`]), once no seam bring-up holds Bluetooth: 30 s, and then the seam's bt lock free for
+/// [`SETTLE`]. A preload's attach and a host's `bt_on` hold that lock for as long as they take (a `bt_on`'s four tries
+/// can take a minute and more), so the bound never starts a bring-up beside one of theirs.
+pub const BOUND: Duration = Duration::from_secs(30);
+/// How long the seam's bt lock must look free, past the bound, before the bring-up goes on: covers the step between
+/// two holders (the preload letting it go, a `bt_on` taking it at its next look, 0.2 s later at most).
+pub const SETTLE: Duration = Duration::from_secs(1);
+/// radio_hal.sh's Bluetooth lock (`lock_take bt`): a directory holding its holder's pid.
+const SEAM_BT_LOCK: &str = "/tmp/.radio_lock_bt";
+/// A lock with no pid in it is being taken, or its holder could not write one (the 21 Nov review, K); one that stays
+/// without one this long is a dead holder's: the age radio_hal.sh's `lock_take` reclaims it at (`-mmin +20`).
+const UNNAMED_LOCK_STALE: Duration = Duration::from_secs(20 * 60);
 
 /// `@<unix_ms> [handover] …`, as btd's other lines (docs/carplay/01_OCBM_PROTOCOL.md CH_LOG).
 fn log(m: &str) {
@@ -87,6 +101,9 @@ pub enum Go {
     BtOn,
     /// SIGTERM.
     Exit,
+    /// Past [`BOUND`] with no handover and no word from `bt_on`, and no seam bring-up holding Bluetooth: today's full
+    /// bring-up, DOWN/UP and all (nothing is known of the controller).
+    Bound,
 }
 
 /// The decision from what is there now: a handover for this host first (it is the sooner and asks less of the
@@ -103,9 +120,33 @@ pub struct Files<'a> {
     pub handover: &'a str,
     pub bt_on_done: &'a str,
     pub origin: &'a str,
+    pub bt_lock: &'a str,
 }
 
-const BOX_FILES: Files<'static> = Files { handover: HANDOVER, bt_on_done: BT_ON_DONE, origin: box_common::timeline::ORIGIN };
+const BOX_FILES: Files<'static> =
+    Files { handover: HANDOVER, bt_on_done: BT_ON_DONE, origin: box_common::timeline::ORIGIN, bt_lock: SEAM_BT_LOCK };
+
+/// The wait's limits ([`BOUND`] and [`SETTLE`] on the box, a test's own elsewhere).
+#[derive(Clone, Copy, Debug)]
+pub struct Limits {
+    pub bound: Duration,
+    pub settle: Duration,
+}
+
+const BOX_LIMITS: Limits = Limits { bound: BOUND, settle: SETTLE };
+
+/// Whether a seam bring-up holds Bluetooth: radio_hal.sh's lock there, naming a live process (a zombie counts, as in
+/// the shell's `pid_live`), or naming none and younger than [`UNNAMED_LOCK_STALE`] (or dated ahead of the clock).
+fn seam_busy(lock: &str) -> bool {
+    let Ok(meta) = std::fs::metadata(lock) else { return false };
+    match std::fs::read_to_string(format!("{lock}/pid")).ok().and_then(|s| s.trim().parse::<libc::pid_t>().ok()) {
+        // SAFETY: kill with signal 0 sends nothing; it only checks that the process exists. EPERM: alive, another user's.
+        Some(pid) => {
+            pid > 0 && (unsafe { libc::kill(pid, 0) } == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
+        }
+        None => meta.modified().ok().and_then(|m| m.elapsed().ok()).is_none_or(|age| age < UNNAMED_LOCK_STALE),
+    }
+}
 
 /// One look at the files.
 fn look(files: &Files, dev: &str) -> Option<Go> {
@@ -126,7 +167,7 @@ pub fn wait(shutdown: &AtomicBool, dev: &str) -> Go {
     };
     let watch = Watch::new(DIR);
     let every = if watch.is_some() { BACKSTOP } else { TICK };
-    let go = wait_on(&BOX_FILES, shutdown, dev, wake.as_ref(), watch.as_ref(), every);
+    let go = wait_on(&BOX_FILES, shutdown, dev, wake.as_ref(), watch.as_ref(), every, BOX_LIMITS);
     let waited = t0.elapsed().as_millis();
     match go {
         Go::Handover(h) => log(&format!(
@@ -136,12 +177,28 @@ pub fn wait(shutdown: &AtomicBool, dev: &str) -> Go {
         )),
         Go::BtOn => log(&format!("bt_on is over after {waited} ms here, with no handover: today's bring-up")),
         Go::Exit => log(&format!("SIGTERM after {waited} ms waiting for the controller")),
+        Go::Bound => log(&format!(
+            "no handover and no word from bt_on in {waited} ms, and no bring-up holds Bluetooth: today's full bring-up \
+             (its DOWN/UP)"
+        )),
     }
     go
 }
 
-/// The wait itself: a look, then a sleep until a write in the watched directory, a signal through `wake`, or `every`.
-fn wait_on(files: &Files, shutdown: &AtomicBool, dev: &str, wake: Option<&UnixStream>, watch: Option<&Watch>, every: Duration) -> Go {
+/// The wait itself: a look, then a sleep until a write in the watched directory, a signal through `wake`, or `every`;
+/// past `limits.bound`, [`Go::Bound`] once the seam's bt lock has looked free for `limits.settle`.
+fn wait_on(
+    files: &Files,
+    shutdown: &AtomicBool,
+    dev: &str,
+    wake: Option<&UnixStream>,
+    watch: Option<&Watch>,
+    every: Duration,
+    limits: Limits,
+) -> Go {
+    let t0 = Instant::now();
+    let mut free_since: Option<Instant> = None;
+    let mut said = false;
     loop {
         if shutdown.load(Ordering::Relaxed) {
             return Go::Exit;
@@ -149,7 +206,21 @@ fn wait_on(files: &Files, shutdown: &AtomicBool, dev: &str, wake: Option<&UnixSt
         if let Some(go) = look(files, dev) {
             return go;
         }
-        sleep_until_woken(wake, watch, every);
+        let past = t0.elapsed() >= limits.bound;
+        if past {
+            if seam_busy(files.bt_lock) {
+                free_since = None;
+                if !said {
+                    log("past the wait's bound, but a radio bring-up holds Bluetooth: waiting for it");
+                    said = true;
+                }
+            } else if free_since.get_or_insert_with(Instant::now).elapsed() >= limits.settle {
+                return Go::Bound;
+            }
+        }
+        // Past the bound the looks come at least four times a settle, so the settle is timed by them, not by a write.
+        let nap = if past { every.min(limits.settle / 4) } else { every.min(limits.bound.saturating_sub(t0.elapsed())) };
+        sleep_until_woken(wake, watch, nap.max(Duration::from_millis(1)));
     }
 }
 
@@ -269,11 +340,48 @@ mod tests {
         assert_eq!(decide(None, None, true, "hci0"), Some(Go::BtOn), "bt_on's end needs no origin");
     }
 
+    /// Limits no test reaches: the bound plays no part.
+    const FOREVER: Limits = Limits { bound: Duration::from_secs(3600), settle: Duration::from_secs(1) };
+
+    /// Past the bound with nothing to go on and no bring-up holding Bluetooth: today's full bring-up, once the lock has
+    /// looked free for the settle. While a live process holds the seam's lock (here this test's own), it waits on, and a
+    /// go that comes then is taken; a lock naming a dead holder holds nothing, and one naming none is being taken.
+    #[test]
+    fn the_wait_ends_at_its_bound_unless_a_bring_up_holds_bluetooth() {
+        let s = Scratch::new("bound");
+        let stop = AtomicBool::new(false);
+        let limits = Limits { bound: Duration::from_millis(150), settle: Duration::from_millis(100) };
+        let t = Instant::now();
+        assert_eq!(wait_on(&s.files(), &stop, "hci0", None, None, TICK, limits), Go::Bound);
+        assert!(t.elapsed() >= Duration::from_millis(240) && t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+
+        std::fs::create_dir(&s.lock).unwrap();
+        std::fs::write(format!("{}/pid", s.lock), format!("{}\n", std::process::id())).unwrap();
+        assert!(seam_busy(&s.lock), "a live holder");
+        let done = s.done.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(500));
+            std::fs::write(done, "").unwrap();
+        });
+        assert_eq!(wait_on(&s.files(), &stop, "hci0", None, None, TICK, limits), Go::BtOn, "held past the bound: bt_on's word taken");
+        writer.join().unwrap();
+
+        std::fs::remove_file(&s.done).unwrap();
+        std::fs::write(format!("{}/pid", s.lock), "999999999\n").unwrap();
+        assert!(!seam_busy(&s.lock), "a dead holder's lock holds nothing");
+        assert_eq!(wait_on(&s.files(), &stop, "hci0", None, None, TICK, limits), Go::Bound);
+        std::fs::remove_file(format!("{}/pid", s.lock)).unwrap();
+        assert!(seam_busy(&s.lock), "a lock naming no holder yet: being taken");
+        std::fs::remove_dir(&s.lock).unwrap();
+        assert!(!seam_busy(&s.lock), "no lock: nothing held");
+    }
+
     struct Scratch {
         dir: std::path::PathBuf,
         handover: String,
         done: String,
         origin: String,
+        lock: String,
     }
 
     impl Scratch {
@@ -282,11 +390,11 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             let p = |n: &str| dir.join(n).to_str().unwrap().to_string();
-            Scratch { handover: p("handover"), done: p("done"), origin: p("origin"), dir }
+            Scratch { handover: p("handover"), done: p("done"), origin: p("origin"), lock: p("lock"), dir }
         }
 
         fn files(&self) -> Files<'_> {
-            Files { handover: &self.handover, bt_on_done: &self.done, origin: &self.origin }
+            Files { handover: &self.handover, bt_on_done: &self.done, origin: &self.origin, bt_lock: &self.lock }
         }
     }
 
@@ -309,7 +417,7 @@ mod tests {
             std::fs::write(handover, "6850 6820 hci0\n").unwrap();
         });
         let t = Instant::now();
-        let go = wait_on(&s.files(), &stop, "hci0", None, None, TICK);
+        let go = wait_on(&s.files(), &stop, "hci0", None, None, TICK, FOREVER);
         writer.join().unwrap();
         assert_eq!(go, Go::Handover(Handover { handed_ms: 6850, hci_up_ms: 6820 }));
         assert!(t.elapsed() >= Duration::from_millis(90) && t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
@@ -320,7 +428,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(100));
             std::fs::write(done, "").unwrap();
         });
-        let go = wait_on(&s.files(), &stop, "hci0", None, None, TICK);
+        let go = wait_on(&s.files(), &stop, "hci0", None, None, TICK, FOREVER);
         writer.join().unwrap();
         assert_eq!(go, Go::BtOn, "a handover from before the host came: bt_on's end");
     }
@@ -330,7 +438,7 @@ mod tests {
     fn a_sigterm_ends_the_wait() {
         let s = Scratch::new("term");
         let stop = AtomicBool::new(true);
-        assert_eq!(wait_on(&s.files(), &stop, "hci0", None, None, TICK), Go::Exit, "already set: at once");
+        assert_eq!(wait_on(&s.files(), &stop, "hci0", None, None, TICK, FOREVER), Go::Exit, "already set: at once");
 
         let stop = std::sync::Arc::new(AtomicBool::new(false));
         let (rx, tx) = UnixStream::pair().unwrap();
@@ -343,7 +451,7 @@ mod tests {
             (&tx).write_all(&[1]).unwrap();
         });
         let t = Instant::now();
-        let go = wait_on(&s.files(), &stop, "hci0", Some(&rx), None, Duration::from_secs(30));
+        let go = wait_on(&s.files(), &stop, "hci0", Some(&rx), None, Duration::from_secs(30), FOREVER);
         signaller.join().unwrap();
         assert_eq!(go, Go::Exit);
         assert!(t.elapsed() < Duration::from_secs(5), "woken by the pipe, not the 30 s backstop: {:?}", t.elapsed());
@@ -366,7 +474,7 @@ mod tests {
             std::fs::write(done, "").unwrap();
         });
         let t = Instant::now();
-        let go = wait_on(&s.files(), &stop, "hci0", None, Some(&watch), Duration::from_secs(30));
+        let go = wait_on(&s.files(), &stop, "hci0", None, Some(&watch), Duration::from_secs(30), FOREVER);
         writer.join().unwrap();
         assert_eq!(go, Go::BtOn);
         assert!(t.elapsed() < Duration::from_secs(5), "woken by the watch, not the 30 s backstop: {:?}", t.elapsed());

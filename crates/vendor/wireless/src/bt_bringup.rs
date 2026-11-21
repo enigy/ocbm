@@ -180,8 +180,14 @@ fn stamp(t0: std::time::Instant, what: &str) {
 /// at once, exactly as before.
 pub fn bring_up(hci_dev: &str, name: &str, just_opened: bool) -> std::io::Result<()> {
     let t0 = std::time::Instant::now();
-    prepare(hci_dev, name, just_opened.then_some("opened by radio_hal.sh just now: no down/up"), t0)?;
+    prepare(hci_dev, name, down_up_skip(just_opened), t0)?;
     open_scans(hci_dev, name, t0)
+}
+
+/// Why [`bring_up`] skips its DOWN/UP, if it does: only a controller radio_hal.sh's `bt_on` opened from DOWN just
+/// before this btd's first bring-up (`just_opened`); anything else does the cycle.
+fn down_up_skip(just_opened: bool) -> Option<&'static str> {
+    just_opened.then_some("opened by radio_hal.sh just now: no down/up")
 }
 
 /// The first session's bring-up from the boot preload's handover (`crate::handover`, R3-5): a controller this boot's
@@ -443,6 +449,13 @@ mod tests {
             &eir[marker_start + 2..marker_start + 18],
             &CARPLAY_MARKER_UUID
         );
+    }
+
+    /// The default path's DOWN/UP (the 21 Nov review, I): skipped only on bt_on's "opened" word, with today's reason.
+    #[test]
+    fn the_down_up_is_skipped_only_for_a_controller_bt_on_just_opened() {
+        assert_eq!(down_up_skip(false), None, "no word: the DOWN/UP");
+        assert_eq!(down_up_skip(true), Some("opened by radio_hal.sh just now: no down/up"));
     }
 
     #[test]
