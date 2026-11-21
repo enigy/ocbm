@@ -149,8 +149,8 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   check '[ ! -e "$d/root/script/radio_handover_off" ] && [ -e "$d/root/script/radio_handover_on" ]' \
     "the handover's retired off file goes with the update; an owner's opt-in stays"
   check '[ ! -e "$d/root/script/radio_preload_off" ] && [ ! -e "$d/root/script/.radio_preload_unfinished" ]' "the new version starts with the boot radio preload on"
-  check '[ ! -e "$d/root/script/radio_together_off" ] && [ ! -e "$d/root/script/.radio_together_failed" ] && [ ! -e "$d/root/script/.radio_together_inflight" ] && [ ! -e "$d/root/script/radio_preload_late" ]' \
-    "and early, and tries the radio order again: the guard's off file, its count and mark lifted"
+  check '[ ! -e "$d/root/script/radio_together_off" ] && [ ! -e "$d/root/script/.radio_together_failed" ] && [ ! -e "$d/root/script/.radio_together_inflight" ] && [ -e "$d/root/script/radio_preload_late" ]' \
+    "and tries the radio order again: the guard's off file, its count and mark lifted; the owner's radio_preload_late kept"
   check '[ "$(content "$d" usr/sbin/ocbmd)" = new-ocbmd ] && [ "$(content "$d" usr/sbin/ocbmd.prev)" = old-ocbmd ]' \
     "the new ocbmd in place, the old one kept as .prev"
   check '! grep -q "usr/sbin/btd" "$d/root/etc/ocbm/update_pending"' "a file that did not change is left alone"
@@ -159,10 +159,14 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   check '[ ! -e "$d/run/ocbm-update.tgz" ] && [ ! -d "$d/run/ocbm-update" ]' "the package and its unpacked copy go"
   : > "$d/root/script/radio_preload_off"   # an older updater's one-event flag, which it left behind
   : > "$d/root/script/radio_handover_off"   # and the handover's retired off file, which an older updater keeps
+  echo "guard: 2 together attaches in a row failed" > "$d/root/script/radio_together_off"   # and the radio order's guard
+  : > "$d/root/script/.radio_together_inflight"; echo 1 > "$d/root/script/.radio_together_failed"
   restart "$d"; touch "$d/run/ocbmd_answered"; boot "$sh" "$d"   # a host answered: Carlink connected
   check 'waitfor "[ ! -e $d/root/script/radio_preload_off ]" 5' "the update's first start clears a flag an older updater left"
   check 'waitfor "[ ! -e $d/root/script/radio_handover_off ]" 5 && [ -e "$d/root/script/radio_handover_on" ]' \
     "  and the handover's retired off file, the owner's opt-in kept"
+  check '[ ! -e "$d/root/script/radio_together_off" ] && [ ! -e "$d/root/script/.radio_together_inflight" ] && [ ! -e "$d/root/script/.radio_together_failed" ]' \
+    "  and the radio order's guard (its off file, mark and count), which an older updater left"
   check 'waitfor "is_new \"$d\"" 5' "the trial passes and a host is answered: the update is kept, installed_version moves on"
   check 'result_is "$d" "committed $NEW (from $OLD)"' "update_result: committed"
   check '[ ! -e "$d/rebooted" ] && [ -e "$d/m.boot" ] && [ "$(cat "$d/root/script/ocbm_mode")" = final ]' "no restart; still final"
@@ -182,9 +186,11 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   # answer_watch timeout after that "rolled back" nothing, with blank versions, and restarted).
   echo "== $sh: an update's trial is kept once a host is answered, and only then"
   d="$T/$sh-deaf"; make_box "$d" final; make_pkg "$d/run/ocbm-update.tgz" dispatch
-  update "$sh" "$d"; restart "$d"; boot "$sh" "$d" ANSWER_SECS=3
+  update "$sh" "$d"; : > "$d/root/script/radio_together_off"   # the owner's own radio order switch (empty: no guard)
+  restart "$d"; boot "$sh" "$d" ANSWER_SECS=3
   check 'waitfor "grep -q \"self-test passed; the update is kept once\" $d/run/box.log" 5 && [ -e "$d/root/usr/sbin/ocbmd.prev" ] && grep -qx placed "$d/root/etc/ocbm/update_pending"' \
     "the self-test passes with no host: not committed, the .prev copies kept"
+  check '[ -e "$d/root/script/radio_together_off" ]' "  the update's first start keeps an owner's own radio order switch (only a guard's goes)"
   echo 40 > "$d/run/ocbmd_heard"; echo "500.00 80.00" > "$d/proc/uptime"
   check 'waitfor "is_old \"$d\" && [ -e \"$d/rebooted\" ]" 8' "heard and never answered: the old version back, and a restart"
   check 'result_is "$d" "rolled_back $NEW: ocbmd heard the host for 460 s and never answered it (kept $OLD)"' \

@@ -165,7 +165,7 @@ newer "$from_min" "$have" && refuse "This package updates OCBM $from_min or newe
 
 # What changes: every file of the new version that the adapter does not already have as it should.
 list="$WORK/changed"
-: > "$list"
+{ true >"$list"; } 2>/dev/null || refuse "Could not write the update's work files (no room in /tmp?)."
 need_kb=0
 while read -r want rel; do
   t=$(target "$rel")
@@ -180,7 +180,7 @@ if [ ! -s "$list" ]; then   # a new version number with no new files
   [ -z "$bench_over" ] || log "$bench_over"
   result "committed $VER (from $have_line): no files changed"
   log "nothing to place: the adapter's files already match $VER"
-  rm -f "$S/radio_preload_off" "$S/.radio_preload_inflight" "$S/.radio_preload_unfinished" "$S/radio_preload_late"   # a new version starts it on
+  rm -f "$S/radio_preload_off" "$S/.radio_preload_inflight" "$S/.radio_preload_unfinished"   # a new version starts it on
   together_guard_lift
   rm -f "$S/radio_handover_off"   # retired (the handover is opt-in): read by nothing
   clean; unlock; exit 0
@@ -231,8 +231,9 @@ if [ "$rc" != 0 ]; then   # no "placed" in the journal: the next start undoes wh
   sync; unlock; $REBOOT; exit 1
 fi
 echo placed >> "$U" && sync
-# A new version starts with the boot radio preload on, and early: its guard counts afresh (radio_hal.sh do_preload).
-rm -f "$S/radio_preload_off" "$S/.radio_preload_inflight" "$S/.radio_preload_unfinished" "$S/radio_preload_late"
+# A new version starts with the boot radio preload on: its guard counts afresh (radio_hal.sh do_preload). An owner's
+# /script/radio_preload_late (the old, later start) stays, as the other owners' switches do (the 21 Nov review G).
+rm -f "$S/radio_preload_off" "$S/.radio_preload_inflight" "$S/.radio_preload_unfinished"
 together_guard_lift
 # The handover's old off file is retired (the handover is opt-in, radio_hal.sh "OPT-IN"): read by nothing, gone. An
 # owner's /script/radio_handover_on stays, as the other owners' switches do.

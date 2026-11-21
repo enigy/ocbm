@@ -102,6 +102,9 @@ BT_FLAG="etc/.custom_bluetooth_name"              # the seam's Bluetooth name fl
 
 say() { echo "[restore] $*"; }
 die() { echo "[restore] ABORT: $*"; echo "RESTORE_ABORT"; exit 1; }
+# An empty work file, or the restore stops saying why: never `:`, a special built-in whose failed redirection ends the
+# script with no message and no RESTORE_ABORT (the 21 Nov review B).
+empty() { for _ef in "$@"; do { true >"$_ef"; } 2>/dev/null || die "could not write the work file $_ef (no room?)"; done; }
 
 in_list() {  # $1 word, $2 list
   for _w in $2; do [ "$_w" = "$1" ] && return 0; done
@@ -201,8 +204,8 @@ diff_trees() {
 
 # Split the action list into the ordered work lists apply walks.
 split_actions() {
-  : > "$W/extra_payload"; : > "$W/extra_late"; : > "$W/extra_dirs"; : > "$W/mkdir"
-  : > "$W/main"; : > "$W/boot"; : > "$W/login"; : > "$W/conflict"; : > "$W/protected"; : > "$W/switch"
+  empty "$W/extra_payload" "$W/extra_late" "$W/extra_dirs" "$W/mkdir"
+  empty "$W/main" "$W/boot" "$W/login" "$W/conflict" "$W/protected" "$W/switch"
   while IFS="$TAB" read -r act typ key p; do
     case "$p" in ''|/*|..|../*|*/..|*/../*) die "refusing an unsafe path in the plan: '$p'" ;; esac
     case "$act" in
@@ -224,7 +227,7 @@ split_actions() {
     esac
   done < "$W/actions"
   # The boot set goes in a fixed order: the scripts start_main_service calls, then the callers.
-  : > "$W/boot.ordered"
+  empty "$W/boot.ordered"
   for b in $BOOT_SET; do awk -F "$TAB" -v p="$b" '$3 == p' "$W/boot" >> "$W/boot.ordered"; done
 }
 
@@ -344,7 +347,7 @@ remove_list() {  # $1 list of paths, $2 label
 # is stopped, and nothing can start it again, its file being gone. The console's ocbmd is never
 # stopped, even running from a file an update replaced. $1 the list removed from, $2 the step's label.
 reap_removed() {
-  : > "$W/reaped"
+  empty "$W/reaped"
   for _e in "$PROC"/[0-9]*/exe; do
     _t=$(readlink "$_e" 2>/dev/null) || continue   # kernel threads have no exe
     case "$_t" in *" (deleted)") ;; *) continue ;; esac
@@ -474,7 +477,7 @@ do_apply_onefile() {
 }
 
 remaining() {  # $1 out: differences that still count (not the NCM flags; onefile: not radio files the guard keeps)
-  : > "$1"
+  empty "$1"
   while IFS="$TAB" read -r act typ key p; do
     in_list "$p" "$PROTECT" && continue
     if [ "$PROFILE" = onefile ] && [ "$act" = extra ]; then

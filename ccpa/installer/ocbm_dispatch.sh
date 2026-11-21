@@ -215,8 +215,14 @@ update_boot() {  # before OCBM starts
   log "update trial: $(journal to), start $((n + 1))"
   # Its first start begins with the boot radio preload on: an updater from before the guard counted (85bff31..9b228f8)
   # cleared nothing, and its one-event flag would read as the owner's (the Mac's 13 Nov review). The handover's retired
-  # off file goes too (an updater from before it was retired leaves it; nothing reads it now).
-  if [ "$n" = 0 ]; then rm -f "$S/radio_preload_off" "$S/.radio_preload_inflight" "$S/.radio_preload_unfinished" "$S/radio_handover_off"; fi
+  # off file goes too (an updater from before it was retired leaves it; nothing reads it now), and the radio order's guard
+  # with them, as this version's updater lifts it (its count, its in-flight mark, an off file it wrote; never the owner's
+  # own off file): 2.6.5's updater knows nothing of them (the 21 Nov review E).
+  if [ "$n" = 0 ]; then
+    rm -f "$S/radio_preload_off" "$S/.radio_preload_inflight" "$S/.radio_preload_unfinished" "$S/radio_handover_off" \
+          "$S/.radio_together_inflight" "$S/.radio_together_failed"
+    grep -q '^guard' "$S/radio_together_off" 2>/dev/null && rm -f "$S/radio_together_off"
+  fi
 }
 
 selftest() {
@@ -233,7 +239,7 @@ selftest() {
     fi
     first_start PASSED
     [ "$mode" = confirmed ] && [ -x "$S/ocbm_finish.sh" ] && "$S/ocbm_finish.sh" >> "$RUN/box.log" 2>&1
-    : > "$RUN/ocbm_selftest_passed"   # the boot radio preload waits for this (ocbm_boot.sh)
+    { true >"$RUN/ocbm_selftest_passed"; } 2>/dev/null   # the boot radio preload waits for this (ocbm_boot.sh); not `:`, whose failed redirection ends a script
   else
     log "self-test: $(tail -1 "$RUN/ocbm_selftest.txt")"
     if [ "$update_trial" = 1 ]; then   # back to the OCBM the update replaced, not to stock
@@ -471,7 +477,7 @@ if [ "$mode" != final ] || [ "$update_trial" = 1 ]; then OCBM_PRELOAD_AFTER="$RU
 # driver wedged the kernel, 19 Oct 2026). The mark comes whether or not the stock script is there.
 OCBM_GPIO_DONE="$RUN/ocbm_gpio_done"; rm -f "$OCBM_GPIO_DONE"; export OCBM_GPIO_DONE
 "$S/ocbm_boot.sh"   # gadget as the OCBM accessory, ocbmd, session supervisor; returns at once
-{ [ -x "$S/init_gpio.sh" ] && "$S/init_gpio.sh"; : > "$OCBM_GPIO_DONE"; } </dev/null >/dev/null 2>&1 &   # stock: Bluetooth reset line, quick-charge pins
+{ [ -x "$S/init_gpio.sh" ] && "$S/init_gpio.sh"; true >"$OCBM_GPIO_DONE"; } </dev/null >/dev/null 2>&1 &   # stock: Bluetooth reset line, quick-charge pins
 respawn "$S/run_ocbmd.sh" </dev/null >/dev/null 2>&1 &
 respawn "$S/run_supervisor.sh" </dev/null >/dev/null 2>&1 &
 # A stick report a restart interrupted; then what a stick in at this start asks for (an update, or in

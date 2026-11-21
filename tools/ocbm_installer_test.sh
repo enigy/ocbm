@@ -244,6 +244,7 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   echo 2 > "$r/root/etc/ocbm/boot_attempts"
   echo "guard: 2 unfinished in a row" > "$r/root/script/radio_preload_off"; : > "$r/root/script/.radio_preload_inflight"
   echo "guard: 2 together attaches in a row failed" > "$r/root/script/radio_together_off"; echo 1 > "$r/root/script/.radio_together_failed"
+  : > "$r/root/script/radio_preload_late"   # the owner's switch for the preload's old start
   refresh "$r"; run_once "$sh" "$r"; rc=$?
   check '[ $rc = 1 ] && grep -q "OCBM_RETRY" "$r/stick/OCBM_RESULT.txt"' "an undone version is refused without OCBM_RETRY"
   touch "$r/stick/OCBM_RETRY"; refresh "$r"; run_once "$sh" "$r"; rc=$?
@@ -257,6 +258,7 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   check '[ ! -e "$r/root/etc/ocbm/boot_attempts" ] && [ ! -e "$r/root/etc/ocbm/pending_result.txt" ]' "arming clears the earlier try's start counter and report"
   check '[ ! -e "$r/root/script/radio_preload_off" ] && [ ! -e "$r/root/script/.radio_preload_inflight" ]' "and the boot radio preload starts on again"
   check '[ ! -e "$r/root/script/radio_together_off" ] && [ ! -e "$r/root/script/.radio_together_failed" ]' "and the radio order's guard is lifted"
+  check '[ -e "$r/root/script/radio_preload_late" ]' "an owner's /script/radio_preload_late stays, as the other owners' switches do"
   echo "== $sh: a Bluetooth name flag the install found comes back with the go-back"
   r="$T/$sh-btflag"; make_box "$r"; echo "My Car" > "$r/root/etc/.custom_bluetooth_name"; run_once "$sh" "$r" >/dev/null; mkdir -p "$r/run"
   check 'gzip -dc "$r/root/etc/ocbm/identity.tgz" | tar -tf - | grep -qx etc/.custom_bluetooth_name' "identity.tgz holds the Bluetooth name flag the install found"
