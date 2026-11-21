@@ -80,6 +80,10 @@ radio_detect_key() {
   _rdk_sums=$(md5sum /script/radio_detect.sh /script/init_bluetooth_wifi.sh /script/attach_bluetooth.sh \
               /lib/firmware/*/*_ko.tar.gz 2>/dev/null | md5sum 2>/dev/null)
   set -f; set -- $_rdk_sums; set +f
+  # No sums (no md5sum), the sums of nothing (none of the files readable: md5 of the empty input), or no SDIO card: no
+  # key a kept copy may be checked against (the 21 Nov reviews, D and L).
+  case "${1:-}" in ''|d41d8cd98f00b204e9800998ecf8427e) echo unkeepable; return 0 ;; esac
+  [ "$_rdk_sdio" = none ] && { echo unkeepable; return 0; }
   _rdk_key="v1 sdio=$_rdk_sdio fw=${_rdk_fw#,} has=$_rdk_has gates=${_rdk_gates#,} sums=${1:-}"
   case "$_rdk_key" in
     *[!A-Za-z0-9._/:=,+\ -]*) echo unkeepable ;;
@@ -358,23 +362,77 @@ BT_SCO_ROUTE_CMD=$(echo "$_SCO_BRANCH" | awk '
     prev = $0
   }' | decomment | safe_cmd)
 
-# ---- 4d. WHETHER THIS UNIT'S OWN BRANCH WAITS FOR THE WI-FI DRIVER (20 Nov 2026) ----------------
+# ---- 4d. WHETHER THIS UNIT'S OWN BRANCH WAITS FOR THE WI-FI DRIVER (20 Nov 2026; conservative since 21 Nov) --------
 # BT_AFTER_WLAN is read off the whole attach script, so one branch's wait loop sets it for every unit. In Carlinkit's
 # 2025.10.15.1127 attach script only the 0xc822 branch and the SD8987 one (0x9149/0x9141) wait for the Wi-Fi interface;
 # the IW416 branch (0x9159) pushes its Bluetooth firmware with fw_loader_linux and attaches without waiting, and that
 # unit's dispatcher starts the attach script in the background BEFORE it loads the Wi-Fi driver. So the stock firmware
 # loads the two side by side on every IW416 boot, and the dev adapter's bench did the same (20 Nov: both loads started
-# at one instant, hci0 answering 3.24 s on, the AP up after). Read per branch like the SCO lines above (attach_branch):
-# BT_TOGETHER=1 where the whole file waits but this unit's own branch does not, and that branch pushes its own firmware
-# (a preload line) before an attach this script could extract, on the mapped backend with a Wi-Fi mapping. radio_hal.sh
-# then loads the Wi-Fi driver beside the Bluetooth firmware and attaches without waiting for the interface; everywhere
-# else (0 here) it keeps today's order. No chipset table: an id the dispatcher never names has no branch, so 0, and the
-# shape below selects the IW416 branch alone in every attach script this project has read.
+# at one instant, hci0 answering 3.24 s on, the AP up after). BT_TOGETHER=1 (radio_hal.sh then loads the Wi-Fi driver
+# beside the Bluetooth firmware and attaches without waiting for the interface) only where the unit's own text shows
+# the stock bring-up doing that, and NO sign anywhere that its attach waits for the Wi-Fi side (the 21 Nov review C: the
+# first rule looked for one exact loop, and a wait before the dispatch, an `until`, a helper, a quoted path or a
+# dispatcher that starts the attach after the Wi-Fi driver all passed it). All of these, else 0 (today's order):
+#   - the whole file waits (BT_AFTER_WLAN=1), on the mapped backend, with a Wi-Fi mapping, and this unit's own branch
+#     pushes its own firmware (a preload line) before an attach this script could extract;
+#   - the dispatcher starts the attach script in the background (`... &`), at its top level (in no function or `{`
+#     group), on a line before any insert of this unit's Wi-Fi modules, and nothing before that line waits, sleeps,
+#     sources a file or names the Wi-Fi side (the stock firmware's own side-by-side start);
+#   - this unit's own branch has no loop and no sleep (`while`, `until`, `sleep`), sources nothing, calls none of the
+#     attach script's own functions, and names nothing of the Wi-Fi side;
+#   - the rest of the attach script, outside every sdioCardID branch (before the dispatch, after it, its functions and
+#     its top level), sources nothing and names nothing of the Wi-Fi side either, and its sdioCardID chains all close.
+# "The Wi-Fi side": /sys/class/net, an interface name (wlan<n>, sta<n>, uap<n>, p2p<n>), ifconfig, iwconfig, `iw dev`,
+# or a Wi-Fi module of this unit's own tarball (by its name), in any quoting, comments aside. No chipset table: the
+# module names come from the unit's tarball, and an id the dispatcher never names has no branch, so 0.
+_nocomment() { sed 's/[[:space:]]*#.*$//'; }
+_wsig='/sys/class/net|(^|[^A-Za-z0-9_])(wlan|sta|uap|p2p)[0-9]|(^|[^A-Za-z0-9_])(ifconfig|iwconfig)([^A-Za-z0-9_]|$)|(^|[^A-Za-z0-9_])iw[[:space:]]+dev'
+for _m in $WLAN_MODS; do _wsig="$_wsig|${_m%.ko}"; done
+# The attach script outside every sdioCardID branch; "UNCLOSED" where a chain never closes (then nothing is assumed).
+attach_outside() {
+  [ -f /script/attach_bluetooth.sh ] || return 0
+  _nocomment </script/attach_bluetooth.sh | awk '
+    function opens(l) { return l ~ /^[ \t]*if[ \t]/ && l !~ /(^|[; \t])fi[ \t;]*$/ }
+    {
+      if (!inchain) {
+        if ($0 ~ /sdioCardID/ && $0 ~ /^[ \t]*if[ \t]/) { inchain = 1; depth = 0; next }
+        print; next
+      }
+      if (depth == 0 && $0 ~ /^[ \t]*fi([ \t;]|$)/) { inchain = 0; next }
+      if (depth == 0 && $0 ~ /^[ \t]*(elif|else)([ \t]|$)/) next
+      if (opens($0)) depth++
+      else if ($0 ~ /^[ \t]*fi([ \t;]|$)/) depth--
+    }
+    END { if (inchain) print "UNCLOSED" }'
+}
+# The dispatcher's own order: 0 when it starts the attach script in the background, at its top level, before inserting
+# any Wi-Fi module of this unit, with no wait, sleep, sourced file or sign of the Wi-Fi side before it (the line itself
+# included). A line ending in `{` opens a body (a function's, a group's) and one starting with `}` closes it.
+dispatch_starts_attach_first() {
+  [ -f /script/init_bluetooth_wifi.sh ] && [ -n "$WLAN_MODS" ] || return 1
+  _dsa_mods=""; for _m in $WLAN_MODS; do _dsa_mods="$_dsa_mods|${_m%.ko}"; done
+  _nocomment </script/init_bluetooth_wifi.sh | awk -v mods="${_dsa_mods#|}" -v wsig="$_wsig" '
+    att == 0 && ($0 ~ wsig || $0 ~ /(^|[^A-Za-z0-9_])(while|until|sleep)([^A-Za-z0-9_]|$)/ || $0 ~ /^[ \t]*(\.|source)[ \t]/) { waits = 1 }
+    att == 0 && /attach_bluetooth/ { att = NR; bg = ($0 ~ /&[ \t]*$/); top = (depth == 0) }
+    ins == 0 && $0 ~ ("insmod[^;&|]*(" mods ")") { ins = NR }
+    /\{[ \t]*$/ { depth++ }
+    /^[ \t]*\}/ { if (depth > 0) depth-- }
+    END { exit !(att > 0 && bg && top && !waits && (ins == 0 || att < ins)) }'
+}
 BT_TOGETHER=0
 if [ "$BT_AFTER_WLAN" = 1 ] && [ "$BACKEND" = mapped ] && [ -n "$BT_PRELOAD_CMD" ] && [ -n "$BT_ATTACH_CMD" ] \
-   && [ -n "$WLAN_INSMOD" ] && [ -n "$_SCO_BRANCH" ] \
-   && ! echo "$_SCO_BRANCH" | grep -qE 'while \[ ! -e /sys/class/net/'; then
-  BT_TOGETHER=1
+   && [ -n "$WLAN_INSMOD" ] && [ -n "$_SCO_BRANCH" ] && dispatch_starts_attach_first; then
+  _tg_branch=$(echo "$_SCO_BRANCH" | _nocomment)
+  _tg_outside=$(attach_outside)
+  _tg_funcs=$(_nocomment </script/attach_bluetooth.sh | sed -n 's/^[[:space:]]*\([A-Za-z_][A-Za-z0-9_]*\)[[:space:]]*()[[:space:]]*{*[[:space:]]*$/\1/p')
+  _tg=1
+  echo "$_tg_branch" | grep -qE '(^|[^A-Za-z0-9_])(while|until|sleep)([^A-Za-z0-9_]|$)' && _tg=0
+  echo "$_tg_branch" | grep -qE "$_wsig" && _tg=0
+  printf '%s\n%s\n' "$_tg_branch" "$_tg_outside" | grep -qE '^[[:space:]]*(\.|source)[[:space:]]' && _tg=0
+  echo "$_tg_outside" | grep -qE "$_wsig" && _tg=0
+  echo "$_tg_outside" | grep -qx 'UNCLOSED' && _tg=0
+  for _f in $_tg_funcs; do echo "$_tg_branch" | grep -qw "$_f" && _tg=0; done
+  BT_TOGETHER=$_tg
 fi
 
 # ---- 5. post-load facts: enumerate, never assume -------------------------------------------
