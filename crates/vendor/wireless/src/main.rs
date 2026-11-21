@@ -24,6 +24,7 @@ mod box_identity;
 mod bt_bringup;
 mod bt_driver;
 mod control;
+mod handover;
 mod mfi_local;
 mod reconnect;
 mod sdp_client;
@@ -125,12 +126,15 @@ fn just_opened() -> bool {
 /// connection when a real arbiter granted us; `None` in standalone mode (no arbiter server present).
 /// `from_armed` is the name the armed bring-up wrote, for this btd's first session after a go
 /// (`armed::run`): its controller is up already, so the session's bring-up is only the step the arm left for the go.
+/// `cold_wait`: this btd started before Bluetooth was up (`handover`, a cold boot with the host waiting on the boot
+/// preload), so its first session waits for the controller after the session's start and before its bring-up.
 fn run_active_session(
     shutdown: &Arc<AtomicBool>,
     arbiter: Option<BufReader<UnixStream>>,
     ctrl: &Arc<control::Control>,
     session_active: &Arc<AtomicBool>,
     from_armed: Option<String>,
+    cold_wait: bool,
 ) {
     // Per-device name derived once per session (reads the Wi-Fi MAC / SoC serial). Used for the EIR
     // Complete Local Name (what the iPhone shows) and the wireless iAP2 identify.
@@ -138,14 +142,37 @@ fn run_active_session(
     // The connect timeline's AP events, for this session: hostapd's and udhcpd's lines as they land (ap_watch). It
     // ends at go-quiet below, or when this returns early.
     let ap_watch = ap_watch::start();
+    // The cold boot (R3-5): the controller is the preload's until it hands it over, or the host's bt_on's until that is
+    // over. Everything below starts after the wait, as in a btd started after bt_on (carplayd and the certificate read
+    // off the attach's CPU; the name once the Wi-Fi interface is in); the record and the AP watch began above, so the
+    // AP's enabling is seen.
+    let handed = if cold_wait {
+        let go = handover::wait(shutdown, HCI_DEV);
+        if go == handover::Go::Exit {
+            return;
+        }
+        log_radio_caps(); // not at the start: the preload may not have written it yet
+        match go {
+            handover::Go::Handover(h) => Some(h),
+            _ => None,
+        }
+    } else {
+        None
+    };
     av::session_starting(); // carplayd and the MFi certificate cache, ready before the phone needs them (A2/A4)
     let accessory_name = carplay_iap2_core::message::accessory_name(ACCESSORY_BRAND);
-    let up = match &from_armed {
-        Some(armed_name) => bt_bringup::open_from_armed(HCI_DEV, &accessory_name, armed_name).inspect(|()| {
+    let up = match (&from_armed, handed) {
+        (Some(armed_name), _) => bt_bringup::open_from_armed(HCI_DEV, &accessory_name, armed_name).inspect(|()| {
             // The connect timeline: this connect started from the armed state (`bt_armed=1`; `bt_power` is `-`).
             startup::stamp(box_common::timeline::ARMED_KEY);
         }),
-        None => bt_bringup::bring_up(HCI_DEV, &accessory_name, just_opened()),
+        (None, Some(h)) => {
+            // Spent unread, as at an arm: the handover is this bring-up's proof of state, and a later session's
+            // bring-up must never take the word bt_on writes for a btd that goes on its return.
+            let _ = just_opened();
+            bt_bringup::from_handover(HCI_DEV, &accessory_name, h)
+        }
+        (None, None) => bt_bringup::bring_up(HCI_DEV, &accessory_name, just_opened()),
     };
     if let Err(e) = up {
         log(&format!("Bluetooth bring-up failed: {e} -- retrying"));
@@ -363,7 +390,13 @@ fn main() {
     // return ECHILD and break bt_bringup + av::running(). See spawn_detached.)
 
     log("starting -- wireless CarPlay (Phase A1: Bluetooth discoverable + pairing + SDP)");
-    log_radio_caps();
+    // A btd the supervisor started before Bluetooth is up (`handover`): its first session waits for the controller.
+    let mut cold_wait = handover::requested();
+    if cold_wait {
+        log("started before Bluetooth is up (the boot preload is attaching it): the first session waits for the controller");
+    } else {
+        log_radio_caps();
+    }
 
     // ARMED (tools/session_supervisor.sh, "Armed Bluetooth"): started between host sessions, this btd brings the
     // controller up invisible and waits for the next host's go (armed.rs). Nothing below runs before the go, so
@@ -416,14 +449,16 @@ fn main() {
         match arbiter_client::try_claim(ARBITER_SOCK) {
             Ok(arbiter_client::ClaimResult::Granted(reader)) => {
                 denied_logged = false;
-                run_active_session(&shutdown, Some(reader), &ctrl, &session_active, from_armed.take());
+                let wait = std::mem::take(&mut cold_wait);
+                run_active_session(&shutdown, Some(reader), &ctrl, &session_active, from_armed.take(), wait);
             }
             Ok(arbiter_client::ClaimResult::GrantedStandalone) => {
                 if !standalone_logged {
                     log("no arbiter present -- running standalone (single-transport) until it is wired in");
                     standalone_logged = true;
                 }
-                run_active_session(&shutdown, None, &ctrl, &session_active, from_armed.take());
+                let wait = std::mem::take(&mut cold_wait);
+                run_active_session(&shutdown, None, &ctrl, &session_active, from_armed.take(), wait);
             }
             Ok(arbiter_client::ClaimResult::Denied) => {
                 if !denied_logged {

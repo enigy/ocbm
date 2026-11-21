@@ -180,13 +180,43 @@ fn stamp(t0: std::time::Instant, what: &str) {
 /// at once, exactly as before.
 pub fn bring_up(hci_dev: &str, name: &str, just_opened: bool) -> std::io::Result<()> {
     let t0 = std::time::Instant::now();
-    prepare(hci_dev, name, just_opened, t0)?;
+    prepare(hci_dev, name, just_opened.then_some("opened by radio_hal.sh just now: no down/up"), t0)?;
     open_scans(hci_dev, name, t0)
 }
 
+/// The first session's bring-up from the boot preload's handover (`crate::handover`, R3-5): a controller this boot's
+/// attach registered moments ago, which the preload claimed with an HCIDEVUP (the kernel's auto power-off cancelled:
+/// `radio_hal.sh`, "The handover") and handed to this host's session with nothing reset since. One round trip proves
+/// it (the armed go's, [`crate::armed::go_proof`]); then [`prepare`] with no DOWN/UP and [`open_scans`]. No DOWN/UP on
+/// the proof of state [`bring_up`]'s `just_opened` rests on: the controller was opened from DOWN just now (the
+/// registration's own `hci_dev_do_open`, which set the event mask), nothing has reset it since, and the claim, like
+/// `bt_on`'s own `up`, leaves nothing to close it. A controller that does not answer takes [`bring_up`]'s DOWN/UP.
+pub fn from_handover(hci_dev: &str, name: &str, h: crate::handover::Handover) -> std::io::Result<()> {
+    let t0 = std::time::Instant::now();
+    let dev = crate::hci::dev_id(hci_dev)?;
+    match crate::armed::go_proof(|| crate::hci::read_scan_enable(dev, crate::armed::GO_PROOF_WAIT)) {
+        Ok(scan) => {
+            stamp(
+                t0,
+                &format!(
+                    "from the boot preload's handover (hci0 answered at uptime {} ms, handed over at {} ms): it answers, \
+                     scan 0x{scan:02x}",
+                    h.hci_up_ms, h.handed_ms
+                ),
+            );
+            prepare(hci_dev, name, Some("handed over by the boot preload: no down/up"), t0)?;
+            open_scans(hci_dev, name, t0)
+        }
+        Err(e) => {
+            eprintln!("[bt-bringup] the handed-over controller did not answer ({e}) -- its down/up, as before");
+            bring_up(hci_dev, name, false)
+        }
+    }
+}
+
 /// Everything [`bring_up`] does before the scan mode: the conflicting daemons stopped, the DOWN->UP cycle (unless
-/// `just_opened`), and the identity writes (Simple Pairing, class, name, EIR).
-fn prepare(hci_dev: &str, name: &str, just_opened: bool, t0: std::time::Instant) -> std::io::Result<()> {
+/// `skip` says why not: a controller opened just now), and the identity writes (Simple Pairing, class, name, EIR).
+fn prepare(hci_dev: &str, name: &str, skip: Option<&str>, t0: std::time::Instant) -> std::io::Result<()> {
     stamp(t0, "start");
     // Name the real fault at its source rather than letting it surface as an unexplained EINVAL.
     // Deliberately a LOG, not an early return: this is diagnostic, the controller may already be
@@ -234,9 +264,11 @@ fn prepare(hci_dev: &str, name: &str, just_opened: bool, t0: std::time::Instant)
     // ONE CYCLE, NOT TWO (the Mac's 13 Nov brief, item 1: about 0.5 s of every connect). `just_opened`: radio_hal.sh's
     // bt_on opened this controller from DOWN moments before this daemon started (`/tmp/.radio_bt_warm` reads
     // "opened"), which is the same `hci_dev_do_open` and the same event mask, after the same reset on close. Only the
-    // first bring-up of a btd may trust it: a later one follows a session.
-    if just_opened {
-        stamp(t0, "opened by radio_hal.sh just now: no down/up");
+    // first bring-up of a btd may trust it: a later one follows a session. The boot preload's handover
+    // ([`from_handover`]) rests on the same proof: the attach's registration opened the controller from DOWN, and the
+    // preload's claim cancelled the kernel's auto power-off.
+    if let Some(why) = skip {
+        stamp(t0, why);
     } else {
         let _ = run_rt(&[hci_dev, "down"]);
         stamp(t0, "down");
@@ -329,7 +361,7 @@ pub fn arm(hci_dev: &str, name: &str) -> std::io::Result<Audit> {
     if let Err(e) = crate::ssp_agent::clear_connectable(dev) {
         eprintln!("[bt-bringup] armed: mgmt connectable not cleared ({e}) -- the scan is still written off and read back");
     }
-    prepare(hci_dev, name, false, t0)?;
+    prepare(hci_dev, name, None, t0)?;
     crate::hci::write_scan_enable_waited(dev, crate::hci::SCAN_NONE, ARMED_WAIT)?;
     let seen = audit(hci_dev, ARMED_WAIT)?;
     stamp(t0, &format!("armed: scan 0x{:02x}, {} connection(s)", seen.scan, seen.conns));
