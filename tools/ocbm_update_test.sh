@@ -391,12 +391,14 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   echo "$NEW" > "$w/VERSION"; echo 1.0.0 > "$w/FROM_MIN"; (cd "$w" && tar -cf - .) | gzip -c > "$d/run/ocbm-update.tgz"
   : > "$d/root/script/radio_together_off"; echo 1 > "$d/root/script/.radio_together_failed"   # the owner's switch, a count
   : > "$d/root/script/radio_handover_off"   # the handover's retired off file
+  : > "$d/root/script/radio_preload_late"   # an owner's switch for the preload's old start
   update "$sh" "$d"; rc=$?
   check '[ $rc = 0 ] && [ ! -e "$d/rebooted" ] && [ "$(content "$d" etc/ocbm/installed_version)" = "$NEW" ] && result_is "$d" "committed $NEW"' \
     "a new version with no new files: committed at once, no restart"
   check '[ -e "$d/root/script/radio_together_off" ] && [ ! -e "$d/root/script/.radio_together_failed" ]' \
     "an owner's own radio order switch stays through an update; the guard's count goes"
   check '[ ! -e "$d/root/script/radio_handover_off" ]' "  and with no new files to place, the handover's retired off file goes all the same"
+  check '[ -e "$d/root/script/radio_preload_late" ]' "  and the owner's radio_preload_late stays (the 21 Nov review G)"
   NEW="$NEW_SAVE"
   d="$T/$sh-revert"; make_box "$d" trial; make_pkg "$d/run/ocbm-update.tgz" ""; update "$sh" "$d"
   env ROOT="$d/root" RUN="$d/run" REBOOT="touch $d/rebooted.revert" "$sh" "$d/root/script/ocbm_revert.sh" "Go back" > /dev/null 2>&1; rc=$?
