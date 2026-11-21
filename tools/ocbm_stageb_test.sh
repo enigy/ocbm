@@ -106,12 +106,12 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   echo "== $sh: a failed self-test goes back to stock"
   d="$T/$sh-fail"; make_box "$d" trial; touch "$d/st.fail"; echo "guard: 2 unfinished in a row" > "$d/root/script/radio_preload_off"
   : > "$d/root/script/radio_preload_late"; : > "$d/root/script/radio_together_off"; : > "$d/root/script/.radio_together_inflight"
-  echo 1 > "$d/root/script/.radio_together_failed"; boot "$sh" "$d"
+  echo 1 > "$d/root/script/.radio_together_failed"; : > "$d/root/script/radio_handover_off"; boot "$sh" "$d"
   check 'waitfor "[ -e $d/rebooted ]" 5 && reverted "$d"' \
     "revert: mode removed, hostapd.conf put back, 'reverted version=' recorded, report pending, restart"
   check '[ ! -e "$d/root/script/radio_preload_off" ]' "the go-back drops the boot radio preload's state with the install"
-  check '[ ! -e "$d/root/script/radio_preload_late" ] && [ ! -e "$d/root/script/radio_together_off" ] && [ ! -e "$d/root/script/.radio_together_inflight" ] && [ ! -e "$d/root/script/.radio_together_failed" ]' \
-    "and the preload's late start and the radio order's switch, mark and count (stock reads none of them)"
+  check '[ ! -e "$d/root/script/radio_preload_late" ] && [ ! -e "$d/root/script/radio_together_off" ] && [ ! -e "$d/root/script/.radio_together_inflight" ] && [ ! -e "$d/root/script/.radio_together_failed" ] && [ ! -e "$d/root/script/radio_handover_off" ]' \
+    "and the preload's late start, the radio order's switch, mark and count, and the handover's switch (stock reads none of them)"
   check 'grep -q "self-test failed (FAILED after 30 s: ocbmd is not running)" "$d/root/etc/ocbm/last_result.txt" && grep -q "^FAILED" "$d/root/etc/ocbm/pending_result.txt"' \
     "the reason and the self-test output are in the record and the report"
   restart "$d"; boot "$sh" "$d"
