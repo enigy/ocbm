@@ -987,6 +987,31 @@ go_watch() {
   if [ "${p:-0}" = 1 ]; then wireless_up fallback; fi
 }
 
+# --- The cold boot: btd before Bluetooth is up (R3-5, 20 Nov 2026) ---------------------------------------------------
+# A host that comes while the boot preload is attaching Bluetooth (the truck: most drives start with the adapter booting,
+# the host at about 3 s) used to get its btd only after its bt_on, which waited for the preload to end: 1.6 to 1.9 s
+# from hci0 answering to the first page on the dev adapter's bench of 70caa3c. With the preload running at the host's
+# arrival, wireless_up's wrapper now starts btd first, waiting (OCBM_BTD_WAIT=1, crates/vendor/wireless/src/handover.rs),
+# then bt_on beside it, then writes /tmp/.btd_bt_on_done once bt_on is over. btd goes on the preload's handover as hci0
+# answers (radio_hal.sh, "The handover": the host's bt_on then touches nothing), or on that file: today's bring-up.
+# Any other start, a failed armed go's fallback, or the handover switched off (the owner's /script/radio_handover_off,
+# the bench's /tmp/bench_handover_off) takes today's wrapper: bt_on, then btd.
+PRELOAD_STATE=${PRELOAD_STATE:-/tmp/radio_preload_state}            # radio_hal.sh's preload states, one per line
+HANDOVER_OFF_FILE=${HANDOVER_OFF_FILE:-/script/radio_handover_off}  # the owner's off switch, on flash
+HANDOVER_BENCH_OFF=${HANDOVER_BENCH_OFF:-/tmp/bench_handover_off}   # the bench's (box_common::bench_flag's rule)
+# The boot preload is under way: its last state is "running" (it writes another as it ends). No fork.
+preload_running() {
+  _prs=""
+  while read -r _prw _prt; do _prs=$_prw; done 2>/dev/null <"$PRELOAD_STATE"
+  [ "$_prs" = running ]
+}
+handover_off() {
+  [ -e "$HANDOVER_OFF_FILE" ] && return 0
+  [ -e "$HANDOVER_BENCH_OFF" ] || return 1
+  _hof=""; read -r _hof 2>/dev/null <"$HANDOVER_BENCH_OFF"
+  [ "$_hof" != off ]
+}
+
 wireless_up() {
   # $1 = fallback: today's path after an armed go that failed (go_watch, wireless_go). The go's timeline stamps and
   # its AP went out already, so the bring-up skips its own (OCBM_GO_FALLBACK, in the wrapper below).
@@ -1065,8 +1090,13 @@ wireless_up() {
   mode=$(pairing_mode)
   restore_stock_hostapd
   usb_observe   # this instant's USB state, for the block's usb_edge stamp: the tick's reading may be a second old
+  # The cold boot (above): btd first, waiting, while the boot preload attaches Bluetooth.
+  _wu_early=0
+  if [ "$_wu_fb" = 0 ] && preload_running && ! handover_off; then _wu_early=1; fi
   if [ "$_wu_fb" = 1 ]; then
     echo "[sup] host PRESENT + wireless enabled -> CLEAN bring-up of Bluetooth after the failed armed go (detached, pairing=$mode) at uptime $(cut -d' ' -f1 /proc/uptime)"
+  elif [ "$_wu_early" = 1 ]; then
+    echo "[sup] host PRESENT + wireless enabled -> CLEAN bring-up of wireless stack (detached, pairing=$mode; the boot preload is attaching Bluetooth: btd starts now and waits for it) at uptime $(cut -d' ' -f1 /proc/uptime)"
   else
     echo "[sup] host PRESENT + wireless enabled -> CLEAN bring-up of wireless stack (detached, pairing=$mode) at uptime $(cut -d' ' -f1 /proc/uptime)"
   fi
@@ -1079,7 +1109,7 @@ wireless_up() {
   # purpose, so values travel as env vars rather than by interpolating into the wrapper's argv.
   wl_raised=1
   env BT_PAIRING_MODE="$mode" BT_SSP_INTERACTIVE="$(pairing_interactive)" OCBM_WL_REAPED="$_wl_reaped" \
-    OCBM_USB_EDGE="$usb_configured_at" OCBM_GO_FALLBACK="$_wu_fb" setsid sh -c '
+    OCBM_USB_EDGE="$usb_configured_at" OCBM_GO_FALLBACK="$_wu_fb" OCBM_BTD_EARLY="$_wu_early" setsid sh -c '
     # Radio bring-up goes through the chipset-neutral seam. It resolves this unit'"'"'s own
     # bring-up mapping at runtime, so the supervisor never names a chip, a module or an attach
     # helper. Exit codes: 0 converged / 1 failed / 2 already up / 3 unsupported on this variant.
@@ -1093,42 +1123,26 @@ wireless_up() {
     # lock (wlan_driver_up), and a descriptor file per caller (radio_detect.sh).
     # The outer subshell returns at once, so the AP bring-up is no child of the btd exec below (which would never reap it).
     # After a failed armed go (OCBM_GO_FALLBACK=1) the AP and these stamps went out with the go: Bluetooth only.
-    if [ "$OCBM_GO_FALLBACK" != 1 ]; then
-    echo "[sup] radios starting at uptime $(cut -d" " -f1 /proc/uptime)" >> /tmp/box.log
-    # The connect timeline (crates/box-common/src/timeline.rs): the radios start now, and the host-facing USB link
-    # last came up at OCBM_USB_EDGE (empty: not known). One append each, no fork; a failed one is ignored.
-    _tl_up=""
-    read -r _tl_up _tl_idle 2>/dev/null </proc/uptime
-    case "$_tl_up" in *.*) echo "t sup_radios ${_tl_up%.*}${_tl_up#*.}0" 2>/dev/null >>/tmp/startup_marks ;; esac
-    [ -n "$OCBM_USB_EDGE" ] && echo "t usb_edge $OCBM_USB_EDGE" 2>/dev/null >>/tmp/startup_marks
-    ( sh /script/radio_hal.sh wifi_ap_on >/tmp/wlan.log 2>&1 & )
-    else
-    echo "[sup] radios after a failed armed go at uptime $(cut -d" " -f1 /proc/uptime): Bluetooth by bt_on and a fresh btd" >> /tmp/box.log
-    fi
-    # bt.log stays the small truncated per-attempt status file that docs/wireless/01_BT_AND_RADIO.md
-    # tells an operator to cat directly. This call is foreground (no trailing ampersand), so teeing
-    # its combined stdout/stderr into the universal log costs nothing and changes no lifecycle.
-    sh /script/radio_hal.sh bt_on 2>&1 | tee -a /tmp/box.log >/tmp/bt.log
-    # btd starts once Bluetooth is up, not once the AP is (about 1-2 s of every connect on the Mac 13 Nov bench). Paging
-    # and the iAP2 set-up come first; its 0x5702 reply, the first thing that needs the AP, waits while wifi_ap_on still
-    # holds the wlan lock (wifi_handoff::wait_for_ap), so it never describes an AP that is not serving yet.
+    #
     # BENCH LEVER (2026-09-03): opt-in btmon capture for this wireless session. Armed by either the
     # file flag or the env var -- the outer `env BT_PAIRING_MODE=... setsid sh -c` wrapper
     # above only lists the vars it OVERRIDES, so CARPLAY_BTMON, if exported by the caller, still
     # reaches here through the normal inherited environment. Whether the CCPA rootfs actually ships
     # btmon is unknown, so this must be a no-op (one log line, not a failure) when it is absent.
-    if { [ -f /tmp/carplay_btmon ] || [ "${CARPLAY_BTMON:-0}" = 1 ]; }; then
-      if command -v btmon >/dev/null 2>&1; then
-        echo "[sup] btmon lever armed -- capturing to /tmp/box.log" >> /tmp/box.log
-        # One sed per session (only runs when armed): btmon has no simple "prefix every line"
-        # option of its own, and this is cheaper than parsing its output to add one.
-        ( btmon 2>&1 | sed "s/^/[btmon] /" >> /tmp/box.log & )
-      else
-        echo "[sup] btmon lever armed but btmon not found on PATH -- skipping" >> /tmp/box.log
+    btmon_capture() {
+      if { [ -f /tmp/carplay_btmon ] || [ "${CARPLAY_BTMON:-0}" = 1 ]; }; then
+        if command -v btmon >/dev/null 2>&1; then
+          echo "[sup] btmon lever armed -- capturing to /tmp/box.log" >> /tmp/box.log
+          # One sed per session (only runs when armed): btmon has no simple "prefix every line"
+          # option of its own, and this is cheaper than parsing its output to add one.
+          ( btmon 2>&1 | sed "s/^/[btmon] /" >> /tmp/box.log & )
+        else
+          echo "[sup] btmon lever armed but btmon not found on PATH -- skipping" >> /tmp/box.log
+        fi
       fi
-    fi
+    }
     # docs/wireless/00_WIRELESS_CARPLAY.md #1.3 (review finding 2026-07-24): truncate the wireless health log HERE, immediately
-    # before exec, not right after the (SIGTERM-only, kill-unconfirmed) reap above — truncating early
+    # before btd starts, not right after the (SIGTERM-only, kill-unconfirmed) reap above — truncating early
     # left a window where the OLD carplayd could still flush its buffered stdio (exit-time flush of an
     # O_APPEND-opened, fully-buffered log) and replay the PRIOR session'"'"'s "pair-verify OK"/"RECORD
     # done" lines back in after the truncate, exactly the bogus-instant-health bug this truncation
@@ -1143,17 +1157,53 @@ wireless_up() {
     #
     # Gated on OCBM_WL_REAPED: in the wired-owned skip branch a live wired carplayd is EXPECTED
     # and writes to its own log, not this one, so it must not burn the bound.
-    if [ "$OCBM_WL_REAPED" = 1 ]; then
-      _i=0
-      while [ "$_i" -lt 25 ] && { pgrep -x carplayd || pgrep -x /usr/sbin/carplayd; } >/dev/null 2>&1; do
-        _i=$((_i + 1)); sleep 0.2
-      done
+    av_settled() {
+      if [ "$OCBM_WL_REAPED" = 1 ]; then
+        _i=0
+        while [ "$_i" -lt 25 ] && { pgrep -x carplayd || pgrep -x /usr/sbin/carplayd; } >/dev/null 2>&1; do
+          _i=$((_i + 1)); sleep 0.2
+        done
+      fi
+      : > /tmp/carplayd_wl.log
+    }
+    if [ "$OCBM_GO_FALLBACK" != 1 ]; then
+    echo "[sup] radios starting at uptime $(cut -d" " -f1 /proc/uptime)" >> /tmp/box.log
+    # The connect timeline (crates/box-common/src/timeline.rs): the radios start now, and the host-facing USB link
+    # last came up at OCBM_USB_EDGE (empty: not known). One append each, no fork; a failed one is ignored.
+    _tl_up=""
+    read -r _tl_up _tl_idle 2>/dev/null </proc/uptime
+    case "$_tl_up" in *.*) echo "t sup_radios ${_tl_up%.*}${_tl_up#*.}0" 2>/dev/null >>/tmp/startup_marks ;; esac
+    [ -n "$OCBM_USB_EDGE" ] && echo "t usb_edge $OCBM_USB_EDGE" 2>/dev/null >>/tmp/startup_marks
+    ( sh /script/radio_hal.sh wifi_ap_on >/tmp/wlan.log 2>&1 & )
+    else
+    echo "[sup] radios after a failed armed go at uptime $(cut -d" " -f1 /proc/uptime): Bluetooth by bt_on and a fresh btd" >> /tmp/box.log
     fi
-    : > /tmp/carplayd_wl.log
-    # S5: O_APPEND (>>), not >. The in-place tail-truncate in bound_logs (~:551-555) relies on
+    # S5 (both btd starts below): O_APPEND (>>), not >. The in-place tail-truncate in bound_logs (~:551-555) relies on
     # the writer fd being O_APPEND so writes after truncation land at the new end-of-file; a
     # non-append fd keeps writing at its old offset, leaving a sparse hole and re-truncating to
     # nothing every tick.
+    if [ "$OCBM_BTD_EARLY" = 1 ]; then
+      # THE COLD BOOT (R3-5): the boot preload is attaching Bluetooth. btd starts first and waits for the controller
+      # (OCBM_BTD_WAIT, crates/vendor/wireless/src/handover.rs), with the capture lever and the settled A/V log before
+      # it as before an exec; bt_on runs beside it, and the file after it tells btd that bt_on is over. btd goes on
+      # the preload handing it the controller as hci0 answers, or on that file (then as a btd started after bt_on).
+      btmon_capture
+      av_settled
+      rm -f /tmp/.btd_bt_on_done
+      OCBM_BTD_WAIT=1 /usr/sbin/btd </dev/null >>/tmp/wl.log 2>&1 &
+      sh /script/radio_hal.sh bt_on 2>&1 | tee -a /tmp/box.log >/tmp/bt.log
+      : > /tmp/.btd_bt_on_done
+      exit 0
+    fi
+    # bt.log stays the small truncated per-attempt status file that docs/wireless/01_BT_AND_RADIO.md
+    # tells an operator to cat directly. This call is foreground (no trailing ampersand), so teeing
+    # its combined stdout/stderr into the universal log costs nothing and changes no lifecycle.
+    sh /script/radio_hal.sh bt_on 2>&1 | tee -a /tmp/box.log >/tmp/bt.log
+    # btd starts once Bluetooth is up, not once the AP is (about 1-2 s of every connect on the Mac 13 Nov bench). Paging
+    # and the iAP2 set-up come first; its 0x5702 reply, the first thing that needs the AP, waits while wifi_ap_on still
+    # holds the wlan lock (wifi_handoff::wait_for_ap), so it never describes an AP that is not serving yet.
+    btmon_capture
+    av_settled
     exec /usr/sbin/btd </dev/null >>/tmp/wl.log 2>&1
   ' </dev/null >/dev/null 2>&1 &
 }
