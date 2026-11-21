@@ -878,7 +878,7 @@ boot_line() {  # $1 = by (preload | bt_on), $2 = its exit code
   _bl=$(awk -v by="$1" -v rc="$2" -v host="$_bl_h" '
     NF >= 2 && !($1 in s) { s[$1] = $2 }
     END {
-      n = split("start caps caps_ms gpio order off wlan_start wlan_up wlan_free btfw_start btfw_end btfw btfw_ms attach hci_up handed tries fallback", k, " ")
+      n = split("start caps caps_ms gpio order off wlan_start wlan_up wlan_free btfw_start btfw_end btfw btfw_ms attach hci_up handover handed tries fallback", k, " ")
       line = "[radio-boot] v1 by=" by
       for (i = 1; i <= n; i++) {
         val = "-"
@@ -981,9 +981,10 @@ together_count() {
 # A host that came while the boot preload attached Bluetooth (the truck's cold start: the host at about 3 s, hci0 at
 # about 6.8) waited, on the dev adapter's bench of 70caa3c (20 Nov), 1.6 to 1.9 s from hci0 answering to its first
 # page: this preload's SCO and name set-up and its bookkeeping, the host's bt_on behind the bt lock (a look every 0.2 s
-# and its confirmation), btd's start after bt_on, and btd's DOWN/UP. Now, with a host here as the preload's attach
-# converges, the preload hands the controller over at once, and the host's btd, started beside its bt_on and waiting
-# (session_supervisor.sh wireless_up, OCBM_BTD_EARLY; crates/vendor/wireless/src/handover.rs), pages straight away:
+# and its confirmation), btd's start after bt_on, and btd's DOWN/UP. When the handover is asked for (OPT-IN, below), with
+# a host here as the preload's attach converges, the preload hands the controller over at once, and the host's btd,
+# started beside its bt_on and waiting (session_supervisor.sh wireless_up, OCBM_BTD_EARLY;
+# crates/vendor/wireless/src/handover.rs), pages straight away:
 #   1. THE CLAIM (bt_handover_claim, as hci0 answers): `hciconfig <dev> up` on the device the attach registered. The
 #      attach leaves the kernel's auto power-off armed: hci_register_dev sets HCI_AUTO_OFF, and the open it queues
 #      (hci_power_on) closes the device again 2 s later unless something claims it (net/bluetooth/hci_core.c, v3.14.52:
@@ -1003,23 +1004,34 @@ together_count() {
 #      one round trip and brought up with no DOWN/UP (2.6.0's "opened" proof of state: a controller opened from DOWN
 #      just now, its event mask set by that open, nothing reset since and, the claim standing in for bt_on's own `up`,
 #      nothing to close it); or the wrapper's word that bt_on is over, today's bring-up.
-#   OFF: the owner's /script/radio_handover_off, or the bench's /tmp/bench_handover_off (bench_flag's rule), read here
-#   at the attach and by the supervisor at the host's arrival: either gives today's path whole. A teardown's bt_off
-#   removes $HANDOVER: it was for the session that ends.
+#   OPT-IN, OFF BY DEFAULT (the owner's decision, 21 Nov 2026). On the dev adapter's bench of 4a6ce9c (real power cuts,
+#   the host up first) the handover did what it was built to do (handed 30 to 40 ms after hci_up, the page about 100 ms
+#   after it) but 2 of its 6 boots had link trouble (a late answer cut for no SDP channel; an RFCOMM connect that timed
+#   out), against 0 of 9 with the DOWN/UP kept (70caa3c's 5 and 4a6ce9c's 4 with it off): suggestive, not proof, the
+#   cause not found (docs/wireless/01_BT_AND_RADIO.md, "The cold boot", 6). So the handover runs only when asked for:
+#   the owner's /script/radio_handover_on on flash, or the bench's /tmp/bench_handover_on (bench_flag's rule: set
+#   unless it reads "off"), read here at the attach and by the supervisor at the host's arrival. With neither, the cold
+#   path is 4a6ce9c's with its old off file: no claim, no handover file, no early btd, btd's DOWN/UP. That off file,
+#   /script/radio_handover_off, is retired: nothing reads it, and updates, an update's first start, reverts and the
+#   restores remove it. A teardown's bt_off removes $HANDOVER: it was for the session that ends.
 HANDOVER=/tmp/.radio_bt_handover
-HANDOVER_OFF=/script/radio_handover_off
-HANDOVER_BENCH_OFF=/tmp/bench_handover_off
-handover_off() { [ -e "$HANDOVER_OFF" ] || bench_flag "$HANDOVER_BENCH_OFF"; }
+HANDOVER_ON=/script/radio_handover_on
+HANDOVER_BENCH_ON=/tmp/bench_handover_on
+# Whether the handover is asked for, and by whom: _hov = on_owner, on_bench, or off (not opted in).
+handover_state() {
+  if [ -e "$HANDOVER_ON" ]; then _hov=on_owner; elif bench_flag "$HANDOVER_BENCH_ON"; then _hov=on_bench; else _hov=off; fi
+}
 
 # The boot preload's attach answered ($1 the device, $2 the uptime ms of the answer): with a host here and the handover
-# on, the claim and bt_power. 0: claimed, the handover due (bt_handover_give); 1: not, today's path (SCO, name, and the
-# host's bt_on after this preload).
+# asked for, the claim and bt_power. 0: claimed, the handover due (bt_handover_give); 1: not, today's path (SCO, name,
+# and the host's bt_on after this preload).
 bt_handover_claim() {
   [ "$VERB" = preload ] || return 1
   _bhc_h=""; read -r _bhc_h 2>/dev/null <"$HOST_FLAG"
   [ "$_bhc_h" = 1 ] && [ -n "$2" ] || return 1
-  if handover_off; then
-    log "handover: switched off ($HANDOVER_OFF or $HANDOVER_BENCH_OFF) - the host's bt_on takes $1 after this preload, as before"
+  handover_state
+  if [ "$_hov" = off ]; then
+    log "handover: off (not asked for: $HANDOVER_ON or $HANDOVER_BENCH_ON) - the host's bt_on takes $1 after this preload"
     return 1
   fi
   if ! hci_rt "$1" up 2>/dev/null; then
@@ -1423,6 +1435,7 @@ do_bt_on() {
       boot_mark start
       bt_order
       boot_note order "$_bto"; boot_note off "$_bto_off"
+      handover_state; boot_note handover "$_hov"   # asked for or not, as the attach starts (the boot line)
       case "$_bto_off" in
         owner)       log "radio order: Wi-Fi first - together is switched off by the owner ($TOGETHER_OFF)" ;;
         guard)       log "radio order: Wi-Fi first - together is switched off by its guard ($TOGETHER_OFF: $_bto_l)" ;;
@@ -1484,10 +1497,10 @@ case "$VERB" in
     echo "chipset=$RADIO_SDIO_DEVICE vendor=$RADIO_SDIO_VENDOR chip=$RADIO_CHIP backend=$RADIO_BACKEND wireless=$RADIO_WIRELESS"
     echo "wlan_insmod=\"$RADIO_WLAN_INSMOD\" bt_attach=\"$RADIO_BT_ATTACH_CMD\" bt_after_wlan=$RADIO_BT_AFTER_WLAN bt_together=$RADIO_BT_TOGETHER"
     # The order the next attach would take, the descriptor's source (the kept copy, or a detection), and whether a boot
-    # preload would hand Bluetooth to a waiting host (on, or switched off by the owner's file or the bench's).
+    # preload would hand Bluetooth to a waiting host: on_owner or on_bench (asked for by that file), or off (the default).
     bt_order peek
-    _pho=on; if [ -e "$HANDOVER_OFF" ]; then _pho=owner; elif bench_flag "$HANDOVER_BENCH_OFF"; then _pho=bench; fi
-    echo "order=$_bto off=$_bto_off descriptor=${RADIO_CAPS_FROM:-unknown} handover=$_pho"
+    handover_state
+    echo "order=$_bto off=$_bto_off descriptor=${RADIO_CAPS_FROM:-unknown} handover=$_hov"
     [ "$RADIO_WIRELESS" = yes ] && exit 0 || exit 3 ;;
   status)
     caps || exit 3

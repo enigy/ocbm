@@ -994,22 +994,25 @@ go_watch() {
 # arrival, wireless_up's wrapper now starts btd first, waiting (OCBM_BTD_WAIT=1, crates/vendor/wireless/src/handover.rs),
 # then bt_on beside it, then writes /tmp/.btd_bt_on_done once bt_on is over. btd goes on the preload's handover as hci0
 # answers (radio_hal.sh, "The handover": the host's bt_on then touches nothing), or on that file: today's bring-up.
-# Any other start, a failed armed go's fallback, or the handover switched off (the owner's /script/radio_handover_off,
-# the bench's /tmp/bench_handover_off) takes today's wrapper: bt_on, then btd.
+# OPT-IN, OFF BY DEFAULT (the owner's decision, 21 Nov 2026, after 2 of 6 boots with link trouble on the bench of
+# 4a6ce9c against 0 of 9 without; radio_hal.sh, "OPT-IN"): only with the owner's /script/radio_handover_on or the
+# bench's /tmp/bench_handover_on. Without either, any other start, and a failed armed go's fallback take today's
+# wrapper: bt_on, then btd. The retired /script/radio_handover_off is read by nothing.
 PRELOAD_STATE=${PRELOAD_STATE:-/tmp/radio_preload_state}            # radio_hal.sh's preload states, one per line
-HANDOVER_OFF_FILE=${HANDOVER_OFF_FILE:-/script/radio_handover_off}  # the owner's off switch, on flash
-HANDOVER_BENCH_OFF=${HANDOVER_BENCH_OFF:-/tmp/bench_handover_off}   # the bench's (box_common::bench_flag's rule)
+HANDOVER_ON_FILE=${HANDOVER_ON_FILE:-/script/radio_handover_on}     # the owner's opt-in, on flash
+HANDOVER_BENCH_ON=${HANDOVER_BENCH_ON:-/tmp/bench_handover_on}      # the bench's (box_common::bench_flag's rule)
 # The boot preload is under way: its last state is "running" (it writes another as it ends). No fork.
 preload_running() {
   _prs=""
   while read -r _prw _prt; do _prs=$_prw; done 2>/dev/null <"$PRELOAD_STATE"
   [ "$_prs" = running ]
 }
-handover_off() {
-  [ -e "$HANDOVER_OFF_FILE" ] && return 0
-  [ -e "$HANDOVER_BENCH_OFF" ] || return 1
-  _hof=""; read -r _hof 2>/dev/null <"$HANDOVER_BENCH_OFF"
-  [ "$_hof" != off ]
+# The handover asked for: the owner's file, or the bench's set (there, and not reading "off").
+handover_on() {
+  [ -e "$HANDOVER_ON_FILE" ] && return 0
+  [ -e "$HANDOVER_BENCH_ON" ] || return 1
+  _hon=""; read -r _hon 2>/dev/null <"$HANDOVER_BENCH_ON"
+  [ "$_hon" != off ]
 }
 
 wireless_up() {
@@ -1090,9 +1093,9 @@ wireless_up() {
   mode=$(pairing_mode)
   restore_stock_hostapd
   usb_observe   # this instant's USB state, for the block's usb_edge stamp: the tick's reading may be a second old
-  # The cold boot (above): btd first, waiting, while the boot preload attaches Bluetooth.
+  # The cold boot (above): btd first, waiting, while the boot preload attaches Bluetooth, when the handover is asked for.
   _wu_early=0
-  if [ "$_wu_fb" = 0 ] && preload_running && ! handover_off; then _wu_early=1; fi
+  if [ "$_wu_fb" = 0 ] && preload_running && handover_on; then _wu_early=1; fi
   if [ "$_wu_fb" = 1 ]; then
     echo "[sup] host PRESENT + wireless enabled -> CLEAN bring-up of Bluetooth after the failed armed go (detached, pairing=$mode) at uptime $(cut -d' ' -f1 /proc/uptime)"
   elif [ "$_wu_early" = 1 ]; then

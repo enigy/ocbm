@@ -10,7 +10,8 @@
 # Covered: the arm's gate and its off switches; the go (its guards, the go file, the timeline stamps, the signal, the
 # AP launch); the go's answer and the fallback to today's path; an arm still under way at the host's arrival; the
 # armed btd's end; the fork-free predicates against the grep and cat forms they replaced; the one-awk config read
-# against the four functions it stands in for.
+# against the four functions it stands in for; the cold boot's early btd (R3-5: only when the handover is asked for,
+# today's wrapper by default) and the wrapper itself.
 set -u
 export LC_ALL=C
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -27,8 +28,8 @@ export SUP_PROC="$R/proc" SUP_SYS="$R/sys" CARPLAY_CFG_FILE="$R/cfg.yaml" FLAG="
 export BTD_ARMED_FILE="$R/btd_armed" BTD_GO_FILE="$R/btd_go" BTD_GO_RESULT="$R/btd_go_result" BT_PHASE_FILE="$R/bt_phase"
 export ARM_OFF_FILE="$R/radio_arm_off" ARM_BENCH_OFF="$R/bench_arm_off" STARTUP_MARKS="$R/startup_marks"
 export RADIO_LOCKS="$R/locks" WL_TEARDOWN_MARK="$R/wl_teardown" CARPLAY_TRANSPORT_FLAG="$R/carplay_transport"
-export RADIO_OFF_FLAG="$R/radio_off" PRELOAD_STATE="$R/radio_preload_state" HANDOVER_OFF_FILE="$R/radio_handover_off"
-export HANDOVER_BENCH_OFF="$R/bench_handover_off" OCBM_SUP_FUNCS=1
+export RADIO_OFF_FLAG="$R/radio_off" PRELOAD_STATE="$R/radio_preload_state" HANDOVER_ON_FILE="$R/radio_handover_on"
+export HANDOVER_BENCH_ON="$R/bench_handover_on" OCBM_SUP_FUNCS=1
 . "$2"
 CALLS="$R/calls"
 now() { echo "${FAKE_NOW:-100}"; }
@@ -337,26 +338,37 @@ echo "waiting 2.10" > "$PRELOAD_STATE"; check "! preload_running" "waiting for t
 echo "running 2.30" >> "$PRELOAD_STATE"; check "preload_running" "running"
 echo "done 7.51" >> "$PRELOAD_STATE"; check "! preload_running" "done: not running"
 printf "stood_down 3.00\n" > "$PRELOAD_STATE"; check "! preload_running" "stood down: not running"
-check "! handover_off" "no switch: the handover on"
-: > "$HANDOVER_BENCH_OFF"; check "handover_off" "the bench hook, empty: off"
-echo off > "$HANDOVER_BENCH_OFF"; check "! handover_off" "the bench hook reading off: on"
-rm "$HANDOVER_BENCH_OFF"; : > "$HANDOVER_OFF_FILE"; check "handover_off" "the owner'"'"'s switch on flash: off"
+check "! handover_on" "no switch: the handover off (the default since 21 Nov)"
+: > "$R/radio_handover_off"; check "! handover_on" "the retired /script/radio_handover_off: read by nothing, still off"
+: > "$HANDOVER_BENCH_ON"; check "handover_on" "the bench hook, empty: on"
+echo off > "$HANDOVER_BENCH_ON"; check "! handover_on" "the bench hook reading off: off"
+rm "$HANDOVER_BENCH_ON"; : > "$HANDOVER_ON_FILE"; check "handover_on" "the owner'"'"'s opt-in on flash: on"
 '
 
   run_case "$sh" '
-# A host while the boot preload attaches Bluetooth: btd starts first, waiting; anything else is today'"'"'s wrapper.
+# A host while the boot preload attaches Bluetooth. By default (21 Nov) today'"'"'s wrapper: bt_on, then btd, no early btd,
+# whatever a retired off file says; btd first, waiting, only when the handover is asked for.
 printf "waiting 2.10\nrunning 2.30\n" > "$PRELOAD_STATE"
 wireless_up > "$R/sup.out"; settle
-check "called \"OCBM_BTD_EARLY=1\" && grep -q \"btd starts now and waits for it\" \"$R/sup.out\"" "the preload running: btd early (OCBM_BTD_EARLY=1), said so"
-: > "$CALLS"; : > "$HANDOVER_OFF_FILE"
+check "called \"OCBM_BTD_EARLY=0\" && ! grep -q \"btd starts now\" \"$R/sup.out\"" "the preload running, nothing asked for: today'"'"'s wrapper (OCBM_BTD_EARLY=0)"
+: > "$CALLS"; : > "$R/radio_handover_off"
+wireless_up > "$R/sup.out"; settle
+check "called \"OCBM_BTD_EARLY=0\"" "  a leftover /script/radio_handover_off changes nothing"
+: > "$CALLS"; : > "$HANDOVER_ON_FILE"
+wireless_up > "$R/sup.out"; settle
+check "called \"OCBM_BTD_EARLY=1\" && grep -q \"btd starts now and waits for it\" \"$R/sup.out\"" "the owner'"'"'s opt-in: btd early (OCBM_BTD_EARLY=1), said so"
+rm "$HANDOVER_ON_FILE"; : > "$CALLS"; echo "on" > "$HANDOVER_BENCH_ON"
 wireless_up; settle
-check "called \"OCBM_BTD_EARLY=0\"" "the owner'"'"'s switch: today'"'"'s wrapper"
-rm "$HANDOVER_OFF_FILE"; : > "$CALLS"; echo "on" > "$HANDOVER_BENCH_OFF"
+check "called \"OCBM_BTD_EARLY=1\"" "the bench'"'"'s: btd early"
+echo off > "$HANDOVER_BENCH_ON"; : > "$CALLS"
 wireless_up; settle
-check "called \"OCBM_BTD_EARLY=0\"" "the bench'"'"'s: today'"'"'s wrapper"
-rm "$HANDOVER_BENCH_OFF"; : > "$CALLS"
+check "called \"OCBM_BTD_EARLY=0\"" "the bench'"'"'s reading off: today'"'"'s wrapper"
+: > "$HANDOVER_ON_FILE"; : > "$CALLS"
 wireless_up fallback; settle
-check "called \"OCBM_GO_FALLBACK=1\" && called \"OCBM_BTD_EARLY=0\"" "a failed armed go'"'"'s fallback: today'"'"'s wrapper, the preload or not"
+check "called \"OCBM_GO_FALLBACK=1\" && called \"OCBM_BTD_EARLY=0\"" "a failed armed go'"'"'s fallback: today'"'"'s wrapper, asked for or not"
+rm "$HANDOVER_ON_FILE"; : > "$CALLS"; echo "done 7.51" >> "$PRELOAD_STATE"; : > "$HANDOVER_ON_FILE"
+wireless_up; settle
+check "called \"OCBM_BTD_EARLY=0\"" "the preload over: today'"'"'s wrapper, asked for or not"
 '
 
   run_case "$sh" '

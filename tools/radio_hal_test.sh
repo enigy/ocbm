@@ -2,8 +2,9 @@
 # radio_hal_test.sh — the radio seam's cold path (20 Nov 2026), on the host: the descriptor kept across boots
 # (radio_hal.sh caps, radio_detect.sh's key), the order Bluetooth and the Wi-Fi driver come up in (together on a unit
 # whose own attach branch waits for nothing, today's order on every other), its two switches, its fallback and its
-# guard, a host's bring-up before, during and after the boot preload, the preload's wait for the stock GPIO set-up,
-# the driver tarball unpacked once, and the boot line.
+# guard, a host's bring-up before, during and after the boot preload, the handover to a waiting host (R3-5: off by
+# default, nothing of it running then; asked for by the owner's or the bench's file), the preload's wait for the stock
+# GPIO set-up, the driver tarball unpacked once, and the boot line.
 #
 # radio_hal.sh and radio_detect.sh run as the adapter runs them, each verb a process of its own, from copies whose
 # absolute paths are moved into a scratch root (as tools/radio_detect_test.sh does). The hardware is stood in for:
@@ -456,17 +457,14 @@ case_host() {
   check '! called "hciconfig hci0 down"' "a host is here: the preload leaves Bluetooth up for its session"
   check '[ "$(key by)" = preload ] && [ "$(key wlan_free)" != - ] && [ "$(key wlan_free)" -lt "$(key hci_up)" ]' \
     "  the boot line: by=preload, the wlan lock free (wlan_free) before hci0 answered"
-  # The handover (R3-5): the controller claimed as hci0 answered and handed to the host's session.
-  check '[ "$(count "hciconfig hci0 up")" = 1 ] && said preload "claimed for the host" && said preload "is the host'"'"'s session'"'"'s from uptime"' \
-    "the handover: the preload claims hci0 once (HCIDEVUP: the kernel's auto power-off cancelled) and hands it over"
-  check 'read -r ha hh hd x < "$R/tmp/.radio_bt_handover" && [ "$ha" = "$(key handed)" ] && [ "$hh" = "$(key hci_up)" ] && [ "$hd" = hci0 ]' \
-    "  the handover file: when it was handed over, when hci0 answered, the device (the boot line's handed and hci_up)"
-  check '[ "$(key handed)" -ge "$(key hci_up)" ] && [ "$(key handed)" -ge "$(key wlan_up)" ] && said_before preload "the bt lock goes now" "preload: done"' \
-    "  handed over once hci0 answered and the Wi-Fi interface was in, the lock let go before the preload's bookkeeping"
-  check 'grep -qx "t bt_power $(key hci_up)" "$R/tmp/startup_marks"' "  the timeline: bt_power is hci0's answer"
-  check '[ ! -e "$R/state/hci0.name" ]' "  no name set by the shell: btd writes the identity"
-  check 'said bt_on "handed over by the boot preload" && ! said bt_on "already converged" && [ "$(cat "$R/tmp/.radio_bt_warm")" = opened ]' \
-    "the host's bt_on touches nothing (rc 2), and leaves opened for a btd that goes on its return"
+  # By default nothing of the handover (R3-5) runs: no claim, no handover file, the name and SCO set as before, the
+  # host's bt_on confirming it, and nothing "opened" for btd, whose DOWN/UP stays (the owner's decision, 21 Nov).
+  check '! called "hciconfig hci0 up" && [ ! -e "$R/tmp/.radio_bt_handover" ] && said preload "handover: off (not asked for"' \
+    "the handover not asked for (the default): no claim, no handover file"
+  check '[ "$(key handover)" = off ] && [ "$(key handed)" = - ]' "  the boot line says so: handover=off handed=-"
+  check 'said bt_on "already converged" && ! said bt_on "handed over" && [ ! -s "$R/tmp/.radio_bt_warm" ] && [ -e "$R/state/hci0.name" ]' \
+    "  the host's bt_on confirms Bluetooth as before, leaves no opened word (btd's DOWN/UP stays), the name set by the preload"
+  check '[ "$(grep -c "^t bt_power" "$R/tmp/startup_marks")" = 1 ]' "  bt_power once, the host's bt_on's"
   echo "== $SH: a host before the boot preload"
   unit
   WLAN_SECS=0.5 FW_SECS=0.5 host_bringup &
@@ -494,9 +492,30 @@ case_host() {
 }
 
 case_handover() {
-  # ---- the handover's edges (R3-5) -------------------------------------------------------------------------------------
-  echo "== $SH: the handover, the Wi-Fi interface later than Bluetooth, the host gone after the claim"
-  unit
+  # ---- the handover (R3-5), asked for --------------------------------------------------------------------------------
+  echo "== $SH: a host during the boot preload, the handover asked for (the owner's /script/radio_handover_on)"
+  unit; : > "$R/script/radio_handover_on"
+  ( WLAN_SECS=0.8 FW_SECS=1.6 hal preload ) &
+  pre=$!
+  waitfor 'called "insmod moal start"' 50
+  WLAN_SECS=0.8 FW_SECS=1.6 AP_SECS=2.5 host_bringup
+  wait "$pre"
+  check '[ "$(rc preload)" = 0 ] && [ "$(rc bt_on)" = 2 ] && [ "$(rc wifi_ap_on)" = 0 ] && called "ap lock held" && ! called "hciconfig hci0 down"' \
+    "converged, the host's bt_on rc 2, its AP up, Bluetooth left up for the session"
+  check '[ "$(count "hciconfig hci0 up")" = 1 ] && said preload "claimed for the host" && said preload "is the host'"'"'s session'"'"'s from uptime"' \
+    "the handover: the preload claims hci0 once (HCIDEVUP: the kernel's auto power-off cancelled) and hands it over"
+  check '[ "$(key handover)" = on_owner ]' "  the boot line: handover=on_owner"
+  check 'read -r ha hh hd x < "$R/tmp/.radio_bt_handover" && [ "$ha" = "$(key handed)" ] && [ "$hh" = "$(key hci_up)" ] && [ "$hd" = hci0 ]' \
+    "  the handover file: when it was handed over, when hci0 answered, the device (the boot line's handed and hci_up)"
+  check '[ "$(key handed)" -ge "$(key hci_up)" ] && [ "$(key handed)" -ge "$(key wlan_up)" ] && said_before preload "the bt lock goes now" "preload: done"' \
+    "  handed over once hci0 answered and the Wi-Fi interface was in, the lock let go before the preload's bookkeeping"
+  check 'grep -qx "t bt_power $(key hci_up)" "$R/tmp/startup_marks"' "  the timeline: bt_power is hci0's answer"
+  check '[ ! -e "$R/state/hci0.name" ]' "  no name set by the shell: btd writes the identity"
+  check 'said bt_on "handed over by the boot preload" && ! said bt_on "already converged" && [ "$(cat "$R/tmp/.radio_bt_warm")" = opened ]' \
+    "the host's bt_on touches nothing (rc 2), and leaves opened for a btd that goes on its return"
+
+  echo "== $SH: the handover asked for by the bench (/tmp/bench_handover_on), the Wi-Fi interface later than Bluetooth, the host gone after the claim"
+  unit; : > "$R/tmp/bench_handover_on"
   ( WLAN_SECS=2.0 FW_SECS=0.2 hal preload ) &
   pre=$!
   waitfor 'called "insmod moal start"' 50
@@ -508,29 +527,34 @@ case_handover() {
   wait "$pre"
   check '[ "$(rc preload)" = 0 ] && [ -e "$R/tmp/.radio_bt_handover" ] && [ "$(key hci_up)" -lt "$(key wlan_up)" ] && [ "$(key handed)" -ge "$(key wlan_up)" ]' \
     "handed over once the Wi-Fi interface came (btd's name is wlan0's), after hci0 answered"
+  check '[ "$(key handover)" = on_bench ]' "  the boot line: handover=on_bench"
   check '! called "hciconfig hci0 down"' "  a controller claimed for a host's session is never powered down by the preload: its teardown does that"
   check '[ "$(grep -c "^t bt_power" "$R/tmp/startup_marks")" = 1 ] && grep -qx "t bt_power $(key hci_up)" "$R/tmp/startup_marks"' \
     "  bt_power stamped by the preload itself, with hci0's answer (no bt_on ran)"
   hal bt_off
   check '[ ! -e "$R/tmp/.radio_bt_handover" ] && called "hciconfig hci0 down"' "the teardown's bt_off: powered down, the handover gone with the session"
 
-  echo "== $SH: the handover switched off"
+  echo "== $SH: the handover's switches, and the retired off file"
   unit
-  check 'hal probe; said probe "handover=on"' "probe: the handover on"
-  : > "$R/tmp/bench_handover_off"; hal probe
-  check 'said probe "handover=bench"' "  the bench's file: off"
-  echo off > "$R/tmp/bench_handover_off"; hal probe
-  check 'said probe "handover=on"' "  the bench's file reading off (Carlink cannot delete it): on"
+  check 'hal probe; said probe "handover=off"' "probe: off by default"
+  : > "$R/tmp/bench_handover_on"; hal probe
+  check 'said probe "handover=on_bench"' "  the bench's file: on (on_bench)"
+  echo off > "$R/tmp/bench_handover_on"; hal probe
+  check 'said probe "handover=off"' "  the bench's file reading off (Carlink cannot delete it): off"
   : > "$R/script/radio_handover_off"; hal probe
-  check 'said probe "handover=owner"' "  the owner's file: off"
+  check 'said probe "handover=off"' "  the retired /script/radio_handover_off alone: off, as without it"
+  : > "$R/script/radio_handover_on"; hal probe
+  check 'said probe "handover=on_owner"' "  the owner's file: on (on_owner), the retired off file beside it read by nothing"
+  rm -f "$R/script/radio_handover_on" "$R/tmp/bench_handover_on"
+  # A leftover off file from a bench (the dev adapter has one): a cold boot as the default's, nothing of the handover.
   ( WLAN_SECS=0.4 FW_SECS=0.6 hal preload ) &
   pre=$!
   waitfor 'called "insmod moal start"' 50
   WLAN_SECS=0.4 FW_SECS=0.6 host_bringup
   wait "$pre"
-  check '[ "$(rc preload)" = 0 ] && [ "$(rc bt_on)" = 2 ] && said preload "handover: switched off" && said bt_on "already converged"' \
-    "the owner's switch: today's path, the host's bt_on after the preload"
-  check '[ ! -e "$R/tmp/.radio_bt_handover" ] && [ "$(key handed)" = - ] && ! called "hciconfig hci0 up" && [ -e "$R/state/hci0.name" ]' \
+  check '[ "$(rc preload)" = 0 ] && [ "$(rc bt_on)" = 2 ] && said preload "handover: off (not asked for" && said bt_on "already converged"' \
+    "a leftover off file: today's path, the host's bt_on after the preload"
+  check '[ ! -e "$R/tmp/.radio_bt_handover" ] && [ "$(key handover)" = off ] && [ "$(key handed)" = - ] && ! called "hciconfig hci0 up" && [ -e "$R/state/hci0.name" ]' \
     "  no claim, no handover, the name set as before"
   check '[ "$(grep -c "^t bt_power" "$R/tmp/startup_marks")" = 1 ]' "  bt_power once, the host's bt_on's"
 
@@ -570,11 +594,11 @@ case_line() {
   # ---- the boot line, composed -----------------------------------------------------------------------------------------
   echo "== $SH: the boot line"
   unit
-  printf 'start 2050\ncaps kept\ncaps_ms 61\ngpio 2330\norder together\noff -\nwlan_start 2410\nwlan_up 4460\nwlan_free 4470\nbtfw_start 2420\nbtfw_end 4930\nbtfw complete\nbtfw_ms 2467\nattach 4940\nhci_up 5390\nhanded 5420\nstart 9999\n' \
+  printf 'start 2050\ncaps kept\ncaps_ms 61\ngpio 2330\norder together\noff -\nwlan_start 2410\nwlan_up 4460\nwlan_free 4470\nbtfw_start 2420\nbtfw_end 4930\nbtfw complete\nbtfw_ms 2467\nattach 4940\nhci_up 5390\nhandover on_owner\nhanded 5420\nstart 9999\n' \
     > "$R/tmp/radio_boot_marks"
   echo 3010 > "$R/tmp/host_present_uptime"
   env RADIO_HAL_FUNCS=1 OCBM_TEST_PATH="$TESTPATH" STUB_R="$R" "$SH" -c '. "$1"; _bt_tries=1; boot_line preload 0' sh "$R/script/radio_hal.sh"
-  want='[radio-boot] v1 by=preload start=2050 caps=kept caps_ms=61 gpio=2330 order=together off=- wlan_start=2410 wlan_up=4460 wlan_free=4470 btfw_start=2420 btfw_end=4930 btfw=complete btfw_ms=2467 attach=4940 hci_up=5390 handed=5420 tries=1 fallback=0 rc=0 host=3010'
+  want='[radio-boot] v1 by=preload start=2050 caps=kept caps_ms=61 gpio=2330 order=together off=- wlan_start=2410 wlan_up=4460 wlan_free=4470 btfw_start=2420 btfw_end=4930 btfw=complete btfw_ms=2467 attach=4940 hci_up=5390 handover=on_owner handed=5420 tries=1 fallback=0 rc=0 host=3010'
   check '[ "$(line)" = "$want" ] && grep -qxF "$want" "$R/tmp/box.log"' "fixed keys in a fixed order, the first stamp of each key standing; in the box log too"
   check 'line | grep -qE "^\[radio-boot\] v1( [a-z_]+=[A-Za-z0-9_-]+)+$" && ! line | grep -qE "CarLink|([0-9a-f]{2}:){5}"' \
     "one grammar, no name and no address"
@@ -583,7 +607,7 @@ case_line() {
   check '[ "$(grep -c . "$R/tmp/radio_boot")" = 1 ]' "after a line with rc=0, no other that boot"
   rm -f "$R/tmp/radio_boot"
   env RADIO_HAL_FUNCS=1 OCBM_TEST_PATH="$TESTPATH" STUB_R="$R" "$SH" -c '. "$1"; boot_line bt_on 1' sh "$R/script/radio_hal.sh"
-  check '[ "$(line)" = "[radio-boot] v1 by=bt_on start=- caps=- caps_ms=- gpio=- order=- off=- wlan_start=- wlan_up=- wlan_free=- btfw_start=- btfw_end=- btfw=- btfw_ms=- attach=- hci_up=- handed=- tries=0 fallback=0 rc=1 host=-" ]' \
+  check '[ "$(line)" = "[radio-boot] v1 by=bt_on start=- caps=- caps_ms=- gpio=- order=- off=- wlan_start=- wlan_up=- wlan_free=- btfw_start=- btfw_end=- btfw=- btfw_ms=- attach=- hci_up=- handover=- handed=- tries=0 fallback=0 rc=1 host=-" ]' \
     "nothing stamped: every key there, each -"
 }
 
