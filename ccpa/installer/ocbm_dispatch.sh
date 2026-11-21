@@ -214,8 +214,9 @@ update_boot() {  # before OCBM starts
   update_trial=1
   log "update trial: $(journal to), start $((n + 1))"
   # Its first start begins with the boot radio preload on: an updater from before the guard counted (85bff31..9b228f8)
-  # cleared nothing, and its one-event flag would read as the owner's (the Mac's 13 Nov review).
-  if [ "$n" = 0 ]; then rm -f "$S/radio_preload_off" "$S/.radio_preload_inflight" "$S/.radio_preload_unfinished"; fi
+  # cleared nothing, and its one-event flag would read as the owner's (the Mac's 13 Nov review). The handover's retired
+  # off file goes too (an updater from before it was retired leaves it; nothing reads it now).
+  if [ "$n" = 0 ]; then rm -f "$S/radio_preload_off" "$S/.radio_preload_inflight" "$S/.radio_preload_unfinished" "$S/radio_handover_off"; fi
 }
 
 selftest() {

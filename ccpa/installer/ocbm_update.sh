@@ -182,6 +182,7 @@ if [ ! -s "$list" ]; then   # a new version number with no new files
   log "nothing to place: the adapter's files already match $VER"
   rm -f "$S/radio_preload_off" "$S/.radio_preload_inflight" "$S/.radio_preload_unfinished" "$S/radio_preload_late"   # a new version starts it on
   together_guard_lift
+  rm -f "$S/radio_handover_off"   # retired (the handover is opt-in): read by nothing
   clean; unlock; exit 0
 fi
 if grep -q ' script/ocbm_dispatch.sh$' "$list"; then
@@ -233,6 +234,9 @@ echo placed >> "$U" && sync
 # A new version starts with the boot radio preload on, and early: its guard counts afresh (radio_hal.sh do_preload).
 rm -f "$S/radio_preload_off" "$S/.radio_preload_inflight" "$S/.radio_preload_unfinished" "$S/radio_preload_late"
 together_guard_lift
+# The handover's old off file is retired (the handover is opt-in, radio_hal.sh "OPT-IN"): read by nothing, gone. An
+# owner's /script/radio_handover_on stays, as the other owners' switches do.
+rm -f "$S/radio_handover_off"
 
 step restart
 result "trial $VER (from $have_line)"
