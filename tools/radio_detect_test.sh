@@ -179,6 +179,10 @@ for RD_SH in ${SHELLS:-$(distinct_shells sh dash)}; do
   attach_dispatch "$d" "" "" ""; head -n 20 "$d/script/attach_bluetooth.sh" > "$T/trunc"; cp "$T/trunc" "$d/script/attach_bluetooth.sh"
   detect "$d" >/dev/null
   check '[ "$(cap "$d" BT_TOGETHER)" = 0 ]' "  an attach script cut short (its chain never closes): today's order"
+  attach_dispatch "$d" "" "" ""; head -n 28 "$d/script/attach_bluetooth.sh" > "$T/trunc"; cp "$T/trunc" "$d/script/attach_bluetooth.sh"
+  detect "$d" >/dev/null
+  check '[ "$(cap "$d" BT_TOGETHER)" = 0 ] && [ -n "$(cap "$d" BT_PRELOAD_CMD)" ] && [ -n "$(cap "$d" BT_ATTACH_CMD)" ]' \
+    "  one cut right after the IW416 branch (its lines read, the chain never closed): today's order"
   attach_dispatch "$d" "" "" ""
   cp "$d/script/init_bluetooth_wifi.sh" "$T/disp.order"
   grep -v 'attach_bluetooth.sh &' "$T/disp.order" \
