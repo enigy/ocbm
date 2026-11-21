@@ -199,6 +199,8 @@ check "called \"radio_hal.sh wifi_ap_prep\" && called \"exec /usr/sbin/btd\"" "t
 check "[ -s \"\$R/body\" ] && ! grep -q -e carplayd -e hostapd \"\$R/body\" && grep -q /usr/sbin/btd \"\$R/body\"" \
   "its body names no A/V daemon and no AP daemon (the teardown patterns), only btd, whose pattern ends an arm under way"
 check "called \"pkill -f carplayd\"" "a stray A/V daemon reaped first, as at a bring-up"
+_u=$(grep -n "unset OCBM_BTD_WAIT" "$R/body" | cut -d: -f1); _x=$(grep -n "exec /usr/sbin/btd" "$R/body" | cut -d: -f1)
+check "[ -n \"\$_u\" ] && [ \"\$_x\" = \"\$((_u + 1))\" ]" "an inherited OCBM_BTD_WAIT unset just before its btd starts (the 21 Nov review, I)"
 '
 
   run_case "$sh" '
@@ -225,6 +227,15 @@ check "called \"setsid sh /script/radio_hal.sh wifi_ap_on\" || { sleep_real=1; i
   "the AP launched after the signal"
 check "! called wireless_down && ! called \"OCBM_GO_FALLBACK=1\"" "no teardown, no fallback"
 check "[ \"\$wl_raised\" = 1 ]" "the radios raised: no teardown may take its early return until one has run"
+'
+
+  run_case "$sh" '
+# The go with its answer file unwritable (the 21 Nov review, B): its truncation was `:`, whose failed redirection ends
+# the supervisor under dash and ash. The go goes on.
+proc 321 btd S; arm_pid=321; echo 321 > "$BTD_ARMED_FILE"
+BTD_GO_RESULT="$R/no_such_dir/btd_go_result"
+wireless_up; settle
+check "called \"kill -USR1 321\" && [ \"\$go_pending\" = 1 ]" "the answer file unwritable: the go still goes, the supervisor still runs"
 '
 
   run_case "$sh" '
@@ -395,6 +406,10 @@ command env BT_PAIRING_MODE=just_works BT_SSP_INTERACTIVE=0 OCBM_WL_REAPED=0 OCB
   OCBM_BTD_EARLY=0 sh "$R/body.run"
 check "before \"radio_hal bt_on end\" \"btd start wait=none\" && ! called \"btd saw bt_on done\" && [ ! -e \"$R/tmp/.btd_bt_on_done\" ]" \
   "today'"'"'s: bt_on, then btd (no wait asked, no file)"
+: > "$CALLS"
+command env BT_PAIRING_MODE=just_works BT_SSP_INTERACTIVE=0 OCBM_WL_REAPED=0 OCBM_USB_EDGE= OCBM_GO_FALLBACK=0 \
+  OCBM_BTD_EARLY=0 OCBM_BTD_WAIT=1 sh "$R/body.run"
+check "called \"btd start wait=none\"" "  an OCBM_BTD_WAIT=1 the supervisor inherited: unset, this btd does not wait (the 21 Nov review, I)"
 '
 done
 [ "$fails" -eq 0 ] && echo "session_supervisor_test: all passed ($passes checks)" || { echo "session_supervisor_test: $fails failed"; exit 1; }

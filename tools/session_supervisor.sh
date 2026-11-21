@@ -328,7 +328,7 @@ arm() {
     return 1
   fi
   kill_session   # idempotent: never leak a duplicate carplayd on re-ARM
-  : > "$AL"      # carplayd's in-process discovery thread logs here too (no separate rx-connect log since 2026-09-08)
+  { true >"$AL"; } 2>/dev/null   # carplayd's in-process discovery thread logs here too (no separate rx-connect log since 2026-09-08). Not `:`, whose failed redirection would end the supervisor
   # docs/wireless/00_WIRELESS_CARPLAY.md: the wireless-metadata experiment (CARPLAY_WIRELESS_METADATA) is set ONLY at the wireless
   # spawn site (crates/vendor/wireless/src/av.rs::ensure_av_layer) — this is the WIRED launcher, and it
   # deliberately does NOT set that var: info.rs/session.rs's iAPChannelInfo/enabledFeatures echoes it
@@ -843,7 +843,8 @@ arm_wireless() {
         _i=$((_i + 1)); sleep 0.2
       done
     fi
-    : > "$OCBM_AV_LOG"
+    { true >"$OCBM_AV_LOG"; } 2>/dev/null
+    unset OCBM_BTD_WAIT   # an armed btd never waits for a handover, whatever the supervisor inherited
     exec /usr/sbin/btd </dev/null >>/tmp/wl.log 2>&1
   ' </dev/null >/dev/null 2>&1 &
   arm_pid=$!
@@ -919,7 +920,7 @@ wireless_go() {  # $1 = the armed btd's pid
     radios_yielded_to_wired=1; _a2_state=1
     return
   fi
-  : 2>/dev/null >"$BTD_GO_RESULT"   # no answer yet (a redirection, not rm: nothing forks before the signal)
+  { true >"$BTD_GO_RESULT"; } 2>/dev/null   # no answer yet (a redirection, not rm: nothing forks before the signal; not `:`, whose failed redirection would end the supervisor)
   printf 'pid=%s\nBT_PAIRING_MODE=%s\nBT_SSP_INTERACTIVE=%s\n' "$1" "$_cs_mode" "$_cs_inter" 2>/dev/null >"$BTD_GO_FILE"
   usb_observe
   uptime_now
@@ -1167,7 +1168,7 @@ wireless_up() {
           _i=$((_i + 1)); sleep 0.2
         done
       fi
-      : > /tmp/carplayd_wl.log
+      { true > /tmp/carplayd_wl.log; } 2>/dev/null
     }
     if [ "$OCBM_GO_FALLBACK" != 1 ]; then
     echo "[sup] radios starting at uptime $(cut -d" " -f1 /proc/uptime)" >> /tmp/box.log
@@ -1195,7 +1196,7 @@ wireless_up() {
       rm -f /tmp/.btd_bt_on_done
       OCBM_BTD_WAIT=1 /usr/sbin/btd </dev/null >>/tmp/wl.log 2>&1 &
       sh /script/radio_hal.sh bt_on 2>&1 | tee -a /tmp/box.log >/tmp/bt.log
-      : > /tmp/.btd_bt_on_done
+      { true > /tmp/.btd_bt_on_done; } 2>/dev/null
       exit 0
     fi
     # bt.log stays the small truncated per-attempt status file that docs/wireless/01_BT_AND_RADIO.md
@@ -1207,6 +1208,7 @@ wireless_up() {
     # holds the wlan lock (wifi_handoff::wait_for_ap), so it never describes an AP that is not serving yet.
     btmon_capture
     av_settled
+    unset OCBM_BTD_WAIT   # this btd never waits for a handover, whatever the supervisor inherited (21 Nov review I)
     exec /usr/sbin/btd </dev/null >>/tmp/wl.log 2>&1
   ' </dev/null >/dev/null 2>&1 &
 }
