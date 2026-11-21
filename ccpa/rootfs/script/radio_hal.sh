@@ -97,6 +97,13 @@ boot_note() { echo "$1 $2" 2>/dev/null >>"$BOOT_MARKS"; return 0; }
 # A pid that still runs: kill -0 is the shell's own (a zombie counts, as /proc/<pid> did).
 pid_live() { [ -n "$1" ] && kill -0 "$1" 2>/dev/null; }
 
+# An empty file written, or one truncated, without `:`: a special built-in, whose failed redirection ends a
+# non-interactive POSIX shell (dash exits 2, which this script defines as "already converged"; BusyBox ash exits 1),
+# so a full flash or a missing directory under `: > FILE` stopped a bring-up dead (the 21 Nov reviews, B). `true` is a
+# regular built-in: its failure is only a status, and the braces keep the shell's message out of the logs. No fork.
+# 0: written; 1: not, which the caller logs where it matters. Nothing here stops a bring-up.
+write_empty() { { true >"$1"; } 2>/dev/null; }
+
 # Single-flight per subsystem. mkdir is the portable atomic test-and-set on busybox (no flock
 # dependency). A concurrent second bring-up must not run - the supervisor can manufacture
 # overlapping edges (a respawn synthesizes a host-present edge), and stacking two insmod/rmmod
@@ -141,6 +148,7 @@ lock_take() {  # $1 = subsystem
     _n=$((_n + _lkw))
   done
   echo $$ > "$_lk/pid" 2>/dev/null
+  lock_mine "$1" 1   # taken by this process, whether or not its pid could be written (lock_drop_own)
   # TWO traps, deliberately. In ash a trapped signal runs the handler and then RESUMES the
   # script: a single combined trap would release the lock on SIGTERM while the bring-up carried
   # on running, so the next caller would take the lock and stack a second attach on top of a
@@ -149,13 +157,19 @@ lock_take() {  # $1 = subsystem
   trap 'rm -rf "/tmp/.radio_lock_'"$1"'" 2>/dev/null; trap - EXIT; exit 143' INT TERM HUP
   return 0
 }
-lock_drop() { trap - EXIT INT TERM HUP; rm -rf "/tmp/.radio_lock_$1" 2>/dev/null; }
-# Drop $1's lock only while this process holds it (its pid in it). The boot preload lets its locks go before it ends
-# (do_preload, bt_attach_together), and the lock by then may be a host's bring-up's: never remove that one.
+lock_drop() { trap - EXIT INT TERM HUP; rm -rf "/tmp/.radio_lock_$1" 2>/dev/null; lock_mine "$1" 0; }
+# Which locks this process took and still holds (lock_take sets it, the drops clear it): _lkm_wlan, _lkm_bt.
+lock_mine() { case "$1" in wlan) _lkm_wlan=$2 ;; bt) _lkm_bt=$2 ;; esac; }
+lock_is_mine() { case "$1" in wlan) [ "${_lkm_wlan:-0}" = 1 ] ;; bt) [ "${_lkm_bt:-0}" = 1 ] ;; *) return 1 ;; esac; }
+# Drop $1's lock only while this process holds it: its pid in it, or (its pid write failed, 21 Nov review K) no pid in
+# it at all and this process took it and has not let it go. The boot preload lets its locks go before it ends
+# (do_preload, bt_attach_together, bt_handover_give), and the lock by then may be a host's bring-up's: never remove
+# that one, even one whose own pid write failed.
 lock_drop_own() {
   _ldo=""; read -r _ldo 2>/dev/null <"/tmp/.radio_lock_$1/pid"
-  [ "$_ldo" = "$$" ] || return 0
-  rm -rf "/tmp/.radio_lock_$1" 2>/dev/null
+  if [ "$_ldo" = "$$" ] || { [ -z "$_ldo" ] && lock_is_mine "$1"; }; then rm -rf "/tmp/.radio_lock_$1" 2>/dev/null; fi
+  lock_mine "$1" 0
+  return 0
 }
 
 # Atomic so a reader can never see a half-written descriptor. Consumers (the Rust daemons) must
@@ -261,13 +275,25 @@ caps_keep() {
   return 0
 }
 
+# The descriptor at $CAPS is final for this boot: it found wireless and names an SDIO device. One made before the
+# radio's SDIO card was enumerated names none (the boot preload now looks at about 2.0 s of uptime), and its insmod and
+# attach lines are then not this unit's own: never final, so the next verb detects again (the 21 Nov review D; caps_check
+# never keeps one on flash either). No fork.
+caps_final() {
+  _cfw=0; _cfs=0
+  while IFS= read -r _cfl; do
+    case "$_cfl" in RADIO_WIRELESS=yes) _cfw=1 ;; RADIO_SDIO_DEVICE=?*) _cfs=1 ;; esac
+  done 2>/dev/null <"$CAPS"
+  [ "$_cfw" = 1 ] && [ "$_cfs" = 1 ]
+}
+
 caps() {
   # Once per boot: /tmp starts empty at every power-up, and what this script reads from the descriptor (the chip, its
   # driver and attach lines) cannot change within one. Detection costs 1.0 s alone and 1.6 s for two at once (the
   # Mac's 13 Nov bench), so a boot first takes the kept copy (caps_from_kept), and detects only when it may not. A
-  # descriptor that found no wireless is taken again. Its post-load facts (interface, MACs) go stale; only btd's
-  # start-up log reads them, and this script enumerates its own (wlan_iface, hci_dev).
-  if ! grep -qx "RADIO_WIRELESS=yes" "$CAPS" 2>/dev/null; then
+  # descriptor that found no wireless, or no SDIO device (caps_final), is taken again. Its post-load facts (interface,
+  # MACs) go stale; only btd's start-up log reads them, and this script enumerates its own (wlan_iface, hci_dev).
+  if ! caps_final; then
     up_ms; _caps_t0=$_um
     if caps_from_kept; then
       boot_note caps kept
@@ -327,7 +353,7 @@ ko_unpack() {
   [ "$_kuown" = 1 ] && echo $$ > "$_kul/pid" 2>/dev/null
   if [ ! -e "$KO_STAMP" ]; then
     { tar -xzf "$RADIO_KO_TARBALL" -C /tmp 2>/dev/null || tar -xf "$RADIO_KO_TARBALL" -C /tmp 2>/dev/null; } \
-      && : > "$KO_STAMP"
+      && write_empty "$KO_STAMP"
   fi
   [ "$_kuown" = 1 ] && rm -rf "$_kul" 2>/dev/null
   [ -e "$KO_STAMP" ]
@@ -814,11 +840,22 @@ do_preload() {
   # Before the chip (20 Nov 2026): this unit's descriptor (the kept copy, caps) and its modules unpacked, neither of
   # which touches it, while the stock GPIO set-up may still be pulsing the Bluetooth reset line; then that set-up's end
   # (gpio_wait), then the chip. ocbm_boot.sh starts this beside the gadget for it, where the dispatcher marks that end.
+  sdio_wait
   caps && ko_unpack
   gpio_wait
   RADIO_BT_MAX_TRIES=1
   _bt_handed=0
   do_bt_on; _pr=$?
+  # A FAILED ATTACH'S HELPER (21 Nov review A). The helper (hciattach ... any) stays up after its attach failed, holding
+  # the UART with hci0 registered and dead: the host's bt_on then spent its confirmation on that hci0 (about 18 s),
+  # pushed the firmware into a UART the helper still held, and its first attempt was a reclaim+reset (rmmod hci_uart and
+  # the gpio1 pulse) with the Wi-Fi driver loaded, the step radio_detect.sh's preload note records as wedging the kernel.
+  # So the preload stops its own helper (bt_helper_stop: SIGTERM, then -9 on the helper; no reset, no rmmod), which takes
+  # hci0 with it. In either order: 2.6.5 left the same helper after a failed Wi-Fi-first preload.
+  if [ "$_pr" = 1 ] && [ "${_bt_attached:-0}" = 1 ]; then
+    log "preload: the attach failed - its helper stopped (no reset, no rmmod): the host's bring-up starts on a free UART"
+    bt_helper_stop
+  fi
   # Attached by this preload: power it down to the between-sessions state. Not when it found the controller up
   # (rc 2: someone else's), not once a host has come (its session is waiting on this lock for the radio), and never
   # one handed to a host's session (bt_handover_give): that session's teardown powers it down, whatever the host does.
@@ -837,6 +874,22 @@ do_preload() {
   log "preload: done rc=$_pr in $_pd s, wlan=$(wlan_iface 2>/dev/null || echo none) bt=$(hciconfig 2>/dev/null | grep -oE 'UP RUNNING|DOWN' | head -1)"
   [ "${_bt_attached:-0}" = 1 ] && boot_line preload "$_pr"
   return $_pr
+}
+
+# THE SDIO CARD FIRST (21 Nov 2026, review D). Started early, the preload reads the descriptor at about 2.0 s of uptime,
+# and a radio whose SDIO card is not enumerated yet gives one that names no device, whose module and attach lines are
+# then not this unit's own. Up to 3 s for the card's node, a look every 0.1 s, said either way; past that the preload
+# goes on, and caps_final has the next verb detect again.
+sdio_seen() { for _sdn in /sys/bus/sdio/devices/*/device; do [ -e "$_sdn" ] && return 0; done; return 1; }
+sdio_wait() {
+  _sdw=0
+  while ! sdio_seen && [ "$_sdw" -lt 30 ]; do _sdw=$((_sdw + 1)); sleep 0.1; done
+  if sdio_seen; then
+    [ "$_sdw" -gt 0 ] && log "preload: waited about $((_sdw * 100)) ms for the radio's SDIO card"
+  else
+    log "preload: no SDIO card in 3 s - the descriptor names no device, and the next bring-up detects again"
+  fi
+  return 0
 }
 
 # THE STOCK GPIO SET-UP FIRST (20 Nov 2026). The dispatcher runs Carlinkit's init_gpio.sh beside ocbm_boot.sh at every
@@ -928,7 +981,9 @@ bt_power_stamp() {
 #   after), so one that never finished (power lost or the box hung inside it) is found at the next attach; each failed
 #   or unfinished one counts (TOGETHER_FAILS), and TOGETHER_GUARD_AFTER in a row switch the order off, by writing the
 #   owner's file with "guard" in it, until the owner removes it. One that converges clears the count. An install, an
-#   update or a way back to stock lifts the guard's file and its count (a new version tries again), never the owner's.
+#   update and an update's first start lift the guard's file and its count (a new version tries again), never the
+#   owner's own file; a revert and the restores remove both, since stock reads neither. A mark, count or off file that
+#   cannot be written (a full flash) never stops a bring-up: the attach goes on, uncounted (21 Nov review B).
 TOGETHER_OFF=/script/radio_together_off
 TOGETHER_BENCH_OFF=/tmp/bench_together_off
 TOGETHER_MARK=/script/.radio_together_inflight
@@ -963,16 +1018,28 @@ bt_order() {
 
 # One together attach that failed or never finished ($1 says which). 0: counted; 1: that made TOGETHER_GUARD_AFTER in a
 # row, and the order is switched off.
+# The off file goes in whole or not at all (21 Nov review F): written beside it, synced, renamed over it, synced, as the
+# kept descriptor is. A plain `>` cut by a power loss left it empty, which every reader takes for the owner's own file,
+# and installs and updates never lift that. A stray $TOGETHER_OFF_NEW at worst (a dot file, so the restores' extras
+# pass removes it; the next trip writes it again). Neither the off file nor the count stops a bring-up when it cannot
+# be written: the failure goes uncounted, the order stays as it was, and the log says so.
+TOGETHER_OFF_NEW=/script/.radio_together_off.new
 together_count() {
   _tgc=""; read -r _tgc 2>/dev/null <"$TOGETHER_FAILS"; case "$_tgc" in ''|*[!0-9]*) _tgc=0 ;; esac
   _tgc=$((_tgc + 1)); rm -f "$TOGETHER_MARK"
   if [ "$_tgc" -ge "$TOGETHER_GUARD_AFTER" ]; then
-    echo "guard: $_tgc together attaches in a row failed or never finished, the last one $1" > "$TOGETHER_OFF"
-    rm -f "$TOGETHER_FAILS"; sync
-    log "radio order: $_tgc together attaches in a row failed or never finished, the last one $1 - together switched OFF, Wi-Fi first from now on (rm $TOGETHER_OFF to try it again)"
-    return 1
+    if { echo "guard: $_tgc together attaches in a row failed or never finished, the last one $1" >"$TOGETHER_OFF_NEW" \
+         && sync && mv -f "$TOGETHER_OFF_NEW" "$TOGETHER_OFF"; } 2>/dev/null; then
+      rm -f "$TOGETHER_FAILS"; sync
+      log "radio order: $_tgc together attaches in a row failed or never finished, the last one $1 - together switched OFF, Wi-Fi first from now on (rm $TOGETHER_OFF to try it again)"
+      return 1
+    fi
+    rm -f "$TOGETHER_OFF_NEW" 2>/dev/null
+    log "radio order: $_tgc together attaches in a row failed or never finished, but the guard's off file could not be written ($TOGETHER_OFF) - the order stays, uncounted"
+    return 0
   fi
-  echo "$_tgc" > "$TOGETHER_FAILS"; sync
+  if { echo "$_tgc" >"$TOGETHER_FAILS"; } 2>/dev/null; then sync
+  else log "radio order: the guard's count could not be written ($TOGETHER_FAILS) - this one goes uncounted"; fi
   log "radio order: a together attach $1 ($_tgc of $TOGETHER_GUARD_AFTER in a row before together is switched off)"
   return 0
 }
@@ -1209,7 +1276,7 @@ RADIO_ATTACH_POLLS=${RADIO_ATTACH_POLLS:-30}
 case "$RADIO_ATTACH_POLLS" in ''|*[!0-9]*) RADIO_ATTACH_POLLS=30 ;; esac
 bt_attach_loop() {
   _helper=${RADIO_BT_ATTACH_CMD%% *}
-  _try=0; _d=""
+  _try=0; _d=""; _bal_ok=0
   while [ "$_try" -lt "$1" ]; do
     _try=$((_try+1)); _bt_tries=$((${_bt_tries:-0} + 1))
     if [ "$_try" -gt 1 ] || pgrep -x "$_helper" >/dev/null 2>&1 || ps | grep -v grep | grep -qw "$_helper"; then
@@ -1220,14 +1287,20 @@ bt_attach_loop() {
     setsid $RADIO_BT_ATTACH_CMD </dev/null >/tmp/radio_bt_attach.log 2>&1 &
     _n=0
     while [ "$_n" -lt "$RADIO_ATTACH_POLLS" ]; do
-      _d=$(hci_dev 2>/dev/null) && bt_responsive "$_d" && break
+      _d=$(hci_dev 2>/dev/null) && bt_responsive "$_d" && { _bal_ok=1; break; }
       _n=$((_n+1)); sleep 0.5
     done
-    _d=$(hci_dev 2>/dev/null) || _d=""
-    [ -n "$_d" ] && bt_responsive "$_d" && break
+    # One last look once the looks ran out. An answer above stands: two further name reads (a healthy RTL8822CS missed
+    # about one in four, bt_responsive_confirmed) used to undo it, and a preload's one try then counted toward the
+    # together guard, or a bt_on went on to reclaim+reset a working chip (the 21 Nov review J).
+    if [ "$_bal_ok" = 0 ]; then
+      _d=$(hci_dev 2>/dev/null) || _d=""
+      [ -n "$_d" ] && bt_responsive "$_d" && _bal_ok=1
+    fi
+    [ "$_bal_ok" = 1 ] && break
     log "  attempt $_try did not converge"
   done
-  if [ -n "$_d" ] && bt_responsive "$_d"; then
+  if [ "$_bal_ok" = 1 ]; then
     boot_mark hci_up
     # A host waiting on the boot preload: its session takes the controller (the handover, above), with no SCO or name
     # set here; bt_handover_give hands it over once the Wi-Fi side is in, and publishes the state.
@@ -1301,15 +1374,19 @@ bt_attach_mapped() {
 # the controller attached, and the attach does not wait for its interface. One attempt: its failure is the fallback.
 bt_attach_together() {
   log "radio order: together - the Bluetooth firmware beside the Wi-Fi driver, attached without waiting for its interface (this unit's own attach branch waits for nothing; Wi-Fi first again with $TOGETHER_OFF or $TOGETHER_BENCH_OFF)"
-  : 2>/dev/null >"$TOGETHER_MARK"; sync
+  # A mark that cannot be written (a full flash) never stops the attach: it goes on, and were it never to finish it
+  # would go uncounted (the guard, above).
+  if write_empty "$TOGETHER_MARK"; then sync
+  else log "radio order: the in-flight mark could not be written ($TOGETHER_MARK) - this together attach goes on, uncounted by the guard should it never finish"; fi
   ko_unpack || log "driver tarball ${RADIO_KO_TARBALL:-<none>} did not unpack"
   # The line discipline first, then both loads at one instant, as the bench ran them (bt_parallel.sh, 20 Nov).
   bt_ldisc_ready
   # The Wi-Fi driver under its own lock (wlan_driver_up), its interface waited for, in a subshell of its own. Once the
   # interface is there a preload lets its wlan lock go, while this one still holds Bluetooth: a host's AP bring-up
   # waiting on it starts beside the firmware load, as on today's path when a host comes before the preload.
+  # Its exit code: 0 the interface came, 1 it did not; 2 more when it let the preload's wlan lock go (lock_mine).
   (
-    _btw_rc=1
+    _btw_rc=1; _btw_freed=0
     if wlan_driver_up; then
       _n=0; while [ "$_n" -lt 120 ]; do wlan_iface >/dev/null 2>&1 && break; _n=$((_n+1)); sleep 0.1; done
       if _btw_i=$(wlan_iface 2>/dev/null); then
@@ -1323,12 +1400,12 @@ bt_attach_together() {
     if [ "$VERB" = preload ]; then
       _btw_h=""; read -r _btw_h 2>/dev/null </tmp/.radio_lock_wlan/pid
       if [ "$_btw_h" = "$$" ]; then
-        rm -rf /tmp/.radio_lock_wlan 2>/dev/null
+        rm -rf /tmp/.radio_lock_wlan 2>/dev/null; _btw_freed=1
         boot_mark wlan_free
         log "  the preload lets the wlan lock go: an AP bring-up may start"
       fi
     fi
-    exit $_btw_rc
+    exit $((_btw_rc + 2 * _btw_freed))
   ) &
   _btw_job=$!
   bt_fw_preload
@@ -1336,6 +1413,8 @@ bt_attach_together() {
   # Clause 1: nothing this verb started still in flight when it returns. The Wi-Fi driver has been the shorter of the
   # two (2.0 s against 3.24 on the bench), so this rarely waits.
   wait "$_btw_job"; _btw_wl=$?
+  # The wlan lock that subshell let go is no longer this process's: a later holder's must stay (lock_drop_own).
+  case "$_btw_wl" in 2|3) lock_mine wlan 0; _btw_wl=$((_btw_wl - 2)) ;; 0|1) ;; *) _btw_wl=1 ;; esac
   # A controller claimed for a waiting host goes to its session now that the Wi-Fi interface is in too (btd's name).
   bt_handover_give
   if [ "$_btw_bt" = 0 ]; then
@@ -1346,7 +1425,7 @@ bt_attach_together() {
     fi
     return 0
   fi
-  : 2>/dev/null >"$TOGETHER_FELL"
+  write_empty "$TOGETHER_FELL" || log "radio order: the fallback mark could not be written ($TOGETHER_FELL) - a later attach this boot may try together again"
   log "radio order: together gave no responsive hci0 - this boot's next attach is Wi-Fi first"
   together_count "gave no responsive hci0" || :
   return 1
@@ -1376,7 +1455,7 @@ do_bt_on() {
   if [ -n "$_d" ] && bt_powered_up "$_d" && bt_responsive_confirmed "$_d"; then
     bt_power_stamp
     log "already converged ($_d responsive)"
-    : > "$BT_WARM"
+    write_empty "$BT_WARM"
     publish "$BT_STATE" "result=ok" "backend=$RADIO_BACKEND" "hci_dev=$_d" \
             "bt_mac=$(cat /sys/class/bluetooth/$_d/address 2>/dev/null)"
     return 2
@@ -1404,7 +1483,7 @@ do_bt_on() {
       log "$_d was only powered down - up and responsive, no reset needed"
       # "opened": this `up` opened a DOWN device, so the kernel set its event mask just now, and btd's first bring-up
       # can skip its own down/up (bt_bringup.rs; the Mac's 13 Nov brief, item 1).
-      if [ "$_bt_was_down" = 1 ]; then echo opened > "$BT_WARM"; else : > "$BT_WARM"; fi
+      if [ "$_bt_was_down" = 1 ]; then echo opened > "$BT_WARM"; else write_empty "$BT_WARM"; fi
       publish "$BT_STATE" "result=ok" "backend=$RADIO_BACKEND" "hci_dev=$_d" \
               "bt_mac=$(cat /sys/class/bluetooth/$_d/address 2>/dev/null)"
       return 0
@@ -1445,8 +1524,10 @@ do_bt_on() {
       if [ "$_bto" = together ]; then
         bt_attach_together && return 0
         # THE FALLBACK. The tries left (bt_on has four, the boot preload one) take today's order, from its start: the
-        # together attempt's helper stopped so the UART is free, the Wi-Fi interface first, the firmware pushed again,
-        # then the attach. A preload's failure leaves it to the host's bt_on, which the boot's mark sends Wi-Fi first.
+        # together attempt's helper stopped so the UART is free (no reset, no rmmod), the Wi-Fi interface first, the
+        # firmware pushed again, then the attach, whose attempt 1 finds no helper and is a plain attach. A preload's
+        # failure leaves it to the host's bt_on, which the boot's mark sends Wi-Fi first: the preload stops its helper
+        # as it ends (do_preload), and that bt_on stops any it still finds before its firmware push (below).
         _bt_left=$(( ${RADIO_BT_MAX_TRIES:-4} - 1 ))
         [ "$_bt_left" -ge 1 ] || return 1
         boot_note fallback 1
@@ -1455,6 +1536,10 @@ do_bt_on() {
         bt_attach_mapped "$_bt_left"
         return $?
       fi
+      # The fallback from an earlier bring-up (21 Nov review A): this boot's together attach failed in another process
+      # (the boot preload), whose helper, were it still there, would hold the UART. Stopped first, as the fallback
+      # above does (no reset, no rmmod), so the firmware push reaches the chip and attempt 1 is a plain attach.
+      [ "$_bto_off" = fallback ] && bt_helper_stop
       bt_attach_mapped "${RADIO_BT_MAX_TRIES:-4}"
       return $?
       ;;

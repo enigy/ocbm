@@ -68,7 +68,8 @@ cat > "$S/fw_loader_linux" <<'EOF'
 R=$STUB_R
 i=no; [ -e "$R/sys/class/net/sta0" ] && i=yes
 w=no; [ -e "$R/state/moal.loading" ] && w=yes
-echo "fw start iface=$i wlan_loading=$w" >> "$R/calls"
+h=no; p=$(cat "$R/state/hciattach.pid" 2>/dev/null) && kill -0 "$p" 2>/dev/null && h=yes
+echo "fw start iface=$i wlan_loading=$w helper=$h" >> "$R/calls"
 sleep "${FW_SECS:-0.8}"
 echo "Download Complete"
 echo "time:${FW_OWN_MS:-2467}"
@@ -76,8 +77,10 @@ echo "fw end" >> "$R/calls"
 EOF
 cat > "$S/hciattach" <<'EOF'
 #!/bin/sh
-# hciattach: hci0 registered, up and (unless ATTACH_DEAD names this attach, by its number this boot) answering; then it
-# stays, as the daemon does, until killed, and its end takes hci0 with it, as the line discipline's close does.
+# hciattach: hci0 registered, up and (unless ATTACH_DEAD or ATTACH_STUCK names this attach, by its number this boot)
+# answering; then it stays, as the daemon does, until killed, and its end takes hci0 with it, as the line discipline's
+# close does. ATTACH_DEAD: the helper gives up by itself a second on; ATTACH_STUCK: it stays until killed, as the real
+# hciattach does over a chip that never answers (the 21 Nov reviews, A).
 R=$STUB_R
 n=$(( $(cat "$R/state/attaches" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$R/state/attaches"
 i=no; [ -e "$R/sys/class/net/sta0" ] && i=yes
@@ -90,6 +93,10 @@ mkdir -p "$R/sys/class/bluetooth/hci0"; echo 02:00:00:00:00:02 > "$R/sys/class/b
 case " ${ATTACH_DEAD:-} " in
   *" $n "*) # a chip that never answers: hci0 there, never up, and the helper gives up a second on
     echo "attach $n dead" >> "$R/calls"; sleep 1; gone ;;
+esac
+case " ${ATTACH_STUCK:-} " in
+  *" $n "*) # a chip that never answers, and a helper that holds the UART until it is killed
+    echo "attach $n stuck" >> "$R/calls"; while :; do sleep 0.1; done ;;
 esac
 : > "$R/state/hci0.up"; : > "$R/state/hci0.answers"
 while :; do sleep 0.1; done
@@ -110,6 +117,10 @@ case "${2:-}" in
   down) rm -f "$R/state/$d.up"; echo "hciconfig $d down" >> "$R/calls" ;;
   name) if [ $# -ge 3 ]; then echo "$3" > "$R/state/$d.name"; exit 0; fi
         [ -e "$R/state/$d.up" ] && [ -e "$R/state/$d.answers" ] || exit 1
+        if [ -n "${NAME_MISS_AFTER:-}" ]; then
+          nr=$(( $(cat "$R/state/name_reads" 2>/dev/null || echo 0) + 1 )); echo "$nr" > "$R/state/name_reads"
+          [ "$nr" -gt "$NAME_MISS_AFTER" ] && exit 1
+        fi
         echo "	Name: '$(cat "$R/state/$d.name" 2>/dev/null || echo X)'" ;;
 esac
 exit 0
@@ -179,6 +190,7 @@ unit() {
   cat > "$R/script/init_bluetooth_wifi.sh" <<EOF
 test -e $R/usr/sbin/wpa_supplicant && supportStaMode=1 || supportStaMode=0
 sdioCardID=\`cat /sys/bus/sdio/devices/mmc0:0001:1/device\`
+test -e /sys/bus/sdio/devices/mmc0:0001:1/device && /script/attach_bluetooth.sh &
 if [ "\$sdioCardID" == "0xc822" ]; then
 	test -e $R/tmp/88x2cs.ko && insmod $R/tmp/88x2cs.ko if2name=sta0
 elif [ "\$sdioCardID" == "0x9149" ] || [ "\$sdioCardID" == "0x9141" ]; then
@@ -569,6 +581,128 @@ case_handover() {
   check 'said bt_on "a handover from before this host came" && said bt_on "already converged"' "  another device's: the same"
 }
 
+case_review() {
+  # ---- the 21 Nov reviews -------------------------------------------------------------------------------------------
+  helper_alive() { _hp=$(cat "$R/state/hciattach.pid" 2>/dev/null) && kill -0 "$_hp" 2>/dev/null; }
+  echo "== $SH: a failed preload attach leaves no helper behind (A)"
+  unit
+  ATTACH_STUCK=1 WLAN_SECS=0.3 FW_SECS=0.2 hal preload
+  check '[ "$(rc preload)" = 1 ] && called "attach 1 stuck" && ! helper_alive && [ ! -d "$R/sys/class/bluetooth/hci0" ]' \
+    "the preload's one together try fails over a helper that stays: the preload stops it, and hci0 goes with it"
+  check 'said preload "its helper stopped (no reset, no rmmod)" && ! called "rmmod" && ! said preload "reclaim+reset"' \
+    "  no reset and no rmmod"
+  : > "$R/calls"
+  host_bringup
+  check '[ "$(rc bt_on)" = 0 ] && said bt_on "(the fallback)" && grep -q "^fw start .*helper=no" "$R/calls" && ! grep -q "helper=yes" "$R/calls"' \
+    "the host's bt_on after it: Wi-Fi first (the fallback), its firmware pushed with no helper holding the UART"
+  check '! said bt_on "reclaim+reset (attempt 1)" && ! called "rmmod" && [ "$(count "attach ")" = 1 ]' \
+    "  and its attempt 1 a plain attach (no reclaim+reset, no rmmod), which converges"
+  echo "== $SH: the in-process fallback over a helper that stays, unchanged"
+  unit
+  ATTACH_STUCK=1 WLAN_SECS=0.3 FW_SECS=0.2 hal bt_on
+  check '[ "$(rc bt_on)" = 0 ] && said bt_on "for the 3 tries left (the fallback)" && [ "$(grep -c "^fw start" "$R/calls")" = 2 ]' \
+    "bt_on's together try fails: Wi-Fi first for the tries left, the firmware pushed again"
+  check '! grep -q "helper=yes" "$R/calls" && ! said bt_on "reclaim+reset (attempt 1)" && ! called "rmmod"' \
+    "  the stuck helper stopped first: each push on a free UART, attempt 1 a plain attach"
+  echo "== $SH: the fallback's bt_on stops a helper another process left, before its push (A)"
+  unit
+  : > "$R/tmp/.radio_together_fell_back"   # this boot's together attach failed in another process...
+  ( ATTACH_STUCK=1 STUB_R="$R" "$S/hciattach" /dev/ttymxc2 any 3000000 flow </dev/null >/dev/null 2>&1 & )   # ...which left its helper
+  waitfor 'called "attach 1 stuck" && helper_alive' 30
+  : > "$R/calls"
+  WLAN_SECS=0.3 FW_SECS=0.2 hal bt_on
+  check '[ "$(rc bt_on)" = 0 ] && said bt_on "(the fallback)" && grep -q "^fw start .*helper=no" "$R/calls" && ! grep -q "helper=yes" "$R/calls"' \
+    "a helper still there at a fallback bt_on: stopped first, the firmware pushed on a free UART"
+  check '! said bt_on "reclaim+reset (attempt 1)" && ! called "rmmod" && [ "$(count "attach ")" = 1 ]' \
+    "  attempt 1 a plain attach (no reclaim+reset, no rmmod), which converges"
+  echo "== $SH: a failed Wi-Fi-first preload (other parts, or together off) stops its helper too"
+  unit; : > "$R/script/radio_together_off"
+  ATTACH_STUCK=1 WLAN_SECS=0.3 FW_SECS=0.2 hal preload
+  check '[ "$(rc preload)" = 1 ] && [ "$(key order)" = wlan_first ] && ! helper_alive && ! called "rmmod"' \
+    "the same stop, no reset: 2.6.5 left this helper as well"
+
+  echo "== $SH: a mark that cannot be written never stops a bring-up (B)"
+  unit
+  ln -s "$R/nowhere/inflight" "$R/script/.radio_together_inflight"
+  WLAN_SECS=0.3 FW_SECS=0.2 hal bt_on
+  check '[ "$(rc bt_on)" = 0 ] && said bt_on "the in-flight mark could not be written" && [ "$(key order)" = together ]' \
+    "the guard's in-flight mark (on flash) unwritable: the together attach goes on, said so, and converges"
+  unit
+  ln -s "$R/nowhere/stamp" "$R/tmp/.radio_ko_unpacked"
+  WLAN_SECS=0.3 FW_SECS=0.2 hal bt_on
+  check '[ "$(rc bt_on)" = 0 ] && [ -e "$R/tmp/mlan.ko" ]' "the unpack stamp unwritable: unpacked, and Bluetooth up"
+  unit
+  ln -s "$R/nowhere/fell" "$R/tmp/.radio_together_fell_back"
+  ATTACH_STUCK=1 WLAN_SECS=0.3 FW_SECS=0.2 hal bt_on
+  check '[ "$(rc bt_on)" = 0 ] && said bt_on "the fallback mark could not be written" && said bt_on "(the fallback)"' \
+    "the fallback mark unwritable: the fallback goes on all the same, and converges"
+  unit
+  ln -s "$R/nowhere/count" "$R/script/.radio_together_failed"; ln -s "$R/nowhere/off" "$R/script/.radio_together_off.new"
+  echo 1 > "$R/tmp/count1"; cp "$R/tmp/count1" "$R/tmp/x"   # (no count readable through the link: 0)
+  ATTACH_STUCK=1 WLAN_SECS=0.3 FW_SECS=0.2 hal bt_on
+  check '[ "$(rc bt_on)" = 0 ] && said bt_on "the guard'"'"'s count could not be written" && [ ! -e "$R/script/radio_together_off" ]' \
+    "the guard's count unwritable: that failure uncounted, said so, the bring-up goes on"
+
+  echo "== $SH: the guard's off file goes in whole (F)"
+  unit; echo 1 > "$R/script/.radio_together_failed"
+  ATTACH_STUCK=1 WLAN_SECS=0.3 FW_SECS=0.2 hal bt_on
+  check 'grep -q "^guard: 2 together attaches in a row" "$R/script/radio_together_off" && [ ! -e "$R/script/.radio_together_off.new" ]' \
+    "the second failure in a row: the off file written beside it and renamed in, with its guard: text"
+  unit; echo 1 > "$R/script/.radio_together_failed"; ln -s "$R/nowhere/off" "$R/script/.radio_together_off.new"
+  ATTACH_STUCK=1 WLAN_SECS=0.3 FW_SECS=0.2 hal bt_on
+  check 'said bt_on "the guard'"'"'s off file could not be written" && [ ! -e "$R/script/radio_together_off" ] && [ "$(rc bt_on)" = 0 ]' \
+    "  one that cannot be written: said so, the order not switched off (no empty file left), Bluetooth up"
+
+  echo "== $SH: no SDIO device yet: the descriptor is not final, never kept (D)"
+  unit
+  mv "$R/sys/bus/sdio/devices/mmc0:0001:1/device" "$R/sdio.device"
+  hal probe
+  check '[ "$(cap WIRELESS)" = yes ] && [ -z "$(cap SDIO_DEVICE)" ] && [ ! -e "$R/etc/ocbm/kept_radio_caps" ]' \
+    "detected before the card is enumerated: no device named, and nothing kept on flash"
+  mv "$R/sdio.device" "$R/sys/bus/sdio/devices/mmc0:0001:1/device"; rm -f "$R/state/detects"
+  WLAN_SECS=0.3 FW_SECS=0.2 hal bt_on
+  check '[ "$(rc bt_on)" = 0 ] && [ -e "$R/state/detects" ] && [ "$(cap SDIO_DEVICE)" = 0x9159 ] && [ -e "$R/etc/ocbm/kept_radio_caps" ]' \
+    "  the next verb detects again (the card there now), brings Bluetooth up, and keeps that one"
+  unit
+  mv "$R/sys/bus/sdio/devices/mmc0:0001:1/device" "$R/sdio.device"
+  ( WLAN_SECS=0.3 FW_SECS=0.2 hal preload ) &
+  pre=$!
+  sleep 0.6; mv "$R/sdio.device" "$R/sys/bus/sdio/devices/mmc0:0001:1/device"
+  wait "$pre"
+  check '[ "$(rc preload)" = 0 ] && said preload "for the radio'"'"'s SDIO card" && [ "$(cap SDIO_DEVICE)" = 0x9159 ]' \
+    "the preload waits for the card (a few hundred ms here), then reads this unit's own descriptor"
+  unit
+  rm "$R/sys/bus/sdio/devices/mmc0:0001:1/device"
+  hal preload
+  check 'said preload "no SDIO card in 3 s" && [ ! -e "$R/etc/ocbm/kept_radio_caps" ]' "  none in 3 s: it goes on, says so, and keeps nothing"
+
+  echo "== $SH: an answer stands (J)"
+  unit
+  NAME_MISS_AFTER=1 WLAN_SECS=0.3 FW_SECS=0.2 hal preload
+  check '[ "$(rc preload)" = 0 ] && [ "$(key rc)" = 0 ] && [ ! -e "$R/script/.radio_together_failed" ] && [ ! -e "$R/tmp/.radio_together_fell_back" ]' \
+    "the controller answered once, later reads miss: the preload's one try converged, nothing counted, no fallback"
+
+  echo "== $SH: a lock whose pid could not be written (K)"
+  unit
+  # (The lock's path in the test's own commands is the scratch root's: only the sourced script's paths are moved.)
+  env RADIO_HAL_FUNCS=1 OCBM_TEST_PATH="$TESTPATH" STUB_R="$R" "$SH" -c '. "$1"; L="$2/tmp/.radio_lock_bt"
+    lock_take bt; rm -f "$L/pid"; lock_drop_own bt; if [ -d "$L" ]; then echo "kept" >> "$2/calls"; else echo "freed" >> "$2/calls"; fi
+    mkdir "$L"; lock_drop_own bt; [ -d "$L" ] && echo "theirs kept" >> "$2/calls"; rm -rf "$L"
+    lock_take bt; rm -f "$L/pid"; lock_drop_own bt; mkdir "$L"; lock_drop_own bt
+    [ -d "$L" ] && echo "later holder kept" >> "$2/calls"; rm -rf "$L"' sh "$R/script/radio_hal.sh" "$R" 2>/dev/null
+  check 'called "freed" && called "theirs kept" && called "later holder kept"' \
+    "its taker frees it all the same; another's with no pid, and a later holder's after it let go, stay"
+  unit
+  ( WLAN_SECS=0.2 FW_SECS=1.5 hal preload ) &
+  pre=$!
+  waitfor 'said preload "the preload lets the wlan lock go"' 50
+  mkdir "$R/tmp/.radio_lock_wlan" 2>/dev/null   # a host's wifi_ap_on that took it and could not write its pid
+  wait "$pre"
+  check '[ "$(rc preload)" = 0 ] && [ -d "$R/tmp/.radio_lock_wlan" ]' \
+    "  the wlan lock the together load let go is no longer the preload's: a later holder's, its pid unwritten, stays"
+  rm -rf "$R/tmp/.radio_lock_wlan"
+}
+
 case_gpio() {
   # ---- the preload's wait for the stock GPIO set-up --------------------------------------------------------------------
   echo "== $SH: the stock GPIO set-up first"
@@ -700,7 +834,7 @@ case_boot() {
 for SH in ${SHELLS:-$(distinct_shells sh dash)}; do
   command -v "$SH" >/dev/null 2>&1 || { echo "== $SH: not installed, skipped"; continue; }
   R="$T/$(basename "$SH").root"
-  for c in ${RH_ONLY:-kept order switches fallback host handover gpio line unpack locks boot}; do "case_$c"; done
+  for c in ${RH_ONLY:-kept order switches fallback host handover review gpio line unpack locks boot}; do "case_$c"; done
   reap
 done
 [ "$fails" -eq 0 ] && echo "radio_hal_test: all passed ($passes checks)" || { echo "radio_hal_test: $fails failed"; exit 1; }
