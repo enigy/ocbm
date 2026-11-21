@@ -676,8 +676,10 @@ real power cycles** (the coordinating session's bench of `70caa3c` on the dev ad
 the adapter had power, so it came at 4.2 to 5.0 s of uptime): together 3 of 3, both loads complete, `tries=1`,
 `fallback=0`, `rc=0`, `btfw_ms` 2207 to 2239, no Wi-Fi driver error, CarPlay every time; `hci_up` 6.82 to 7.03 s
 together against 9.23 and 9.38 with `/script/radio_together_off`; the first frame 13.8 to 15.4 s against 16.2 and
-17.4. **6, the handover (R3-5), built the same day, tested against stubbed hardware, NOT benched.** Bench plan and
-revert conditions: [../ops/02_TESTING.md](../ops/02_TESTING.md), "Cold boot: real power cycles".
+17.4. **6, the handover (R3-5), built the same day and benched on `4a6ce9c` on 21 Nov: it works as designed, but 2 of
+its 6 boots had link trouble against 0 of 9 without it, the cause not established, so it is OFF BY DEFAULT** (the
+owner's decision, 21 Nov: opt-in only, `/script/radio_handover_on`; see 6). Bench plan and revert conditions:
+[../ops/02_TESTING.md](../ops/02_TESTING.md), "Cold boot: real power cycles".
 
 **Why.** In the owner's truck the adapter loses power 15 to 30 minutes after the truck is switched off, so most drives
 start with it booting: 22 of 26 display-on connects on 16-20 Nov found it just booted, and those reached the picture
@@ -797,12 +799,19 @@ host's `wifi_ap_on` on at once, hostapd about 1 s on (the configuration is not w
 AP-ENABLED about 0.9 s after that, 6.4 to 6.9 s, against about 12.6 s on the truck (17 Nov); well ahead of the phone's
 0x5702, which comes after btd's start, the page and the iAP2 set-up, several seconds after `bt_power`. **The bench**
 (20 Nov, above) put `hci0` answering at 6.82 to 7.03 s and `bt_power` 0.72 to 0.85 s after it: the trace's 0.4 s was
-short, and `page_start` came 1.60 to 1.93 s after `hci0` answered. Section 6 takes that gap out.
+short, and `page_start` came 1.60 to 1.93 s after `hci0` answered (section 6, opt-in, takes that gap out). **The
+truck, corrected (21 Nov):** those benches had the host at 4.2 to 5.0 s; with it at 3.3 s, as on the truck (the bench
+of `4a6ce9c`, boot 10), the radio loads ran about 1 s slower (`wlan_start` 4030, `btfw_end` 6990, `hci_up` 8010), the
+host's own start-up sharing the one core with them. So on the truck expect `hci_up` near 8 s and, by default (no
+handover), a cold picture near 16.5 s of uptime (that boot: 16.85), against about 19 s on 2.6.5; the estimate above
+for a host at 3.0 s (`hci0` at 5.8 to 6.4 s) was too early.
 
 **5. The boot line** (`[radio-boot] v1`, one per boot): its keys are documented beside the timeline's in
 [../ops/02_TESTING.md](../ops/02_TESTING.md), "The boot's radio line".
 
-**6. The handover: a waiting host's session takes Bluetooth as `hci0` answers (R3-5).** On the 20 Nov bench the
+**6. The handover: a waiting host's session takes Bluetooth as `hci0` answers (R3-5; opt-in, off by default since
+21 Nov).** Everything below runs only when the owner asks for it (the opt-in, and the open question, at the end of this
+section); by default the cold path is section 4's. On the 20 Nov bench the
 first page went out 1.60 to 1.93 s after `hci0` answered, in three parts (ms since the host subscribed, from
 `[timeline] v1`): `hci_up` to `bt_power` 0.72 to 0.85 s, the preload's name and SCO set-up (about 0.37 s on its own),
 its bookkeeping, then the host's `bt_on` behind the bt lock (a look every 0.2 s) and its confirmation; `bt_power` to
@@ -848,33 +857,68 @@ start and its DOWN/UP (`down +205 ms`, `up +520 ms`) on a controller the preload
   `hci_dev_do_open`, which set the SSP event mask), nothing has reset it since, and the claim, like `bt_on`'s own
   `up` from DOWN, leaves nothing to close it. A controller that does not answer gets the DOWN/UP, as before; a later
   session in the same btd (a phone switch) does its DOWN/UP as before (the "opened" word is spent unread).
-- **Off:** the owner's `/script/radio_handover_off` or the bench's `/tmp/bench_handover_off` (`box_common::bench_flag`'s
-  rule), read by the preload at its attach and by the supervisor at the host's arrival: either gives today's path
-  whole. `radio_hal.sh probe` says `handover=on|owner|bench`. A revert and the full way back to stock remove the owner's
-  file (`radio_*` is `is_radio()`'s, so the restore's lists name it); installs and updates keep it.
+- **Opt-in (21 Nov):** the owner's `/script/radio_handover_on` on flash, or the bench's `/tmp/bench_handover_on`
+  (`box_common::bench_flag`'s rule: set unless it reads `off`), read by the preload at its attach and by the supervisor
+  at the host's arrival. With neither, nothing of this runs: no claim, no handover file, no early btd, the host's
+  `bt_on` and btd's DOWN/UP as in section 4, exactly the path `4a6ce9c` took with its old off file (the same hardware
+  calls, the same wrapper, byte for byte; the one log line reads `handover: off (not asked for ...)`). `radio_hal.sh
+  probe` and the boot line say `handover=on_owner`, `on_bench` or `off`. That old off file, `/script/radio_handover_off`
+  (4a6ce9c's switch; the dev adapter has one), is retired: nothing reads it, and an update, an update's first start
+  (for a package an older updater placed), a revert and the restores remove it. A revert and the restores remove the
+  owner's opt-in too (`radio_*` is `is_radio()`'s, so the restore's lists name both); installs and updates keep it.
 - **Everything else as before:** a host before the preload (it stands down; the host's `bt_on` attaches), after it
   (it powered down; `bt_on` powers up, "opened"), the armed wake path, a failed armed go's fallback, a self-test wait
   (`waiting`, not `running`), a preload that converged before the host came, a failed together attach (the host's
   `bt_on` takes the fallback order, btd goes on its end), and a second session in the same btd. Where the early btd
   started and no handover came, it goes on `bt_on`'s end as a btd started after it.
 
-**The estimate (not a measurement):** from `hci0` answering, the claim (one `hciconfig` exec, about 30 ms), the Wi-Fi
-join (none on the bench: `wlan_up` came 0.75 s before `hci_up`), the handover file, btd woken at once, its round trip
-(a few ms), the conflicting daemons and the identity writes (about 40 ms, as `+520` to `+560` on the bench), the
-scans, then the reconnect's page about 11 ms after `bt_up`: `page_start` about 0.1 to 0.15 s after `hci0` answers,
-`bt_power` to `page_start` on the timeline, against 1.60 to 1.93 s. btd's start (its exec from flash, about 0.1 to
-0.3 s) moves to the host's arrival, during the attach: the bench's A/B (`/script/radio_handover_off`) says whether it
-costs `hci_up` anything.
+**The estimate, then the bench.** Estimated before the bench: from `hci0` answering, the claim (one `hciconfig` exec,
+about 30 ms), the Wi-Fi join (none: `wlan_up` came first), the handover file, btd woken at once, its round trip, the
+conflicting daemons and the identity writes (about 40 ms), the scans, the reconnect's page about 11 ms after `bt_up`:
+`page_start` about 0.1 to 0.15 s after `hci0` answers. **The bench of `4a6ce9c`** (21 Nov, the coordinating session:
+the dev adapter, real power cuts by hand, the host up first, the owner's phone beside the adapter throughout; uptime in
+s, `page_start - bt_power` in ms):
+
+| Boot | Handover | `page_start` | page − `bt_power` | phone answered after | first frame | |
+|---|---|---|---|---|---|---|
+| 1 | on | 7.16 | 95 | 0.31 s | 12.95 | clean |
+| 2 | on | 6.96 | 101 | 1.83 s | 13.95 | clean |
+| 3 | on | about 6.93 | about 100 | 3.0 s | 111.5 | answered late, no SDP channel within 0.7 s: cut; the re-page `CONNECT_FAILED 0x09`; the second bonded phone took the session, joined Wi-Fi 52 s later, never started CarPlay, and the 90 s rule ended it; then the first phone connected normally |
+| 4 | on | 7.52 | 88 | 2.18 s | 55.5 | the SDP search took 0.93 s, then `RFCOMM connect to channel 1 failed: connect timed out` (8 s), four "answered, no SDP channel" cuts, a link lost with reason 0x01, 3 absent pages; connected at about 51 s (the second phone's Bluetooth off for this and later boots) |
+| 5 | on | 7.09 | 98 | 0.41 s | 13.09 | clean |
+| 6 | on | 7.09 | 110 | 1.80 s | 13.68 | clean |
+| 7 | off | 8.91 | 1036 | 0.61 s | 14.37 | clean |
+| 8 | off | 8.71 | 1045 | 1.32 s | 14.50 | clean |
+| 9 | off | 8.53 | 946 | 2.21 s | 15.29 | clean |
+| 10 | off | 9.60 | 1017 | 2.44 s | 16.85 | clean; the host at 3.3 s (the truck's timing), the loads about 1 s slower |
+
+In every handover boot `handed - hci_up` was 30 to 40 ms, btd started before `bt_power`, and the controller stayed up:
+the mechanism did what it was built to do, and the estimate held. With it on and a clean boot, the phone then waited
+for the access point (`ap_enabled` at 8.5 to 9.5 s of uptime, `svc_seen` up to 1 s after `wifi_rsp`): the AP is the
+next limit.
+
+**OPEN: the handover, 2 of 6 boots with link trouble against 0 of 9 without, cause not established, off by default.**
+The DOWN/UP path was clean in 9 of 9 (`70caa3c`'s 5 and these 4); the handover in 4 of 6. Suggestive, not proof: the
+same "late answer, no SDP channel" cut happens on released 2.6.5 on the truck, and dmesg showed no Bluetooth error.
+A proper test needs many real power cycles (tens per arm, alternating `/script/radio_handover_on` and none, one bonded
+phone, the second phone's Bluetooth off), which by hand the owner cannot keep doing: a switched power supply or a
+relay on the adapter's USB power would make it a bench run. The suspects: no second controller init after the attach
+(the controller only ever saw the registration's `hci_dev_do_open`, where the DOWN/UP path adds a reset and a full
+second init before the page); the page overlapping the access point's bring-up (with the handover the page goes out
+about 1 s sooner, while hostapd is starting on the same IW416); or the phone (its Bluetooth state or the second bonded
+phone). Each has a discriminating run: the handover with a DOWN/UP put back in btd (keeps the early start, removes the
+first suspect); the handover with the page held until `ap_enabled` (the second); and the phone's own log over USB
+(`idevicesyslog`, its `bluetoothd` lines) for the third.
 
 **Not proven:** the together order on the truck's 2025.02.25 vendor scripts (the shape is read on the unit: the boot
 line's `order=` and `radio_hal.sh probe` say which it took); the AP's bring-up beside the firmware push from the
 preload (the bench brought it up after `hci0` answered; today's path does it beside the push when a host comes first);
 what the early start costs the gadget's enumeration; the SDIO card being enumerated by the time the preload starts at
 about 2.0 s (the self-test, which starts as early, has always found it); and every number in the estimates above. For
-the handover: the kernel's auto power-off on this unit (read from the v3.14.52 source, not observed: the bench's
-`hciconfig hci0` 2 to 3 s after an attach with no host would show `DOWN`), a session with no DOWN/UP after a fresh
-attach (pairing a new phone in it is the test of the event mask), what btd's earlier start costs the attach, and the
-handover on any chipset but the IW416.
+the handover (opt-in): why 2 of its 6 boots had link trouble (the OPEN question above); the kernel's auto power-off
+on this unit (read from the v3.14.52 source, not observed: the bench's `hciconfig hci0` 2 to 3 s after an attach with
+no host would show `DOWN`); a session with no DOWN/UP after a fresh attach pairing a new phone (the test of the event
+mask); what btd's earlier start costs the attach; and the handover on any chipset but the IW416.
 
 ---
 

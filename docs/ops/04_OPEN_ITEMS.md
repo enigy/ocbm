@@ -868,9 +868,10 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
 
 - **The cold boot's radios: built 20 Nov 2026 (branch `cold-boot`, from 2.6.5) and benched on `70caa3c` the same day
   (the dev adapter, real power cycles: together 3 of 3, `hci_up` 6.82 to 7.03 s against 9.23 and 9.38 Wi-Fi first,
-  the first frame 13.8 to 15.4 s against 16.2 and 17.4); the handover after it (R3-5) built, NOT benched.** Most of the truck's
-  drives start from a power-up (22 of 26 display-on connects, 16-20 Nov), whose picture came about 19 s after display
-  on against about 7 s from a powered adapter, and its Bluetooth 7.4 to 8.6 s after a host that subscribed at about 3 s.
+  the first frame 13.8 to 15.4 s against 16.2 and 17.4); the handover after it (R3-5) benched on `4a6ce9c` on 21 Nov
+  and shipped OFF BY DEFAULT (opt-in).** Most of the truck's drives start from a power-up (22 of 26 display-on
+  connects, 16-20 Nov), whose picture came about 19 s after display on against about 7 s from a powered adapter, and
+  its Bluetooth 7.4 to 8.6 s after a host that subscribed at about 3 s.
   Built: the descriptor kept across boots (`/etc/ocbm/kept_radio_caps`, reused while `radio_detect.sh`'s key holds:
   the 0.8 s detection saved); the Bluetooth firmware beside the Wi-Fi driver on the IW416 (`RADIO_BT_TOGETHER`, read
   off the unit's own attach branch: Carlinkit's own IW416 branch waits for nothing, and its dispatcher starts the attach
@@ -879,19 +880,37 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
   started first in `ocbm_boot.sh` and held behind the stock GPIO set-up's end, which the dispatcher now marks
   (`OCBM_GPIO_DONE`; `/script/radio_preload_late` puts the old start back); the preload's wlan lock let go once the
   Wi-Fi driver is up, so a host's AP starts beside the firmware push; the seam's lock looks every 0.2 s; the driver
-  tarball unpacked once a boot; one `[radio-boot] v1` line per boot. The bench left 1.60 to 1.93 s from `hci0`
-  answering to the first page. **The handover (R3-5):** with a host waiting, the preload claims the controller as
-  `hci0` answers (an HCIDEVUP: the attach leaves the kernel's 2 s auto power-off armed, which btd's DOWN/UP used to
-  cover) and hands it over once the Wi-Fi side is in (`/tmp/.radio_bt_handover`), and btd, started at the host's
-  arrival and waiting (`OCBM_BTD_WAIT=1`), proves it with one round trip and pages with no DOWN/UP; the host's `bt_on`
-  touches nothing; off with `/script/radio_handover_off` or `/tmp/bench_handover_off`. Estimated, not measured: the
-  first page about 0.1 to 0.15 s after `hci0` answers (`page_start - bt_power` on the timeline). Open: the bench's
-  steps 10 to 14 (docs/ops/02_TESTING.md, "Cold boot: real power cycles": the A/B, the auto power-off seen, a new
-  phone paired in a handed-over session, a host leaving during the wait); whether the truck's 2025.02.25 attach
-  script has the same IW416 branch (step 1); the AP brought up from the preload beside the firmware push; what the
-  early start costs the gadget's enumeration; `tools/radio_hal_test.sh` and `tools/session_supervisor_test.sh`'s new
-  cases under BusyBox's sh (no busybox on the Mac that built them); the attach loop's 0.5 s look, which can put up to
-  0.5 s between `hci0` answering and `hci_up`. Source: docs/wireless/01_BT_AND_RADIO.md, "The cold boot".
+  tarball unpacked once a boot; one `[radio-boot] v1` line per boot. **The truck, corrected (21 Nov):** with the host
+  at about 3 s the radio loads run about 1 s slower than on the benches with the host at 4.2 to 5.0 s (`4a6ce9c`'s
+  boot 10, host at 3.3 s: `hci_up` 8.01 s, the first frame 16.85 s), so expect `hci_up` near 8 s and a cold picture
+  near 16.5 s (2.6.5: about 19 s); the 20 Nov estimate (`hci0` at 5.8 to 6.4 s for a host at 3.0 s) was too early.
+  **The handover (R3-5), opt-in:** with a host waiting, the preload claims the controller as `hci0` answers (an
+  HCIDEVUP: the attach leaves the kernel's 2 s auto power-off armed, which btd's DOWN/UP otherwise covers) and hands it
+  over once the Wi-Fi side is in (`/tmp/.radio_bt_handover`), and btd, started at the host's arrival and waiting
+  (`OCBM_BTD_WAIT=1`), proves it with one round trip and pages with no DOWN/UP; the host's `bt_on` touches nothing.
+  Asked for only with the owner's `/script/radio_handover_on` or the bench's `/tmp/bench_handover_on`; without either
+  the cold path is exactly `4a6ce9c`'s with its old off file (`/script/radio_handover_off`, retired: read by nothing,
+  removed by updates, an update's first start, reverts and the restores). `radio_hal.sh probe` and the boot line say
+  `handover=on_owner|on_bench|off`.
+  **OPEN: the handover, 2 of 6 boots with link trouble against 0 of 9 without, cause not established, off by default.**
+  On `4a6ce9c` (21 Nov, the dev adapter, real power cuts by hand) it did as designed (`handed - hci_up` 30 to 40 ms,
+  `page_start - bt_power` 88 to 110 ms against 946 to 1045 without, the first frame 12.95 to 13.95 s on its clean
+  boots against 14.37 to 16.85 without), but boot 3 (the phone answered late with no SDP channel, cut; the second
+  bonded phone took the session and never started CarPlay; 111.5 s) and boot 4 (an RFCOMM connect that timed out, four
+  no-SDP-channel cuts, a link lost with reason 0x01; 55.5 s) went wrong, against 0 of 9 boots with the DOWN/UP kept
+  (`70caa3c`'s 5, `4a6ce9c`'s 4 with it off). Suggestive, not proof: the same late-answer cut happens on released
+  2.6.5 on the truck, and dmesg showed no Bluetooth error. A proper test needs many real power cycles, tens per arm,
+  alternating the opt-in and none, with one bonded phone (a relay or switched supply on the adapter's USB power, since
+  the owner cannot keep cutting it by hand). The suspects, each with a discriminating run: no second controller init
+  after the attach (the handover with btd's DOWN/UP put back); the page overlapping the access point's bring-up (the
+  page held until `ap_enabled`); or the phone (its own log over USB). With it on and a clean boot the phone then waited
+  for the AP (`ap_enabled` at 8.5 to 9.5 s, `svc_seen` up to 1 s after `wifi_rsp`): the AP is the next limit, and the
+  AP-ahead idea is not started.
+  Also open: whether the truck's 2025.02.25 attach script has the same IW416 branch (docs/ops/02_TESTING.md, "Cold
+  boot: real power cycles", step 1); the AP brought up from the preload beside the firmware push; what the early start
+  costs the gadget's enumeration; `tools/radio_hal_test.sh` and `tools/session_supervisor_test.sh` under BusyBox's sh
+  (no busybox on the Mac that built them); the attach loop's 0.5 s look, which can put up to 0.5 s between `hci0`
+  answering and `hci_up`. Source: docs/wireless/01_BT_AND_RADIO.md, "The cold boot".
 
 - **The armed state (Bluetooth powered but invisible between host sessions, the AP configured ahead): benched
   16 Nov 2026, one wake open.** On the dev adapter 12 wakes and a cold boot (a restart by `reboot`, which keeps the

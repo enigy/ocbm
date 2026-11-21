@@ -348,11 +348,12 @@ can write but not delete, so it clears one by writing `off`. From a debug build:
   again. Read at each attach, so it reaches a host's `bt_on` that attaches (the preload off or failed), never a boot's
   own preload: a power cut clears `/tmp`. For cold boots use the owner's switch on flash, `/script/radio_together_off`
   (docs/wireless/01_BT_AND_RADIO.md, "The cold boot").
-- `/tmp/bench_handover_off` (20 Nov 2026, R3-5): no boot preload hands Bluetooth to a waiting host, and the supervisor
-  starts no btd before Bluetooth is up: today's path whole; `off` (or no file) on again. Read by the preload at its
-  attach and by the supervisor at each host's arrival, so like the order's file it never reaches a power cut's own
-  preload: for cold boots use the owner's `/script/radio_handover_off` (docs/wireless/01_BT_AND_RADIO.md, "The cold
-  boot", 6).
+- `/tmp/bench_handover_on` (21 Nov 2026, R3-5): asks for the cold boot's handover (docs/wireless/01_BT_AND_RADIO.md,
+  "The cold boot", 6), which is off by default: a boot preload hands Bluetooth to a host waiting on it, and the
+  supervisor starts that host's btd before Bluetooth is up. `off` (or no file) is the default again. Read by the preload
+  at its attach and by the supervisor at each host's arrival, so like the order's file it never reaches a power cut's
+  own preload: for cold boots use the owner's `/script/radio_handover_on`. It replaces 4a6ce9c's
+  `/tmp/bench_handover_off` and `/script/radio_handover_off`, which nothing reads now.
 - `/tmp/bench_dial_early`: carplayd dials the phone btd names at its first resolve, before btd has sent that phone
   its 0x5703 (by default it waits for the name file's ` wifi` mark, A2), and says so per dial with a `[bench]
   dial_early` line. For one experiment: does the phone accept a dial before its Wi-Fi handoff? Still never another
@@ -400,7 +401,7 @@ not benched yet; A2 moves `carplayd_start` from just after `wifi_rsp` to just af
 |---|---|---|
 | `sup_radios` | the supervisor starts the radios (`wifi_ap_on` and `bt_on`; from the armed state, the go and `wifi_ap_on`) | `tools/session_supervisor.sh`, `wireless_up`'s block, `wireless_go` |
 | `bt_armed` | NOT a time: `1` when the connect started from the armed state (Bluetooth powered between host sessions, the host's arrival a go; docs/wireless/01_BT_AND_RADIO.md), else `0`. From btd's `t bt_armed`, stamped as its first session opens the scans after the go, carried with the radio stamps; a stamp from before the origin is another host's and reads `0` | `wireless/src/main.rs`, `run_active_session` |
-| `bt_power` | `bt_on` has the controller up and answering (each of its success paths; not the boot preload). `-` from the armed state: no `bt_on` ran. On a cold boot whose preload handed the controller to the waiting host (R3-5): `hci0`'s first answer, stamped by the preload, so `page_start - bt_power` is `hci0` answering to the first page | `radio_hal.sh`, `do_bt_on`; `bt_handover_claim` |
+| `bt_power` | `bt_on` has the controller up and answering (each of its success paths; not the boot preload). `-` from the armed state: no `bt_on` ran. On a cold boot whose preload handed the controller to the waiting host (R3-5, when asked for): `hci0`'s first answer, stamped by the preload, so `page_start - bt_power` is `hci0` answering to the first page | `radio_hal.sh`, `do_bt_on`; `bt_handover_claim` |
 | `btd_start` | btd begins this session's record (from the armed state: after the go, as its session starts; a btd started before Bluetooth is up, R3-5: at the host's arrival, before `bt_power`) | `wireless/src/startup.rs`, `begin` |
 | `bt_up` | btd's Bluetooth bring-up done: `[startup]`'s "Bluetooth up", on the timeline's clock (from the armed state: the scans opened after the go; from the boot preload's handover: the scans opened after its proof, no DOWN/UP) | `wireless/src/main.rs`, `run_active_session` |
 | `page_start` | the session's first page (the SDP connect that pages) | `sdp_client.rs`, `connect_sdp` |
@@ -524,7 +525,7 @@ line adds its name and up to 13 digits to the widest: keep the 12-digit widest u
 One line per boot, beside the timeline but not in it, for the cold boot's radio path (docs/wireless/01_BT_AND_RADIO.md,
 "The cold boot"):
 
-    [radio-boot] v1 by=preload start=2050 caps=kept caps_ms=61 gpio=2330 order=together off=- wlan_start=2410 wlan_up=4460 wlan_free=4470 btfw_start=2420 btfw_end=4930 btfw=complete btfw_ms=2467 attach=4940 hci_up=5390 handed=5420 tries=1 fallback=0 rc=0 host=3010
+    [radio-boot] v1 by=preload start=2050 caps=kept caps_ms=61 gpio=2330 order=together off=- wlan_start=2410 wlan_up=4460 wlan_free=4470 btfw_start=2420 btfw_end=4930 btfw=complete btfw_ms=2467 attach=4940 hci_up=5390 handover=on_owner handed=5420 tries=1 fallback=0 rc=0 host=3010
 
 (the unit test's line, not a measurement). `radio_hal.sh` writes it into `/tmp/box.log` (and `/tmp/radio_boot`) once
 the first bring-up that attached Bluetooth this boot is over: the boot preload's, or a host's `bt_on` where no preload
@@ -547,7 +548,8 @@ timeline uses, but from power-up, not from the host's arrival; `-` is a value no
 | `btfw_start`, `btfw_end` | the Bluetooth firmware push (`fw_loader_linux`) |
 | `btfw`, `btfw_ms` | what the loader said, `complete`, `error` or `other`, and its own time (`time:N`), `-` without one |
 | `attach`, `hci_up` | the first attach launched; `hci0` answered a name read |
-| `handed` | the preload handed the controller to the waiting host's session (R3-5, docs/wireless/01_BT_AND_RADIO.md "The cold boot" 6): claimed as `hci0` answered, handed over once the attach's Wi-Fi side was in; `-`: no host as it answered, the handover switched off, or a `bt_on`'s line |
+| `handover` | whether the handover (R3-5) was asked for as the attach started: `on_owner` (`/script/radio_handover_on`), `on_bench` (`/tmp/bench_handover_on`), or `off`, the default |
+| `handed` | the preload handed the controller to the waiting host's session (R3-5, docs/wireless/01_BT_AND_RADIO.md "The cold boot" 6): claimed as `hci0` answered, handed over once the attach's Wi-Fi side was in; `-`: the handover not asked for (the default), no host as it answered, or a `bt_on`'s line |
 | `tries` | attach attempts |
 | `fallback` | `1`: a `together` attach gave no responsive `hci0`, and the bring-up went on in today's order |
 | `rc` | the bring-up's exit code (`0` up, `1` failed) |
@@ -556,7 +558,7 @@ timeline uses, but from power-up, not from the host's arrival; `-` is a value no
 **A cold boot or a restart.** A power cut downloads both firmwares: `btfw_end - btfw_start` about 2.2 to 2.7 s with
 `btfw=complete`, `wlan_up - wlan_start` about 2 s (the 20 Nov bench). A `reboot` keeps the chip's firmware, so both
 come out far shorter: such a line times no cold boot. The session's Bluetooth is about `max(hci_up, host)` plus the
-host's `bt_on` confirming it (a lock look and one name read); with the handover (R3-5), `handed`, and the session's
+host's `bt_on` confirming it (a lock look and one name read); with the handover asked for (R3-5), `handed`, and the session's
 first page about 0.1 s after it (the timeline's `page_start - bt_power`).
 
 ### The armed path (16 Nov 2026; benched the same day)
@@ -605,16 +607,21 @@ with no host; a go that fails on a healthy controller (`fail` in `/tmp/.btd_go_r
 fallback does not complete; wakes slower than with `/tmp/bench_arm_off`. While there, `/usr/sbin/hostapd -v` says
 whether this hostapd knows `noscan` (docs/ops/04_OPEN_ITEMS.md).
 
-### Cold boot: real power cycles (20 Nov 2026; steps 3 and 4 run on `70caa3c`, the handover's 10 to 14 not yet)
+### Cold boot: real power cycles (20 Nov 2026; steps 3 and 4 run on `70caa3c`, 10 and 11 on `4a6ce9c`)
 
 The cold boot's radio path (docs/wireless/01_BT_AND_RADIO.md, "The cold boot"): the descriptor kept across boots, the
 Bluetooth firmware beside the Wi-Fi driver on the IW416, the preload started first and held behind the stock GPIO
-set-up, the boot line, and the handover to a waiting host's session (R3-5). On the dev adapter, then the truck. **Run
+set-up, the boot line, and the handover to a waiting host's session (R3-5, opt-in, off by default since 21 Nov). On
+the dev adapter, then the truck. **Run
 20 Nov on `70caa3c`** (the coordinating session, the dev adapter in final mode, power really removed, the host up
 first and reaching the adapter at 4.2 to 5.0 s): together 3 of 3 (`hci_up` 6.82, 6.91, 7.03 s; `btfw_ms` 2207 to
 2239; `tries=1 fallback=0 rc=0`; no Wi-Fi driver error; CarPlay every time), `/script/radio_together_off` 2 of 2
 (`hci_up` 9.23 and 9.38 s); the first frame 13.8 to 15.4 s against 16.2 and 17.4; `page_start` 1.60 to 1.93 s after
-`hci0` answered, which the handover (steps 10 to 14) is for. `caps_ms` read 780 to 890 with `caps=kept` though the key
+`hci0` answered, which the handover (steps 10 to 14) is for. **Run 21 Nov on `4a6ce9c`** (steps 10 and 11, ten cold
+boots: the table in docs/wireless/01_BT_AND_RADIO.md, "The cold boot", 6): the handover did as designed (`handed -
+hci_up` 30 to 40 ms, `page_start - bt_power` 88 to 110 ms against 946 to 1045 without it) but 2 of its 6 boots had link
+trouble against 0 of 4 without (0 of 9 with `70caa3c`'s), so it ships off; with the host at 3.3 s (boot 10, the
+truck's timing) the loads ran about 1 s slower, `hci_up` 8.01 s, the first frame 16.85 s. `caps_ms` read 780 to 890 with `caps=kept` though the key
 takes 0.05 s by hand on the idle adapter: the first 3.4 s of a power-up are slow throughout (cold flash, one busy core). **Every boot here is a power cut**: pull the adapter's USB
 cable (it is powered from it) or switch its port, and give it power again. Never `reboot`: the IW416 keeps its firmware
 through one, so a restart skips both downloads and times nothing of a cold boot (20 Nov); the line tells them apart
@@ -642,13 +649,16 @@ order does. After an update, step 1 is the first cold boot once the update has b
 3. **A against B, the order:** `touch /script/radio_together_off`, three cold boots, then `rm` it. Those lines read
    `order=wlan_first off=owner` with `hci_up - start` about 6.5 to 7 s; together should be 2 s or more shorter.
 4. **The truck's path, a host at about 3 s:** Carlink running and the display on before the adapter gets power, five
-   cold boots. The boot line's `host` about 3000 and `wlan_free` before `hci_up`; in the box log the host's
-   `[radio] hostapd starting` after the preload's `lets the wlan lock go`, and the host's bt_on `handed over by the boot
-   preload` (with the handover off, step 11: `already converged`).
-   The `[timeline]` line: `bt_power` about 3.2 to 3.9 s (7.4 to 8.6 s before), `ap_start` and `ap_up` before
+   cold boots. The boot line's `host` about 3000, `handover=off handed=-` (the default), and `wlan_free` before
+   `hci_up`, which comes near 8 s with the host this early (the loads run about 1 s slower than with the host at 4 to
+   5 s: `4a6ce9c`'s boot 10); in the box log the host's `[radio] hostapd starting` after the preload's `lets the wlan
+   lock go`, the preload's `handover: off (not asked for ...)`, and the host's bt_on `already converged`.
+   The `[timeline]` line: `bt_power` about 1 s after `hci_up` (less `host`), `page_start` about 1 s after that,
+   `ap_start` and `ap_up` before
    `wifi_req` (`ap_enabled` reads `-` when hostapd enabled the AP before btd's session began, as on a cold start: then
    read `AP up: ... (AP-ENABLED N ms after it was serving)` in `/tmp/wlan.log` over the console), `wifi_rsp - wifi_req`
-   about 0 (btd waited for no AP), `first_frame`. `[startup]` still says `preload running`.
+   about 0 (btd waited for no AP), `first_frame` near 16.5 s of uptime (2.6.5: about 19 s). `[startup]` still says
+   `preload running`.
 5. **A host before the preload** (its radios a host's `bt_on`'s): `touch /script/radio_preload_off`, two cold boots
    with the host up, then `rm` it. The boot line `by=bt_on order=together rc=0`; the AP up (the box log's
    `[radio] hostapd starting`, then `AP-ENABLED`) beside a Bluetooth bring-up that converges, each loaded once:
@@ -670,8 +680,13 @@ order does. After an update, step 1 is the first cold boot once the update has b
 9. **A restart is no cold boot:** `reboot` over the console once. Its boot line: `btfw_end - btfw_start` and
    `wlan_up - wlan_start` a fraction of step 2's. Write that ratio here, so a later reader can tell the two apart.
 
-The handover (R3-5; docs/wireless/01_BT_AND_RADIO.md, "The cold boot", 6). Steps 10 to 14 on a build with it, the
-host up before the adapter has power unless a step says otherwise. Read, per boot: the boot line; the box log's
+The handover (R3-5; docs/wireless/01_BT_AND_RADIO.md, "The cold boot", 6): **off by default; steps 10, 13 and 14
+ask for it** with `touch /script/radio_handover_on` (the owner's opt-in; the bench's `/tmp/bench_handover_on` never
+reaches a power cut's own preload), and `rm /script/radio_handover_on` gives the default back. The OPEN question
+(2 of 6 boots with link trouble on `4a6ce9c`) wants many boots per arm: alternate the file and none, one bonded phone
+with the second phone's Bluetooth off, and count, per boot, a connect in under 20 s or not, and every `answered, no
+SDP channel`, `RFCOMM connect ... failed` and link-loss line in `/tmp/wl.log`. The host up before the adapter has
+power unless a step says otherwise. Read, per boot: the boot line (`handover=on_owner`); the box log's
 `[sup] ... the boot preload is attaching Bluetooth: btd starts now and waits for it`, the preload's `claimed for the
 host's session` and `handover: hci0 is the host's session's from uptime N ms`, and the host's bt_on's `handed over by
 the boot preload`; `/tmp/wl.log`'s `[handover] the boot preload handed hci0 over ...` and `[bt-bringup] from the boot
@@ -679,22 +694,23 @@ preload's handover ... it answers, scan 0x00`, then `handed over by the boot pre
 `up (+` line); and `[timeline] v1`, where **`page_start - bt_power` is `hci0` answering to the first page**
 (`bt_power` is the boot line's `hci_up` less `host`, to the shell's 10 ms).
 
-10. **Five cold boots, the truck's path.** `handed` set, `handed - hci_up` about 30 ms (more only when `wlan_up` came
+10. **Cold boots asked for (`/script/radio_handover_on`), the truck's path.** `handed` set, `handed - hci_up` about 30 ms (more only when `wlan_up` came
     after `hci_up`: then `handed` just after `wlan_up`); `btd_start` before `bt_power` on the timeline (btd started at
     the host's arrival); `page_start - bt_power` under 300 ms (the estimate is 100 to 150; 1600 to 1930 on `70caa3c`);
     `bt_up - bt_power` about 90 to 140; `ap_enabled` stamped now (btd's AP watch began at the host's arrival); CarPlay
     connects each time, `first_frame` compared with `70caa3c`'s 13.8 to 15.4 s after power-up. Over the console in one of them, 3 s after `handed`: `hciconfig hci0` still `UP RUNNING` (the claim
     held: the kernel's auto power-off did not fire).
-11. **A against B:** `touch /script/radio_handover_off`, three cold boots as in step 10, then `rm` it. Those read
-    `handed=-`, `[sup] ... CLEAN bring-up of wireless stack (detached, pairing=...)` with no `btd starts now`, the host's
-    bt_on `already converged`, btd's `down (+` and `up (+` lines, and `page_start - bt_power` back near 1.6 to 1.9 s.
+11. **A against B, the default:** `rm /script/radio_handover_on`, as many cold boots as in step 10. Those read
+    `handover=off handed=-`, `[sup] ... CLEAN bring-up of wireless stack (detached, pairing=...)` with no `btd starts now`, the host's
+    bt_on `already converged`, btd's `down (+` and `up (+` lines, `page_start - bt_power` near 1.0 s (946 to 1045 ms
+    on `4a6ce9c`; `bt_power` is then the host's `bt_on`'s, after the preload), and `hci_up` to the page near 1.6 to 1.9 s.
     Compare `hci_up` (and `btfw_ms`) between the two sets: btd's earlier start must not cost the attach more than
     about 100 ms.
 12. **The kernel's auto power-off, seen once:** one cold boot with no host (Carlink closed) and
     `/script/radio_preload_off` on flash; over the console `: > /tmp/bench_arm_off` (or the supervisor arms the
     controller the next command attaches), then `sh /script/radio_hal.sh bt_on` and, 3 s after it returns,
     `hciconfig hci0`: a `bt_on`'s attach makes no claim, so this reads `DOWN` if the kernel closed it 2 s on (the reason
-    for the claim). `rm /script/radio_preload_off /tmp/bench_arm_off` after.
+    for the claim). `rm /script/radio_preload_off /tmp/bench_arm_off` after. (The handover need not be asked for.)
 13. **A new phone paired in a handed-over session** (the SSP event mask, which no DOWN/UP re-set): a cold boot as in
     step 10, then Add phone in Carlink and pair a phone the adapter has never seen; Numeric Comparison or Just Works
     completes and CarPlay starts. One known-good phone suffices.
@@ -703,12 +719,15 @@ preload's handover ... it answers, scan 0x00`, then `handed over by the boot pre
     after N ms waiting`), no page in `/tmp/wl.log`; then, over the console, `hciconfig hci0` `DOWN` once the teardown is
     over, and no `/tmp/.radio_bt_handover`. Then the armed state as after any session.
 
-**Revert** the handover (`touch /script/radio_handover_off`; the previous build if that does not hold) on any of these:
-a handed-over session that does not reach CarPlay where step 11's do; `page_start - bt_power` over 1 s with `handed`
+**Leave the handover off** (`rm /script/radio_handover_on`: the default) on any of these, and treat its being asked for
+as ready only after many boots show none: a handed-over session that does not reach CarPlay where step 11's do (2 of
+6 on `4a6ce9c`, boots 3 and 4); `page_start - bt_power` over 1 s with `handed`
 set; `[bt-bringup] the handed-over controller did not answer`; `hciconfig hci0` `DOWN` or a controller error in
 `dmesg` during a handed-over session; step 13's pairing failing (`Pairing Unsuccessful`) where it works with the
 switch; step 11 showing `hci_up` more than about 100 ms later with the handover than without; a page, `PSCAN` or
-`ISCAN` with no host (step 14).
+`ISCAN` with no host (step 14). **The default itself** reverts like the rest of the build: it is the cold path `4a6ce9c`
+took with its old off file, which boots 7 to 10 ran. A leftover `/script/radio_handover_off` (the dev adapter's) is
+read by nothing, and the first start of an update to this build removes it (whichever updater placed it).
 
 **Revert** on any of these. The order (`touch /script/radio_together_off`; the previous build if that does not hold):
 `rc=1` or `together gave no responsive hci0` on a healthy unit, no `sta0`, a Wi-Fi driver error 2.6.5 does not show,
