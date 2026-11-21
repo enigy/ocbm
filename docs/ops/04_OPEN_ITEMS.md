@@ -892,6 +892,16 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
   the cold path is exactly `4a6ce9c`'s with its old off file (`/script/radio_handover_off`, retired: read by nothing,
   removed by updates, an update's first start, reverts and the restores). `radio_hal.sh probe` and the boot line say
   `handover=on_owner|on_bench|off`.
+  **The 21 Nov review's fixes** (on the branch, against stubs only): a failed preload attach stops its own helper, and
+  the fallback's `bt_on` stops any left, so the host's attempt 1 is a plain attach (A); no `:` with a redirection in
+  the scripts this branch changed, and a mark, count or off file that cannot be written never stops a bring-up (B); the
+  together rule conservative, any sign of a wait for the Wi-Fi side today's order (C; on the 2025.10.15.1127 texts
+  still 0x9159 alone); no descriptor without an SDIO id final or kept, the preload waiting up to 3 s for the card (D,
+  L); an update's first start lifting the together guard too (E); the guard's off file renamed in whole (F);
+  `/script/radio_preload_late` kept by installs and updates (G); the handover wait bounded at 30 s, and the other
+  wrappers starting btd with no `OCBM_BTD_WAIT` (I); an answered attach never counted (J); a lock freed by its taker
+  whose pid write failed (K). Still `:` with redirections in `ccpa/installer/ocbm_finish.sh` (lines 148 and 181), which
+  this branch did not change.
   **OPEN: the handover, 2 of 6 boots with link trouble against 0 of 9 without, cause not established, off by default.**
   On `4a6ce9c` (21 Nov, the dev adapter, real power cuts by hand) it did as designed (`handed - hci_up` 30 to 40 ms,
   `page_start - bt_power` 88 to 110 ms against 946 to 1045 without, the first frame 12.95 to 13.95 s on its clean

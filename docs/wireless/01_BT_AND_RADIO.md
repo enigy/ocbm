@@ -718,6 +718,14 @@ the full way back to stock removes it, since its name is outside `is_radio()`'s 
 preload's flags are: `is_radio()` keeps every `radio_*` file there through every deletion unless a remover names it.
 A start with a self-test (every trial start, an update's first) gains nothing from it: the self-test's own detection
 fills `/tmp/radio_caps` first, and nothing is kept from it; a final adapter's starts are the ones it serves.
+**A descriptor with no SDIO id is never final, and never kept** (the 21 Nov review, D and L). Started at about 2.0 s,
+the preload could read the chip before the kernel has enumerated its SDIO card; the detection then names no device,
+and its insmod and attach lines are not this unit's own. So the preload first waits for the card (`sdio_wait`: a look
+every 0.1 s, 3 s at most, said either way), and `caps` takes `/tmp/radio_caps` as this boot's only when it found
+wireless and names an SDIO device (`caps_final`): one that names none is detected again at the next verb. None of that
+reaches the flash: `caps_check` wants an SDIO id, and `radio_detect_key` says `unkeepable` for a unit with no card, for
+no `md5sum` output, and for the md5 of nothing (every input unreadable), so a key that read none of its inputs never
+stands for a later boot's.
 
 **2. The order: the Bluetooth firmware beside the Wi-Fi driver.** `RADIO_BT_AFTER_WLAN` is read off the whole attach
 script, so another branch's wait loop set it on the IW416. In Carlinkit's 2025.10.15.1127 scripts only the 0xc822
@@ -727,7 +735,21 @@ background before it loads the Wi-Fi driver. So the stock firmware loads the two
 `radio_detect.sh` section 4d reads this unit's own branch, as the SCO lines are read: `RADIO_BT_TOGETHER=1` where the
 whole file waits, this unit's branch does not, and that branch pushes its own firmware before an attach the script
 could extract (on the mapped backend, with a Wi-Fi mapping). No chipset table: of every attach script this project
-has read, the shape selects the IW416 branch alone, and an id the dispatcher never names has no branch, so 0. The
+has read, the shape selects the IW416 branch alone, and an id the dispatcher never names has no branch, so 0.
+**Conservative since 21 Nov** (the review's C: the first rule looked for one exact wait loop, and a wait before the
+dispatch, an `until`, a helper function, a quoted path or a dispatcher that starts the attach after the Wi-Fi driver
+all passed it): any sign that the attach waits for the Wi-Fi side is today's order. Besides the above, the dispatcher
+must start the attach script in the background at its top level (in no function or `{` group), before it inserts any
+of this unit's Wi-Fi modules, with nothing before that start that waits, sleeps, sources a file or names the Wi-Fi side;
+this unit's branch must have no loop or sleep (`while`, `until`, `sleep`), source nothing, call none of the attach
+script's own functions and name nothing of the Wi-Fi side; and the rest of the attach script (outside every
+`sdioCardID` branch: before the dispatch, after it, its functions, its top level) must source nothing and name nothing
+of the Wi-Fi side, its `sdioCardID` chains all closed. "The Wi-Fi side": `/sys/class/net`, an interface name
+(`wlan<n>`, `sta<n>`, `uap<n>`, `p2p<n>`), `ifconfig`, `iwconfig`, `iw dev`, or one of this unit's own Wi-Fi modules by
+name, in any quoting, comments aside. The stock top level's own wait (for the Bluetooth driver's unpack,
+`/tmp/*hci_uart.ko`) names none. On Carlinkit's 2025.10.15.1127 texts, the only stock texts this project has (the
+factory rootfs copy; the truck's 2025.02.25 text is unread), the rule gives together for 0x9159 alone, as before: 0 for
+0x9149, 0x9141, 0xc822, 0xb822, 0xb733, 0x4354 and 0x4358, under sh and dash. The
 dev adapter's bench (20 Nov, power really removed, the preload off, one trial each): Bluetooth first, no Wi-Fi driver
 loaded: `fw_loader_linux` 2.48 s, `hci0` present 0.12 s and answering 0.43 s after the attach began, then the Wi-Fi
 driver (insmod 2.13 s, `sta0` and `wlan0`, "WLAN FW is active"), `hci0` still answering, `wifi_ap_on` rc 0 with
@@ -751,13 +773,30 @@ verb returns (clause 1). Today's order (`bt_attach_mapped`) is the code of befor
   reset yet), the Wi-Fi interface first, the firmware pushed again, the attach; later attaches that boot are Wi-Fi first
   (`off=fallback` on the boot line). A preload's failure leaves it to the host's `bt_on`, which the mark sends Wi-Fi
   first.
+- **A failed attach's helper is stopped** (the 21 Nov review A). The attach helper (`hciattach ... any`) outlives an
+  attach that failed, holding the UART with a dead `hci0` registered: the host's `bt_on` then spent its confirmation on
+  that `hci0`, pushed the firmware into a UART the helper still held, and made its attempt 1 a reclaim+reset (the line
+  discipline's rmmod and the gpio1 pulse) with the Wi-Fi driver loaded, the step radio_detect.sh's preload note records
+  as wedging the kernel (19 Oct). Now a preload whose attach failed with no tries left stops its own helper as it ends
+  (SIGTERM, then -9: no reset, no rmmod), and a `bt_on` that finds this boot's fallback mark stops any helper still
+  there before its firmware push, so its attempt 1 is a plain attach, as the in-process fallback's always was. The
+  first half holds in every order and on every chipset of the mapped backend: 2.6.5 left the same helper after a failed
+  Wi-Fi-first preload, so there a host's `bt_on` after a failed preload now begins with a plain push and attach where
+  it began with a reclaim+reset, and its attempts 2 to 4 reclaim and reset as before. The second half is the IW416's
+  alone, as together is.
 - **The guard**, as the preload's: a together attach is bracketed by `/script/.radio_together_inflight` (written and
   synced before it, removed after), so one that never finished (power lost or the box hung inside it) is found at the
   next attach; each failed or unfinished one counts in `/script/.radio_together_failed`, two in a row write the owner's
   file with `guard:` in it, and the order is Wi-Fi first until the owner removes it. One that converges clears the
-  count. A together attach that gave Bluetooth but no Wi-Fi interface counts as well. An install, an update and every way
-  back to stock lift the guard's file and its count (a new version tries again), never an owner's own file (as the
-  armed path's switch); the restore's lists name all three (`radio_*` is `is_radio()`'s).
+  count. A together attach that gave Bluetooth but no Wi-Fi interface counts as well; one whose controller answered
+  never counts, however a later name read goes (the 21 Nov review J). An install, an update and an update's first start
+  (for a package an older updater placed) lift the guard's file and its count (a new version tries again), never an
+  owner's own file (as the armed path's switch); a revert and the restores remove both, the owner's too, since stock
+  reads neither (the restore's lists name all three: `radio_*` is `is_radio()`'s). The off file goes in whole, written
+  beside it as `/script/.radio_together_off.new`, synced and renamed in (a plain `>` cut by a power loss left an empty
+  file, which every reader takes for the owner's). A mark, count or off file that cannot be written (a full flash)
+  never stops a bring-up: the attach goes on, uncounted, and the log says so (the review's B: a `: > FILE` there used
+  to end the whole script, dash with 2, this script's "already converged").
 
 **3. Where the preload starts, and the stock GPIO set-up.** The dispatcher runs Carlinkit's `init_gpio.sh` beside
 `ocbm_boot.sh` at every boot, and it pulses the Bluetooth reset line (gpio1) before setting the charge pins. Pulled
@@ -768,7 +807,9 @@ script's end (`OCBM_GPIO_DONE`, `/tmp/ocbm_gpio_done`, written whether or not th
 `ocbm_boot.sh` then starts the preload first, beside the gadget's set-up, about 0.8 s sooner. The preload reads its
 descriptor and unpacks the modules (nothing touches the chip), then waits for the mark (`gpio_wait`, 3 s at most, said
 either way), then the chip. Where nothing marks that end (another start script), or with `/script/radio_preload_late`
-on flash (the bench's A/B, the owner's way back), it starts where it always did. **The cost, unmeasured:** on this one
+on flash (the bench's A/B, the owner's way back), it starts where it always did. That file is an owner's switch (the
+21 Nov review G): installs and updates keep it, as the other owners' switches; a revert and the restores remove it.
+**The cost, unmeasured:** on this one
 core the preload's descriptor read and unpack share the CPU with the gadget's set-up, which may be ready a little later
 than 2.37 s; the host's session waits on the radios, not on the link, so the radios first is the order that gives
 that session its Bluetooth soonest: even after this change Bluetooth answers about 2.5 to 3 s after a host's
@@ -785,7 +826,9 @@ configuration not written ahead at a cold boot). After: the preload starts at ab
 at the GPIO mark (about 2.3 s) the Wi-Fi driver and the firmware start together; once `sta0` is up the preload's
 Wi-Fi subshell lets the wlan lock go (`wlan_free`), so a waiting `wifi_ap_on` brings the AP up beside the firmware push,
 as on today's path when a host comes before the preload; `hci0` answers, the Wi-Fi load is joined, and the preload
-drops its locks at once, before its bookkeeping, only while they are still its own (`lock_drop_own`). `lock_take` looks
+drops its locks at once, before its bookkeeping, only while they are still its own (`lock_drop_own`: its pid in the
+lock, or no pid at all in one this process took and has not let go, where its pid write failed: the 21 Nov review K).
+`lock_take` looks
 every 0.2 s (no fork but the sleep). No double load: the modules are unpacked once (`ko_unpack`: its own lock and a
 stamp, where each caller used to untar on a missing file, so two side by side could insmod half a file), the Wi-Fi
 driver once (`wlan_driver_up`'s lock, `/proc/modules`), the firmware and the attach once (the bt lock). No deadlock:
@@ -824,7 +867,12 @@ start and its DOWN/UP (`down +205 ms`, `up +520 ms`) on a controller the preload
   cold boot: btd before Bluetooth is up"). btd (`crates/vendor/wireless/src/handover.rs`) does what a btd does at its
   start up to its first bring-up (the control port, `/tmp/bt_phase`, the session's record, the AP watch), then
   sleeps in `poll()` on an inotify watch of `/tmp` and a pipe SIGTERM writes to (a backstop look every 250 ms), until
-  the preload's handover, that file (today's bring-up, as a btd started after `bt_on`), or SIGTERM. The rest of the
+  the preload's handover, that file (today's bring-up, as a btd started after `bt_on`), or SIGTERM. **The wait is
+  bounded** (the 21 Nov review I): with neither after 30 s (`handover::BOUND`; an early wrapper killed before it wrote
+  the file, say), and once the seam's bt lock has looked free for 1 s (a live holder's lock, or one being taken, keeps
+  it waiting: a `bt_on`'s tries can take minutes), btd logs it and takes the full bring-up, its DOWN/UP and all. The
+  other wrappers (today's, the armed one) unset `OCBM_BTD_WAIT` before they start btd, so only the early start waits.
+  The rest of the
   session's start (carplayd and the certificate read, the radio descriptor's log, the name) comes after the wait, off
   the attach's CPU and once the Wi-Fi interface is in. Nothing pages or scans before the session's bring-up, as in
   any btd.
@@ -918,7 +966,11 @@ about 2.0 s (the self-test, which starts as early, has always found it); and eve
 the handover (opt-in): why 2 of its 6 boots had link trouble (the OPEN question above); the kernel's auto power-off
 on this unit (read from the v3.14.52 source, not observed: the bench's `hciconfig hci0` 2 to 3 s after an attach with
 no host would show `DOWN`); a session with no DOWN/UP after a fresh attach pairing a new phone (the test of the event
-mask); what btd's earlier start costs the attach; and the handover on any chipset but the IW416.
+mask); what btd's earlier start costs the attach; and the handover on any chipset but the IW416. From the 21 Nov
+review's fixes, read off the code and run against stubs only: that a stopped helper takes its dead `hci0` with it and
+leaves the chip a plain push and attach can bring back (A); how long the SDIO card takes to appear at a power-up (D;
+`waited about N ms for the radio's SDIO card` in the box log says); and the handover wait's bound (I), which no bench
+has reached.
 
 ---
 

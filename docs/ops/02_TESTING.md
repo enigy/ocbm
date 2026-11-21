@@ -645,7 +645,8 @@ order does. After an update, step 1 is the first cold boot once the update has b
    beside the Bluetooth firmware` and `the preload lets the wlan lock go` (before `BT converged`, as the bench's Wi-Fi
    driver took 2.0 s against Bluetooth's 3.24), `BT converged: hci0 responsive on attempt 1`, `preload: done rc=0`,
    then `[sup] no host: arming Bluetooth for the next one`. `dmesg | grep -iE 'woal|mlan|fail|error|timeout'`
-   shows nothing 2.6.5's cold boot does not.
+   shows nothing 2.6.5's cold boot does not. The preload's `waited about N ms for the radio's SDIO card` is absent or
+   a few hundred ms at most, and never `no SDIO card in 3 s` (the 21 Nov review D: write down any N seen).
 3. **A against B, the order:** `touch /script/radio_together_off`, three cold boots, then `rm` it. Those lines read
    `order=wlan_first off=owner` with `hci_up - start` about 6.5 to 7 s; together should be 2 s or more shorter.
 4. **The truck's path, a host at about 3 s:** Carlink running and the display on before the adapter gets power, five
@@ -679,6 +680,11 @@ order does. After an update, step 1 is the first cold boot once the update has b
    `order=together`.
 9. **A restart is no cold boot:** `reboot` over the console once. Its boot line: `btfw_end - btfw_start` and
    `wlan_up - wlan_start` a fraction of step 2's. Write that ratio here, so a later reader can tell the two apart.
+
+**A preload attach that fails** (none is expected; read it wherever a boot line says `by=preload` with `rc=1`, step 8's
+cut boots aside): the box log's `preload: the attach failed - its helper stopped (no reset, no rmmod)`, then the host's
+`bt_on` with `attach attempt 1` and no `reclaim+reset (attempt 1)` before it (the 21 Nov review A; on 2.6.5 that
+attempt began with the reclaim+reset). Bluetooth up after it, and nothing in `dmesg` 2.6.5 does not show.
 
 The handover (R3-5; docs/wireless/01_BT_AND_RADIO.md, "The cold boot", 6): **off by default; steps 10, 13 and 14
 ask for it** with `touch /script/radio_handover_on` (the owner's opt-in; the bench's `/tmp/bench_handover_on` never
@@ -725,7 +731,8 @@ as ready only after many boots show none: a handed-over session that does not re
 set; `[bt-bringup] the handed-over controller did not answer`; `hciconfig hci0` `DOWN` or a controller error in
 `dmesg` during a handed-over session; step 13's pairing failing (`Pairing Unsuccessful`) where it works with the
 switch; step 11 showing `hci_up` more than about 100 ms later with the handover than without; a page, `PSCAN` or
-`ISCAN` with no host (step 14). **The default itself** reverts like the rest of the build: it is the cold path `4a6ce9c`
+`ISCAN` with no host (step 14); `[handover] no handover and no word from bt_on` in `/tmp/wl.log` (the wait's 30 s bound,
+the 21 Nov review I, reached on a boot where neither came). **The default itself** reverts like the rest of the build: it is the cold path `4a6ce9c`
 took with its old off file, which boots 7 to 10 ran. A leftover `/script/radio_handover_off` (the dev adapter's) is
 read by nothing, and the first start of an update to this build removes it (whichever updater placed it).
 
