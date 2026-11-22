@@ -1281,21 +1281,55 @@ bt_ldisc_ready() {
 }
 
 # The firmware this unit's branch pushes over the UART before its attach, where it has one (the NXP parts), timed for
-# the boot line, with what the loader said: its verdict, and its own time (a chip that kept its firmware through a
-# restart answers in a fraction of a cold download's 2.2 s).
+# the boot line, with what the loader said: its verdict, and its own time. The first run's stamps stand.
+#
+# BOUNDED (22 Nov 2026): a push takes 2.2 to 3.2 s (every boot line logged), and the loader waits 4 s for the chip's
+# boot loader (its own "Timeout: 4000"); one still running after RADIO_BTFW_WAIT seconds (10; a test hook) is sent TERM,
+# and KILL 2 s later. It ran unbounded before, under the bt lock.
+#
+# Its code: 0 pushed; 1 not, the loader having said why (its last lines go to the log, any address in them masked) or
+# been stopped. A non-zero code given at once (under a second) with no output is 0 all the same: that is how the loader
+# answers a chip that runs its firmware, not reset since it was pushed (the 20 Nov bench, by hand: a gpio1 pulse with the
+# line discipline unloaded left the firmware running, and the loader "returned at once with no output"; its code was not
+# noted), and such a chip attaches as before. A SoC restart does reset the chip: the 13 Nov bench's `reboot` pushed in
+# full (2.78 s). The truck bench of 22 Nov: the loader exited 255 about 4 s in, the attach went on, and the box went silent.
+RADIO_BTFW_WAIT=${RADIO_BTFW_WAIT:-10}
+case "$RADIO_BTFW_WAIT" in ''|*[!0-9]*) RADIO_BTFW_WAIT=10 ;; esac
+# A BR/EDR address in the loader's lines, masked: it prints none that we know of (chip id, file, baud rates, sizes).
+MAC_MASK='s/[0-9A-Fa-f][0-9A-Fa-f]\(:[0-9A-Fa-f][0-9A-Fa-f]\)\{5\}/<addr>/g'
 bt_fw_preload() {
   [ -n "$RADIO_BT_PRELOAD" ] && [ -n "${RADIO_BT_PRELOAD_CMD:-}" ] || return 0
   log "firmware preload: $RADIO_BT_PRELOAD_CMD"
-  boot_mark btfw_start
-  $RADIO_BT_PRELOAD_CMD >/tmp/radio_bt_fw.log 2>&1; _bfp_rc=$?
-  boot_mark btfw_end
-  [ "$_bfp_rc" = 0 ] || log "  firmware preload exited $_bfp_rc"
+  _bt_fw_runs=$((${_bt_fw_runs:-0} + 1))
+  boot_mark btfw_start; _bfp_t0=${_um:-0}
+  $RADIO_BT_PRELOAD_CMD >/tmp/radio_bt_fw.log 2>&1 &
+  _bfp_pid=$!
+  # The bound: TERM, then KILL. The watcher goes once the loader has been reaped, so its signals never reach another
+  # process that took the pid; its own sleep, left alone, ends by itself.
+  ( sleep "$RADIO_BTFW_WAIT"; kill -TERM "$_bfp_pid" 2>/dev/null; sleep 2; kill -KILL "$_bfp_pid" 2>/dev/null ) \
+    </dev/null >/dev/null 2>&1 &
+  _bfp_w=$!
+  wait "$_bfp_pid"; _bfp_rc=$?
+  kill "$_bfp_w" 2>/dev/null; wait "$_bfp_w" 2>/dev/null
+  boot_mark btfw_end; _bfp_ms=$(( ${_um:-0} - _bfp_t0 ))
   set -- $(awk '/Download Complete/ { c = 1 } /Download Error/ { e = 1 }
     match($0, /time:[ ]*[0-9]+/) { t = substr($0, RSTART, RLENGTH); sub(/time:[ ]*/, "", t) }
     END { v = "other"; if (c) v = "complete"; if (e) v = "error"; if (t == "") t = "-"; print v " " t }' \
     /tmp/radio_bt_fw.log 2>/dev/null)
   boot_note btfw "${1:-other}"; boot_note btfw_ms "${2:--}"
-  return 0
+  [ "$_bfp_rc" = 0 ] && return 0
+  log "  firmware preload exited $_bfp_rc"
+  if [ "$_bfp_ms" -ge $((RADIO_BTFW_WAIT * 1000)) ]; then
+    log "  the loader had not returned after $RADIO_BTFW_WAIT s - stopped"
+    return 1
+  fi
+  if [ ! -s /tmp/radio_bt_fw.log ] && [ "$_bfp_ms" -lt 1000 ]; then
+    log "  it returned at once with nothing to say: a chip that runs its firmware answers it so - the attach goes on"
+    return 0
+  fi
+  log "  the loader's last lines:"
+  tail -5 /tmp/radio_bt_fw.log 2>/dev/null | cut -c1-160 | sed -e "$MAC_MASK" -e "s/^/$LOGP   /"
+  return 1
 }
 
 # Attach and converge, $1 tries. Clause 1: the attach runs detached so a helper that blocks cannot hang this verb, but

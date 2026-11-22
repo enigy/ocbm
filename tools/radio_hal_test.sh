@@ -64,13 +64,26 @@ echo "rmmod $1" >> "$R/calls"
 EOF
 cat > "$S/fw_loader_linux" <<'EOF'
 #!/bin/sh
-# The Bluetooth firmware push: FW_SECS long, noting whether the Wi-Fi interface was there and moal still loading.
+# The Bluetooth firmware push: FW_SECS long, noting whether the Wi-Fi interface was there and moal still loading. Each
+# run this boot is numbered: FW_FAIL names runs that fail as a boot loader that never answers does (its message, rc 255),
+# FW_HANG runs that never return and ignore TERM, FW_WARM runs that return at once with no output and rc 255 (as the
+# loader answers a chip that runs its firmware, the 20 Nov bench).
 R=$STUB_R
+n=$(( $(cat "$R/state/fw_runs" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$R/state/fw_runs"
 i=no; [ -e "$R/sys/class/net/sta0" ] && i=yes
 w=no; [ -e "$R/state/moal.loading" ] && w=yes
 h=no; p=$(cat "$R/state/hciattach.pid" 2>/dev/null) && kill -0 "$p" 2>/dev/null && h=yes
 echo "fw start iface=$i wlan_loading=$w helper=$h" >> "$R/calls"
+case " ${FW_WARM:-} " in *" $n "*) echo "fw warm $n" >> "$R/calls"; exit 255 ;; esac
+case " ${FW_HANG:-} " in *" $n "*)
+  echo "fw hang $n" >> "$R/calls"; echo $$ > "$R/state/fw_loader_linux.pid"; trap '' TERM
+  while :; do sleep 0.1; done ;;
+esac
 sleep "${FW_SECS:-0.8}"
+case " ${FW_FAIL:-} " in *" $n "*)
+  echo "0xa5,0xaa,0xab or 0xa7 is not received in 4000 ms"; echo "Download Error"
+  echo "fw fail $n" >> "$R/calls"; exit 255 ;;
+esac
 echo "Download Complete"
 echo "time:${FW_OWN_MS:-2467}"
 echo "fw end" >> "$R/calls"
@@ -839,6 +852,28 @@ case_boot() {
   rm -f "$S/pkill"
 }
 
+case_fwpush() {
+  # ---- the Bluetooth firmware push (22 Nov 2026): bounded, and what the loader said -----------------------------------
+  echo "== $SH: the firmware push: a loader that never returns is stopped"
+  unit
+  t0=$(date +%s)
+  RADIO_BTFW_WAIT=1 FW_HANG=1 WLAN_SECS=0.2 FW_SECS=0.2 hal preload
+  t1=$(date +%s)
+  check 'said preload "firmware preload exited" && said preload "the loader had not returned after 1 s - stopped" && [ $((t1 - t0)) -lt 20 ]' \
+    "stopped at the bound, TERM then KILL (it ignores TERM), and the preload ends"
+  check '! { p=$(cat "$R/state/fw_loader_linux.pid" 2>/dev/null) && kill -0 "$p" 2>/dev/null; }' "  the loader is gone"
+  echo "== $SH: the firmware push: a loader that fails says why"
+  unit
+  FW_FAIL=1 WLAN_SECS=0.2 FW_SECS=0.2 hal preload
+  check 'said preload "firmware preload exited 255" && said preload "the loader'"'"'s last lines:" && grep -q "^\[radio_hal\]   0xa5,0xaa,0xab or 0xa7 is not received in 4000 ms$" "$R/out.preload"' \
+    "its exit code and its last lines in the log"
+  echo "== $SH: the firmware push: a chip that runs its firmware (the loader returns at once, no output)"
+  unit
+  FW_WARM=1 WLAN_SECS=0.2 FW_SECS=0.2 hal preload
+  check '[ "$(rc preload)" = 0 ] && said preload "it returned at once with nothing to say" && [ "$(count "fw start")" = 1 ] && called "attach 1"' \
+    "as before: no failure, one run, the attach goes on"
+}
+
 case_round4() {
   # ---- round 4's bench switches (22 Nov 2026), each on by its file on flash (/etc/ocbm/bench_<name>) ------------------
   echo "== $SH: round 4, attach_poll: hci0 looked at every 0.1 s"
@@ -893,7 +928,7 @@ case_round4() {
 for SH in ${SHELLS:-$(distinct_shells sh dash)}; do
   command -v "$SH" >/dev/null 2>&1 || { echo "== $SH: not installed, skipped"; continue; }
   R="$T/$(basename "$SH").root"
-  for c in ${RH_ONLY:-kept order switches fallback host handover review gpio line unpack locks boot round4}; do "case_$c"; done
+  for c in ${RH_ONLY:-kept order switches fallback host handover review gpio line unpack locks boot round4 fwpush}; do "case_$c"; done
   reap
 done
 [ "$fails" -eq 0 ] && echo "radio_hal_test: all passed ($passes checks)" || { echo "radio_hal_test: $fails failed"; exit 1; }
