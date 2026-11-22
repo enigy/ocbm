@@ -57,6 +57,9 @@ struct Round4 {
     /// Item 2 (`first_retry_ms`, 0-60000 ms): the pause after a failed first round, for [`FIRST_RETRY_SECS`]. Still once
     /// per loop, and a round pages at least one phone, so 0 cannot spin.
     first_retry_ms: Option<u64>,
+    /// Item 5 (`early_gap_secs`, 1-60 s): the gap between rounds in the first [`EARLY_WINDOW`], for [`EARLY_GAP_SECS`].
+    /// Not 0: a gap is the loop's floor against spinning on pages that fail at once (audit B5).
+    early_gap_secs: Option<u64>,
 }
 
 impl Round4 {
@@ -78,6 +81,13 @@ impl Round4 {
             lines.push(format!(
                 "[bench] round4: first_retry_ms={ms} ({at}): after a failed first round the next one in {ms} ms, once (default {} ms)",
                 FIRST_RETRY_SECS * 1000
+            ));
+        }
+        if let Some((s, at)) = number(&get, &mut lines, "early_gap_secs", 1, 60, "s") {
+            r.early_gap_secs = Some(s);
+            lines.push(format!(
+                "[bench] round4: early_gap_secs={s} ({at}): rounds {s} s apart in the first {} s (default {EARLY_GAP_SECS} s)",
+                EARLY_WINDOW.as_secs()
             ));
         }
         (r, lines)
@@ -210,12 +220,12 @@ impl Rounds {
 
 /// The wait before the next round: [`FIRST_RETRY_SECS`] once after a failed first round; [`EARLY_GAP_SECS`] in the
 /// first [`EARLY_WINDOW`] after a host came (`early`); else the backoff, which starts doubling only after that window.
-/// Round 4's bench switch `r4` may set the first ([`Round4::first_retry_ms`]).
+/// Round 4's bench switches `r4` may set the first two ([`Round4::first_retry_ms`], [`Round4::early_gap_secs`]).
 fn round_gap(quick: bool, early: bool, backoff: u64, r4: &Round4) -> Duration {
     if quick {
         r4.first_retry_ms.map_or(Duration::from_secs(FIRST_RETRY_SECS), Duration::from_millis)
     } else if early {
-        Duration::from_secs(EARLY_GAP_SECS.min(backoff))
+        Duration::from_secs(r4.early_gap_secs.unwrap_or(EARLY_GAP_SECS).min(backoff))
     } else {
         Duration::from_secs(backoff)
     }
@@ -1837,6 +1847,39 @@ mod tests {
         for bad in ["60001", "-5", "2s", ""] {
             assert_eq!(round4_from(&[("first_retry_ms", bad)]).0, super::Round4::default(), "{bad:?}");
         }
+    }
+
+    /// Round 4, item 5 (bench): the early window's gap as the switch says, still under the backoff; then the backoff from
+    /// the window's end, as before.
+    #[test]
+    fn round4_early_gap_secs_sets_the_early_window_s_gap() {
+        let s = Duration::from_secs;
+        let r4 = super::Round4 { early_gap_secs: Some(1), ..Default::default() };
+        assert_eq!(round_gap(false, true, 10, &r4), s(1));
+        assert_eq!(round_gap(false, false, 20, &r4), s(20), "past the window: the backoff");
+        assert_eq!(round_gap(true, true, 10, &r4), s(FIRST_RETRY_SECS), "the quick retry as before");
+        let r4 = super::Round4 { early_gap_secs: Some(30), ..Default::default() };
+        assert_eq!(round_gap(false, true, 10, &r4), s(10), "never past the backoff");
+        let (r, lines) = round4_from(&[("early_gap_secs", "1")]);
+        assert_eq!(r.early_gap_secs, Some(1));
+        assert_eq!(
+            lines,
+            ["[bench] round4: early_gap_secs=1 (/etc/ocbm/bench_early_gap_secs): rounds 1 s apart in the first 120 s (default 5 s)"]
+        );
+        for bad in ["0", "61", "0.5", ""] {
+            assert_eq!(round4_from(&[("early_gap_secs", bad)]).0, super::Round4::default(), "{bad:?}");
+        }
+
+        let ctrl = Control::default();
+        set_order(&ctrl, &[PHONE_A]);
+        let mut fake = Fake::new(&ctrl, 60, |_, _| Attempt::Absent);
+        fake.round4.early_gap_secs = Some(1);
+        run_loop(&fake, &ctrl);
+        let gaps = fake.gaps.borrow().clone();
+        assert_eq!(gaps[0], FIRST_RETRY_SECS, "the quick retry first");
+        let early = gaps[1..].iter().take_while(|g| **g == 1).count();
+        assert!(early >= 20, "1 s apart while early: {gaps:?}");
+        assert_eq!(&gaps[1 + early..1 + early + 5], &[10, 20, 40, 60, 60], "then the backoff, as before: {gaps:?}");
     }
 
     /// Round 4, item 2 through the loop: 0 ms, the next round at once and only once; no switch, 2 s as in 2.7.0.
