@@ -482,11 +482,12 @@ enum Attempt {
     /// paging it again just produces another prompt it cannot accept. Hold off for the maximum
     /// backoff and let the operator re-pair from the iPhone.
     PairRejected,
-    /// The page failed with EALREADY, EMLINK or EBUSY (HCI 0x0B "ACL Connection Already Exists", 0x09/0x0A "Connection
-    /// Limit Exceeded", 0x0C "Command Disallowed"): the controller still holds a link to the phone, the one the last page
-    /// left or one the phone is bringing up itself (the truck, 21 Nov: right after a cut, then the other phone and about
-    /// 100 s lost). Everywhere exactly [`Attempt::Failed`], save one: as the re-page after a reset or a cut, round 4's
-    /// `same_phone_repage` (on by default since 2.7.1) pages the same phone again ([`walk`]).
+    /// The page (the SDP connect that pages) failed with EALREADY, EMLINK or EBUSY (HCI 0x0B "ACL Connection Already
+    /// Exists", 0x09/0x0A "Connection Limit Exceeded", 0x0C "Command Disallowed"): the controller still holds a link to
+    /// the phone, the one the last page left or one the phone is bringing up itself (the truck, 21 Nov: right after a
+    /// cut, then the other phone and about 100 s lost). The same errnos from the RFCOMM connect are no crossing
+    /// ([`rfcomm_failure`]: Failed). Everywhere exactly [`Attempt::Failed`], save one: as the re-page after a reset or a
+    /// cut, round 4's `same_phone_repage` (on by default since 2.7.1) pages the same phone again ([`walk`]).
     Crossed,
     /// Round 4, item 4 (`rfcomm_limit_ms`, 1.5 s by default since 2.7.1): the phone answered, SDP gave its iAP2
     /// channel, and the RFCOMM connect was not up within the limit, so btd closed it and dropped the link
@@ -494,6 +495,17 @@ enum Attempt {
     /// ([`walk`], `run_loop`), and counted nothing toward a forgotten pairing ([`ResetStreak::note`]): btd gave up on
     /// it, and the re-page says what the phone does. Never with the limit off (2.7.0's).
     Stalled,
+}
+
+/// [`failure`] for the RFCOMM connect, after SDP gave the channel: the page is over and its link up, so EALREADY,
+/// EMLINK or EBUSY there are no page crossing. On the 3.14 kernel `__rfcomm_dlc_open` answers EBUSY for a DLC that is
+/// still on the link (the attempt just closed, on a link that was kept), which no page clears: [`Attempt::Failed`], as
+/// 2.7.0 had them, so none of [`Attempt::Crossed`]'s re-pages is spent on it (the 2.7.1 review).
+fn rfcomm_failure(e: &std::io::Error) -> Attempt {
+    match failure(e) {
+        Attempt::Crossed => Attempt::Failed,
+        other => other,
+    }
 }
 
 /// [`Attempt::Cut`] for `sdp_client`'s cut, [`Attempt::Reset`] when the phone reset the link, [`Attempt::Absent`] when the
@@ -712,8 +724,11 @@ fn attempt(
             return Attempt::Stalled;
         }
         Err(e) => {
-            log(&format!("RFCOMM connect to channel {channel} failed: {e}"));
-            return failure(&e);
+            let result = rfcomm_failure(&e);
+            let busy = result != failure(&e);
+            let why = if busy { " (the link still holds that channel: no page crossing, so no re-page)" } else { "" };
+            log(&format!("RFCOMM connect to channel {channel} failed: {e}{why}"));
+            return result;
         }
     };
     log(&format!("RFCOMM connected OUT to the phone (ch {channel}) — starting iAP2 handshake"));
@@ -2480,5 +2495,20 @@ mod tests {
         for errno in [libc::ETIMEDOUT, libc::ECONNREFUSED] {
             assert_eq!(failure(&std::io::Error::from_raw_os_error(errno)), Attempt::Failed, "errno {errno}");
         }
+    }
+
+    /// The 2.7.1 review: EALREADY, EMLINK and EBUSY are a crossing only from the page; from the RFCOMM connect, a channel
+    /// still on the link, Failed, as in 2.7.0. Everything else the RFCOMM connect reports classifies as from the page.
+    #[test]
+    fn a_busy_rfcomm_connect_is_no_page_crossing() {
+        use super::rfcomm_failure;
+        let os = std::io::Error::from_raw_os_error;
+        for errno in [libc::EALREADY, libc::EMLINK, libc::EBUSY] {
+            assert_eq!(failure(&os(errno)), Attempt::Crossed, "the page's errno {errno}");
+            assert_eq!(rfcomm_failure(&os(errno)), Attempt::Failed, "the RFCOMM connect's errno {errno}");
+        }
+        assert_eq!(rfcomm_failure(&os(libc::ECONNRESET)), Attempt::Reset, "a reset is a reset at either stage");
+        assert_eq!(rfcomm_failure(&os(libc::ETIMEDOUT)), Attempt::Failed);
+        assert_eq!(rfcomm_failure(&os(libc::EHOSTDOWN)), Attempt::Absent);
     }
 }
