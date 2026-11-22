@@ -65,8 +65,8 @@ const RFCOMM_LIMIT_MS: u64 = 1_500;
 /// [`Round4::default`]: the first page 5.12 s, the same phone paged again after a crossing, the RFCOMM connect's 1.5 s
 /// limit), each turned back to 2.7.0's by "off" in its file ([`box_common::bench_override`]: the first file there
 /// decides, so an "off" in /tmp overrides the flash); two stay off, set by their file ([`box_common::bench_switch`]).
-/// Each file read says so once, in a `[bench] round4:` line; the two off by default say so again where they act, the
-/// defaults with plain lines.
+/// Each file read says so once, in a `[bench] round4:` line; `first_retry_ms` says so again where it acts
+/// (`early_gap_secs` does not: its gaps log nothing more), and the defaults act with plain lines.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Round4 {
     /// Item 1 (`first_page_slots`, 1-12800 slots of 0.625 ms, [`FIRST_PAGE_SLOTS_MAX`]; default [`FIRST_PAGE_SLOTS`]):

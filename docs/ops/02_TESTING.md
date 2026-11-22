@@ -400,7 +400,8 @@ five, and `/tmp/bench_screen_nudge_ms` at `500`; the firmware push's changes hav
 or out of its range, is refused with a line and the default stands. A file that sets a switch or turns one off says so
 in a line holding `[bench] round4:` (btd's in `/tmp/wl.log`, carplayd's in `/tmp/carplayd_wl.log`, the scripts' in
 `/tmp/box.log`): btd for each file as its loop starts, `off` too; carplayd and the scripts where the switch acts. A
-switch off by default says so again where it acts; the six on by default act with plain lines (below), which the
+switch off by default says so again where it acts, but for `early_gap_secs`, whose gaps log nothing more; the six on by
+default act with plain lines (below), which the
 scripts tag `[bench] round4: <name> (<file>):` when a file turned one on, and their `off` says so where the switch
 would have acted (`attach_poll=off`, `page_trim=off`, `btd_early=off`). For a cold boot put `btd_early`,
 `page_trim`, `attach_poll` and `preload_nice` in `/etc/ocbm`: they act during the boot, while `/tmp` is still empty.
