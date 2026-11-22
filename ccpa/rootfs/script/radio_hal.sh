@@ -950,7 +950,7 @@ boot_line() {  # $1 = by (preload | bt_on), $2 = its exit code
   _bl_h=""; read -r _bl_h 2>/dev/null </tmp/host_present_uptime
   case "$_bl_h" in ''|0|*[!0-9]*) _bl_h=- ;; esac
   boot_note tries "${_bt_tries:-0}"
-  boot_note btfw_tries "${_bt_fw_runs:--}"   # the loader's runs (bt_fw_push: 2 when the first push failed)
+  boot_note btfw_tries "${_bt_fw_runs:--}"   # the loader's runs (bt_fw_push; one more after each reclaim+reset)
   _bl=$(awk -v by="$1" -v rc="$2" -v host="$_bl_h" '
     NF >= 2 && !($1 in s) { s[$1] = $2 }
     END {
@@ -1289,14 +1289,14 @@ bt_ldisc_ready() {
 # boot loader (its own "Timeout: 4000"); one still running after RADIO_BTFW_WAIT seconds (10; a test hook) is sent TERM,
 # and KILL 2 s later. It ran unbounded before, under the bt lock.
 #
-# Its code: 0 pushed; 1 not, the loader having said why (its last lines go to the log, any address in them masked) or
-# been stopped. A non-zero code given at once (under a second) with no output is 0 all the same: that is how the loader
-# answers a chip that runs its firmware, not reset since it was pushed (the 20 Nov bench, by hand: a gpio1 pulse with the
-# line discipline unloaded left the firmware running, and the loader "returned at once with no output"; its code was not
-# noted), and such a chip attaches as before. A SoC restart does reset the chip: the 13 Nov bench's `reboot` pushed in
-# full (2.78 s). The truck bench of 22 Nov: the loader exited 255 about 4 s in, the attach went on, and the box went silent.
+# Its code: 0 pushed, with BT_FW_PUSHED written (bt_fw_push); 1 not, the loader having failed (its code and its last
+# lines go to the log, any address in them masked) or been stopped at the bound. The bench of 22 Nov (a cold boot, by
+# hand): the loader exited 255, the attach went on against a chip with no firmware, and the box went silent.
 RADIO_BTFW_WAIT=${RADIO_BTFW_WAIT:-10}
 case "$RADIO_BTFW_WAIT" in ''|*[!0-9]*) RADIO_BTFW_WAIT=10 ;; esac
+# A firmware push that succeeded this boot (bt_fw_push). In /tmp, so a SoC restart or a power cut, which put the chip
+# back in its boot loader, take it away with the firmware.
+BT_FW_PUSHED=/tmp/.radio_btfw_pushed
 # A BR/EDR address in the loader's lines, masked: it prints none that we know of (chip id, file, baud rates, sizes).
 MAC_MASK='s/[0-9A-Fa-f][0-9A-Fa-f]\(:[0-9A-Fa-f][0-9A-Fa-f]\)\{5\}/<addr>/g'
 bt_fw_preload() {
@@ -1306,8 +1306,8 @@ bt_fw_preload() {
   boot_mark btfw_start; _bfp_t0=${_um:-0}
   $RADIO_BT_PRELOAD_CMD >/tmp/radio_bt_fw.log 2>&1 &
   _bfp_pid=$!
-  # The bound: TERM, then KILL. The watcher goes once the loader has been reaped, so its signals never reach another
-  # process that took the pid; its own sleep, left alone, ends by itself.
+  # The bound: TERM, then KILL. The watcher is stopped as soon as the loader has been reaped, so only in that instant
+  # could a signal of its own find the pid taken by another process; its sleep, left alone, ends by itself.
   ( sleep "$RADIO_BTFW_WAIT"; kill -TERM "$_bfp_pid" 2>/dev/null; sleep 2; kill -KILL "$_bfp_pid" 2>/dev/null ) \
     </dev/null >/dev/null 2>&1 &
   _bfp_w=$!
@@ -1319,15 +1319,15 @@ bt_fw_preload() {
     END { v = "other"; if (c) v = "complete"; if (e) v = "error"; if (t == "") t = "-"; print v " " t }' \
     /tmp/radio_bt_fw.log 2>/dev/null)
   boot_note btfw "${1:-other}"; boot_note btfw_ms "${2:--}"
-  [ "$_bfp_rc" = 0 ] && return 0
+  if [ "$_bfp_rc" = 0 ]; then
+    # A builtin's redirection, no fork. Unwritten (a full /tmp), a later failed push stops the attach.
+    write_empty "$BT_FW_PUSHED" || log "  the push's mark could not be written ($BT_FW_PUSHED)"
+    return 0
+  fi
   log "  firmware preload exited $_bfp_rc"
   if [ "$_bfp_ms" -ge $((RADIO_BTFW_WAIT * 1000)) ]; then
     log "  the loader had not returned after $RADIO_BTFW_WAIT s - stopped"
     return 1
-  fi
-  if [ ! -s /tmp/radio_bt_fw.log ] && [ "$_bfp_ms" -lt 1000 ]; then
-    log "  it returned at once with nothing to say: a chip that runs its firmware answers it so - the attach goes on"
-    return 0
   fi
   log "  the loader's last lines:"
   tail -5 /tmp/radio_bt_fw.log 2>/dev/null | cut -c1-160 | sed -e "$MAC_MASK" -e "s/^/$LOGP   /"
@@ -1338,13 +1338,25 @@ bt_fw_preload() {
 # and the caller attaches nothing, with no hciattach and no reclaim+reset: an attach against a chip left without its
 # firmware is what preceded the silent box of the 22 Nov bench. _bt_nofw says so to the preload's end (no helper to
 # stop), and the boot line counts the runs (btfw_tries).
+#
+# A failure after a push that succeeded earlier this boot (BT_FW_PUSHED) is no reason to stop: the chip still runs that
+# firmware, which only a SoC restart or a power cut takes away (both empty /tmp; the 13 Nov restarts each pushed in
+# full), not reclaim+reset's gpio1 pulse (20 Nov, by hand: after it hci0 answered within half a second, and the Wi-Fi
+# driver loaded in under 0.4 s, too quick for a download). A loader before such a chip finds no boot loader: most
+# likely it waits its 4 s for one and fails (not measured; that 20 Nov run's "at once, no output" was a result file
+# left by the run before it). So the attach goes on, as it always has there: the together fallback's, a host's bt_on
+# after the preload's attach failed, a try after a reset.
 bt_fw_push() {
   _bt_nofw=0
   bt_fw_preload && return 0
+  if [ -e "$BT_FW_PUSHED" ]; then
+    log "  the chip runs the firmware pushed earlier this boot - the attach goes on"
+    return 0
+  fi
   log "  the firmware push failed - pushing it once more"
   bt_fw_preload && return 0
   _bt_nofw=1
-  log "  the firmware push failed twice - no attach: no hciattach, no reset"
+  log "  the firmware push failed twice - no attach, and no reset after it"
   publish "$BT_STATE" "result=fail" "backend=mapped" "chipset=$RADIO_SDIO_DEVICE" "detail=no-firmware"
   return 1
 }
@@ -1368,10 +1380,14 @@ bt_attach_loop() {
     log "[bench] round4: attach_poll ($_r4f): hci0 looked at every 0.1 s as the attach converges, not 0.5 s"
   fi
   while [ "$_try" -lt "$1" ]; do
-    _try=$((_try+1)); _bt_tries=$((${_bt_tries:-0} + 1))
+    _try=$((_try+1))
     if [ "$_try" -gt 1 ] || pgrep -x "$_helper" >/dev/null 2>&1 || ps | grep -v grep | grep -qw "$_helper"; then
       log "reclaim+reset (attempt $_try)"; bt_reclaim_reset
+      # A push after each reset, before its attach (22 Nov 2026). With none (bt_fw_push: two failures and no push earlier
+      # this boot) this attempt attaches nothing, and none follows: no further reset.
+      bt_fw_push || { log "  attempt $_try attaches nothing: no firmware after its reset"; return 1; }
     fi
+    _bt_tries=$((${_bt_tries:-0} + 1))
     log "attach attempt $_try: $RADIO_BT_ATTACH_CMD"
     boot_mark attach
     setsid $RADIO_BT_ATTACH_CMD </dev/null >/tmp/radio_bt_attach.log 2>&1 &

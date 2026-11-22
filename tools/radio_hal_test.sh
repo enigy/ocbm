@@ -65,23 +65,21 @@ EOF
 cat > "$S/fw_loader_linux" <<'EOF'
 #!/bin/sh
 # The Bluetooth firmware push: FW_SECS long, noting whether the Wi-Fi interface was there and moal still loading. Each
-# run this boot is numbered: FW_FAIL names runs that fail as a boot loader that never answers does (its message, rc 255),
-# FW_HANG runs that never return and ignore TERM, FW_WARM runs that return at once with no output and rc 255 (as the
-# loader answers a chip that runs its firmware, the 20 Nov bench).
+# run this boot is numbered: FW_FAIL names runs that fail as a boot loader that never answers does (its message, rc 255:
+# a chip that already runs its firmware most likely answers so too), FW_HANG runs that never return and ignore TERM.
 R=$STUB_R
 n=$(( $(cat "$R/state/fw_runs" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$R/state/fw_runs"
 i=no; [ -e "$R/sys/class/net/sta0" ] && i=yes
 w=no; [ -e "$R/state/moal.loading" ] && w=yes
 h=no; p=$(cat "$R/state/hciattach.pid" 2>/dev/null) && kill -0 "$p" 2>/dev/null && h=yes
 echo "fw start iface=$i wlan_loading=$w helper=$h" >> "$R/calls"
-case " ${FW_WARM:-} " in *" $n "*) echo "fw warm $n" >> "$R/calls"; exit 255 ;; esac
 case " ${FW_HANG:-} " in *" $n "*)
   echo "fw hang $n" >> "$R/calls"; echo $$ > "$R/state/fw_loader_linux.pid"; trap '' TERM
   while :; do sleep 0.1; done ;;
 esac
 sleep "${FW_SECS:-0.8}"
 case " ${FW_FAIL:-} " in *" $n "*)
-  echo "0xa5,0xaa,0xab or 0xa7 is not received in 4000 ms"; echo "Download Error"
+  echo "0xa5,0xaa,0xab or 0xa7 is not received in 4000 ms"; [ -n "${FW_SAY:-}" ] && echo "$FW_SAY"; echo "Download Error"
   echo "fw fail $n" >> "$R/calls"; exit 255 ;;
 esac
 echo "Download Complete"
@@ -869,12 +867,15 @@ case_fwpush() {
   FW_FAIL=1 WLAN_SECS=0.2 FW_SECS=0.2 hal preload
   check 'said preload "firmware preload exited 255" && said preload "the loader'"'"'s last lines:" && grep -q "^\[radio_hal\]   0xa5,0xaa,0xab or 0xa7 is not received in 4000 ms$" "$R/out.preload"' \
     "its exit code and its last lines in the log"
-  echo "== $SH: the firmware push: a chip that runs its firmware (the loader returns at once, no output)"
   unit
-  FW_WARM=1 WLAN_SECS=0.2 FW_SECS=0.2 hal preload
-  check '[ "$(rc preload)" = 0 ] && said preload "it returned at once with nothing to say" && [ "$(count "fw start")" = 1 ] && called "attach 1"' \
-    "as before: no failure, one run, the attach goes on"
-  check '[ "$(key btfw_tries)" = 1 ] && [ "$(key rc)" = 0 ]' "  the boot line: btfw_tries=1"
+  FW_FAIL=1 FW_SAY="ChipID 7201 at 02:00:00:00:00:0a" WLAN_SECS=0.2 FW_SECS=0.2 hal preload
+  check 'grep -q "^\[radio_hal\]   ChipID 7201 at <addr>$" "$R/out.preload" && ! grep -q "02:00:00:00:00:0a" "$R/out.preload"' \
+    "  an address in its lines masked"
+  echo "== $SH: the firmware push: a good one leaves its mark for this boot"
+  unit
+  WLAN_SECS=0.2 FW_SECS=0.2 hal preload
+  check '[ "$(rc preload)" = 0 ] && [ -e "$R/tmp/.radio_btfw_pushed" ] && [ "$(key btfw_tries)" = 1 ] && [ "$(key btfw)" = complete ]' \
+    "the mark in /tmp; the boot line btfw=complete btfw_tries=1"
 
   echo "== $SH: the firmware push: one that fails is pushed once more"
   unit
@@ -888,10 +889,10 @@ case_fwpush() {
   echo "== $SH: the firmware push: one that fails twice attaches nothing"
   unit
   FW_FAIL="1 2" WLAN_SECS=0.2 FW_SECS=0.2 hal preload
-  check '[ "$(rc preload)" = 1 ] && [ "$(count "fw start")" = 2 ] && said preload "the firmware push failed twice - no attach: no hciattach, no reset"' \
+  check '[ "$(rc preload)" = 1 ] && [ "$(count "fw start")" = 2 ] && said preload "the firmware push failed twice - no attach, and no reset after it"' \
     "two pushes, then rc 1"
-  check '! called "attach " && ! called "rmmod" && ! said preload "reclaim+reset" && ! said preload "its helper stopped"' \
-    "  no hciattach, no reset pulse, and no helper to stop"
+  check '! called "attach " && ! called "rmmod" && ! said preload "reclaim+reset" && ! said preload "its helper stopped" && [ ! -e "$R/tmp/.radio_btfw_pushed" ]' \
+    "  no hciattach, no reset pulse, no helper to stop, and no mark"
   check '[ -e "$R/tmp/.radio_together_fell_back" ] && [ "$(cat "$R/script/.radio_together_failed")" = 1 ] && [ ! -e "$R/script/.radio_together_inflight" ] && said preload "together gave no responsive hci0"' \
     "  the marks as today: this boot's fallback, the guard's count 1, no in-flight mark"
   check '[ "$(key by)" = preload ] && [ "$(key rc)" = 1 ] && [ "$(key btfw_tries)" = 2 ] && [ "$(key attach)" = - ] && grep -q "^done_rc1 " "$R/tmp/radio_preload_state"' \
@@ -910,6 +911,48 @@ case_fwpush() {
   FW_FAIL="1 2 3 4" WLAN_SECS=0.2 FW_SECS=0.2 hal bt_on
   check '[ "$(rc bt_on)" = 1 ] && [ "$(count "fw start")" = 4 ] && ! called "attach " && ! called "rmmod" && ! said bt_on "reclaim+reset"' \
     "two pushes of its own, then rc 1: no hciattach, and none of the reclaim+reset tries"
+
+  # A push that succeeded earlier this boot: the chip runs that firmware, and a loader then fails (most likely); the
+  # attach goes on, as it always has.
+  echo "== $SH: the firmware push: a failure after a good push this boot is no reason to stop"
+  unit
+  ATTACH_DEAD=1 FW_FAIL=2 WLAN_SECS=0.4 FW_SECS=0.2 hal bt_on
+  check '[ "$(rc bt_on)" = 0 ] && said bt_on "together gave no responsive hci0" && said bt_on "the chip runs the firmware pushed earlier this boot - the attach goes on" && called "attach 2 iface=yes"' \
+    "the together fallback's push fails: the attach goes on, and converges"
+  check '[ "$(count "fw start")" = 2 ] && ! said bt_on "pushing it once more" && [ "$(key btfw_tries)" = 2 ] && [ "$(key rc)" = 0 ]' \
+    "  no second run of its own (two in the bring-up: btfw_tries=2)"
+  unit
+  ATTACH_DEAD=1 WLAN_SECS=0.3 FW_SECS=0.2 hal preload
+  check '[ "$(rc preload)" = 1 ] && [ -e "$R/tmp/.radio_btfw_pushed" ] && said preload "its helper stopped"' \
+    "a preload whose push was good and whose attach failed: rc 1, the mark kept"
+  host_comes
+  FW_FAIL=2 WLAN_SECS=0.3 FW_SECS=0.2 hal bt_on
+  check '[ "$(rc bt_on)" = 0 ] && said bt_on "the chip runs the firmware pushed earlier this boot - the attach goes on" && [ "$(count "fw start")" = 2 ] && called "attach 2 iface=yes"' \
+    "  the host's bt_on: its push fails, the attach goes on (Wi-Fi first), Bluetooth up"
+
+  # The reclaim+reset tries (a host's bt_on, today's order): a push after each reset, before its attach.
+  echo "== $SH: the firmware push: a reset is followed by a push before its attach"
+  nth() { grep -nF -- "$1" "$R/calls" | sed -n "${2}p" | cut -d: -f1; }
+  unit; : > "$R/script/radio_together_off"
+  ATTACH_DEAD=1 WLAN_SECS=0.3 FW_SECS=0.2 hal bt_on
+  check '[ "$(rc bt_on)" = 0 ] && said bt_on "reclaim+reset (attempt 2)" && [ "$(count "fw start")" = 2 ] && called "attach 2 iface=yes"' \
+    "attempt 2: reclaim+reset, a push, the attach: converges"
+  check '[ "$(nth "rmmod hci_uart" 1)" -lt "$(nth "fw start" 2)" ] && [ "$(nth "fw start" 2)" -lt "$(nth "attach 2" 1)" ]' \
+    "  in that order: the reset (rmmod), the push, the attach"
+  check '[ "$(key order)" = wlan_first ] && [ "$(key tries)" = 2 ] && [ "$(key btfw_tries)" = 2 ] && [ "$(key rc)" = 0 ]' \
+    "  its boot line: tries=2 btfw_tries=2 rc=0"
+  unit; : > "$R/script/radio_together_off"
+  ATTACH_DEAD=1 FW_FAIL=2 WLAN_SECS=0.3 FW_SECS=0.2 hal bt_on
+  check '[ "$(rc bt_on)" = 0 ] && said bt_on "the chip runs the firmware pushed earlier this boot - the attach goes on" && [ "$(count "fw start")" = 2 ] && called "attach 2 iface=yes"' \
+    "the push after the reset fails, with a good one earlier this boot: the attach goes on, as before"
+  # No good push this boot (its mark unwritable here, as on a full /tmp): no firmware after the reset, no attach.
+  unit; : > "$R/script/radio_together_off"; ln -s "$R/nowhere/pushed" "$R/tmp/.radio_btfw_pushed"
+  ATTACH_DEAD=1 FW_FAIL="2 3" WLAN_SECS=0.3 FW_SECS=0.2 hal bt_on
+  check '[ "$(rc bt_on)" = 1 ] && said bt_on "the push'"'"'s mark could not be written" && said bt_on "attempt 2 attaches nothing: no firmware after its reset"' \
+    "no firmware after the reset (two failures, no good push this boot): rc 1"
+  check '! called "attach 2" && [ "$(count "fw start")" = 3 ] && [ "$(count "rmmod hci_uart")" = 1 ] && ! said bt_on "reclaim+reset (attempt 3)"' \
+    "  no attach after it, and no further reset"
+  check '[ "$(key rc)" = 1 ] && [ "$(key tries)" = 1 ] && [ "$(key btfw_tries)" = 3 ]' "  its boot line: rc=1 tries=1 btfw_tries=3"
 }
 
 case_round4() {

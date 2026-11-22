@@ -374,7 +374,9 @@ the host's arrival and the first frame, the PSK count is a lower bound: `PSK mis
 
 ### Round 4 switches (22 Nov 2026; a bench build, branch `round4`)
 
-Each is off by default, and with none set the build behaves as 2.7.0. A switch is set by `/tmp/bench_<name>` (a reboot
+Each is off by default, and with none set the build behaves as 2.7.0, but for one fix that is no switch: the
+Bluetooth firmware push bounded, pushed once more when it fails, and no attach without firmware
+(docs/wireless/01_BT_AND_RADIO.md, "No attach without firmware"). A switch is set by `/tmp/bench_<name>` (a reboot
 clears it; Carlink's debug builds can write it) or, kept across a power cut so a cold boot sees it, by
 `/etc/ocbm/bench_<name>` on flash: OCBM's own state directory, which updates keep and the full way back to stock removes
 whole. `/tmp` is read first; either one by `bench_flag`'s rule (absent or `off`: not set). A number that is not one, or out
@@ -575,7 +577,7 @@ timeline uses, but from power-up, not from the host's arrival; `-` is a value no
 | `wlan_free` | `together` in the preload: it let the wlan lock go, and a host's AP bring-up waiting on it may start |
 | `btfw_start`, `btfw_end` | the Bluetooth firmware push (`fw_loader_linux`) |
 | `btfw`, `btfw_ms` | what the loader said, `complete`, `error` or `other`, and its own time (`time:N`), `-` without one |
-| `btfw_tries` | the loader's runs in that bring-up (22 Nov 2026): `1`, or `2` when the first push failed and it was pushed once more; `btfw` and `btfw_ms` stay the first run's. Two failed pushes attach nothing (`attach=-`, `rc=1`: no `hciattach`, no reclaim+reset; `radio_hal.sh` `bt_fw_push`); `-` on a part with no loader |
+| `btfw_tries` | the loader's runs in that bring-up (22 Nov 2026): `1`; `2` when the first push failed and it was pushed once more; one more after each reclaim+reset. `btfw` and `btfw_ms` stay the first run's. Two failed pushes with no good one earlier this boot attach nothing (`attach=-`, `rc=1`: no `hciattach`, no reset after them; `radio_hal.sh` `bt_fw_push`); after a good one (`/tmp/.radio_btfw_pushed`) a failed push is not run again and the attach goes on (docs/wireless/01_BT_AND_RADIO.md, "No attach without firmware"). `-` on a part with no loader |
 | `attach`, `hci_up` | the first attach launched; `hci0` answered a name read |
 | `handover` | whether the handover (R3-5) was asked for as the attach started: `on_owner` (`/script/radio_handover_on`), `on_bench` (`/tmp/bench_handover_on`), or `off`, the default |
 | `handed` | the preload handed the controller to the waiting host's session (R3-5, docs/wireless/01_BT_AND_RADIO.md "The cold boot" 6): claimed as `hci0` answered, handed over once the attach's Wi-Fi side was in; `-`: the handover not asked for (the default), no host as it answered, or a `bt_on`'s line |
