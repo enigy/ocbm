@@ -500,8 +500,8 @@ because BT attach waits for WLAN on this part, Bluetooth with it. Both forms now
 ## Between host sessions: armed (Bluetooth powered, invisible)
 
 **Status: built and benched 16 Nov 2026** (branch `resident-bt` merged with `carplayd-early` into a local `round2`,
-on the dev adapter, IW416). 12 wakes and a cold boot connected from the armed state (that boot a restart by `reboot`,
-which keeps the radio chip's firmware: no cold boot for radio timing, "The cold boot" below): `sup_radios` about 50 ms,
+on the dev adapter, IW416). 12 wakes and a cold boot connected from the armed state (that boot a restart by `reboot`:
+no cold boot for radio timing, its firmware downloads in it but the host up already, "The cold boot" below): `sup_radios` about 50 ms,
 `bt_armed=1`, `page_start` about 100 ms and `ap_enabled` about 1.16 s after the host's arrival. With no host the armed
 state read over the console as built: `hci0` `UP RUNNING` with neither `PSCAN` nor `ISCAN`, no link, no hostapd, udhcpd
 or carplayd, the AP interface (`sta0`) down. Against `/tmp/bench_arm_off` arming saved about 1.0 s per connect. The

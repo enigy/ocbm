@@ -645,8 +645,8 @@ Bluetooth powered but invisible between host sessions, the host's arrival a go (
 "Between host sessions: armed").
 
 **The first bench** (16 Nov, the dev adapter, `resident-bt` merged with `carplayd-early` as a local `round2`): 12 wakes
-and a cold boot (a restart by `reboot`, which keeps the radio chip's firmware: no cold boot for radio timing; "Cold
-boot: real power cycles", below) from the armed state, `sup_radios` about 50 ms, `bt_armed=1`, `page_start` about 100 ms, `ap_enabled`
+and a cold boot (a restart by `reboot`: no cold boot for radio timing, its firmware downloads in it but the host up
+already, docs/wireless/01_BT_AND_RADIO.md, "A cold boot is a power cut"; "Cold boot: real power cycles", below) from the armed state, `sup_radios` about 50 ms, `bt_armed=1`, `page_start` about 100 ms, `ap_enabled`
 about 1.16 s after the host's arrival; the no-host state as in step 1 below; arming about 1.0 s faster than
 `/tmp/bench_arm_off`; the forced fallback (step 4) as written. One bad wake, the first about 90 s after an update was
 committed: 24.8 s, of two delays (the Mac's second reading, 17 Nov). A late join, its cause open: `AP-ENABLED` 4.5 s
@@ -701,9 +701,10 @@ hci_up` 30 to 40 ms, `page_start - bt_power` 88 to 110 ms against 946 to 1045 wi
 trouble against 0 of 4 without (0 of 9 with `70caa3c`'s), so it ships off; with the host at 3.3 s (boot 10, the
 truck's timing) the loads ran about 1 s slower, `hci_up` 8.01 s, the first frame 16.85 s. `caps_ms` read 780 to 890 with `caps=kept` though the key
 takes 0.05 s by hand on the idle adapter: the first 3.4 s of a power-up are slow throughout (cold flash, one busy core). **Every boot here is a power cut**: pull the adapter's USB
-cable (it is powered from it) or switch its port, and give it power again. Never `reboot`: the IW416 keeps its firmware
-through one, so a restart skips both downloads and times nothing of a cold boot (20 Nov); the line tells them apart
-("The boot's radio line", above). Before each power cut, save the box log (Carlink's Save Logs, or `/tmp/box.log` over
+cable (it is powered from it) or switch its port, and give it power again. Never `reboot`: a SoC restart resets the
+IW416 too, so a restart downloads both firmwares as a cold boot does (the three 13 Nov restarts pushed the Bluetooth
+firmware in full), but with the host up already it times nothing of a cold boot, and the line's download times do not
+tell the two apart ("The boot's radio line", above, "A cold boot or a restart"). Before each power cut, save the box log (Carlink's Save Logs, or `/tmp/box.log` over
 the console): `/tmp` goes with the power. Read the boot line with `grep '^\[radio-boot\]' /tmp/box.log`. **On a final
 adapter** (`cat /script/ocbm_mode`): in a trial (and on an update's first start) the dispatcher runs the self-test at
 every start, whose `radio_detect.sh` fills `/tmp/radio_caps` (the boot line then reads `caps=detected`, and nothing is
@@ -757,7 +758,9 @@ order does. After an update, step 1 is the first cold boot once the update has b
    Bluetooth up. Clean up: `rm /script/radio_together_off /script/radio_preload_off`, and one cold boot back to
    `order=together`.
 9. **A restart is no cold boot:** `reboot` over the console once. Its boot line: `btfw_end - btfw_start` and
-   `wlan_up - wlan_start` a fraction of step 2's. Write that ratio here, so a later reader can tell the two apart.
+   `wlan_up - wlan_start` near step 2's, not a fraction of them (a SoC restart resets the chip: the 13 Nov restarts
+   pushed in full, 2.75 to 2.83 s; the 20 Nov reading that a restart keeps the firmware was a stale result file). So
+   the download times cannot tell a restart from a cold boot: only a power cut is one. Write its line here.
 
 **A preload attach that fails** (none is expected; read it wherever a boot line says `by=preload` with `rc=1`, step 8's
 cut boots aside): the box log's `preload: the attach failed - its helper stopped (no reset, no rmmod)`, then the host's

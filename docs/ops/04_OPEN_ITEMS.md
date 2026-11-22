@@ -932,8 +932,8 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
   "Round 4 switches"). Source: docs/wireless/01_BT_AND_RADIO.md, "The cold boot".
 
 - **The armed state (Bluetooth powered but invisible between host sessions, the AP configured ahead): benched
-  16 Nov 2026, one wake open.** On the dev adapter 12 wakes and a cold boot (a restart by `reboot`, which keeps the
-  radio chip's firmware: no cold boot for radio timing) connected from the armed state
+  16 Nov 2026, one wake open.** On the dev adapter 12 wakes and a cold boot (a restart by `reboot`: no cold boot for
+  radio timing, its firmware downloads in it but the host up already) connected from the armed state
   (`page_start` about 100 ms, `ap_enabled` about 1.16 s after the host), the no-host state read as built, arming
   about 1.0 s faster than without, and the forced fallback completed its connect. **Open:** the first wake about 90 s
   after an update was committed took 24.8 s, of two delays; neither repeated after a reboot. The first, a late join,
