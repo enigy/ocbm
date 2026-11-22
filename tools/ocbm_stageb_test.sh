@@ -103,6 +103,31 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   check 'waitfor "[ -e $d/run/ocbm_gpio_done ]" 5' "the mark is written, so the preload never waits out its 3 s for it"
   reap
 
+  echo "== $sh: round 4, gpio_first: the stock GPIO set-up first (a bench switch, off by default)"
+  # ocbm_boot.sh's stand-in notes whether the GPIO set-up's end was marked as it started.
+  gf_box() {  # $1 dir, $2 the GPIO stand-in's line
+    make_box "$1" trial
+    stand_in "$1/root/script/ocbm_boot.sh" "$1/m.boot" "[ -e \"\${OCBM_GPIO_DONE:-/none}\" ] && echo mark-there >> '$1/m.boot.env'; exit 0"
+    stand_in "$1/root/script/init_gpio.sh" "$1/m.gpio" "$2"
+  }
+  d="$T/$sh-gf0"; gf_box "$d" "sleep 0.3; echo gpio-end >> '$d/m.gpio'"; boot "$sh" "$d"
+  check '[ -e "$d/m.boot" ] && ! grep -qs mark-there "$d/m.boot.env" && ! grep -qs round4 "$d/run/box.log"' \
+    "no switch: ocbm_boot.sh first, the set-up beside it, as before"
+  reap
+  d="$T/$sh-gf1"; gf_box "$d" "sleep 0.3; echo gpio-end >> '$d/m.gpio'"; : > "$d/root/etc/ocbm/bench_gpio_first"; boot "$sh" "$d"
+  check 'grep -qs mark-there "$d/m.boot.env" && grep -q "\[bench\] round4: gpio_first ($d/root/etc/ocbm/bench_gpio_first): the stock GPIO set-up first, its end after about" "$d/run/box.log"' \
+    "on flash: the set-up's end marked before ocbm_boot.sh starts, said so"
+  check 'waitfor "[ -e $d/m.run_ocbmd ] && grep -qs PASSED $d/root/etc/ocbm/first_start.txt" 5' "  the start goes on as before: the respawn loops, a passing self-test"
+  reap
+  d="$T/$sh-gf2"; gf_box "$d" "sleep 0.3; echo gpio-end >> '$d/m.gpio'"; echo off > "$d/root/etc/ocbm/bench_gpio_first"; boot "$sh" "$d"
+  check '! grep -qs mark-there "$d/m.boot.env" && ! grep -qs round4 "$d/run/box.log"' "reading off: as before"
+  reap
+  d="$T/$sh-gf3"; gf_box "$d" "sleep 4; echo gpio-end >> '$d/m.gpio'"; : > "$d/run/bench_gpio_first"
+  t0=$(date +%s); boot "$sh" "$d"; t1=$(date +%s)
+  check '[ -e "$d/m.boot" ] && [ $((t1 - t0)) -lt 3 ] && grep -q "round4: gpio_first ($d/run/bench_gpio_first): no end of the stock GPIO set-up in 1 s - ocbm_boot.sh now" "$d/run/box.log"' \
+    "the bench's in /tmp, a set-up that hangs: ocbm_boot.sh after 1 s all the same, said so"
+  reap
+
   echo "== $sh: a failed self-test goes back to stock"
   d="$T/$sh-fail"; make_box "$d" trial; touch "$d/st.fail"; echo "guard: 2 unfinished in a row" > "$d/root/script/radio_preload_off"
   : > "$d/root/script/radio_preload_late"; : > "$d/root/script/radio_together_off"; : > "$d/root/script/.radio_together_inflight"

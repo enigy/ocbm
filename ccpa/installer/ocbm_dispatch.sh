@@ -488,8 +488,31 @@ if [ "$mode" != final ] || [ "$update_trial" = 1 ]; then OCBM_PRELOAD_AFTER="$RU
 # preload at once, which touches the chip only after the mark (radio_hal.sh gpio_wait; a pulse under a loading Wi-Fi
 # driver wedged the kernel, 19 Oct 2026). The mark comes whether or not the stock script is there.
 OCBM_GPIO_DONE="$RUN/ocbm_gpio_done"; rm -f "$OCBM_GPIO_DONE"; export OCBM_GPIO_DONE
-"$S/ocbm_boot.sh"   # gadget as the OCBM accessory, ocbmd, session supervisor; returns at once
-{ [ -x "$S/init_gpio.sh" ] && "$S/init_gpio.sh"; true >"$OCBM_GPIO_DONE"; } </dev/null >/dev/null 2>&1 &   # stock: Bluetooth reset line, quick-charge pins
+# Round 4, item 7 (bench gpio_first, 22 Nov 2026; docs/ops/02_TESTING.md, "Round 4 switches"): the stock GPIO set-up
+# first, its end waited for (1 s at most), then ocbm_boot.sh. The boot preload's loads wait for that end (radio_hal.sh
+# gpio_wait), which came at about 3.45 s for a script with 0.2 s of sleeps, sharing the core with the gadget's set-up,
+# ocbmd and the supervisor; the gadget then comes that much later, while the host waits on the radios anyway. Off by
+# default: ocbm_boot.sh first and the set-up beside it, as before. On with $RUN/bench_gpio_first or, for a cold boot,
+# $EO/bench_gpio_first on flash (set unless it reads "off").
+gpio_first=""
+for _gf in "$RUN/bench_gpio_first" "$EO/bench_gpio_first"; do
+  [ -e "$_gf" ] || continue
+  _gv=""; read -r _gv 2>/dev/null <"$_gf"
+  [ "$_gv" = off ] || { gpio_first=$_gf; break; }
+done
+if [ -n "$gpio_first" ]; then
+  { [ -x "$S/init_gpio.sh" ] && "$S/init_gpio.sh"; true >"$OCBM_GPIO_DONE"; } </dev/null >/dev/null 2>&1 &   # stock: Bluetooth reset line, quick-charge pins
+  _gi=0; while [ ! -e "$OCBM_GPIO_DONE" ] && [ "$_gi" -lt 20 ]; do sleep 0.05; _gi=$((_gi + 1)); done
+  if [ -e "$OCBM_GPIO_DONE" ]; then
+    log "[bench] round4: gpio_first ($gpio_first): the stock GPIO set-up first, its end after about $((_gi * 50)) ms; ocbm_boot.sh now"
+  else
+    log "[bench] round4: gpio_first ($gpio_first): no end of the stock GPIO set-up in 1 s - ocbm_boot.sh now, the set-up still running beside it"
+  fi
+  "$S/ocbm_boot.sh"   # gadget as the OCBM accessory, ocbmd, session supervisor; returns at once
+else
+  "$S/ocbm_boot.sh"   # gadget as the OCBM accessory, ocbmd, session supervisor; returns at once
+  { [ -x "$S/init_gpio.sh" ] && "$S/init_gpio.sh"; true >"$OCBM_GPIO_DONE"; } </dev/null >/dev/null 2>&1 &   # stock: Bluetooth reset line, quick-charge pins
+fi
 respawn "$S/run_ocbmd.sh" </dev/null >/dev/null 2>&1 &
 respawn "$S/run_supervisor.sh" </dev/null >/dev/null 2>&1 &
 # A stick report a restart interrupted; then what a stick in at this start asks for (an update, or in
