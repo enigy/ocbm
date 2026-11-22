@@ -411,8 +411,8 @@ its `preload_nice` stays.
 | Name | Value | Default (2.7.1); `off`, 2.7.0's | Read | Does |
 |---|---|---|---|---|
 | `first_page_slots` | 1-12800 slots (8 s), or `off` | 8192 (5.12 s); `off`: the round's (6000 over several phones in the first round, 0x2000 otherwise) | btd, each session | the first page of the first round this long; every other page the round's. `6000` gives a 3.75 s first page, which is 2.7.0's only over several phones. No more than 8 s: the SDP connect that carries the page has its own 8 s deadline, which would end a longer page there, as a failure rather than a page timeout |
-| `same_phone_repage` | flag, or `off` | on; `off`: the next phone | btd, each session | a re-page after a reset or cut that fails with EALREADY, EMLINK or EBUSY waits for the link (up to 1.5 s, then 0.3 s with none) and pages the same phone again, twice at most, then the next phone |
-| `rfcomm_limit_ms` | 1000-8000 ms, or `off` | 1500; `off` (or `8000`): no limit, the plain 8000 ms, then the next phone | btd, each session | the RFCOMM connect cut at this unless a pairing prompt holds it; its link dropped as a cut's, the phone paged once more (counted once a round, as a cut) |
+| `same_phone_repage` | flag, or `off` | on; `off`: the next phone | btd, each session | a re-page after a reset or cut whose page fails with EALREADY, EMLINK or EBUSY waits for the link (up to 1.5 s, then 0.3 s with none) and pages the same phone again, twice at most, then the next phone. The same errnos from the RFCOMM connect are no crossing (a channel still on the link): a failure, the next phone, as in 2.7.0 |
+| `rfcomm_limit_ms` | 1000-8000 ms, or `off` | 1500; `off` (or `8000`): no limit, the plain 8000 ms, then the next phone | btd, each session | the RFCOMM connect cut at this unless a pairing prompt holds it; its link dropped as a cut's, the phone paged once more, that re-page's RFCOMM connect with no limit (2.7.0's 8 s), so a phone that is only slow still connects; the cut counts nothing toward a forgotten pairing, the re-page's own result does |
 | `btd_early` | flag, or `off` | on; `off`: bt_on, then btd | the supervisor, at the host's arrival | with the boot preload running and the handover not asked for: btd started at once, waiting for bt_on's end, then today's bring-up |
 | `page_trim` | flag, or `off` | on; `off`: the name and SCO set, the mark cleared in the attach, the 0.2 s look | radio_hal.sh | with a host waiting on the preload: no SCO lines or name set on its attach, the together guard's mark cleared after its locks; and every lock wait looks every 0.05 s |
 | `attach_poll` | flag, or `off` | on; `off`: the 0.5 s look | radio_hal.sh, each attach | hci0 looked at every 0.1 s as the attach converges, not 0.5 s; an attempt bounded by its uptime, 2.7.0's 15 s, however long a look takes (a name read can take 5 s against a wedged controller) |
@@ -430,7 +430,9 @@ bonded phone every page was 5.12 s already, so nothing changes there.
 **The six defaults' lines**, plain: btd `paging 5120 ms for the first page of the first round` and `paging 3750 ms
 again: the first page is over` (several phones), `the re-page crossed a link the controller holds; ...`, `RFCOMM
 connect to channel N not connected within its 1500 ms limit: closed; ...` and `... answered and opened no RFCOMM
-channel within the connect's limit -- paging it once more before the next phone`; radio_hal.sh `the bt lock taken
+channel within the connect's limit -- paging it once more, its RFCOMM connect with no limit, before the next phone`;
+`RFCOMM connect to channel N failed: ... (the link still holds that channel: no page crossing, so no re-page)`;
+radio_hal.sh `the bt lock taken
 after about N ms of waiting, looked at every 0.05 s`, `a host is waiting - no SCO lines and no name set on hci0 (...)`
 and `the together guard's mark cleared after the locks went`; the supervisor's bring-up line, `... the boot preload is
 attaching Bluetooth: btd starts now and waits for it`.
