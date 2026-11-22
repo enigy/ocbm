@@ -456,6 +456,8 @@ pub struct AvSession {
     /// Each RCS (type-130) channel this connection SETUP, by `channelID`: what a partial TEARDOWN is matched
     /// against ([`rcs_channels_named`]), so tearing down one channel never takes the others with it.
     rcs_channels: HashMap<String, RcsChannel>,
+    /// The main screen stream's SETUP and what its thread has carried since ([`ScreenFrames`]), for its teardown's line.
+    screen_carried: Option<(Instant, Arc<ScreenFrames>)>,
 }
 
 /// One RCS (type-130) channel as its SETUP made it: the transport token returned for it (`streamID`),
@@ -506,6 +508,50 @@ const ACCEPT_POLL: Duration = Duration::from_millis(10);
 /// 7 then paid the whole wait, the largest spread left in a connect. A phone that sets its screen up again does so
 /// within about 30 ms (bench 2026-11-02), and a requestUI it did not need is the one RECORD sends anyway.
 const SCREEN_NUDGE_AFTER: Duration = Duration::from_millis(500);
+
+/// Round 4, item 10 (bench, docs/ops/02_TESTING.md, "Round 4 switches"): the first nudge's wait in whole ms, for
+/// [`SCREEN_NUDGE_AFTER`]; 0-2500, so it always comes before the second at 3 s. /tmp only (`box_common::bench_text`:
+/// "off" or absent is the default); read at each nudge. Nothing in the product writes it.
+const BENCH_SCREEN_NUDGE_MS: &str = "/tmp/bench_screen_nudge_ms";
+
+/// The first nudge's wait from the bench file's text (`None`: not set), and, when it is set, the line that says so: its
+/// value, or why it was refused and the default stands.
+fn screen_nudge_after(text: Option<&str>) -> (Duration, Option<String>) {
+    let default_ms = SCREEN_NUDGE_AFTER.as_millis();
+    let Some(t) = text else {
+        return (SCREEN_NUDGE_AFTER, None);
+    };
+    match t.parse::<u64>() {
+        Ok(ms) if ms <= 2500 => (
+            Duration::from_millis(ms),
+            Some(format!(
+                "[bench] round4: screen_nudge_ms={ms} ({BENCH_SCREEN_NUDGE_MS}): the first nudge {ms} ms after the phone tore its screen down (default {default_ms} ms)"
+            )),
+        ),
+        _ => (
+            SCREEN_NUDGE_AFTER,
+            Some(format!("[bench] round4: {BENCH_SCREEN_NUDGE_MS} refused ({t:?}: want ms 0-2500): the default {default_ms} ms")),
+        ),
+    }
+}
+
+/// What the main screen stream carried (round 4, item 10): every frame read off it, and the video frames among them,
+/// counted by its thread ([`spawn_screen`]) for the line its teardown prints ([`torn_screen_line`]).
+#[derive(Default)]
+struct ScreenFrames {
+    all: AtomicU64,
+    video: AtomicU64,
+}
+
+/// The line a teardown of the main screen stream prints beside the partial TEARDOWN's: how long the stream lived from its
+/// SETUP and what it carried, so a bench tells the phone's set-up-and-tear-down quirk (about 30 ms, no frame, bench
+/// 2026-11-02) from a real teardown.
+fn torn_screen_line(lived: Duration, frames: u64, video: u64) -> String {
+    format!(
+        "[session] the screen stream was torn down {} ms after its SETUP, having carried {frames} frames ({video} video)",
+        lived.as_millis()
+    )
+}
 
 /// The bench flag that swallows the first screen nudge's requestUI once (it is removed when used), so the second
 /// fires on cue (the Mac's 13 Nov bench-hooks brief, item 6). /tmp only; nothing in the product writes it.
@@ -584,6 +630,7 @@ impl AvSession {
             negotiated_features: Vec::new(),
             rcs_channels: HashMap::new(),
             resolution: (0, 0, 0),
+            screen_carried: None,
         }
     }
 
@@ -609,8 +656,9 @@ impl AvSession {
         flag
     }
 
-    /// The phone tore down its screen stream: if it has not set up another within [`SCREEN_NUDGE_AFTER`],
-    /// send `requestUI` once, as RECORD does, so iOS brings its UI back and sets the screen up again.
+    /// The phone tore down its screen stream: if it has not set up another within [`SCREEN_NUDGE_AFTER`] (or round 4's
+    /// bench wait, [`BENCH_SCREEN_NUDGE_MS`]), send `requestUI` once, as RECORD does, so iOS brings its UI back and sets
+    /// the screen up again.
     ///
     /// Bench 2026-11-02: an iPhone 7 on iOS 15 set up its screen stream and tore it down about 30 ms
     /// later in 2 of 5 sessions (4 of 5 on the bench before), then never set up another. The session
@@ -620,13 +668,18 @@ impl AvSession {
         let streams = self.av_streams.clone();
         let alive = self.alive.clone();
         let torn = Instant::now();
+        // Round 4, item 10 (bench): the first wait from BENCH_SCREEN_NUDGE_MS, said when it is set; the default otherwise.
+        let (after, bench) = screen_nudge_after(box_common::bench_text(BENCH_SCREEN_NUDGE_MS).as_deref());
+        if let Some(line) = bench {
+            eprintln!("{line}");
+        }
         let spawned = thread::Builder::new().name("screen-nudge".into()).spawn(move || {
-            thread::sleep(SCREEN_NUDGE_AFTER);
+            thread::sleep(after);
             if !alive.load(Ordering::Acquire) {
                 return;
             }
             if screen_stream_live(&streams) {
-                eprintln!("[session] the phone set its screen up again within {} ms — no nudge", SCREEN_NUDGE_AFTER.as_millis());
+                eprintln!("[session] the phone set its screen up again within {} ms — no nudge", after.as_millis());
                 return;
             }
             // What the session had when it fired, so a bench can tell a phone that would have come back from one that
@@ -1041,7 +1094,9 @@ impl AvSession {
                             "[session] SETUP phase2 screen(110) scid={scid} → dataPort {port}"
                         );
                         let flag = self.stream_flag(110);
-                        spawn_screen(listener, shared, scid, 9001, flag, self.activity.clone());
+                        let carried = Arc::new(ScreenFrames::default());
+                        self.screen_carried = Some((Instant::now(), carried.clone()));
+                        spawn_screen(listener, shared, scid, 9001, flag, self.activity.clone(), Some(carried));
                         crate::startup::stage(crate::startup::Stage::ScreenSetup);
                         let mut r = Dictionary::new();
                         r.insert("type".into(), Value::Integer(110.into()));
@@ -1063,7 +1118,7 @@ impl AvSession {
                         let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
                         eprintln!("[session] SETUP phase2 ALT screen(111) scid={scid} → dataPort {port} (→ :9005)");
                         let flag = self.stream_flag(111);
-                        spawn_screen(listener, shared, scid, 9005, flag, self.activity.clone());
+                        spawn_screen(listener, shared, scid, 9005, flag, self.activity.clone(), None);
                         let mut r = Dictionary::new();
                         r.insert("type".into(), Value::Integer(111.into()));
                         r.insert("dataPort".into(), Value::Integer((port as i64).into()));
@@ -2013,6 +2068,11 @@ impl SessionDelegate for AvSession {
                 "[session] partial TEARDOWN reason=host-request — stopped streams {stopped:?}, session kept"
             );
             if stopped.contains(&110) {
+                // What the torn stream had carried and how long it lived (round 4, item 10), beside the line above.
+                if let Some((setup, c)) = self.screen_carried.take() {
+                    let (all, video) = (c.all.load(Ordering::Relaxed), c.video.load(Ordering::Relaxed));
+                    eprintln!("{}", torn_screen_line(setup.elapsed(), all, video));
+                }
                 self.nudge_screen_back();
             }
             // The mic uplink is the INPUT leg of the type-100 MainAudio stream, so it dies WITH that
@@ -2516,6 +2576,7 @@ fn forward_screen2(
 /// stream's OUTPUT key (the key the C decrypts incoming data with), AAD = the 128-B header, nonce =
 /// 4 zero bytes ‖ a per-frame 64-bit LE counter from 0. opcode 0 = VideoFrame (AVCC), 1 = VideoConfig
 /// (avcC SPS/PPS). Faithful to AirPlayReceiverSessionScreen.c `_ProcessFrame`.
+/// `carried`: the main screen's count of what it carried, for its teardown's line ([`ScreenFrames`]); None for the cluster.
 fn spawn_screen(
     listener: TcpListener,
     shared: [u8; 32],
@@ -2523,6 +2584,7 @@ fn spawn_screen(
     sink_port: u16,
     alive: Arc<AtomicBool>,
     activity: Arc<AtomicU64>,
+    carried: Option<Arc<ScreenFrames>>,
 ) {
     thread::spawn(move || {
         let keys = derive_stream_keys(&shared, stream_connection_id);
@@ -2632,6 +2694,12 @@ fn spawn_screen(
             let body = &mut body_buf[..body_size];
             if !read_full(&mut sock, body, &alive) {
                 break;
+            }
+            if let Some(c) = &carried {
+                c.all.fetch_add(1, Ordering::Relaxed);
+                if opcode == 0 {
+                    c.video.fetch_add(1, Ordering::Relaxed);
+                }
             }
             // Diagnostics: dump the first frame's key material + bytes for offline decrypt analysis.
             if frames == 0 && counter == 0 {
@@ -3487,6 +3555,52 @@ mod tests {
         assert!(!screen_stream_live(&s.av_streams), "the screen went");
         assert!(crate::plock(&s.av_streams).keys().any(|(t, _)| *t == 111), "the alt screen stayed");
         // The session ends here, so the nudge thread finds it gone and sends nothing.
+        s.alive.store(false, Ordering::Release);
+    }
+
+    /// Round 4, item 10 (bench): the first nudge's wait from its file, 0-2500 ms, said; anything else the 500 ms default,
+    /// said as refused; no file, the default and no line. Always before the second nudge at 3 s.
+    #[test]
+    fn round4_the_first_screen_nudge_waits_as_the_bench_file_says() {
+        assert_eq!(screen_nudge_after(None), (SCREEN_NUDGE_AFTER, None), "no file: 500 ms, no line");
+        let (wait, line) = screen_nudge_after(Some("100"));
+        assert_eq!(wait, Duration::from_millis(100));
+        assert_eq!(
+            line.as_deref(),
+            Some("[bench] round4: screen_nudge_ms=100 (/tmp/bench_screen_nudge_ms): the first nudge 100 ms after the phone tore its screen down (default 500 ms)")
+        );
+        assert_eq!(screen_nudge_after(Some("0")).0, Duration::ZERO, "0: at once");
+        assert_eq!(screen_nudge_after(Some("2500")).0, Duration::from_millis(2500));
+        for bad in ["2501", "-1", "0.1", "soon", ""] {
+            let (wait, line) = screen_nudge_after(Some(bad));
+            assert_eq!(wait, SCREEN_NUDGE_AFTER, "{bad:?}");
+            assert!(line.is_some_and(|l| l.contains("refused") && l.ends_with("the default 500 ms")), "{bad:?}");
+        }
+        assert!(Duration::from_millis(2500) < SCREEN_NUDGE_AGAIN);
+    }
+
+    /// Round 4, item 10: the torn screen stream's line says how long it lived and what it carried, and its partial
+    /// TEARDOWN takes the stream's record with it.
+    #[test]
+    fn round4_a_torn_screen_stream_says_how_long_it_lived_and_what_it_carried() {
+        assert_eq!(
+            torn_screen_line(Duration::from_millis(31), 0, 0),
+            "[session] the screen stream was torn down 31 ms after its SETUP, having carried 0 frames (0 video)"
+        );
+        let mut s = AvSession::new();
+        let _screen = s.stream_flag(110);
+        let carried = Arc::new(ScreenFrames::default());
+        carried.all.fetch_add(3, Ordering::Relaxed);
+        carried.video.fetch_add(2, Ordering::Relaxed);
+        s.screen_carried = Some((Instant::now(), carried));
+        let mut stream = Dictionary::new();
+        stream.insert("type".into(), Value::Integer(110.into()));
+        let mut req = Dictionary::new();
+        req.insert("streams".into(), Value::Array(vec![Value::Dictionary(stream)]));
+        let mut body = Vec::new();
+        Value::Dictionary(req).to_writer_binary(&mut body).unwrap();
+        s.teardown(&body);
+        assert!(s.screen_carried.is_none(), "the teardown took the record (and printed its line)");
         s.alive.store(false, Ordering::Release);
     }
 
