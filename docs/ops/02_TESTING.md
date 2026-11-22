@@ -553,7 +553,7 @@ line adds its name and up to 13 digits to the widest: keep the 12-digit widest u
 One line per boot, beside the timeline but not in it, for the cold boot's radio path (docs/wireless/01_BT_AND_RADIO.md,
 "The cold boot"):
 
-    [radio-boot] v1 by=preload start=2050 caps=kept caps_ms=61 gpio=2330 order=together off=- wlan_start=2410 wlan_up=4460 wlan_free=4470 btfw_start=2420 btfw_end=4930 btfw=complete btfw_ms=2467 attach=4940 hci_up=5390 handover=on_owner handed=5420 tries=1 fallback=0 rc=0 host=3010
+    [radio-boot] v1 by=preload start=2050 caps=kept caps_ms=61 gpio=2330 order=together off=- wlan_start=2410 wlan_up=4460 wlan_free=4470 btfw_start=2420 btfw_end=4930 btfw=complete btfw_ms=2467 btfw_tries=1 attach=4940 hci_up=5390 handover=on_owner handed=5420 tries=1 fallback=0 rc=0 host=3010
 
 (the unit test's line, not a measurement). `radio_hal.sh` writes it into `/tmp/box.log` (and `/tmp/radio_boot`) once
 the first bring-up that attached Bluetooth this boot is over: the boot preload's, or a host's `bt_on` where no preload
@@ -575,6 +575,7 @@ timeline uses, but from power-up, not from the host's arrival; `-` is a value no
 | `wlan_free` | `together` in the preload: it let the wlan lock go, and a host's AP bring-up waiting on it may start |
 | `btfw_start`, `btfw_end` | the Bluetooth firmware push (`fw_loader_linux`) |
 | `btfw`, `btfw_ms` | what the loader said, `complete`, `error` or `other`, and its own time (`time:N`), `-` without one |
+| `btfw_tries` | the loader's runs in that bring-up (22 Nov 2026): `1`, or `2` when the first push failed and it was pushed once more; `btfw` and `btfw_ms` stay the first run's. Two failed pushes attach nothing (`attach=-`, `rc=1`: no `hciattach`, no reclaim+reset; `radio_hal.sh` `bt_fw_push`); `-` on a part with no loader |
 | `attach`, `hci_up` | the first attach launched; `hci0` answered a name read |
 | `handover` | whether the handover (R3-5) was asked for as the attach started: `on_owner` (`/script/radio_handover_on`), `on_bench` (`/tmp/bench_handover_on`), or `off`, the default |
 | `handed` | the preload handed the controller to the waiting host's session (R3-5, docs/wireless/01_BT_AND_RADIO.md "The cold boot" 6): claimed as `hci0` answered, handed over once the attach's Wi-Fi side was in; `-`: the handover not asked for (the default), no host as it answered, or a `bt_on`'s line |

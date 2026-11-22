@@ -868,7 +868,8 @@ do_preload() {
   # the gpio1 pulse) with the Wi-Fi driver loaded, the step radio_detect.sh's preload note records as wedging the kernel.
   # So the preload stops its own helper (bt_helper_stop: SIGTERM, then -9 on the helper; no reset, no rmmod), which takes
   # hci0 with it. In either order: 2.6.5 left the same helper after a failed Wi-Fi-first preload.
-  if [ "$_pr" = 1 ] && [ "${_bt_attached:-0}" = 1 ]; then
+  # No firmware pushed (_bt_nofw): no attach was started, so there is no helper to stop.
+  if [ "$_pr" = 1 ] && [ "${_bt_attached:-0}" = 1 ] && [ "${_bt_nofw:-0}" != 1 ]; then
     log "preload: the attach failed - its helper stopped (no reset, no rmmod): the host's bring-up starts on a free UART"
     bt_helper_stop
   fi
@@ -949,10 +950,11 @@ boot_line() {  # $1 = by (preload | bt_on), $2 = its exit code
   _bl_h=""; read -r _bl_h 2>/dev/null </tmp/host_present_uptime
   case "$_bl_h" in ''|0|*[!0-9]*) _bl_h=- ;; esac
   boot_note tries "${_bt_tries:-0}"
+  boot_note btfw_tries "${_bt_fw_runs:--}"   # the loader's runs (bt_fw_push: 2 when the first push failed)
   _bl=$(awk -v by="$1" -v rc="$2" -v host="$_bl_h" '
     NF >= 2 && !($1 in s) { s[$1] = $2 }
     END {
-      n = split("start caps caps_ms gpio order off wlan_start wlan_up wlan_free btfw_start btfw_end btfw btfw_ms attach hci_up handover handed tries fallback", k, " ")
+      n = split("start caps caps_ms gpio order off wlan_start wlan_up wlan_free btfw_start btfw_end btfw btfw_ms btfw_tries attach hci_up handover handed tries fallback", k, " ")
       line = "[radio-boot] v1 by=" by
       for (i = 1; i <= n; i++) {
         val = "-"
@@ -1332,6 +1334,21 @@ bt_fw_preload() {
   return 1
 }
 
+# The firmware push (22 Nov 2026): the loader once, and once more when it failed. 0: pushed (or none to push); 1: not,
+# and the caller attaches nothing, with no hciattach and no reclaim+reset: an attach against a chip left without its
+# firmware is what preceded the silent box of the 22 Nov bench. _bt_nofw says so to the preload's end (no helper to
+# stop), and the boot line counts the runs (btfw_tries).
+bt_fw_push() {
+  _bt_nofw=0
+  bt_fw_preload && return 0
+  log "  the firmware push failed - pushing it once more"
+  bt_fw_preload && return 0
+  _bt_nofw=1
+  log "  the firmware push failed twice - no attach: no hciattach, no reset"
+  publish "$BT_STATE" "result=fail" "backend=mapped" "chipset=$RADIO_SDIO_DEVICE" "detail=no-firmware"
+  return 1
+}
+
 # Attach and converge, $1 tries. Clause 1: the attach runs detached so a helper that blocks cannot hang this verb, but
 # we DO NOT return until it converges. That is the whole difference from the vendor path, which forks the attach and
 # returns immediately. RADIO_BT_MAX_TRIES: the boot preload passes 1, so it never reaches reclaim+reset (attempt 1 only
@@ -1446,8 +1463,12 @@ bt_attach_mapped() {
 
   ko_unpack || log "driver tarball ${RADIO_KO_TARBALL:-<none>} did not unpack"
   bt_ldisc_ready
-  bt_fw_preload
-  bt_attach_loop "$1"; _bam_rc=$?
+  # No firmware pushed (bt_fw_push, twice): no attach, so none of the reclaim+reset tries either.
+  if bt_fw_push; then
+    bt_attach_loop "$1"; _bam_rc=$?
+  else
+    _bam_rc=1
+  fi
   bt_handover_give   # nothing left to join: wlan_first brought the Wi-Fi interface up first, bt_alone brings none
   return $_bam_rc
 }
@@ -1490,8 +1511,13 @@ bt_attach_together() {
     exit $((_btw_rc + 2 * _btw_freed))
   ) &
   _btw_job=$!
-  bt_fw_preload
-  bt_attach_loop 1; _btw_bt=$?
+  # No firmware pushed (bt_fw_push, twice): no attach, and the fallback, its mark and the guard's count as for any
+  # together attach that gave no responsive hci0 (below).
+  if bt_fw_push; then
+    bt_attach_loop 1; _btw_bt=$?
+  else
+    _btw_bt=1
+  fi
   # Clause 1: nothing this verb started still in flight when it returns. The Wi-Fi driver has been the shorter of the
   # two (2.0 s against 3.24 on the bench), so this rarely waits.
   wait "$_btw_job"; _btw_wl=$?
