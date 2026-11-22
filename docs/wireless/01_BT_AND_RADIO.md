@@ -798,8 +798,9 @@ verb returns (clause 1). Today's order (`bt_attach_mapped`) is the code of befor
   which a SoC restart or a power cut takes away (both empty `/tmp`) and reclaim+reset's gpio1 pulse does not (20 Nov),
   and a loader before it most likely waits out its 4 s for a boot loader (not measured). That is the together
   fallback's push, a host's `bt_on` after a preload whose attach failed, and a try after a reset, where the attach
-  always went on, failed loader or not. Each reclaim+reset is followed by a push before its attach. The boot line
-  counts the runs (`btfw_tries`).
+  always went on, failed loader or not. Each reclaim+reset is followed by a push before its attach, a loader run per
+  reset that 2.7.0 did not make: a full push if the pulse took the firmware away, else most likely its 4 s wait for a
+  boot loader, then the attach (not measured). The boot line counts the runs (`btfw_tries`).
 - **The guard**, as the preload's: a together attach is bracketed by `/script/.radio_together_inflight` (written and
   synced before it, removed after), so one that never finished (power lost or the box hung inside it) is found at the
   next attach; each failed or unfinished one counts in `/script/.radio_together_failed`, two in a row write the owner's
