@@ -254,7 +254,7 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
      And an iPhone 7 on iOS 15 tore down its screen stream about 30 ms after setting it up in 2 of 5
      sessions (4 of 5 on the bench before), leaving media and no video for minutes; when no new screen
      stream follows within 3 s, `carplayd` now sends `requestUI` again (`AvSession::nudge_screen_back`;
-     that wait 0.5 s from 13 Nov, and none on branch `round4` from 22 Nov: docs/ops/02_TESTING.md, "Round 4 switches").
+     that wait 0.5 s from 13 Nov, and none from 2.7.1, round 4 of 22 Nov: docs/ops/02_TESTING.md, "Round 4 switches").
      Why iOS 15 tears it down is not known; the failing sessions sent one more `modesChanged` before the
      screen SETUP than the good ones. **Bench 15 Nov (the Mac), two iPhones: 84 s lost.** A phone that
      knows the AP joins it ~1.5 s after its Bluetooth link, before its 0x5703 names it, so `carplayd`
@@ -927,8 +927,9 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
   Also open: whether the truck's 2025.02.25 attach script has the same IW416 branch (docs/ops/02_TESTING.md, "Cold
   boot: real power cycles", step 1); the AP brought up from the preload beside the firmware push; what the early start
   costs the gadget's enumeration; `tools/radio_hal_test.sh` and `tools/session_supervisor_test.sh` under BusyBox's sh
-  (no busybox on the Mac that built them); the attach loop's 0.5 s look, which can put up to 0.5 s between `hci0`
-  answering and `hci_up`. Source: docs/wireless/01_BT_AND_RADIO.md, "The cold boot".
+  (no busybox on the Mac that built them). The attach loop's 0.5 s look, which could put up to 0.5 s between `hci0`
+  answering and `hci_up`, is 0.1 s from 2.7.1 (round 4's `attach_poll`, on by default: docs/ops/02_TESTING.md,
+  "Round 4 switches"). Source: docs/wireless/01_BT_AND_RADIO.md, "The cold boot".
 
 - **The armed state (Bluetooth powered but invisible between host sessions, the AP configured ahead): benched
   16 Nov 2026, one wake open.** On the dev adapter 12 wakes and a cold boot (a restart by `reboot`, which keeps the

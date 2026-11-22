@@ -870,6 +870,13 @@ host's own start-up sharing the one core with them. So on the truck expect `hci_
 handover), a cold picture near 16.5 s of uptime (that boot: 16.85), against about 19 s on 2.6.5; the estimate above
 for a host at 3.0 s (`hci0` at 5.8 to 6.4 s) was too early.
 
+**From 2.7.1** (round 4, the owner's decisions of 22 Nov 2026; each on by default, with `off` in its file for 2.7.0's
+path: [../ops/02_TESTING.md](../ops/02_TESTING.md), "Round 4 switches"): `lock_take` looks every 0.05 s and the attach
+every 0.1 s (`page_trim`, `attach_poll`); with a host waiting, the preload sets no SCO lines and no name on its attach
+(btd's bring-up resets the controller and writes the name) and clears the together guard's mark after its locks
+(`page_trim`); and the supervisor starts btd at the host's arrival, waiting for `bt_on`'s end, with the handover not
+asked for (`btd_early`). The trace and figures above are 2.7.0's path.
+
 **5. The boot line** (`[radio-boot] v1`, one per boot): its keys are documented beside the timeline's in
 [../ops/02_TESTING.md](../ops/02_TESTING.md), "The boot's radio line".
 
