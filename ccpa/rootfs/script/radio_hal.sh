@@ -127,13 +127,15 @@ write_empty() { { true >"$1"; } 2>/dev/null; }
 # for each (its wifi_ap_on for wlan, its bt_on for bt), and a look every 0.5 s put up to half a second between the
 # preload letting go and the host's bring-up going on. Between looks only the sleep forks (the shell's own test sees
 # the lock go; the pid is read with `read`), so five looks a second cost no more than the two of before, which forked
-# cat and mkdir each time. Still 30 s at most, and a lock is still reclaimed only when its holder is gone.
+# cat and mkdir each time. Still 30 s at most, and a lock is still reclaimed only when its holder is gone. Since 2.7.1
+# every 0.05 s by default (round 4's page_trim, below).
 lock_take() {  # $1 = subsystem
   _lk="/tmp/.radio_lock_$1"; _n=0
-  # Round 4, item 6 (bench page_trim): a look every 0.05 s while it waits (20 a round, 600 in all: still 30 s at most),
-  # so a host's bt_on goes on within 50 ms of the boot preload letting the lock go, not 200.
-  _lks=0.2; _lkr=5; _lkm=150
-  if r4_on page_trim; then _lks=0.05; _lkr=20; _lkm=600; fi
+  # Round 4, item 6 (page_trim, on by default since 2.7.1): a look every 0.05 s while it waits (20 a round, 600 in all:
+  # still 30 s at most), so a host's bt_on goes on within 50 ms of the boot preload letting the lock go, not 200. Off
+  # (2.7.0's): the 0.2 s look. _lkt: the line's tag when a file turned it on.
+  _lks=0.2; _lkr=5; _lkm=150; _lkt=""
+  if r4_on page_trim; then _lks=0.05; _lkr=20; _lkm=600; _lkt=$_r4t; fi
   while ! mkdir "$_lk" 2>/dev/null; do
     _holder=""; read -r _holder 2>/dev/null <"$_lk/pid"
     if [ -n "$_holder" ] && ! pid_live "$_holder"; then
@@ -151,7 +153,7 @@ lock_take() {  # $1 = subsystem
     while :; do sleep "$_lks"; _lkw=$((_lkw + 1)); [ "$_lkw" -lt "$_lkr" ] && [ -d "$_lk" ] || break; done
     _n=$((_n + _lkw))
   done
-  [ "$_lks" = 0.05 ] && [ "$_n" -gt 0 ] && log "[bench] round4: page_trim ($_r4f): the $1 lock taken after about $((_n * 50)) ms of waiting, looked at every 0.05 s"
+  [ "$_lks" = 0.05 ] && [ "$_n" -gt 0 ] && log "${_lkt}the $1 lock taken after about $((_n * 50)) ms of waiting, looked at every 0.05 s"
   echo $$ > "$_lk/pid" 2>/dev/null
   lock_mine "$1" 1   # taken by this process, whether or not its pid could be written (lock_drop_own)
   # TWO traps, deliberately. In ash a trapped signal runs the handler and then RESUMES the
@@ -883,7 +885,7 @@ do_preload() {
   # Round 4's page trim: the together guard's mark, left for here by a converged attach a host was waiting on; one sync.
   if [ "${_bt_mark_late:-0}" = 1 ]; then
     rm -f "$TOGETHER_MARK" "$TOGETHER_FAILS"
-    log "[bench] round4: page_trim: the together guard's mark cleared after the locks went"
+    log "the together guard's mark cleared after the locks went"
   fi
   rm -f "$PRELOAD_MARK" "$PRELOAD_UNFINISHED"; sync
   # "done" only when Bluetooth came up (rc 0, or 2: already up); a failed attach says so, e.g. done_rc1, so the
@@ -1017,14 +1019,23 @@ TOGETHER_GUARD_AFTER=2
 # A bench flag: there, and not reading "off" (an empty file is set). The first line, with the shell's own read.
 bench_flag() { [ -e "$1" ] || return 1; _bfl=""; read -r _bfl 2>/dev/null <"$1"; [ "$_bfl" != off ]; }
 
-# ---- Round 4's bench switches (22 Nov 2026; docs/ops/02_TESTING.md, "Round 4 switches") -----------------------------
-# Each off by default, today's path then exactly as before. On with /tmp/bench_<name> (a reboot clears it) or, for a cold
-# boot, whose /tmp is empty, /etc/ocbm/bench_<name> on flash (OCBM's own state directory: updates keep it, the full way
-# back to stock removes it whole, so no remover names it); bench_flag's rule. Each says so in a "[bench] round4:" line
-# where it acts. 0: set, _r4f the file that set it; 1: not.
+# ---- Round 4's switches here (22 Nov 2026; docs/ops/02_TESTING.md, "Round 4 switches") -------------------------------
+# attach_poll and page_trim, both ON BY DEFAULT since 2.7.1 (the owner's decision of 22 Nov 2026). Each goes back to
+# 2.7.0's path, exactly, with "off" in /tmp/bench_<name> (a reboot clears it) or, for a cold boot, whose /tmp is empty,
+# in /etc/ocbm/bench_<name> on flash (OCBM's own state directory: updates keep it, the full way back to stock removes it
+# whole, so no remover names it). The first of the two that exists decides, so an "off" in /tmp overrides the flash
+# (box_common::bench_override's rule); any other text, an empty file or "on", is on. 0: on, 1: off. _r4f: the file that
+# decided, "" for the default; _r4t: "[bench] round4: <name> (<file>): " when a file turned it on, the tag its lines
+# carry then, else "" (the default's lines are plain). Its "off" says so where it would have acted.
 r4_on() {
-  for _r4f in "/tmp/bench_$1" "/etc/ocbm/bench_$1"; do bench_flag "$_r4f" && return 0; done
-  _r4f=""; return 1
+  _r4t=""
+  for _r4f in "/tmp/bench_$1" "/etc/ocbm/bench_$1"; do
+    [ -e "$_r4f" ] || continue
+    _r4v=""; read -r _r4v 2>/dev/null <"$_r4f"
+    [ "$_r4v" = off ] && return 1
+    _r4t="[bench] round4: $1 ($_r4f): "; return 0
+  done
+  _r4f=""; return 0
 }
 
 # The order the next attach takes: _bto = together | wlan_first | bt_alone, and _bto_off = why a part that could take
@@ -1365,19 +1376,22 @@ bt_fw_push() {
 # we DO NOT return until it converges. That is the whole difference from the vendor path, which forks the attach and
 # returns immediately. RADIO_BT_MAX_TRIES: the boot preload passes 1, so it never reaches reclaim+reset (attempt 1 only
 # reclaims a helper that is already running, which at boot none is). RADIO_ATTACH_POLLS is a test hook
-# (tools/radio_hal_test.sh): the looks, 0.5 s apart, an attempt gets to converge (30).
+# (tools/radio_hal_test.sh): the looks an attempt gets to converge at 0.5 s apart (30); attach_poll, below, makes them
+# 0.1 s apart and five times as many.
 RADIO_ATTACH_POLLS=${RADIO_ATTACH_POLLS:-30}
 case "$RADIO_ATTACH_POLLS" in ''|*[!0-9]*) RADIO_ATTACH_POLLS=30 ;; esac
 bt_attach_loop() {
   _helper=${RADIO_BT_ATTACH_CMD%% *}
   _try=0; _d=""; _bal_ok=0
-  # Round 4, item 8 (bench attach_poll): a look every 0.1 s, not 0.5, as hci0 comes up, which put hci_up up to half a
-  # second after hci0 answered; an attempt keeps its 15 s (five times the looks). A look with no hci0 forks one subshell
-  # (the glob's), and one with hci0 there but not up fails fast (ENETDOWN).
+  # Round 4, item 8 (attach_poll, on by default since 2.7.1): a look every 0.1 s, not 0.5, as hci0 comes up, which put
+  # hci_up up to half a second after hci0 answered; an attempt keeps its 15 s (five times the looks). A look with no hci0
+  # forks one subshell (the glob's), and one with hci0 there but not up fails fast (ENETDOWN). Off: 2.7.0's 0.5 s look.
   _bal_s=0.5; _bal_n=$RADIO_ATTACH_POLLS
   if r4_on attach_poll; then
     _bal_s=0.1; _bal_n=$((RADIO_ATTACH_POLLS * 5))
-    log "[bench] round4: attach_poll ($_r4f): hci0 looked at every 0.1 s as the attach converges, not 0.5 s"
+    [ -n "$_r4t" ] && log "${_r4t}hci0 looked at every 0.1 s as the attach converges, not 0.5 s"
+  else
+    log "[bench] round4: attach_poll=off ($_r4f): hci0 looked at every 0.5 s as the attach converges, as in 2.7.0"
   fi
   while [ "$_try" -lt "$1" ]; do
     _try=$((_try+1))
@@ -1415,12 +1429,18 @@ bt_attach_loop() {
       return 0
     fi
     bt_power_stamp
-    # Round 4, item 6 (bench page_trim), a host waiting on this preload: no SCO lines and no name set here (0.39 s of
-    # hci_up to the first page). The host's session resets the controller before it uses it (btd's DOWN/UP), and btd
-    # writes the name, class, Simple Pairing and EIR itself (bt_bringup.rs prepare); the vendor's SCO set-up never
-    # outlived that reset (apply_sco), as the handover's claim already relies on. The name files only where they change.
-    if [ "$VERB" = preload ] && host_here && r4_on page_trim; then
-      log "[bench] round4: page_trim ($_r4f): a host is waiting - no SCO lines and no name set on $_d (btd's bring-up resets the controller and writes the name)"
+    # Round 4, item 6 (page_trim, on by default since 2.7.1), a host waiting on this preload: no SCO lines and no name set
+    # here (0.39 s of hci_up to the first page). The host's session resets the controller before it uses it (btd's
+    # DOWN/UP), and btd writes the name, class, Simple Pairing and EIR itself (bt_bringup.rs prepare); the vendor's SCO
+    # set-up never outlived that reset (apply_sco), as the handover's claim already relies on. The name files only where
+    # they change. Off (2.7.0's): both set, as with no host.
+    _bal_trim=0
+    if [ "$VERB" = preload ] && host_here; then
+      if r4_on page_trim; then _bal_trim=1
+      else log "[bench] round4: page_trim=off ($_r4f): a host is waiting - SCO lines and the name set on $_d, as in 2.7.0"; fi
+    fi
+    if [ "$_bal_trim" = 1 ]; then
+      log "${_r4t}a host is waiting - no SCO lines and no name set on $_d (btd's bring-up resets the controller and writes the name)"
       bt_name_files
     else
       # Vendor SCO tuning where the mapping carried it; non-fatal. Was a HARDCODED
@@ -1543,9 +1563,9 @@ bt_attach_together() {
   bt_handover_give
   if [ "$_btw_bt" = 0 ]; then
     if [ "$_btw_wl" = 0 ]; then
-      # Round 4, item 6 (bench page_trim), a host waiting on this preload: the guard's mark and count go once the locks
-      # have (do_preload), so their flash sync is off the path the host's bt_on waits on. A power cut in between counts
-      # this attach as unfinished: more careful, never less.
+      # Round 4, item 6 (page_trim, on by default since 2.7.1), a host waiting on this preload: the guard's mark and count
+      # go once the locks have (do_preload), so their flash sync is off the path the host's bt_on waits on. A power cut
+      # in between counts this attach as unfinished: more careful, never less. Off (2.7.0's): cleared here.
       if [ "$VERB" = preload ] && host_here && r4_on page_trim; then
         _bt_mark_late=1
       else

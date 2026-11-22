@@ -483,13 +483,14 @@ case_host() {
   check '! called "hciconfig hci0 down"' "a host is here: the preload leaves Bluetooth up for its session"
   check '[ "$(key by)" = preload ] && [ "$(key wlan_free)" != - ] && [ "$(key wlan_free)" -lt "$(key hci_up)" ]' \
     "  the boot line: by=preload, the wlan lock free (wlan_free) before hci0 answered"
-  # By default nothing of the handover (R3-5) runs: no claim, no handover file, the name and SCO set as before, the
-  # host's bt_on confirming it, and nothing "opened" for btd, whose DOWN/UP stays (the owner's decision, 21 Nov).
+  # By default nothing of the handover (R3-5) runs: no claim, no handover file, the host's bt_on confirming it, and
+  # nothing "opened" for btd, whose DOWN/UP stays (the owner's decision, 21 Nov). No name or SCO set by the preload with
+  # a host waiting: round 4's page_trim, on by default since 2.7.1 (case_round4), btd writes the name.
   check '! called "hciconfig hci0 up" && [ ! -e "$R/tmp/.radio_bt_handover" ] && said preload "handover: off (not asked for"' \
     "the handover not asked for (the default): no claim, no handover file"
   check '[ "$(key handover)" = off ] && [ "$(key handed)" = - ]' "  the boot line says so: handover=off handed=-"
-  check 'said bt_on "already converged" && ! said bt_on "handed over" && [ ! -s "$R/tmp/.radio_bt_warm" ] && [ -e "$R/state/hci0.name" ]' \
-    "  the host's bt_on confirms Bluetooth as before, leaves no opened word (btd's DOWN/UP stays), the name set by the preload"
+  check 'said bt_on "already converged" && ! said bt_on "handed over" && [ ! -s "$R/tmp/.radio_bt_warm" ] && [ ! -e "$R/state/hci0.name" ]' \
+    "  the host's bt_on confirms Bluetooth as before, leaves no opened word (btd's DOWN/UP stays), no name set by the preload"
   check '[ "$(grep -c "^t bt_power" "$R/tmp/startup_marks")" = 1 ]' "  bt_power once, the host's bt_on's"
   echo "== $SH: a host before the boot preload"
   unit
@@ -580,8 +581,8 @@ case_handover() {
   wait "$pre"
   check '[ "$(rc preload)" = 0 ] && [ "$(rc bt_on)" = 2 ] && said preload "handover: off (not asked for" && said bt_on "already converged"' \
     "a leftover off file: today's path, the host's bt_on after the preload"
-  check '[ ! -e "$R/tmp/.radio_bt_handover" ] && [ "$(key handover)" = off ] && [ "$(key handed)" = - ] && ! called "hciconfig hci0 up" && [ -e "$R/state/hci0.name" ]' \
-    "  no claim, no handover, the name set as before"
+  check '[ ! -e "$R/tmp/.radio_bt_handover" ] && [ "$(key handover)" = off ] && [ "$(key handed)" = - ] && ! called "hciconfig hci0 up" && [ ! -e "$R/state/hci0.name" ]' \
+    "  no claim, no handover, no name set (page_trim, the default)"
   check '[ "$(grep -c "^t bt_power" "$R/tmp/startup_marks")" = 1 ]' "  bt_power once, the host's bt_on's"
 
   echo "== $SH: a handover from before this host came"
@@ -785,10 +786,20 @@ case_locks() {
   rel=$!
   t0=$(date +%s)
   env RADIO_HAL_FUNCS=1 OCBM_TEST_PATH="$TESTPATH" STUB_R="$R" "$SH" -c '. "$1"; lock_take bt && echo "taken" >> "$2/calls"; lock_drop bt' \
-    sh "$R/script/radio_hal.sh" "$R"
+    sh "$R/script/radio_hal.sh" "$R" > "$R/out.lock0" 2>&1
   t1=$(date +%s)
   wait "$rel"; wait "$holder" 2>/dev/null
   check 'before "released" "taken" && [ $((t1 - t0)) -le 3 ]' "a held lock is waited for, and taken once it goes"
+  check 'grep -q "the bt lock taken after about [0-9]* ms of waiting, looked at every 0.05 s" "$R/out.lock0" && ! grep -q round4 "$R/out.lock0"' \
+    "  looked at every 0.05 s while it waited (round 4's page_trim, on by default since 2.7.1), said in a plain line"
+  mkdir "$R/tmp/.radio_lock_bt"; sleep 30 & holder=$!; echo "$holder" > "$R/tmp/.radio_lock_bt/pid"
+  ( sleep 1; kill "$holder" 2>/dev/null; rm -rf "$R/tmp/.radio_lock_bt" ) &
+  rel=$!
+  echo off > "$R/tmp/bench_page_trim"
+  env RADIO_HAL_FUNCS=1 OCBM_TEST_PATH="$TESTPATH" STUB_R="$R" "$SH" -c '. "$1"; lock_take bt && echo "taken at 0.2" >> "$2/calls"; lock_drop bt' \
+    sh "$R/script/radio_hal.sh" "$R" > "$R/out.lock0" 2>&1
+  wait "$rel"; wait "$holder" 2>/dev/null; rm -f "$R/tmp/bench_page_trim"
+  check 'called "taken at 0.2" && ! grep -q "lock taken after" "$R/out.lock0"' "  with page_trim off: 2.7.0's 0.2 s look, no line"
   sh -c 'exit 0' & gone=$!; wait "$gone"
   mkdir "$R/tmp/.radio_lock_bt"; echo "$gone" > "$R/tmp/.radio_lock_bt/pid"
   env RADIO_HAL_FUNCS=1 OCBM_TEST_PATH="$TESTPATH" STUB_R="$R" "$SH" -c '. "$1"; lock_take bt && echo "taken again" >> "$2/calls"; lock_drop bt' \
@@ -956,21 +967,31 @@ case_fwpush() {
 }
 
 case_round4() {
-  # ---- round 4's bench switches (22 Nov 2026), each on by its file on flash (/etc/ocbm/bench_<name>) ------------------
-  echo "== $SH: round 4, attach_poll: hci0 looked at every 0.1 s"
+  # ---- round 4's switches here (22 Nov 2026): attach_poll and page_trim, on by default since 2.7.1; "off" in a file for
+  # 2.7.0's path, the first of /tmp/bench_<name> and /etc/ocbm/bench_<name> that is there deciding --------------------
+  echo "== $SH: round 4, attach_poll: hci0 looked at every 0.1 s by default"
   # The scratch clock is coarse and runs a little slow, so the two looks are compared with each other, not with a figure.
   unit; echo off > "$R/etc/ocbm/bench_attach_poll"
   WLAN_SECS=0.3 FW_SECS=0.2 hal preload
   slow=$(( $(key hci_up) - $(key attach) ))
-  check '[ "$(rc preload)" = 0 ] && ! said preload "round4"' "reading off: the 0.5 s look, as before, and no round-4 line"
+  check '[ "$(rc preload)" = 0 ] && said preload "[bench] round4: attach_poll=off ($R/etc/ocbm/bench_attach_poll): hci0 looked at every 0.5 s as the attach converges, as in 2.7.0"' \
+    "off on flash: the 0.5 s look, as in 2.7.0, said so"
+  unit
+  WLAN_SECS=0.3 FW_SECS=0.2 hal preload
+  check '[ "$(rc preload)" = 0 ] && ! said preload "attach_poll" && ! said preload "round4"' \
+    "no file: on, the preload converges, and no round-4 line"
+  check '[ $(( $(key hci_up) - $(key attach) )) -lt "$slow" ]' "  hci_up sooner after the attach than with the 0.5 s look"
   unit; : > "$R/etc/ocbm/bench_attach_poll"
   WLAN_SECS=0.3 FW_SECS=0.2 hal preload
   check '[ "$(rc preload)" = 0 ] && said preload "[bench] round4: attach_poll ($R/etc/ocbm/bench_attach_poll): hci0 looked at every 0.1 s"' \
-    "on: the preload converges, and says the switch is on"
-  check '[ $(( $(key hci_up) - $(key attach) )) -lt "$slow" ]' "  hci_up sooner after the attach than with the 0.5 s look"
+    "an empty file on flash, as the bench left it: on, and says the file"
+  unit; : > "$R/etc/ocbm/bench_attach_poll"; echo off > "$R/tmp/bench_attach_poll"
+  WLAN_SECS=0.3 FW_SECS=0.2 hal preload
+  check '[ "$(rc preload)" = 0 ] && said preload "[bench] round4: attach_poll=off ($R/tmp/bench_attach_poll)"' \
+    "off in /tmp over the flash's on: off (the first file there decides)"
 
-  echo "== $SH: round 4, page_trim: a host during the boot preload"
-  unit; : > "$R/etc/ocbm/bench_page_trim"
+  echo "== $SH: round 4, page_trim: a host during the boot preload, by default"
+  unit
   ( WLAN_SECS=0.8 FW_SECS=1.6 hal preload ) &
   pre=$!
   waitfor 'called "insmod moal start"' 50
@@ -978,13 +999,13 @@ case_round4() {
   wait "$pre"
   check '[ "$(rc preload)" = 0 ] && [ "$(rc bt_on)" = 2 ] && [ "$(rc wifi_ap_on)" = 0 ] && said bt_on "already converged"' \
     "the preload converges, the host's bt_on confirms Bluetooth up (rc 2), the AP comes up"
-  check 'said preload "[bench] round4: page_trim ($R/etc/ocbm/bench_page_trim): a host is waiting - no SCO lines and no name set on hci0" && [ ! -e "$R/state/hci0.name" ]' \
-    "  no name set on the controller by the preload, said so"
+  check 'said preload "a host is waiting - no SCO lines and no name set on hci0" && [ ! -e "$R/state/hci0.name" ] && ! said preload "round4"' \
+    "  no name set on the controller by the preload, said in a plain line"
   check '[ "$(cat "$R/etc/.custom_bluetooth_name")" = CarLink-a1b2 ] && [ "$(cat "$R/etc/bluetooth_name")" = CarLink-a1b2 ]' \
     "  the two name files written all the same"
-  check 'said preload "[bench] round4: page_trim: the together guard'"'"'s mark cleared after the locks went" && [ ! -e "$R/script/.radio_together_inflight" ] && [ ! -e "$R/script/.radio_together_failed" ]' \
+  check 'said preload "the together guard'"'"'s mark cleared after the locks went" && [ ! -e "$R/script/.radio_together_inflight" ] && [ ! -e "$R/script/.radio_together_failed" ]' \
     "  the together guard's mark gone, after the locks"
-  check 'said bt_on "[bench] round4: page_trim ($R/etc/ocbm/bench_page_trim): the bt lock taken after about" && said bt_on "looked at every 0.05 s"' \
+  check 'said bt_on "the bt lock taken after about" && said bt_on "looked at every 0.05 s" && ! said bt_on "round4"' \
     "  the host's bt_on waited for the bt lock with a look every 0.05 s"
   check '! called "hciconfig hci0 down" && [ ! -e "$R/tmp/.radio_bt_handover" ] && [ ! -s "$R/tmp/.radio_bt_warm" ]' \
     "  Bluetooth left up for the host, no handover, nothing opened (btd's DOWN/UP stays)"
@@ -997,8 +1018,30 @@ case_round4() {
   check '[ "$(rc preload)" = 0 ] && said preload "a host is waiting - no SCO lines and no name set" && [ "$(inode "$R/etc/bluetooth_name")" = "$i0" ] && [ "$(inode "$R/etc/.custom_bluetooth_name")" = "$i1" ]' \
     "  the next boot's, with the name the files hold: neither written again"
 
-  echo "== $SH: round 4, page_trim: the boot preload alone"
+  echo "== $SH: round 4, page_trim: on by a file on flash, off by one in /tmp"
   unit; : > "$R/etc/ocbm/bench_page_trim"
+  ( WLAN_SECS=0.8 FW_SECS=1.6 hal preload ) &
+  pre=$!
+  waitfor 'called "insmod moal start"' 50
+  WLAN_SECS=0.8 FW_SECS=1.6 AP_SECS=2.5 host_bringup
+  wait "$pre"
+  check 'said preload "[bench] round4: page_trim ($R/etc/ocbm/bench_page_trim): a host is waiting - no SCO lines and no name set on hci0" && [ ! -e "$R/state/hci0.name" ]' \
+    "an empty file on flash, as the bench left it: on, and says the file"
+  check 'said bt_on "[bench] round4: page_trim ($R/etc/ocbm/bench_page_trim): the bt lock taken after about"' "  its lock wait's line too"
+  unit; : > "$R/etc/ocbm/bench_page_trim"; echo off > "$R/tmp/bench_page_trim"
+  ( WLAN_SECS=0.8 FW_SECS=1.6 hal preload ) &
+  pre=$!
+  waitfor 'called "insmod moal start"' 50
+  WLAN_SECS=0.8 FW_SECS=1.6 AP_SECS=2.5 host_bringup
+  wait "$pre"
+  check '[ "$(rc preload)" = 0 ] && [ "$(rc bt_on)" = 2 ] && said preload "[bench] round4: page_trim=off ($R/tmp/bench_page_trim): a host is waiting - SCO lines and the name set on hci0, as in 2.7.0"' \
+    "off in /tmp over the flash's on: 2.7.0's preload, said so"
+  check '[ -e "$R/state/hci0.name" ] && ! said preload "mark cleared after the locks" && [ ! -e "$R/script/.radio_together_inflight" ]' \
+    "  the name set on the controller, the guard's mark cleared before the locks went, as in 2.7.0"
+  check '! said bt_on "looked at every 0.05 s"' "  the host's bt_on: no 0.05 s look"
+
+  echo "== $SH: round 4, page_trim: the boot preload alone"
+  unit
   WLAN_SECS=0.4 FW_SECS=0.4 hal preload
   check '[ "$(rc preload)" = 0 ] && [ -e "$R/state/hci0.name" ] && ! said preload "a host is waiting" && ! said preload "mark cleared after the locks"' \
     "no host: the name set and the mark cleared as before"
