@@ -833,11 +833,26 @@ case_boot() {
   rm -f "$S/pkill"
 }
 
+case_round4() {
+  # ---- round 4's bench switches (22 Nov 2026), each on by its file on flash (/etc/ocbm/bench_<name>) ------------------
+  echo "== $SH: round 4, attach_poll: hci0 looked at every 0.1 s"
+  # The scratch clock is coarse and runs a little slow, so the two looks are compared with each other, not with a figure.
+  unit; echo off > "$R/etc/ocbm/bench_attach_poll"
+  WLAN_SECS=0.3 FW_SECS=0.2 hal preload
+  slow=$(( $(key hci_up) - $(key attach) ))
+  check '[ "$(rc preload)" = 0 ] && ! said preload "round4"' "reading off: the 0.5 s look, as before, and no round-4 line"
+  unit; : > "$R/etc/ocbm/bench_attach_poll"
+  WLAN_SECS=0.3 FW_SECS=0.2 hal preload
+  check '[ "$(rc preload)" = 0 ] && said preload "[bench] round4: attach_poll ($R/etc/ocbm/bench_attach_poll): hci0 looked at every 0.1 s"' \
+    "on: the preload converges, and says the switch is on"
+  check '[ $(( $(key hci_up) - $(key attach) )) -lt "$slow" ]' "  hci_up sooner after the attach than with the 0.5 s look"
+}
+
 . "$HERE/test_shells.sh"
 for SH in ${SHELLS:-$(distinct_shells sh dash)}; do
   command -v "$SH" >/dev/null 2>&1 || { echo "== $SH: not installed, skipped"; continue; }
   R="$T/$(basename "$SH").root"
-  for c in ${RH_ONLY:-kept order switches fallback host handover review gpio line unpack locks boot}; do "case_$c"; done
+  for c in ${RH_ONLY:-kept order switches fallback host handover review gpio line unpack locks boot round4}; do "case_$c"; done
   reap
 done
 [ "$fails" -eq 0 ] && echo "radio_hal_test: all passed ($passes checks)" || { echo "radio_hal_test: $fails failed"; exit 1; }

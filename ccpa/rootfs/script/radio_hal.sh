@@ -994,6 +994,16 @@ TOGETHER_GUARD_AFTER=2
 # A bench flag: there, and not reading "off" (an empty file is set). The first line, with the shell's own read.
 bench_flag() { [ -e "$1" ] || return 1; _bfl=""; read -r _bfl 2>/dev/null <"$1"; [ "$_bfl" != off ]; }
 
+# ---- Round 4's bench switches (22 Nov 2026; docs/ops/02_TESTING.md, "Round 4 switches") -----------------------------
+# Each off by default, today's path then exactly as before. On with /tmp/bench_<name> (a reboot clears it) or, for a cold
+# boot, whose /tmp is empty, /etc/ocbm/bench_<name> on flash (OCBM's own state directory: updates keep it, the full way
+# back to stock removes it whole, so no remover names it); bench_flag's rule. Each says so in a "[bench] round4:" line
+# where it acts. 0: set, _r4f the file that set it; 1: not.
+r4_on() {
+  for _r4f in "/tmp/bench_$1" "/etc/ocbm/bench_$1"; do bench_flag "$_r4f" && return 0; done
+  _r4f=""; return 1
+}
+
 # The order the next attach takes: _bto = together | wlan_first | bt_alone, and _bto_off = why a part that could take
 # together does not (owner | guard | bench | fallback), else "-". $1 = peek: count nothing (the probe verb).
 bt_order() {
@@ -1277,6 +1287,14 @@ case "$RADIO_ATTACH_POLLS" in ''|*[!0-9]*) RADIO_ATTACH_POLLS=30 ;; esac
 bt_attach_loop() {
   _helper=${RADIO_BT_ATTACH_CMD%% *}
   _try=0; _d=""; _bal_ok=0
+  # Round 4, item 8 (bench attach_poll): a look every 0.1 s, not 0.5, as hci0 comes up, which put hci_up up to half a
+  # second after hci0 answered; an attempt keeps its 15 s (five times the looks). A look with no hci0 forks one subshell
+  # (the glob's), and one with hci0 there but not up fails fast (ENETDOWN).
+  _bal_s=0.5; _bal_n=$RADIO_ATTACH_POLLS
+  if r4_on attach_poll; then
+    _bal_s=0.1; _bal_n=$((RADIO_ATTACH_POLLS * 5))
+    log "[bench] round4: attach_poll ($_r4f): hci0 looked at every 0.1 s as the attach converges, not 0.5 s"
+  fi
   while [ "$_try" -lt "$1" ]; do
     _try=$((_try+1)); _bt_tries=$((${_bt_tries:-0} + 1))
     if [ "$_try" -gt 1 ] || pgrep -x "$_helper" >/dev/null 2>&1 || ps | grep -v grep | grep -qw "$_helper"; then
@@ -1286,9 +1304,9 @@ bt_attach_loop() {
     boot_mark attach
     setsid $RADIO_BT_ATTACH_CMD </dev/null >/tmp/radio_bt_attach.log 2>&1 &
     _n=0
-    while [ "$_n" -lt "$RADIO_ATTACH_POLLS" ]; do
+    while [ "$_n" -lt "$_bal_n" ]; do
       _d=$(hci_dev 2>/dev/null) && bt_responsive "$_d" && { _bal_ok=1; break; }
-      _n=$((_n+1)); sleep 0.5
+      _n=$((_n+1)); sleep "$_bal_s"
     done
     # One last look once the looks ran out. An answer above stands: two further name reads (a healthy RTL8822CS missed
     # about one in four, bt_responsive_confirmed) used to undo it, and a preload's one try then counted toward the
