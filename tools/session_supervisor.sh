@@ -997,8 +997,9 @@ go_watch() {
 # answers (radio_hal.sh, "The handover": the host's bt_on then touches nothing), or on that file: today's bring-up.
 # OPT-IN, OFF BY DEFAULT (the owner's decision, 21 Nov 2026, after 2 of 6 boots with link trouble on the bench of
 # 4a6ce9c against 0 of 9 without; radio_hal.sh, "OPT-IN"): only with the owner's /script/radio_handover_on or the
-# bench's /tmp/bench_handover_on. Without either, any other start, and a failed armed go's fallback take today's
-# wrapper: bt_on, then btd. The retired /script/radio_handover_off is read by nothing.
+# bench's /tmp/bench_handover_on. Without either, btd still starts first while the preload runs, by btd_early (below,
+# on by default since 2.7.1), and waits for that file; with btd_early off, any other start, and a failed armed go's
+# fallback take today's wrapper: bt_on, then btd. The retired /script/radio_handover_off is read by nothing.
 PRELOAD_STATE=${PRELOAD_STATE:-/tmp/radio_preload_state}            # radio_hal.sh's preload states, one per line
 HANDOVER_ON_FILE=${HANDOVER_ON_FILE:-/script/radio_handover_on}     # the owner's opt-in, on flash
 HANDOVER_BENCH_ON=${HANDOVER_BENCH_ON:-/tmp/bench_handover_on}      # the bench's (box_common::bench_flag's rule)
@@ -1015,21 +1016,23 @@ handover_on() {
   _hon=""; read -r _hon 2>/dev/null <"$HANDOVER_BENCH_ON"
   [ "$_hon" != off ]
 }
-# Round 4, item 6 (bench btd_early, 22 Nov 2026; docs/ops/02_TESTING.md, "Round 4 switches"): the same early btd while
-# the boot preload runs, with the handover NOT asked for. Nothing is handed over (radio_hal.sh claims nothing without the
+# Round 4, item 6 (btd_early, 22 Nov 2026; docs/ops/02_TESTING.md, "Round 4 switches"): the same early btd while the
+# boot preload runs, with the handover NOT asked for. Nothing is handed over (radio_hal.sh claims nothing without the
 # handover's own opt-in), so btd waits for the file that says bt_on is over (crates/vendor/wireless/src/handover.rs,
 # Go::BtOn) and brings Bluetooth up as today, DOWN/UP and all: only its exec and start (about 0.35 s from bt_on's end)
-# move off the path. Off by default. On with /tmp/bench_btd_early or, for a cold boot, /etc/ocbm/bench_btd_early on flash
-# (set unless it reads "off"); _beo is the file that set it.
+# move off the path. ON BY DEFAULT since 2.7.1 (the owner's decision of 22 Nov 2026). Off, 2.7.0's wrapper (bt_on, then
+# btd), with "off" in /tmp/bench_btd_early or, for a cold boot, in /etc/ocbm/bench_btd_early on flash: the first of the
+# two that exists decides, so an "off" in /tmp overrides the flash; any other text (empty, "on") is on. 0: on, 1: off;
+# _beo is the file that decided, "" for the default.
 BTD_EARLY_BENCH_ON=${BTD_EARLY_BENCH_ON:-/tmp/bench_btd_early}
 BTD_EARLY_ON_FILE=${BTD_EARLY_ON_FILE:-/etc/ocbm/bench_btd_early}
 btd_early_on() {
   for _beo in "$BTD_EARLY_BENCH_ON" "$BTD_EARLY_ON_FILE"; do
     [ -e "$_beo" ] || continue
     _beo_v=""; read -r _beo_v 2>/dev/null <"$_beo"
-    [ "$_beo_v" != off ] && return 0
+    [ "$_beo_v" != off ]; return
   done
-  _beo=""; return 1
+  _beo=""; return 0
 }
 
 wireless_up() {
@@ -1113,10 +1116,15 @@ wireless_up() {
   # The cold boot (above): btd first, waiting, while the boot preload attaches Bluetooth, when the handover is asked for.
   _wu_early=0
   if [ "$_wu_fb" = 0 ] && preload_running && handover_on; then _wu_early=1; fi
-  # Round 4 (bench btd_early, above): the early btd with the handover off; it waits for bt_on's end.
-  if [ "$_wu_early" = 0 ] && [ "$_wu_fb" = 0 ] && preload_running && btd_early_on; then
-    _wu_early=1
-    echo "[sup] [bench] round4: btd_early ($_beo): the handover is off - btd starts now and waits for bt_on to end, then brings Bluetooth up as today"
+  # Round 4 (btd_early, above; on by default since 2.7.1): the early btd with the handover off; it waits for bt_on's end.
+  # A file that decides says so; the default has the bring-up's own line below.
+  if [ "$_wu_early" = 0 ] && [ "$_wu_fb" = 0 ] && preload_running; then
+    if btd_early_on; then
+      _wu_early=1
+      [ -n "$_beo" ] && echo "[sup] [bench] round4: btd_early ($_beo): the handover is off - btd starts now and waits for bt_on to end, then brings Bluetooth up as today"
+    else
+      echo "[sup] [bench] round4: btd_early=off ($_beo): bt_on first, then btd, as in 2.7.0"
+    fi
   fi
   if [ "$_wu_fb" = 1 ]; then
     echo "[sup] host PRESENT + wireless enabled -> CLEAN bring-up of Bluetooth after the failed armed go (detached, pairing=$mode) at uptime $(cut -d' ' -f1 /proc/uptime)"
