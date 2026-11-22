@@ -54,6 +54,9 @@ struct Round4 {
     /// later page at the round's ([`round_page_slots`]). 8192 is the controller's 5.12 s: a phone that answers a cold
     /// page late (3.4-4.3 s on the truck) is reached on that first page.
     first_page_slots: Option<u16>,
+    /// Item 2 (`first_retry_ms`, 0-60000 ms): the pause after a failed first round, for [`FIRST_RETRY_SECS`]. Still once
+    /// per loop, and a round pages at least one phone, so 0 cannot spin.
+    first_retry_ms: Option<u64>,
 }
 
 impl Round4 {
@@ -62,17 +65,20 @@ impl Round4 {
     fn from(get: impl Fn(&str) -> Option<(String, String)>) -> (Round4, Vec<String>) {
         let mut r = Round4::default();
         let mut lines = Vec::new();
-        if let Some((text, at)) = get("first_page_slots") {
-            match text.parse::<u16>() {
-                Ok(n) if n > 0 => {
-                    r.first_page_slots = Some(n);
-                    lines.push(format!(
-                        "[bench] round4: first_page_slots={n} ({at}): the first page of the first round {} ms; every other page the round's",
-                        slots_ms(n)
-                    ));
-                }
-                _ => lines.push(refused(&at, &text, "slots, 1-65535")),
-            }
+        if let Some((n, at)) = number(&get, &mut lines, "first_page_slots", 1, u64::from(u16::MAX), "slots") {
+            let n = n as u16;
+            r.first_page_slots = Some(n);
+            lines.push(format!(
+                "[bench] round4: first_page_slots={n} ({at}): the first page of the first round {} ms; every other page the round's",
+                slots_ms(n)
+            ));
+        }
+        if let Some((ms, at)) = number(&get, &mut lines, "first_retry_ms", 0, 60_000, "ms") {
+            r.first_retry_ms = Some(ms);
+            lines.push(format!(
+                "[bench] round4: first_retry_ms={ms} ({at}): after a failed first round the next one in {ms} ms, once (default {} ms)",
+                FIRST_RETRY_SECS * 1000
+            ));
         }
         (r, lines)
     }
@@ -84,6 +90,26 @@ impl Round4 {
             log(l);
         }
         r
+    }
+}
+
+/// Switch `name`'s whole number in `lo..=hi` (`unit`), and the file it came from; a text that is not one is refused,
+/// with a line in `lines`.
+fn number(
+    get: &impl Fn(&str) -> Option<(String, String)>,
+    lines: &mut Vec<String>,
+    name: &str,
+    lo: u64,
+    hi: u64,
+    unit: &str,
+) -> Option<(u64, String)> {
+    let (text, at) = get(name)?;
+    match text.parse::<u64>() {
+        Ok(n) if (lo..=hi).contains(&n) => Some((n, at)),
+        _ => {
+            lines.push(refused(&at, &text, &format!("{unit} {lo}-{hi}")));
+            None
+        }
     }
 }
 
@@ -184,13 +210,14 @@ impl Rounds {
 
 /// The wait before the next round: [`FIRST_RETRY_SECS`] once after a failed first round; [`EARLY_GAP_SECS`] in the
 /// first [`EARLY_WINDOW`] after a host came (`early`); else the backoff, which starts doubling only after that window.
-fn round_gap(quick: bool, early: bool, backoff: u64) -> u64 {
+/// Round 4's bench switch `r4` may set the first ([`Round4::first_retry_ms`]).
+fn round_gap(quick: bool, early: bool, backoff: u64, r4: &Round4) -> Duration {
     if quick {
-        FIRST_RETRY_SECS
+        r4.first_retry_ms.map_or(Duration::from_secs(FIRST_RETRY_SECS), Duration::from_millis)
     } else if early {
-        EARLY_GAP_SECS.min(backoff)
+        Duration::from_secs(EARLY_GAP_SECS.min(backoff))
     } else {
-        backoff
+        Duration::from_secs(backoff)
     }
 }
 
@@ -309,6 +336,20 @@ fn sleep_or_request(secs: u64, shutdown: &AtomicBool, ctrl: &Control) -> bool {
             return true;
         }
         thread::sleep(Duration::from_secs(1));
+    }
+    !shutdown.load(Ordering::Relaxed)
+}
+
+/// [`sleep_or_request`] to the millisecond, for a round's gap (round 4's bench switches can set one under a second): its
+/// whole seconds as [`sleep_or_request`] sleeps them, then the rest unless a request came first. A gap of whole seconds
+/// sleeps exactly as before.
+fn sleep_or_request_for(gap: Duration, shutdown: &AtomicBool, ctrl: &Control) -> bool {
+    if !sleep_or_request(gap.as_secs(), shutdown, ctrl) {
+        return false;
+    }
+    let rest = gap.saturating_sub(Duration::from_secs(gap.as_secs()));
+    if !rest.is_zero() && !ctrl.has_request() {
+        thread::sleep(rest);
     }
     !shutdown.load(Ordering::Relaxed)
 }
@@ -601,6 +642,8 @@ trait Env {
     fn sleep(&self, secs: u64) -> bool;
     /// Sleep `secs`, cut short by a connect request, false on shutdown ([`sleep_or_request`]).
     fn sleep_or_request(&self, secs: u64) -> bool;
+    /// A round's gap, to the millisecond ([`sleep_or_request_for`]).
+    fn sleep_or_request_for(&self, gap: Duration) -> bool;
     /// Since the loop started (a host has just come).
     fn elapsed(&self) -> Duration;
     /// The monotonic and wall clocks and the link-key store's last write, for [`ResetStreak::note`].
@@ -656,6 +699,9 @@ impl Env for OnBox<'_> {
     }
     fn sleep_or_request(&self, secs: u64) -> bool {
         sleep_or_request(secs, self.shutdown, self.ctrl)
+    }
+    fn sleep_or_request_for(&self, gap: Duration) -> bool {
+        sleep_or_request_for(gap, self.shutdown, self.ctrl)
     }
     fn elapsed(&self) -> Duration {
         self.started.elapsed()
@@ -1066,10 +1112,13 @@ fn run_loop(env: &impl Env, ctrl: &Control) {
         let quick = first_round && !ran && !rejected;
         first_round = false;
         if quick {
-            log(&format!("first page round failed -- one quick retry in {FIRST_RETRY_SECS}s"));
+            match round4.first_retry_ms {
+                None => log(&format!("first page round failed -- one quick retry in {FIRST_RETRY_SECS}s")),
+                Some(ms) => env.bench(&format!("[bench] round4: first_retry_ms: first page round failed -- one quick retry in {ms} ms")),
+            }
         }
         let early = !rejected && env.elapsed() < EARLY_WINDOW;
-        if !env.sleep_or_request(round_gap(quick, early, backoff)) {
+        if !env.sleep_or_request_for(round_gap(quick, early, backoff, &round4)) {
             break;
         }
         if rejected {
@@ -1182,6 +1231,8 @@ mod tests {
         round4: super::Round4,
         /// Each Write_Page_Timeout ([`Env::page_slots`]): how many pages had gone, and the length.
         slots: std::cell::RefCell<Vec<(usize, u16)>>,
+        /// Each round's gap in ms ([`Env::sleep_or_request_for`]); `gaps` has them in whole seconds, with the other sleeps.
+        gaps_ms: std::cell::RefCell<Vec<u64>>,
     }
 
     impl<'a> Fake<'a> {
@@ -1204,12 +1255,25 @@ mod tests {
                 forgot_left: Default::default(),
                 round4: Default::default(),
                 slots: Default::default(),
+                gaps_ms: Default::default(),
             }
         }
 
         /// The phones paged in `round`, in order.
         fn paged(&self, round: usize) -> Vec<[u8; 6]> {
             self.pages.borrow().iter().filter(|(r, _)| *r == round).map(|(_, p)| *p).collect()
+        }
+
+        /// A gap of `secs` ends: the clock on, the next round, and the app's policy as it becomes there.
+        fn next_round(&self, secs: u64) {
+            self.gaps.borrow_mut().push(secs);
+            self.clock.set(self.clock.get() + secs);
+            self.round.set(self.round.get() + 1);
+            for (round, auto_connect, order) in &self.policy_at {
+                if *round == self.round.get() {
+                    self.ctrl.set_policy(crate::control::Policy { auto_connect: *auto_connect, order: order.clone() });
+                }
+            }
         }
     }
 
@@ -1235,15 +1299,14 @@ mod tests {
         }
         fn sleep_or_request(&self, secs: u64) -> bool {
             if secs > 0 {
-                self.gaps.borrow_mut().push(secs);
-                self.clock.set(self.clock.get() + secs);
-                self.round.set(self.round.get() + 1);
-                for (round, auto_connect, order) in &self.policy_at {
-                    if *round == self.round.get() {
-                        self.ctrl.set_policy(crate::control::Policy { auto_connect: *auto_connect, order: order.clone() });
-                    }
-                }
+                self.next_round(secs);
             }
+            !self.shutdown()
+        }
+        /// A round's gap: always the next round, one of 0 ms too (round 4's first_retry_ms).
+        fn sleep_or_request_for(&self, gap: Duration) -> bool {
+            self.gaps_ms.borrow_mut().push(gap.as_millis() as u64);
+            self.next_round(gap.as_secs());
             !self.shutdown()
         }
         fn elapsed(&self) -> Duration {
@@ -1750,9 +1813,50 @@ mod tests {
     /// The Mac, 13 Nov: rounds 5 s apart in the early window, and a backoff that starts at its window's end.
     #[test]
     fn rounds_are_5_s_apart_early_then_back_off_from_the_start() {
-        assert_eq!(round_gap(true, true, 10), FIRST_RETRY_SECS);
-        assert_eq!(round_gap(false, true, 10), EARLY_GAP_SECS);
-        assert_eq!(round_gap(false, false, BACKOFF_START_SECS), BACKOFF_START_SECS);
+        let s = Duration::from_secs;
+        let none = super::Round4::default();
+        assert_eq!(round_gap(true, true, 10, &none), s(FIRST_RETRY_SECS));
+        assert_eq!(round_gap(false, true, 10, &none), s(EARLY_GAP_SECS));
+        assert_eq!(round_gap(false, false, BACKOFF_START_SECS, &none), s(BACKOFF_START_SECS));
+    }
+
+    /// Round 4, item 2 (bench): the quick retry's pause as the switch says, once; nothing else moves.
+    #[test]
+    fn round4_first_retry_ms_sets_the_quick_retry_alone() {
+        let ms = Duration::from_millis;
+        let r4 = super::Round4 { first_retry_ms: Some(0), ..Default::default() };
+        assert_eq!(round_gap(true, true, 10, &r4), ms(0));
+        assert_eq!(round_gap(false, true, 10, &r4), Duration::from_secs(EARLY_GAP_SECS), "the early gap as before");
+        assert_eq!(round_gap(false, false, 40, &r4), Duration::from_secs(40), "the backoff as before");
+        let (r, lines) = round4_from(&[("first_retry_ms", "0")]);
+        assert_eq!(r.first_retry_ms, Some(0));
+        assert_eq!(
+            lines,
+            ["[bench] round4: first_retry_ms=0 (/etc/ocbm/bench_first_retry_ms): after a failed first round the next one in 0 ms, once (default 2000 ms)"]
+        );
+        for bad in ["60001", "-5", "2s", ""] {
+            assert_eq!(round4_from(&[("first_retry_ms", bad)]).0, super::Round4::default(), "{bad:?}");
+        }
+    }
+
+    /// Round 4, item 2 through the loop: 0 ms, the next round at once and only once; no switch, 2 s as in 2.7.0.
+    #[test]
+    fn round4_the_loop_retries_a_failed_first_round_as_the_switch_says() {
+        let ctrl = Control::default();
+        set_order(&ctrl, &[PHONE_A]);
+        let fake = Fake::new(&ctrl, 3, |_, _| Attempt::Absent);
+        run_loop(&fake, &ctrl);
+        assert_eq!(fake.gaps_ms.borrow()[..2], [2000, 5000], "no switch: 2 s, then the early window's 5 s");
+
+        let ctrl = Control::default();
+        set_order(&ctrl, &[PHONE_A]);
+        let mut fake = Fake::new(&ctrl, 3, |_, _| Attempt::Absent);
+        fake.round4.first_retry_ms = Some(0);
+        run_loop(&fake, &ctrl);
+        assert_eq!(fake.gaps_ms.borrow()[..2], [0, 5000], "at once, once");
+        assert_eq!((fake.paged(1), fake.paged(2)), (vec![PHONE_A], vec![PHONE_A]), "each round pages");
+        let logs = fake.logs.borrow();
+        assert!(logs.iter().any(|l| l == "[bench] round4: first_retry_ms: first page round failed -- one quick retry in 0 ms"), "{logs:?}");
     }
 
     /// The dev bench, 2 Nov: after a power cut the first-called iPhone answered and reset the link, and the
