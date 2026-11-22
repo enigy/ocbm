@@ -409,7 +409,7 @@ its `preload_nice` stays.
 
 | Name | Value | Default (2.7.1); `off`, 2.7.0's | Read | Does |
 |---|---|---|---|---|
-| `first_page_slots` | 1-65535 slots, or `off` | 8192 (5.12 s); `off`: the round's (6000 over several phones in the first round, 0x2000 otherwise) | btd, each session | the first page of the first round this long; every other page the round's. `6000` gives a 3.75 s first page, which is 2.7.0's only over several phones |
+| `first_page_slots` | 1-12800 slots (8 s), or `off` | 8192 (5.12 s); `off`: the round's (6000 over several phones in the first round, 0x2000 otherwise) | btd, each session | the first page of the first round this long; every other page the round's. `6000` gives a 3.75 s first page, which is 2.7.0's only over several phones. No more than 8 s: the SDP connect that carries the page has its own 8 s deadline, which would end a longer page there, as a failure rather than a page timeout |
 | `same_phone_repage` | flag, or `off` | on; `off`: the next phone | btd, each session | a re-page after a reset or cut that fails with EALREADY, EMLINK or EBUSY waits for the link (up to 1.5 s, then 0.3 s with none) and pages the same phone again, twice at most, then the next phone |
 | `rfcomm_limit_ms` | 1000-8000 ms, or `off` | 1500; `off` (or `8000`): no limit, the plain 8000 ms, then the next phone | btd, each session | the RFCOMM connect cut at this unless a pairing prompt holds it; its link dropped as a cut's, the phone paged once more (counted once a round, as a cut) |
 | `btd_early` | flag, or `off` | on; `off`: bt_on, then btd | the supervisor, at the host's arrival | with the boot preload running and the handover not asked for: btd started at once, waiting for bt_on's end, then today's bring-up |

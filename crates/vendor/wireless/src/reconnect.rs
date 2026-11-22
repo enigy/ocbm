@@ -50,6 +50,11 @@ const FIRST_ROUND_PAGE_SLOTS: u16 = 6_000;
 /// each phone in the driver's order, the first round's other pages 3.75 s, later rounds the full default.
 const FIRST_PAGE_SLOTS: u16 = 8_192;
 
+/// The longest first page a file may ask for ([`Round4::first_page_slots`]): 12800 slots, 8 s. The SDP connect that
+/// carries the page has its own [`CONNECT_TIMEOUT_SECS`] deadline (`sdp_client::wait_connected`), which would end a
+/// longer page there, and as a failure, not a page timeout (the 2.7.1 review).
+const FIRST_PAGE_SLOTS_MAX: u64 = CONNECT_TIMEOUT_SECS as u64 * 1000 * 8 / 5;
+
 /// The RFCOMM connect's limit by default since 2.7.1 ([`Round4::rfcomm_limit_ms`]): 1.5 s, the owner's decision of 22
 /// Nov 2026. 2.7.0 had none: the connect's plain [`CONNECT_TIMEOUT_SECS`], then the next phone.
 const RFCOMM_LIMIT_MS: u64 = 1_500;
@@ -64,10 +69,10 @@ const RFCOMM_LIMIT_MS: u64 = 1_500;
 /// defaults with plain lines.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Round4 {
-    /// Item 1 (`first_page_slots`, 1-65535 slots of 0.625 ms; default [`FIRST_PAGE_SLOTS`]): the first page of the
-    /// first round, at this length; every later page at the round's ([`round_page_slots`]). None ("off", 2.7.0's): that
-    /// page at the round's length too. 8192 is the controller's 5.12 s: a phone that answers a cold page late
-    /// (3.4-4.3 s on the truck) is reached on that first page.
+    /// Item 1 (`first_page_slots`, 1-12800 slots of 0.625 ms, [`FIRST_PAGE_SLOTS_MAX`]; default [`FIRST_PAGE_SLOTS`]):
+    /// the first page of the first round, at this length; every later page at the round's ([`round_page_slots`]). None
+    /// ("off", 2.7.0's): that page at the round's length too. 8192 is the controller's 5.12 s: a phone that answers a
+    /// cold page late (3.4-4.3 s on the truck) is reached on that first page.
     first_page_slots: Option<u16>,
     /// Item 2 (`first_retry_ms`, 0-60000 ms; off by default): the pause after a failed first round, for
     /// [`FIRST_RETRY_SECS`]. Still once per loop, and a round pages at least one phone, so 0 cannot spin.
@@ -121,7 +126,7 @@ impl Round4 {
             if text == "off" {
                 r.first_page_slots = None;
                 lines.push(format!("[bench] round4: first_page_slots=off ({at}): every page the round's, as in 2.7.0"));
-            } else if let Some(n) = number(&text, &at, &mut lines, 1, u64::from(u16::MAX), "slots") {
+            } else if let Some(n) = number(&text, &at, &mut lines, 1, FIRST_PAGE_SLOTS_MAX, "slots") {
                 let n = n as u16;
                 r.first_page_slots = Some(n);
                 lines.push(format!(
@@ -1645,7 +1650,9 @@ mod tests {
             ["[bench] round4: first_page_slots=6000 (/etc/ocbm/bench_first_page_slots): the first page of the first round 3750 ms; \
               every other page the round's (default 5120 ms)"]
         );
-        for bad in ["0", "65536", "-1", "5.12", "soon", ""] {
+        assert_eq!(super::FIRST_PAGE_SLOTS_MAX, 12_800, "8 s, the SDP connect's own deadline");
+        assert_eq!(round4_from(&[("first_page_slots", "12800")]).0.first_page_slots, Some(12_800));
+        for bad in ["0", "12801", "65535", "65536", "-1", "5.12", "soon", ""] {
             let (r, lines) = round4_from(&[("first_page_slots", bad)]);
             assert_eq!(r, super::Round4::default(), "{bad:?}");
             assert!(lines.len() == 1 && lines[0].contains("refused") && lines[0].ends_with("the default"), "{bad:?}: {lines:?}");
@@ -1681,14 +1688,14 @@ mod tests {
         assert_eq!(*fake.slots.borrow(), vec![(0, FIRST_ROUND_PAGE_SLOTS), (2, default)], "off: 3.75 s in round 1, then 5.12, as 2.7.0");
         assert!(fake.logs.borrow().is_empty(), "and no line");
 
-        // One phone: its first page takes the switch's length too (a 10.24 s page, for an uncensored answer time). At the
-        // default, the controller's own 5.12 s: nothing written, as in 2.7.0.
+        // One phone: its first page takes the switch's length too (7.5 s here; 8 s at most, the SDP connect's own
+        // deadline). At the default, the controller's own 5.12 s: nothing written, as in 2.7.0.
         let ctrl = Control::default();
         set_order(&ctrl, &[PHONE_A]);
         let mut fake = Fake::new(&ctrl, 2, |_, _| Attempt::Absent);
-        fake.round4.first_page_slots = Some(16384);
+        fake.round4.first_page_slots = Some(12_000);
         run_loop(&fake, &ctrl);
-        assert_eq!(*fake.slots.borrow(), vec![(0, 16384), (1, default)]);
+        assert_eq!(*fake.slots.borrow(), vec![(0, 12_000), (1, default)]);
         let ctrl = Control::default();
         set_order(&ctrl, &[PHONE_A]);
         let fake = Fake::new(&ctrl, 2, |_, _| Attempt::Absent);
