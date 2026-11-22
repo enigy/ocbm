@@ -101,10 +101,10 @@ pub fn connect_to(peer: [u8; 6], channel: u8, connect_timeout_secs: i64) -> std:
     connect_to_limited(peer, channel, connect_timeout_secs, None)
 }
 
-/// [`connect_to`], its connect's own wait cut at `limit` when one is given (btd's round-4 bench switch,
-/// `rfcomm_limit_ms`): an error [`is_limited`] tells apart from the plain timeout. Never while a pairing prompt is up for
-/// this attempt, which holds the connect as before ([`PAIRING_HOLD_SECS`]); a rejection still ends it at once. `None`,
-/// or a limit not under `connect_timeout_secs`: exactly [`connect_to`].
+/// [`connect_to`], its connect's own wait cut at `limit` when one is given (btd's round-4 limit, `rfcomm_limit_ms`,
+/// 1.5 s by default since 2.7.1): an error [`is_limited`] tells apart from the plain timeout. Never while a pairing
+/// prompt is up for this attempt, which holds the connect as before ([`PAIRING_HOLD_SECS`]); a rejection still ends it
+/// at once. `None`, or a limit not under `connect_timeout_secs`: exactly [`connect_to`].
 pub fn connect_to_limited(
     peer: [u8; 6],
     channel: u8,
@@ -440,8 +440,8 @@ mod tests {
         assert_eq!(connect_wait_decision(D::from_secs(70), D::from_secs(90), true, false), WaitDecision::Wait);
     }
 
-    /// btd's round-4 limit (bench): the connect is cut at the limit unless a pairing prompt has held it, the looks end at
-    /// the limit, and the error is told from the plain timeout. No limit: nothing changes.
+    /// btd's round-4 limit (`rfcomm_limit_ms`): the connect is cut at the limit unless a pairing prompt has held it, the
+    /// looks end at the limit, and the error is told from the plain timeout. No limit: nothing changes.
     #[test]
     fn a_connect_limit_cuts_the_wait_but_never_a_pairing_prompt() {
         use std::time::Duration as D;

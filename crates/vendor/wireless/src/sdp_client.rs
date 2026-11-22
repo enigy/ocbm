@@ -307,11 +307,12 @@ fn stalled_link(acl: Option<crate::hci::AclInfo>, keep: Option<&'static str>) ->
     }
 }
 
-/// Round 4, item 4 (bench): the RFCOMM connect after this page passed btd's limit and its socket is closed. The link the
-/// page brought up goes as a cut's does ([`cut`]): its Disconnect, up to [`CUT_LINK_GONE`] for it to go, and a link still
-/// up, or one whose Disconnect could not be sent, noted as the left link, so the re-page tells it from the phone's own
-/// and sends its Disconnect again rather than riding a half-open link ([`before_page`]), and a crossing it still meets
-/// is item 3's. `keep` (why): a link up before the page, or one a live session rides, is left alone. What it did.
+/// Round 4, item 4 (on by default since 2.7.1): the RFCOMM connect after this page passed btd's limit and its socket is
+/// closed. The link the page brought up goes as a cut's does ([`cut`]): its Disconnect, up to [`CUT_LINK_GONE`] for it
+/// to go, and a link still up, or one whose Disconnect could not be sent, noted as the left link, so the re-page tells it
+/// from the phone's own and sends its Disconnect again rather than riding a half-open link ([`before_page`]), and a
+/// crossing it still meets is item 3's. `keep` (why): a link up before the page, or one a live session rides, is left
+/// alone. What it did.
 pub(crate) fn drop_stalled_link(peer: [u8; 6], keep: Option<&'static str>) -> String {
     let Ok(dev) = crate::hci::dev_id(crate::HCI_DEV) else {
         return "no controller to look at".into();
@@ -505,9 +506,9 @@ fn crossed_next(acl: Option<crate::hci::AclInfo>, waited: std::time::Duration) -
     }
 }
 
-/// Round 4, item 3 (bench): before the same phone is paged again after its re-page failed with EALREADY, EMLINK or
-/// EBUSY (a link the controller still holds): up to [`CUT_LINK_GONE`] for the kernel's link to it to go or come up, and
-/// with none left, [`CROSSED_SETTLE`] more ([`crossed_next`]). What it found, for the walk's `[bench]` line.
+/// Round 4, item 3 (on by default since 2.7.1): before the same phone is paged again after its re-page failed with
+/// EALREADY, EMLINK or EBUSY (a link the controller still holds): up to [`CUT_LINK_GONE`] for the kernel's link to it to
+/// go or come up, and with none left, [`CROSSED_SETTLE`] more ([`crossed_next`]). What it found, for the walk's line.
 pub(crate) fn settle_crossed(peer: [u8; 6]) -> &'static str {
     let Ok(dev) = crate::hci::dev_id(crate::HCI_DEV) else {
         std::thread::sleep(CROSSED_SETTLE);

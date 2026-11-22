@@ -86,8 +86,8 @@ fn log_radio_caps() {
     }
 }
 
-/// Outbound counterpart of [`rfcomm_accept`], used by `reconnect` for an already-bonded phone. `limit`: round 4's bench
-/// limit on the connect's own wait (`rfcomm::connect_to_limited`); None, today's.
+/// Outbound counterpart of [`rfcomm_accept`], used by `reconnect` for an already-bonded phone. `limit`: round 4's limit
+/// on the connect's own wait (`rfcomm::connect_to_limited`), 1.5 s by default since 2.7.1; None, 2.7.0's deadline.
 fn rfcomm_connect(
     peer: [u8; 6],
     channel: u8,
