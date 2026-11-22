@@ -159,9 +159,11 @@ lock_take() {  # $1 = subsystem
   # TWO traps, deliberately. In ash a trapped signal runs the handler and then RESUMES the
   # script: a single combined trap would release the lock on SIGTERM while the bring-up carried
   # on running, so the next caller would take the lock and stack a second attach on top of a
-  # still-live one. The signal trap must therefore also exit.
-  trap 'rm -rf "/tmp/.radio_lock_'"$1"'" 2>/dev/null' EXIT
-  trap 'rm -rf "/tmp/.radio_lock_'"$1"'" 2>/dev/null; trap - EXIT; exit 143' INT TERM HUP
+  # still-live one. The signal trap must therefore also exit. Both stop a Bluetooth firmware loader in
+  # flight before the lock goes (bt_fw_stop: it holds the UART); the signal trap ignores a second
+  # signal meanwhile, so the stop ends before the lock does (2.7.1 review).
+  trap 'bt_fw_stop; rm -rf "/tmp/.radio_lock_'"$1"'" 2>/dev/null' EXIT
+  trap 'trap "" INT TERM HUP; bt_fw_stop; rm -rf "/tmp/.radio_lock_'"$1"'" 2>/dev/null; trap - EXIT; exit 143' INT TERM HUP
   return 0
 }
 lock_drop() { trap - EXIT INT TERM HUP; rm -rf "/tmp/.radio_lock_$1" 2>/dev/null; lock_mine "$1" 0; }
@@ -1317,15 +1319,17 @@ bt_fw_preload() {
   log "firmware preload: $RADIO_BT_PRELOAD_CMD"
   _bt_fw_runs=$((${_bt_fw_runs:-0} + 1))
   boot_mark btfw_start; _bfp_t0=${_um:-0}
+  # _bfp_live, _bfp_w: the loader and its watcher while they run, for a trapped signal to stop first (bt_fw_stop).
+  _bfp_w=""
   $RADIO_BT_PRELOAD_CMD >/tmp/radio_bt_fw.log 2>&1 &
-  _bfp_pid=$!
+  _bfp_pid=$!; _bfp_live=$_bfp_pid
   # The bound: TERM, then KILL. The watcher is stopped as soon as the loader has been reaped, so only in that instant
   # could a signal of its own find the pid taken by another process; its sleep, left alone, ends by itself.
   ( sleep "$RADIO_BTFW_WAIT"; kill -TERM "$_bfp_pid" 2>/dev/null; sleep 2; kill -KILL "$_bfp_pid" 2>/dev/null ) \
     </dev/null >/dev/null 2>&1 &
   _bfp_w=$!
-  wait "$_bfp_pid"; _bfp_rc=$?
-  kill "$_bfp_w" 2>/dev/null; wait "$_bfp_w" 2>/dev/null
+  wait "$_bfp_pid"; _bfp_rc=$?; _bfp_live=""
+  kill "$_bfp_w" 2>/dev/null; wait "$_bfp_w" 2>/dev/null; _bfp_w=""
   boot_mark btfw_end; _bfp_ms=$(( ${_um:-0} - _bfp_t0 ))
   set -- $(awk '/Download Complete/ { c = 1 } /Download Error/ { e = 1 }
     match($0, /time:[ ]*[0-9]+/) { t = substr($0, RSTART, RLENGTH); sub(/time:[ ]*/, "", t) }
@@ -1356,6 +1360,22 @@ bt_fw_preload() {
   log "  the loader's last lines:"
   tail -5 /tmp/radio_bt_fw.log 2>/dev/null | cut -c1-160 | sed -e "$MAC_MASK" -e "s/^/$LOGP   /"
   return 1
+}
+
+# The loader in flight (bt_fw_preload), stopped before a trapped signal lets the bt lock go (lock_take's traps; the
+# 2.7.1 review): it runs in the background, so the wait for it ends at the signal, and it would go on holding the UART
+# that the lock's next holder pushes to or attaches on. Its watcher first, then TERM, and KILL 2 s later, as the bound
+# does, the loader reaped before the lock goes. The KILL's own timer is stopped with KILL: the trap ignores TERM by
+# then, and so does a child it starts. Nothing when no loader runs.
+bt_fw_stop() {
+  [ -n "${_bfp_live:-}" ] || return 0
+  [ -n "${_bfp_w:-}" ] && kill "$_bfp_w" 2>/dev/null
+  kill -TERM "$_bfp_live" 2>/dev/null
+  ( sleep 2; kill -KILL "$_bfp_live" 2>/dev/null ) </dev/null >/dev/null 2>&1 &
+  _bfs_k=$!
+  wait "$_bfp_live" 2>/dev/null
+  kill -KILL "$_bfs_k" 2>/dev/null
+  _bfp_live=""
 }
 
 # The firmware push (22 Nov 2026): the loader once, and once more when it failed. 0: pushed (or none to push); 1: not,

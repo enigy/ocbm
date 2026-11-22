@@ -793,8 +793,9 @@ verb returns (clause 1). Today's order (`bt_attach_mapped`) is the code of befor
   under a bound (10 s, then TERM, and KILL 2 s later; it had none), and once more when it failed. A push is good when
   the loader exits 0 or says `Download Complete` (with no `Download Error`), whatever its code, the bound's stop after
   it included (the code logged: the 2.7.1 review); a failure logs the loader's code into box.log, and its last lines
-  (an address in them masked) unless the bound stopped it, which says so instead. Two failures attach nothing: no
-  `hciattach`, no reclaim+reset, `rc=1`;
+  (an address in them masked) unless the bound stopped it, which says so instead. The loader runs in the background
+  under the bt lock, so a signal to the bring-up (a teardown's TERM) stops it, and reaps it, before the lock goes
+  (`bt_fw_stop`, from `lock_take`'s traps). Two failures attach nothing: no `hciattach`, no reclaim+reset, `rc=1`;
   in the together order the fallback mark and the guard's count as for any together attach that gave no responsive
   `hci0`, so the host's `bt_on` takes today's order with a push of its own. A good push leaves
   `/tmp/.radio_btfw_pushed`, and a failure after it that boot does not stop the attach: the chip runs that firmware,

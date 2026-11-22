@@ -882,6 +882,21 @@ case_fwpush() {
   check '! { p=$(cat "$R/state/fw_loader_linux.pid" 2>/dev/null) && kill -0 "$p" 2>/dev/null; }' "  the loader is gone"
   check '[ "$(rc preload)" = 0 ] && [ "$(key btfw_tries)" = 2 ] && [ "$(count "attach ")" = 1 ]' \
     "  then pushed once more, and the boot converges (btfw_tries=2)"
+  # The 2.7.1 review: a TERM during the loader's wait. The loader runs in the background, so the wait ends at the signal;
+  # the trap stops it (it ignores TERM here: KILL 2 s later) and reaps it before the bt lock goes.
+  echo "== $SH: the firmware push: a signal during the loader's wait stops the loader before the bt lock goes"
+  unit
+  ( RADIO_BTFW_WAIT=30 FW_HANG=1 WLAN_SECS=0.2 FW_SECS=0.2 hal preload ) &
+  pre=$!
+  waitfor 'called "fw hang 1"' 100
+  hp=$(cat "$R/tmp/.radio_lock_bt/pid" 2>/dev/null); lp=$(cat "$R/state/fw_loader_linux.pid" 2>/dev/null)
+  kill -TERM "$hp" 2>/dev/null
+  waitfor '[ ! -d "$R/tmp/.radio_lock_bt" ]' 100
+  alive=no; [ -n "$lp" ] && kill -0 "$lp" 2>/dev/null && alive=yes
+  wait "$pre"
+  check '[ -n "$hp" ] && [ -n "$lp" ] && [ "$alive" = no ] && [ ! -d "$R/tmp/.radio_lock_bt" ]' \
+    "TERM to the preload: the loader (deaf to TERM) stopped and reaped, then the bt lock gone"
+  check '[ "$(rc preload)" = 143 ]' "  and the preload ends there (143)"
   echo "== $SH: the firmware push: a loader that fails says why"
   unit
   FW_FAIL=1 WLAN_SECS=0.2 FW_SECS=0.2 hal preload
