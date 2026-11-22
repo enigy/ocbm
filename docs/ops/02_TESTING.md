@@ -372,6 +372,34 @@ that never reached CarPlay, a wired preempt), so a second session's line counts 
 session's carplayd's. The phantom's pages count as absent. When ocbmd rotated `box.log` (it empties it at its cap) between
 the host's arrival and the first frame, the PSK count is a lower bound: `PSK mismatches >=N (box.log cut)`.
 
+### Round 4 switches (22 Nov 2026; a bench build, branch `round4`)
+
+Each is off by default, and with none set the build behaves as 2.7.0. A switch is set by `/tmp/bench_<name>` (a reboot
+clears it; Carlink's debug builds can write it) or, kept across a power cut so a cold boot sees it, by
+`/etc/ocbm/bench_<name>` on flash: OCBM's own state directory, which updates keep and the full way back to stock removes
+whole. `/tmp` is read first; either one by `bench_flag`'s rule (absent or `off`: not set). A number that is not one, or out
+of its range, is refused with a line and the default stands. Every switch that is set says so in a line holding
+`[bench] round4:` (btd's in `/tmp/wl.log`, carplayd's in `/tmp/carplayd_wl.log`, the scripts' in `/tmp/box.log`), once
+where it is read and again where it acts. For a cold boot set the bottom four and `btd_early` in `/etc/ocbm`: they act
+during the boot, while `/tmp` is still empty. Removing the file turns one off.
+
+| Name | Value | Default | Read | Does |
+|---|---|---|---|---|
+| `first_page_slots` | 1-65535 slots | the round's (6000 over several phones, 0x2000 otherwise) | btd, each session | the first page of the first round this long; every other page the round's |
+| `first_retry_ms` | 0-60000 ms | 2000 | btd, each session | the pause after a failed first round, once |
+| `same_phone_repage` | flag | off | btd, each session | a re-page after a reset or cut that fails with EALREADY, EMLINK or EBUSY waits for the link (up to 1.5 s, then 0.3 s with none) and pages the same phone again, twice at most, then the next phone |
+| `rfcomm_limit_ms` | 1000-8000 ms | 8000, then the next phone | btd, each session | the RFCOMM connect cut at this unless a pairing prompt holds it; its link dropped as a cut's, the phone paged once more (counted once a round, as a cut) |
+| `early_gap_secs` | 1-60 s | 5 | btd, each session | the gap between rounds in the first 120 s |
+| `screen_nudge_ms` | 0-2500 ms, `/tmp` only | 500 | carplayd, each nudge | the first screen nudge's wait; the 3 s second nudge as before |
+| `dial_early` | flag | off | carplayd, each dial | the existing early dial, now also from flash |
+| `btd_early` | flag | off | the supervisor, at the host's arrival | with the boot preload running and the handover not asked for: btd started at once, waiting for bt_on's end, then today's bring-up |
+| `page_trim` | flag | off | radio_hal.sh | with a host waiting on the preload: no SCO lines or name set on its attach, the together guard's mark cleared after its locks; and every lock wait looks every 0.05 s |
+| `attach_poll` | flag | off | radio_hal.sh, each attach | hci0 looked at every 0.1 s as the attach converges, not 0.5 s |
+| `gpio_first` | flag | off | the dispatcher, each start | the stock GPIO set-up first, its end waited for (1 s at most), then ocbm_boot.sh |
+| `preload_nice` | flag | off | ocbm_boot.sh, each start | the boot preload reniced to -5 before it starts |
+
+Not built in round 4: the AP configured ahead of the cold path, `noscan`, and anything in the handover itself.
+
 ### The connect timeline (16 Nov 2026; M1)
 
 Right after `[startup]`, the wireless carplayd prints one more line at the first frame, on the same stream
