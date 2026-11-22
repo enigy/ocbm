@@ -587,10 +587,14 @@ timeline uses, but from power-up, not from the host's arrival; `-` is a value no
 | `host` | the host's arrival, ocbmd's `/tmp/host_present_uptime`; `-` before one |
 
 **A cold boot or a restart.** A power cut downloads both firmwares: `btfw_end - btfw_start` about 2.2 to 2.7 s with
-`btfw=complete`, `wlan_up - wlan_start` about 2 s (the 20 Nov bench). A `reboot` keeps the chip's firmware, so both
-come out far shorter: such a line times no cold boot. The session's Bluetooth is about `max(hci_up, host)` plus the
-host's `bt_on` confirming it (a lock look and one name read); with the handover asked for (R3-5), `handed`, and the session's
-first page about 0.1 s after it (the timeline's `page_start - bt_power`).
+`btfw=complete`, `wlan_up - wlan_start` about 2 s (the 20 Nov bench). A `reboot` was taken to keep the chip's firmware,
+so that both would come out far shorter; but the three logged (13 Nov, `[bench] reboot under a running host`) each
+pushed in full, 2.75 to 2.83 s from the push to the attach: a SoC restart resets the chip too. What leaves the firmware
+running is less than that: an attach helper that died, or reclaim+reset's gpio1 pulse (20 Nov, by hand; that run's
+"the loader returned at once with no output" was a result file left by the run before it). The session's Bluetooth is
+about `max(hci_up, host)` plus the host's `bt_on` confirming it (a lock look and one name read); with the handover
+asked for (R3-5), `handed`, and the session's first page about 0.1 s after it (the timeline's
+`page_start - bt_power`).
 
 ### The armed path (16 Nov 2026; benched the same day)
 

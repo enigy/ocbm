@@ -692,11 +692,15 @@ by hand); the Wi-Fi driver first 3.90-6.54 (insmod 4.08, firmware over 4.75, "WL
 the Bluetooth firmware 6.58-9.35 (`fw_loader_linux`'s own timer about 2.2 s); `hciattach` to `hci0` answering
 9.35-10.11; "preload: done rc=0 in 7.5 s" 10.44.
 
-**A cold boot is a power cut, never a `reboot`.** The IW416 keeps its firmware through a `reboot`, so a restart skips
-both firmware downloads (Wi-Fi and Bluetooth) and times nothing of a cold boot; and it cannot be put back into its boot
-loader from the adapter (a gpio1 pulse did not do it, 20 Nov). Only removing power gives a cold boot. The benches
-before 20 Nov that said "a cold boot" (the armed path's, above, among them) were restarts of that kind, by the
-coordinating session's reading of 20 Nov: their radio timings are a restart's.
+**A cold boot is a power cut, never a `reboot`.** A `reboot` was read on 20 Nov as keeping the IW416's firmware, but
+the three restarts logged on 13 Nov (`[bench] reboot under a running host`, the connect-speed benches) each pushed the
+Bluetooth firmware in full, 2.75 to 2.83 s from the push to the attach, and loaded the Wi-Fi driver in about 2.5 s: a
+SoC restart resets the chip (22 Nov, from those logs). What the adapter cannot do without one is put the chip back into
+its boot loader: reclaim+reset's gpio1 pulse did not (20 Nov, by hand: after it `hci0` answered within half a second,
+and the Wi-Fi driver loaded in under 0.4 s, too quick for a download; that run's "the loader returned at once with no
+output" was a result file left by the run before it). The benches before 20 Nov that said "a cold boot" (the armed path's,
+above, among them) were restarts, with the downloads in them but the host already up: only removing power gives a
+cold boot.
 
 **1. The descriptor, kept across boots.** `/tmp` is empty at every power-up, so every boot ran `radio_detect.sh`
 again, though its answer changes only when what it reads changes. `radio_hal.sh` `caps` now keeps the last descriptor
