@@ -501,13 +501,22 @@ const SHUTDOWN_POLL: Duration = Duration::from_millis(500);
 /// wake-ups until the phone connects, typically under a second.
 const ACCEPT_POLL: Duration = Duration::from_millis(10);
 
-/// How long after the phone tears down its screen stream we wait for it to set one up again before
-/// asking for its UI ([`AvSession::nudge_screen_back`]).
+/// How long after the phone tears down its screen stream the first nudge waits for it to set one up again before
+/// asking for its UI ([`AvSession::nudge_screen_back`]): not at all, by the owner's decision of 22 Nov 2026.
 ///
 /// 3 s until the Mac's 13 Nov bench: the older iPhone dropped its first screen stream in 7 of 8 cold connects and 3 of
-/// 7 then paid the whole wait, the largest spread left in a connect. A phone that sets its screen up again does so
-/// within about 30 ms (bench 2026-11-02), and a requestUI it did not need is the one RECORD sends anyway.
-const SCREEN_NUDGE_AFTER: Duration = Duration::from_millis(500);
+/// 7 then paid the whole wait, the largest spread left in a connect. 500 ms from then to 2.7.0: a phone that sets its
+/// screen up again does so within about 30 ms (bench 2026-11-02), and a requestUI it did not need is the one RECORD
+/// sends anyway. No wait since the bench of 22 Nov 2026: an iPhone 7 set its screen stream up and tore it down 18-54 ms
+/// later with 0 frames on nearly every connect, then set it up again; with no wait the first frame came about 0.1 s
+/// after that second screen SETUP, against about 1.9 s with 500 ms, in every wake of 40. A phone that never tears its
+/// screen down (an iPhone on iOS 27) never reaches the nudge.
+///
+/// With no wait, the "set its screen up again within N ms — no nudge" check can spare nothing, so it is not made: the
+/// phone's next screen SETUP comes on the control connection after the TEARDOWN being handled, and a look at once
+/// could only race it. The nudge goes at once; the check is made only after a wait the bench file sets
+/// ([`BENCH_SCREEN_NUDGE_MS`]; 500 benches 2.7.0's).
+const SCREEN_NUDGE_AFTER: Duration = Duration::ZERO;
 
 /// Round 4, item 10 (bench, docs/ops/02_TESTING.md, "Round 4 switches"): the first nudge's wait in whole ms, for
 /// [`SCREEN_NUDGE_AFTER`]; 0-2500, so it always comes before the second at 3 s. /tmp only (`box_common::bench_text`:
@@ -553,13 +562,68 @@ fn torn_screen_line(lived: Duration, frames: u64, video: u64) -> String {
     )
 }
 
+/// The first screen nudge, `after` the teardown at `torn` ([`AvSession::nudge_screen_back`], on its thread): false
+/// when a wait spared it (the phone set its screen up again within it, or the session ended), and then no second
+/// follows. With no wait (the default) nothing is looked at and it always goes: the session is live, its partial
+/// TEARDOWN being handled ([`SCREEN_NUDGE_AFTER`]).
+fn first_screen_nudge(after: Duration, torn: Instant, alive: &AtomicBool, streams: &StreamFlags) -> bool {
+    let waited = if after.is_zero() {
+        None
+    } else {
+        thread::sleep(after);
+        if !alive.load(Ordering::Acquire) {
+            return false;
+        }
+        if screen_stream_live(streams) {
+            eprintln!("[session] the phone set its screen up again within {} ms — no nudge", after.as_millis());
+            return false;
+        }
+        Some(torn.elapsed())
+    };
+    // What the session had when it fired, so a bench can tell a phone that would have come back from one that needed
+    // it: the streams still live, by type.
+    let mut live: Vec<i64> = crate::plock(streams).keys().map(|(ty, _)| *ty).collect();
+    live.sort_unstable();
+    live.dedup();
+    // Bench only (docs/ops/02_TESTING.md): skip this first requestUI once, so the second one can be checked. The flag
+    // is set unless absent or "off" (box_common::bench_flag), and is removed when used.
+    let sent = if box_common::bench_flag(BENCH_SKIP_FIRST_REQUESTUI) {
+        let _ = std::fs::remove_file(BENCH_SKIP_FIRST_REQUESTUI);
+        None
+    } else {
+        crate::startup::nudged(false);
+        Some(crate::events::send_request_ui())
+    };
+    eprintln!("{}", first_nudge_line(waited, &live, sent));
+    true
+}
+
+/// The first nudge's line ([`first_screen_nudge`]). `waited`: how long after the teardown it fired, when it had a wait
+/// (the bench file's), so the line says no screen stream had come back by then; `None` with none (the default), when
+/// nothing was looked for and the line says only that it went at once. `sent`: the requestUI's result, `None` when the
+/// bench flag skipped it ([`BENCH_SKIP_FIRST_REQUESTUI`]). `live`: the streams still live, by type.
+fn first_nudge_line(waited: Option<Duration>, live: &[i64], sent: Option<bool>) -> String {
+    let (what, when) = match waited {
+        Some(t) => (format!("no screen stream {} ms after the phone tore it down", t.as_millis()), ""),
+        None => ("the phone tore its screen stream down".to_string(), " at once"),
+    };
+    match sent {
+        Some(sent) => {
+            format!("[session] {what} (streams live: {live:?}) — asked for its UI again{when} (requestUI={sent})")
+        }
+        None => format!(
+            "[bench] {what} (streams live: {live:?}) — first nudge skipped by {BENCH_SKIP_FIRST_REQUESTUI}: the second comes at 3 s"
+        ),
+    }
+}
+
 /// The bench flag that swallows the first screen nudge's requestUI once (it is removed when used), so the second
 /// fires on cue (the Mac's 13 Nov bench-hooks brief, item 6). /tmp only; nothing in the product writes it.
 const BENCH_SKIP_FIRST_REQUESTUI: &str = "/tmp/bench_skip_first_requestui";
 
-/// A second requestUI this long after the teardown if the first went unanswered: the 0.5 s one is untested on the
-/// older iOS 15 phone, which answered every 3 s one (11 of 11, 13 Nov); without it the session would keep audio and no
-/// picture (the Mac's 13 Nov review, N1).
+/// A second requestUI this long after the teardown if there is still no screen stream: the older iOS 15 phone answered
+/// every 3 s one (11 of 11, 13 Nov), and it stayed when the first came sooner (0.5 s from 13 Nov, at once from 22 Nov);
+/// without it the session would keep audio and no picture (the Mac's 13 Nov review, N1).
 const SCREEN_NUDGE_AGAIN: Duration = Duration::from_secs(3);
 
 /// Per-stream liveness flags keyed by `(stream type, channelID)` ([`AvSession`]'s `av_streams`).
@@ -656,14 +720,14 @@ impl AvSession {
         flag
     }
 
-    /// The phone tore down its screen stream: if it has not set up another within [`SCREEN_NUDGE_AFTER`] (or round 4's
-    /// bench wait, [`BENCH_SCREEN_NUDGE_MS`]), send `requestUI` once, as RECORD does, so iOS brings its UI back and sets
-    /// the screen up again.
+    /// The phone tore down its screen stream: send `requestUI`, as RECORD does, so iOS brings its UI back and sets the
+    /// screen up again. At once ([`SCREEN_NUDGE_AFTER`]); after a wait round 4's bench file sets
+    /// ([`BENCH_SCREEN_NUDGE_MS`]), only if the phone has not set up another screen stream by then. A second at 3 s
+    /// ([`SCREEN_NUDGE_AGAIN`]) if there is still none.
     ///
     /// Bench 2026-11-02: an iPhone 7 on iOS 15 set up its screen stream and tore it down about 30 ms
     /// later in 2 of 5 sessions (4 of 5 on the bench before), then never set up another. The session
-    /// stayed up with media and no video for minutes. iOS 27 never did. A teardown it follows with a
-    /// new screen SETUP within the wait gets no nudge.
+    /// stayed up with media and no video for minutes. iOS 27 never did.
     fn nudge_screen_back(&self) {
         let streams = self.av_streams.clone();
         let alive = self.alive.clone();
@@ -674,34 +738,8 @@ impl AvSession {
             eprintln!("{line}");
         }
         let spawned = thread::Builder::new().name("screen-nudge".into()).spawn(move || {
-            thread::sleep(after);
-            if !alive.load(Ordering::Acquire) {
+            if !first_screen_nudge(after, torn, &alive, &streams) {
                 return;
-            }
-            if screen_stream_live(&streams) {
-                eprintln!("[session] the phone set its screen up again within {} ms — no nudge", after.as_millis());
-                return;
-            }
-            // What the session had when it fired, so a bench can tell a phone that would have come back from one that
-            // needed it: the streams still live, by type.
-            let mut live: Vec<i64> = crate::plock(&streams).keys().map(|(ty, _)| *ty).collect();
-            live.sort_unstable();
-            live.dedup();
-            // Bench only (docs/ops/02_TESTING.md): skip this first requestUI once, so the second one can be checked. The
-            // flag is set unless absent or "off" (box_common::bench_flag), and is removed when used.
-            if box_common::bench_flag(BENCH_SKIP_FIRST_REQUESTUI) {
-                let _ = std::fs::remove_file(BENCH_SKIP_FIRST_REQUESTUI);
-                eprintln!(
-                    "[bench] no screen stream {} ms after the phone tore it down (streams live: {live:?}) — first nudge skipped by {BENCH_SKIP_FIRST_REQUESTUI}: the second comes at 3 s",
-                    torn.elapsed().as_millis()
-                );
-            } else {
-                crate::startup::nudged(false);
-                let sent = crate::events::send_request_ui();
-                eprintln!(
-                    "[session] no screen stream {} ms after the phone tore it down (streams live: {live:?}) — asked for its UI again (requestUI={sent})",
-                    torn.elapsed().as_millis()
-                );
             }
             thread::sleep(SCREEN_NUDGE_AGAIN.saturating_sub(torn.elapsed()));
             if !alive.load(Ordering::Acquire) || screen_stream_live(&streams) {
@@ -3537,7 +3575,8 @@ mod tests {
     }
 
     /// The phone tearing down its screen stream (iOS 15, bench 2026-11-02) leaves none live, which is
-    /// what the nudge checks for before asking for the UI again; the other streams stay.
+    /// what the second nudge (and a bench wait's first) checks for before asking for the UI again; the
+    /// other streams stay.
     #[test]
     fn a_partial_teardown_of_the_screen_leaves_no_screen_stream_live() {
         let mut s = AvSession::new();
@@ -3554,29 +3593,73 @@ mod tests {
         s.teardown(&body);
         assert!(!screen_stream_live(&s.av_streams), "the screen went");
         assert!(crate::plock(&s.av_streams).keys().any(|(t, _)| *t == 111), "the alt screen stayed");
-        // The session ends here, so the nudge thread finds it gone and sends nothing.
+        // The first nudge went at once (to no event channel here: requestUI=false); the session ends here, so the
+        // second finds it gone and sends nothing.
         s.alive.store(false, Ordering::Release);
     }
 
-    /// Round 4, item 10 (bench): the first nudge's wait from its file, 0-2500 ms, said; anything else the 500 ms default,
-    /// said as refused; no file, the default and no line. Always before the second nudge at 3 s.
+    /// Round 4, item 10 (bench): the first nudge's wait from its file, 0-2500 ms, said; anything else the default
+    /// (none, since 22 Nov 2026), said as refused; no file, the default and no line. 500, 2.7.0's, still benches.
+    /// Always before the second nudge at 3 s.
     #[test]
     fn round4_the_first_screen_nudge_waits_as_the_bench_file_says() {
-        assert_eq!(screen_nudge_after(None), (SCREEN_NUDGE_AFTER, None), "no file: 500 ms, no line");
-        let (wait, line) = screen_nudge_after(Some("100"));
-        assert_eq!(wait, Duration::from_millis(100));
+        assert_eq!(SCREEN_NUDGE_AFTER, Duration::ZERO, "the default: at once");
+        assert_eq!(screen_nudge_after(None), (Duration::ZERO, None), "no file: at once, no line");
+        let (wait, line) = screen_nudge_after(Some("500"));
+        assert_eq!(wait, Duration::from_millis(500), "2.7.0's wait");
         assert_eq!(
             line.as_deref(),
-            Some("[bench] round4: screen_nudge_ms=100 (/tmp/bench_screen_nudge_ms): the first nudge 100 ms after the phone tore its screen down (default 500 ms)")
+            Some("[bench] round4: screen_nudge_ms=500 (/tmp/bench_screen_nudge_ms): the first nudge 500 ms after the phone tore its screen down (default 0 ms)")
         );
-        assert_eq!(screen_nudge_after(Some("0")).0, Duration::ZERO, "0: at once");
+        assert_eq!(screen_nudge_after(Some("100")).0, Duration::from_millis(100));
+        assert_eq!(screen_nudge_after(Some("0")).0, Duration::ZERO, "0: at once, as the default");
         assert_eq!(screen_nudge_after(Some("2500")).0, Duration::from_millis(2500));
         for bad in ["2501", "-1", "0.1", "soon", ""] {
             let (wait, line) = screen_nudge_after(Some(bad));
-            assert_eq!(wait, SCREEN_NUDGE_AFTER, "{bad:?}");
-            assert!(line.is_some_and(|l| l.contains("refused") && l.ends_with("the default 500 ms")), "{bad:?}");
+            assert_eq!(wait, Duration::ZERO, "{bad:?}");
+            assert!(line.is_some_and(|l| l.contains("refused") && l.ends_with("the default 0 ms")), "{bad:?}");
         }
         assert!(Duration::from_millis(2500) < SCREEN_NUDGE_AGAIN);
+    }
+
+    /// The first nudge with no wait (the default since 22 Nov 2026) goes whatever the streams: a screen stream already
+    /// live again cannot spare it, as it could only have raced in. After a wait, one spares it as before, and none does
+    /// not; a session that ended by then sends none. Each that goes is to no event channel here (requestUI=false).
+    #[test]
+    fn round4_with_no_wait_nothing_spares_the_first_screen_nudge() {
+        let s = AvSession::new();
+        let _screen = s.stream_flag(110);
+        assert!(first_screen_nudge(Duration::ZERO, Instant::now(), &s.alive, &s.av_streams), "no wait: it goes");
+        let wait = Duration::from_millis(5);
+        assert!(!first_screen_nudge(wait, Instant::now(), &s.alive, &s.av_streams), "a wait: a screen back spares it");
+        let none = AvSession::new();
+        assert!(first_screen_nudge(wait, Instant::now(), &none.alive, &none.av_streams), "a wait, none back: it goes");
+        none.alive.store(false, Ordering::Release);
+        assert!(!first_screen_nudge(wait, Instant::now(), &none.alive, &none.av_streams), "the session ended: none");
+        s.alive.store(false, Ordering::Release);
+    }
+
+    /// The first nudge's line says what was looked at: after a wait, that no screen stream had come back by then; with
+    /// none, only that the phone tore it down and the nudge went at once. The bench flag's skip says so either way.
+    #[test]
+    fn round4_the_first_nudge_line_claims_no_look_it_did_not_make() {
+        assert_eq!(
+            first_nudge_line(None, &[100, 130], Some(true)),
+            "[session] the phone tore its screen stream down (streams live: [100, 130]) — asked for its UI again at once (requestUI=true)"
+        );
+        assert_eq!(
+            first_nudge_line(Some(Duration::from_millis(503)), &[100], Some(false)),
+            "[session] no screen stream 503 ms after the phone tore it down (streams live: [100]) — asked for its UI again (requestUI=false)"
+        );
+        assert_eq!(
+            first_nudge_line(None, &[], None),
+            "[bench] the phone tore its screen stream down (streams live: []) — first nudge skipped by /tmp/bench_skip_first_requestui: the second comes at 3 s"
+        );
+        assert_eq!(
+            first_nudge_line(Some(Duration::from_millis(501)), &[130], None),
+            "[bench] no screen stream 501 ms after the phone tore it down (streams live: [130]) — first nudge skipped by /tmp/bench_skip_first_requestui: the second comes at 3 s"
+        );
+        assert!(!first_nudge_line(None, &[100], Some(true)).contains("no screen stream"), "no claim of a look");
     }
 
     /// Round 4, item 10: the torn screen stream's line says how long it lived and what it carried, and its partial

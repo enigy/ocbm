@@ -334,7 +334,7 @@ can write but not delete, so it clears one by writing `off`. From a debug build:
   with a `[bench]` line and removed; `off` is no order. An order dropped unused (the round ended or a phone
   connected first, nothing was left to page, a session, a Connect or a switch hold came first) says why in a
   `[bench]` line.
-- `/tmp/bench_skip_first_requestui`: carplayd skips the 0.5 s screen nudge's requestUI once (the file is removed
+- `/tmp/bench_skip_first_requestui`: carplayd skips the first screen nudge's requestUI once (the file is removed
   when used) and says so, so the 3 s second nudge fires.
 - `/tmp/bench_sdp_after_acl_ms` (whole ms): how long btd gives the SDP channel after a page is answered (the link
   BT_CONNECTED) before it cuts the connect; 700 without it, or with `off`. Read at each page; a window not the
@@ -374,9 +374,10 @@ the host's arrival and the first frame, the PSK count is a lower bound: `PSK mis
 
 ### Round 4 switches (22 Nov 2026; a bench build, branch `round4`)
 
-Each is off by default, and with none set the build behaves as 2.7.0, but for one fix that is no switch: the
+Each is off by default, and with none set the build behaves as 2.7.0, but for two changes that are no switch: the
 Bluetooth firmware push bounded, pushed once more when it fails, and no attach without firmware
-(docs/wireless/01_BT_AND_RADIO.md, "No attach without firmware"). A switch is set by `/tmp/bench_<name>` (a reboot
+(docs/wireless/01_BT_AND_RADIO.md, "No attach without firmware"); and the first screen nudge at once, where 2.7.0 waited
+500 ms (`screen_nudge_ms`, below). A switch is set by `/tmp/bench_<name>` (a reboot
 clears it; Carlink's debug builds can write it) or, kept across a power cut so a cold boot sees it, by
 `/etc/ocbm/bench_<name>` on flash: OCBM's own state directory, which updates keep and the full way back to stock removes
 whole. `/tmp` is read first; either one by `bench_flag`'s rule (absent or `off`: not set). A number that is not one, or out
@@ -393,12 +394,21 @@ set-up before ocbm_boot.sh) was benched 0.25 s slower at the start and dropped; 
 | `same_phone_repage` | flag | off | btd, each session | a re-page after a reset or cut that fails with EALREADY, EMLINK or EBUSY waits for the link (up to 1.5 s, then 0.3 s with none) and pages the same phone again, twice at most, then the next phone |
 | `rfcomm_limit_ms` | 1000-8000 ms | 8000, then the next phone | btd, each session | the RFCOMM connect cut at this unless a pairing prompt holds it; its link dropped as a cut's, the phone paged once more (counted once a round, as a cut) |
 | `early_gap_secs` | 1-60 s | 5 | btd, each session | the gap between rounds in the first 120 s |
-| `screen_nudge_ms` | 0-2500 ms, `/tmp` only | 500 | carplayd, each nudge | the first screen nudge's wait; the 3 s second nudge as before |
+| `screen_nudge_ms` | 0-2500 ms, `/tmp` only | 0 (2.7.0: 500) | carplayd, each nudge | the first screen nudge's wait. At 0 it goes at once, and nothing spares it; after a wait it is spared when the phone has set its screen up again by then (`500` benches 2.7.0). The 3 s second nudge as before |
 | `dial_early` | flag | off | carplayd, each dial | the existing early dial, now also from flash |
 | `btd_early` | flag | off | the supervisor, at the host's arrival | with the boot preload running and the handover not asked for: btd started at once, waiting for bt_on's end, then today's bring-up |
 | `page_trim` | flag | off | radio_hal.sh | with a host waiting on the preload: no SCO lines or name set on its attach, the together guard's mark cleared after its locks; and every lock wait looks every 0.05 s |
 | `attach_poll` | flag | off | radio_hal.sh, each attach | hci0 looked at every 0.1 s as the attach converges, not 0.5 s |
 | `preload_nice` | flag | off | ocbm_boot.sh, each start | the boot preload reniced to -5 before it starts |
+
+The first screen nudge at once is the owner's decision of 22 Nov 2026, after a bench of 40 wakes: an iPhone 7 set its
+screen stream up and tore it down 18-54 ms later with 0 frames on nearly every connect, then set it up again; with no
+wait the first frame came about 0.1 s after that second screen SETUP, against about 1.9 s with 500 ms, in every wake. A
+phone that never tears its screen down (an iPhone on iOS 27) never reaches the nudge. With no wait the "set its screen
+up again within N ms — no nudge" check is not made: the phone's next SETUP comes after the TEARDOWN on the control
+connection, so a look at once could only race it. carplayd's line for that nudge reads `the phone tore its screen
+stream down (streams live: [...]) — asked for its UI again at once`; after a wait, `no screen stream N ms after the
+phone tore it down ...` as before (`crates/vendor/receiver/src/session.rs`, `SCREEN_NUDGE_AFTER`).
 
 Not built in round 4: the AP configured ahead of the cold path, `noscan`, and anything in the handover itself.
 

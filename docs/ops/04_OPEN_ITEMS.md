@@ -253,7 +253,8 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
      it now keeps up to 8 keys per identifier ([../carplay/02_SESSION_LIFECYCLE.md](../carplay/02_SESSION_LIFECYCLE.md)).
      And an iPhone 7 on iOS 15 tore down its screen stream about 30 ms after setting it up in 2 of 5
      sessions (4 of 5 on the bench before), leaving media and no video for minutes; when no new screen
-     stream follows within 3 s, `carplayd` now sends `requestUI` again (`AvSession::nudge_screen_back`).
+     stream follows within 3 s, `carplayd` now sends `requestUI` again (`AvSession::nudge_screen_back`;
+     that wait 0.5 s from 13 Nov, and none on branch `round4` from 22 Nov: docs/ops/02_TESTING.md, "Round 4 switches").
      Why iOS 15 tears it down is not known; the failing sessions sent one more `modesChanged` before the
      screen SETUP than the good ones. **Bench 15 Nov (the Mac), two iPhones: 84 s lost.** A phone that
      knows the AP joins it ~1.5 s after its Bluetooth link, before its 0x5703 names it, so `carplayd`
