@@ -43,6 +43,60 @@ const FIRST_RETRY_SECS: u64 = 2;
 /// Mac's 13 Nov bench, at times a 2.56 s page-scan interval), which cost 9.7 s. 3.75 s covers that interval.
 const FIRST_ROUND_PAGE_SLOTS: u16 = 6_000;
 
+/// Round 4's bench switches for this loop (docs/ops/02_TESTING.md, "Round 4 switches"), read once as it starts
+/// ([`Round4::read`]): each at `/tmp/bench_<name>` or, kept across a power cut for a cold boot, at
+/// `/etc/ocbm/bench_<name>` ([`box_common::bench_switch`]). None set, the default: the loop as 2.7.0 ran it, and the 13
+/// Nov rule (every phone paged briefly in the driver's order first) stands. Each one set says so once, in a
+/// `[bench] round4:` line, and again where it acts.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Round4 {
+    /// Item 1 (`first_page_slots`, 1-65535 slots of 0.625 ms): the first page of the first round, at this length; every
+    /// later page at the round's ([`round_page_slots`]). 8192 is the controller's 5.12 s: a phone that answers a cold
+    /// page late (3.4-4.3 s on the truck) is reached on that first page.
+    first_page_slots: Option<u16>,
+}
+
+impl Round4 {
+    /// The switches as `get` reads them (a name to its text and the file it came from, [`box_common::bench_switch`]), and
+    /// one line for each that is set: what it does, or why its text was refused (the default then stands).
+    fn from(get: impl Fn(&str) -> Option<(String, String)>) -> (Round4, Vec<String>) {
+        let mut r = Round4::default();
+        let mut lines = Vec::new();
+        if let Some((text, at)) = get("first_page_slots") {
+            match text.parse::<u16>() {
+                Ok(n) if n > 0 => {
+                    r.first_page_slots = Some(n);
+                    lines.push(format!(
+                        "[bench] round4: first_page_slots={n} ({at}): the first page of the first round {} ms; every other page the round's",
+                        slots_ms(n)
+                    ));
+                }
+                _ => lines.push(refused(&at, &text, "slots, 1-65535")),
+            }
+        }
+        (r, lines)
+    }
+
+    /// The box's switches, each line logged.
+    fn read() -> Round4 {
+        let (r, lines) = Round4::from(box_common::bench_switch);
+        for l in &lines {
+            log(l);
+        }
+        r
+    }
+}
+
+/// A switch's text that is not one: the line that says so.
+fn refused(at: &str, text: &str, want: &str) -> String {
+    format!("[bench] round4: {at} refused ({text:?}: want {want}): the default")
+}
+
+/// A page length in slots of 0.625 ms, in whole ms.
+fn slots_ms(slots: u16) -> u64 {
+    u64::from(slots) * 5 / 8
+}
+
 /// `order` with the phones whose page timed out last round moved last, in their order. After a failed first round the
 /// next one paged the absent first-listed phone first again, now for the full 5.12 s; and the present phone,
 /// paged straight after an absent one's timeout, answered and reset the link in 4 of 17 connects (the Mac, 13 Nov).
@@ -529,7 +583,7 @@ pub fn run(
     if !interruptible_sleep(settle, shutdown) {
         return;
     }
-    let env = OnBox { name, shutdown, session_active, ctrl, started: Instant::now() };
+    let env = OnBox { name, shutdown, session_active, ctrl, started: Instant::now(), round4: Round4::read() };
     run_loop(&env, ctrl);
     log("reconnect loop exiting");
 }
@@ -563,6 +617,8 @@ trait Env {
     fn bench(&self, line: &str);
     /// Forget the link a cut left ([`sdp_client::forget_left_link`]): btd's bring-up just reset the controller.
     fn forget_left_link(&self);
+    /// Round 4's bench switches ([`Round4`]), as this loop read them at its start.
+    fn round4(&self) -> Round4;
 }
 
 /// The real [`Env`].
@@ -572,6 +628,7 @@ struct OnBox<'a> {
     session_active: &'a Arc<AtomicBool>,
     ctrl: &'a Arc<Control>,
     started: Instant,
+    round4: Round4,
 }
 
 impl Env for OnBox<'_> {
@@ -626,6 +683,9 @@ impl Env for OnBox<'_> {
     }
     fn forget_left_link(&self) {
         sdp_client::forget_left_link();
+    }
+    fn round4(&self) -> Round4 {
+        self.round4
     }
 }
 
@@ -718,13 +778,32 @@ fn take_bench_order(path: &str) -> Option<BenchOrder> {
     }
 }
 
+/// Round 4, item 1 (bench): Write_Page_Timeout `slots` unless the controller has it already (`*now`), saying so. True
+/// when the controller pages with it now; a write that failed leaves the length as it was.
+fn bench_page_slots(env: &impl Env, now: &mut u16, slots: u16, why: &str) -> bool {
+    if *now != slots {
+        if let Err(e) = env.page_slots(slots) {
+            env.bench(&format!("[bench] round4: first_page_slots: page timeout {slots} not set ({e}); paging with the controller's"));
+            return false;
+        }
+        *now = slots;
+    }
+    env.bench(&format!("[bench] round4: first_page_slots: paging {} ms {why}", slots_ms(slots)));
+    true
+}
+
 /// [`run`]'s loop, against `env`: see [`run`].
 fn run_loop(env: &impl Env, ctrl: &Control) {
+    let round4 = env.round4();
     let mut backoff = BACKOFF_START_SECS;
     let mut streak = ResetStreak::default();
     let mut first_round = true;
     // What the controller pages with now: the reset default, until a round asks for another.
     let mut page_slots = crate::hci::PAGE_TIMEOUT_DEFAULT;
+    // Round 4, item 1 (bench): the first page's own length, until the loop's first page goes; and whether the controller
+    // pages with it now rather than with the round's.
+    let mut first_page = round4.first_page_slots;
+    let mut first_paged = false;
     // Log only on a change in the bonded/idle state, so the per-round re-read below doesn't spam the log.
     // `None` = nothing logged yet; `Some(true)` = had bonds; `Some(false)` = idle.
     let mut last_state: Option<bool> = None;
@@ -900,6 +979,13 @@ fn run_loop(env: &impl Env, ctrl: &Control) {
                 env.sleep_or_request(RESET_RETRY_SECS) && !ctrl.has_request() && !env.session_active()
             },
             |peer| {
+                // Round 4, item 1 (bench): the first round's first page at its own length, the round's again for the page
+                // after it. With no switch nothing here runs: the round's length was written above, as in 2.7.0.
+                if let Some(n) = first_page.take().filter(|_| first_round) {
+                    first_paged = bench_page_slots(env, &mut page_slots, n, "for the first page of the first round");
+                } else if std::mem::take(&mut first_paged) && page_slots != want {
+                    bench_page_slots(env, &mut page_slots, want, "again: the first page is over");
+                }
                 let result = env.attempt(peer);
                 let (mono, wall, bonds_at) = env.now();
                 // A reset straight after another phone's page timed out is most likely the two crossing, not a
@@ -1092,6 +1178,10 @@ mod tests {
         logs: std::cell::RefCell<Vec<String>>,
         /// How many pages had gone at each [`Env::forget_left_link`].
         forgot_left: std::cell::RefCell<Vec<usize>>,
+        /// Round 4's switches ([`Env::round4`]).
+        round4: super::Round4,
+        /// Each Write_Page_Timeout ([`Env::page_slots`]): how many pages had gone, and the length.
+        slots: std::cell::RefCell<Vec<(usize, u16)>>,
     }
 
     impl<'a> Fake<'a> {
@@ -1112,6 +1202,8 @@ mod tests {
                 policy_at: Vec::new(),
                 logs: Default::default(),
                 forgot_left: Default::default(),
+                round4: Default::default(),
+                slots: Default::default(),
             }
         }
 
@@ -1161,7 +1253,8 @@ mod tests {
             let wall = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000 + self.clock.get());
             (self.base + self.elapsed(), wall, Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(900_000)))
         }
-        fn page_slots(&self, _slots: u16) -> std::io::Result<()> {
+        fn page_slots(&self, slots: u16) -> std::io::Result<()> {
+            self.slots.borrow_mut().push((self.pages.borrow().len(), slots));
             Ok(())
         }
         fn bond_lost(&self) {
@@ -1184,6 +1277,9 @@ mod tests {
         }
         fn forget_left_link(&self) {
             self.forgot_left.borrow_mut().push(self.pages.borrow().len());
+        }
+        fn round4(&self) -> super::Round4 {
+            self.round4
         }
     }
 
@@ -1210,6 +1306,85 @@ mod tests {
         run_loop(&fake, &ctrl);
         assert_eq!(fake.paged(0), vec![PHONE_A]);
         assert_eq!(*fake.forgot_left.borrow(), vec![0], "once, with no page gone");
+    }
+
+    // ---- Round 4's bench switches (docs/ops/02_TESTING.md, "Round 4 switches") ---------------------------------------
+
+    /// The switches as read from `set` (a name and its text), each as if from its file on flash.
+    fn round4_from(set: &[(&str, &str)]) -> (super::Round4, Vec<String>) {
+        super::Round4::from(|name| {
+            set.iter().find(|(n, _)| *n == name).map(|(_, text)| (text.to_string(), format!("/etc/ocbm/bench_{name}")))
+        })
+    }
+
+    #[test]
+    fn round4_with_no_switch_set_is_the_default_and_says_nothing() {
+        let (r, lines) = round4_from(&[]);
+        assert_eq!(r, super::Round4::default());
+        assert!(lines.is_empty(), "{lines:?}");
+    }
+
+    #[test]
+    fn round4_first_page_slots_is_taken_or_refused() {
+        let (r, lines) = round4_from(&[("first_page_slots", "8192")]);
+        assert_eq!(r.first_page_slots, Some(8192));
+        assert_eq!(
+            lines,
+            ["[bench] round4: first_page_slots=8192 (/etc/ocbm/bench_first_page_slots): the first page of the first round 5120 ms; every other page the round's"]
+        );
+        for bad in ["0", "65536", "-1", "5.12", "soon", ""] {
+            let (r, lines) = round4_from(&[("first_page_slots", bad)]);
+            assert_eq!(r, super::Round4::default(), "{bad:?}");
+            assert!(lines.len() == 1 && lines[0].contains("refused") && lines[0].ends_with("the default"), "{bad:?}: {lines:?}");
+        }
+    }
+
+    /// Round 4, item 1 (bench): the first round's first page at the switch's length, the round's again for the page after
+    /// it, later rounds as before. No switch: the round's length alone, written before each round as in 2.7.0.
+    #[test]
+    fn round4_the_first_page_alone_takes_the_switch_s_length() {
+        let default = crate::hci::PAGE_TIMEOUT_DEFAULT;
+        let ctrl = Control::default();
+        set_order(&ctrl, &[PHONE_A, PHONE_B]);
+        let fake = Fake::new(&ctrl, 2, |_, _| Attempt::Absent);
+        run_loop(&fake, &ctrl);
+        assert_eq!(*fake.slots.borrow(), vec![(0, FIRST_ROUND_PAGE_SLOTS), (2, default)], "no switch: 3.75 s in round 1, then 5.12");
+        assert!(fake.logs.borrow().is_empty(), "and no [bench] line");
+
+        let ctrl = Control::default();
+        set_order(&ctrl, &[PHONE_A, PHONE_B]);
+        let mut fake = Fake::new(&ctrl, 2, |_, _| Attempt::Absent);
+        fake.round4.first_page_slots = Some(8192);
+        run_loop(&fake, &ctrl);
+        assert_eq!(fake.paged(0), vec![PHONE_A, PHONE_B], "still the driver's order");
+        assert_eq!(
+            *fake.slots.borrow(),
+            vec![(0, FIRST_ROUND_PAGE_SLOTS), (0, 8192), (1, FIRST_ROUND_PAGE_SLOTS), (2, default)],
+            "the first page 5.12 s, the second phone's 3.75 s, round 2 the default"
+        );
+        let logs = fake.logs.borrow();
+        assert!(logs.iter().any(|l| l == "[bench] round4: first_page_slots: paging 5120 ms for the first page of the first round"), "{logs:?}");
+
+        // One phone: its first page takes the switch's length too (a 10.24 s page, for an uncensored answer time).
+        let ctrl = Control::default();
+        set_order(&ctrl, &[PHONE_A]);
+        let mut fake = Fake::new(&ctrl, 2, |_, _| Attempt::Absent);
+        fake.round4.first_page_slots = Some(16384);
+        run_loop(&fake, &ctrl);
+        assert_eq!(*fake.slots.borrow(), vec![(0, 16384), (1, default)]);
+
+        // The first page answered and reset: its re-page at the round's length.
+        let ctrl = Control::default();
+        set_order(&ctrl, &[PHONE_A, PHONE_B]);
+        let mut pages = 0;
+        let mut fake = Fake::new(&ctrl, 1, move |_, _| {
+            pages += 1;
+            if pages == 1 { Attempt::Reset } else { Attempt::Absent }
+        });
+        fake.round4.first_page_slots = Some(8192);
+        run_loop(&fake, &ctrl);
+        assert_eq!(fake.paged(0), vec![PHONE_A, PHONE_A, PHONE_B]);
+        assert_eq!(*fake.slots.borrow(), vec![(0, FIRST_ROUND_PAGE_SLOTS), (0, 8192), (1, FIRST_ROUND_PAGE_SLOTS)]);
     }
 
     /// R2 and R3 through the loop: only the timed-out phone goes last next round; a lost claim moves nobody.
