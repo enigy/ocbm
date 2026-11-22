@@ -1015,6 +1015,22 @@ handover_on() {
   _hon=""; read -r _hon 2>/dev/null <"$HANDOVER_BENCH_ON"
   [ "$_hon" != off ]
 }
+# Round 4, item 6 (bench btd_early, 22 Nov 2026; docs/ops/02_TESTING.md, "Round 4 switches"): the same early btd while
+# the boot preload runs, with the handover NOT asked for. Nothing is handed over (radio_hal.sh claims nothing without the
+# handover's own opt-in), so btd waits for the file that says bt_on is over (crates/vendor/wireless/src/handover.rs,
+# Go::BtOn) and brings Bluetooth up as today, DOWN/UP and all: only its exec and start (about 0.35 s from bt_on's end)
+# move off the path. Off by default. On with /tmp/bench_btd_early or, for a cold boot, /etc/ocbm/bench_btd_early on flash
+# (set unless it reads "off"); _beo is the file that set it.
+BTD_EARLY_BENCH_ON=${BTD_EARLY_BENCH_ON:-/tmp/bench_btd_early}
+BTD_EARLY_ON_FILE=${BTD_EARLY_ON_FILE:-/etc/ocbm/bench_btd_early}
+btd_early_on() {
+  for _beo in "$BTD_EARLY_BENCH_ON" "$BTD_EARLY_ON_FILE"; do
+    [ -e "$_beo" ] || continue
+    _beo_v=""; read -r _beo_v 2>/dev/null <"$_beo"
+    [ "$_beo_v" != off ] && return 0
+  done
+  _beo=""; return 1
+}
 
 wireless_up() {
   # $1 = fallback: today's path after an armed go that failed (go_watch, wireless_go). The go's timeline stamps and
@@ -1097,6 +1113,11 @@ wireless_up() {
   # The cold boot (above): btd first, waiting, while the boot preload attaches Bluetooth, when the handover is asked for.
   _wu_early=0
   if [ "$_wu_fb" = 0 ] && preload_running && handover_on; then _wu_early=1; fi
+  # Round 4 (bench btd_early, above): the early btd with the handover off; it waits for bt_on's end.
+  if [ "$_wu_early" = 0 ] && [ "$_wu_fb" = 0 ] && preload_running && btd_early_on; then
+    _wu_early=1
+    echo "[sup] [bench] round4: btd_early ($_beo): the handover is off - btd starts now and waits for bt_on to end, then brings Bluetooth up as today"
+  fi
   if [ "$_wu_fb" = 1 ]; then
     echo "[sup] host PRESENT + wireless enabled -> CLEAN bring-up of Bluetooth after the failed armed go (detached, pairing=$mode) at uptime $(cut -d' ' -f1 /proc/uptime)"
   elif [ "$_wu_early" = 1 ]; then
