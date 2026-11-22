@@ -380,8 +380,9 @@ clears it; Carlink's debug builds can write it) or, kept across a power cut so a
 whole. `/tmp` is read first; either one by `bench_flag`'s rule (absent or `off`: not set). A number that is not one, or out
 of its range, is refused with a line and the default stands. Every switch that is set says so in a line holding
 `[bench] round4:` (btd's in `/tmp/wl.log`, carplayd's in `/tmp/carplayd_wl.log`, the scripts' in `/tmp/box.log`), once
-where it is read and again where it acts. For a cold boot set the bottom four and `btd_early` in `/etc/ocbm`: they act
-during the boot, while `/tmp` is still empty. Removing the file turns one off.
+where it is read and again where it acts. For a cold boot set the bottom three and `btd_early` in `/etc/ocbm`: they act
+during the boot, while `/tmp` is still empty. Removing the file turns one off. Item 7's `gpio_first` (the stock GPIO
+set-up before ocbm_boot.sh) was benched 0.25 s slower at the start and dropped; its `preload_nice` stays.
 
 | Name | Value | Default | Read | Does |
 |---|---|---|---|---|
@@ -395,7 +396,6 @@ during the boot, while `/tmp` is still empty. Removing the file turns one off.
 | `btd_early` | flag | off | the supervisor, at the host's arrival | with the boot preload running and the handover not asked for: btd started at once, waiting for bt_on's end, then today's bring-up |
 | `page_trim` | flag | off | radio_hal.sh | with a host waiting on the preload: no SCO lines or name set on its attach, the together guard's mark cleared after its locks; and every lock wait looks every 0.05 s |
 | `attach_poll` | flag | off | radio_hal.sh, each attach | hci0 looked at every 0.1 s as the attach converges, not 0.5 s |
-| `gpio_first` | flag | off | the dispatcher, each start | the stock GPIO set-up first, its end waited for (1 s at most), then ocbm_boot.sh |
 | `preload_nice` | flag | off | ocbm_boot.sh, each start | the boot preload reniced to -5 before it starts |
 
 Not built in round 4: the AP configured ahead of the cold path, `noscan`, and anything in the handover itself.
