@@ -1,0 +1,5 @@
+Carlink 3.30: the OCBM 2.7.0 update, for a sooner start from a powered-off adapter
+
+- Offers the adapter update to OCBM 2.7.0 in Settings › Adapter and about, from OCBM 1.0.1 or later, and installs 2.7.0 on a stock adapter from the connecting screen (Convert to OCBM).
+- 2.7.0 is ready sooner after the adapter gets power, the start a car sees when it has cut the adapter's USB power while parked: the adapter loads its two radios side by side and earlier in its start, and calls the phone about 2 s sooner. On the bench the first CarPlay frame came 13.8 to 16.9 s after power-on when the iPhone answered the adapter's first call.
+- Nothing else changes in Carlink since 3.25.
