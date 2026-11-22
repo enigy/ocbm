@@ -789,10 +789,14 @@ verb returns (clause 1). Today's order (`bt_attach_mapped`) is the code of befor
   next attach; each failed or unfinished one counts in `/script/.radio_together_failed`, two in a row write the owner's
   file with `guard:` in it, and the order is Wi-Fi first until the owner removes it. One that converges clears the
   count. A together attach that gave Bluetooth but no Wi-Fi interface counts as well; one whose controller answered
-  never counts, however a later name read goes (the 21 Nov review J). An install, an update and an update's first start
-  (for a package an older updater placed) lift the guard's file and its count (a new version tries again), never an
-  owner's own file (as the armed path's switch); a revert and the restores remove both, the owner's too, since stock
-  reads neither (the restore's lists name all three: `radio_*` is `is_radio()`'s). The off file goes in whole, written
+  never counts, however a later name read goes (the 21 Nov review J). An install and an update lift the guard's file,
+  its count and its mark (a new version tries again), never an owner's own file (as the armed path's switch), and so
+  does an update's trial, once, at its first start, for this guard and the preload's alike: recorded in the update's
+  journal (`guards_lifted` in `/etc/ocbm/update_pending`), so a package an older updater placed gets its lift there,
+  and the rest of the trial counts as any boot does. Until 21 Nov that lift came at every start of a trial not yet kept
+  (each passing self-test deletes the start count it was keyed on, so every start read as the first): neither guard
+  could trip while a trial stayed open, at 2.6.5 too for the preload's. A revert and the restores remove both, the
+  owner's too, since stock reads neither (the restore's lists name all three: `radio_*` is `is_radio()`'s). The off file goes in whole, written
   beside it as `/script/.radio_together_off.new`, synced and renamed in (a plain `>` cut by a power loss left an empty
   file, which every reader takes for the owner's). A mark, count or off file that cannot be written (a full flash)
   never stops a bring-up: the attach goes on, uncounted, and the log says so (the review's B: a `: > FILE` there used

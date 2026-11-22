@@ -213,15 +213,27 @@ update_boot() {  # before OCBM starts
     || log "could not count this start (flash full?)"
   update_trial=1
   log "update trial: $(journal to), start $((n + 1))"
-  # Its first start begins with the boot radio preload on: an updater from before the guard counted (85bff31..9b228f8)
-  # cleared nothing, and its one-event flag would read as the owner's (the Mac's 13 Nov review). The handover's retired
-  # off file goes too (an updater from before it was retired leaves it; nothing reads it now), and the radio order's guard
-  # with them, as this version's updater lifts it (its count, its in-flight mark, an off file it wrote; never the owner's
-  # own off file): 2.6.5's updater knows nothing of them (the 21 Nov review E).
-  if [ "$n" = 0 ]; then
+  # THE RADIO GUARDS, LIFTED ONCE PER UPDATE. A new version starts with the boot radio preload on and the radio order
+  # together again: the preload guard's off flag, mark and count (an updater from before that guard counted,
+  # 85bff31..9b228f8, cleared nothing, and its one-event flag would read as the owner's: the Mac's 13 Nov review), the
+  # order guard's mark, count and an off file it wrote, never the owner's own (2.6.5's updater knows nothing of them:
+  # the 21 Nov review E), and the handover's retired off file. ONCE, at this update's first trial start, recorded in
+  # its journal ("guards_lifted", on a line of its own): every start whose self-test passes deletes update_attempts
+  # (selftest), so "n = 0", the test this lift had until 21 Nov, held at every start of a trial not yet kept, and the
+  # lift there wiped what a preload or a together attach that hung the start before had left: neither guard could
+  # trip, and a trial whose radios hung the adapter stayed open for ever (no commit without a host's session, no
+  # rollback before n = 2). The record follows the lift: a power cut between them lifts again at the next start, never
+  # not at all. The journal is this update's alone (each updater writes it new, the commit and the rollback remove it),
+  # so a later update, or this one tried again after a rollback, lifts once of its own; one an older updater placed
+  # (2.6.5's) gets its lift here as well.
+  if ! grep -qx guards_lifted "$U"; then
     rm -f "$S/radio_preload_off" "$S/.radio_preload_inflight" "$S/.radio_preload_unfinished" "$S/radio_handover_off" \
           "$S/.radio_together_inflight" "$S/.radio_together_failed"
     grep -q '^guard' "$S/radio_together_off" 2>/dev/null && rm -f "$S/radio_together_off"
+    sync
+    if { printf '\nguards_lifted\n' >> "$U"; } 2>/dev/null; then sync
+      log "update trial: the radio guards lifted for this update (once; recorded in its journal)"
+    else log "update trial: the radio guards lifted, but the journal could not record it (flash full?): the next start lifts them again"; fi
   fi
 }
 

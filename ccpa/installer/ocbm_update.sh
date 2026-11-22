@@ -166,14 +166,18 @@ newer "$from_min" "$have" && refuse "This package updates OCBM $from_min or newe
 # What changes: every file of the new version that the adapter does not already have as it should.
 list="$WORK/changed"
 { true >"$list"; } 2>/dev/null || refuse "Could not write the update's work files (no room in /tmp?)."
-need_kb=0
+need_kb=0; listed=0
 while read -r want rel; do
   t=$(target "$rel")
   [ "$(sum_of "$ROOT/$t")" = "$want" ] && continue
   [ -e "$WORK/files/$rel" ] || refuse "The package lacks /$t, which this adapter needs: it updates from OCBM $from_min, and the adapter runs $have."
-  echo "$want $rel" >> "$list"
+  { echo "$want $rel" >> "$list"; } 2>/dev/null || refuse "Could not write the update's work files (no room in /tmp?)."
+  listed=$((listed + 1))
   need_kb=$((need_kb + $(kb_on_flash "$WORK/files/$rel")))
 done < "$WORK/SHA256SUMS"
+# Every changed file in the list, or nothing goes on (the 21 Nov review): a full /tmp can take an append and keep none
+# of it, and an empty list reads as "no files changed" below, which moves installed_version on with nothing placed.
+[ "$(grep -c '' "$list" 2>/dev/null)" = "$listed" ] || refuse "Could not write the update's work files (no room in /tmp?)."
 if [ ! -s "$list" ]; then   # a new version number with no new files
   { echo "$VER" > "$EO/installed_version.new" && mv -f "$EO/installed_version.new" "$EO/installed_version"; } \
     || refuse "Could not write /etc/ocbm/installed_version."
