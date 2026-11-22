@@ -162,6 +162,7 @@ impl PhoneGate {
     }
 
     /// With the bench lever at `bench` (a test's own).
+    #[cfg(test)]
     pub fn with_bench(file: Option<PathBuf>, bench: PathBuf) -> Self {
         Self::with_benches(file, bench, None)
     }
