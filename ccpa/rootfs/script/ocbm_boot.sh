@@ -27,6 +27,49 @@ touch /tmp/UDiskPassThroughMode
     echo "[ocbm-boot] ---- end of previous boot's log ----" >> /tmp/box.log
     rm -f /script/box_crash.log
   fi
+
+  # Boot radio preload, on unless /script/radio_preload_off (Scott, 13 Nov; it switches itself off after a preload
+  # that never finished): drivers + BT attach into the between-sessions state while the head
+  # unit boots (radio_hal.sh do_preload has the why and the wedge guards). Once it is done the supervisor arms
+  # Bluetooth for the first host, powered but invisible (session_supervisor.sh, "Armed Bluetooth"); without a
+  # preload Bluetooth is not attached at boot, and nothing is armed until a host's session has attached it.
+  # Backgrounded, so it can never block the boot. A start with a self-test shares the boot with nothing new until it
+  # passes: the dispatcher names its pass file in OCBM_PRELOAD_AFTER, and the preload waits up to 120 s for it (a
+  # failure reverts or rolls back before then). Never on the legacy first-boot trial (/script/ocbm_trial), whose
+  # self-revert has no self-test to wait for.
+  # WHERE IT STARTS (20 Nov 2026). The host's session waits on the radios, not on the link: a host subscribes about 3 s
+  # into a cold boot and its Bluetooth came 7.4 to 8.6 s later (the truck, 16-20 Nov). So where the dispatcher marks
+  # the end of the stock GPIO set-up (OCBM_GPIO_DONE), the preload starts here, first, beside the gadget's set-up,
+  # about 0.8 s sooner than after ocbmd and the supervisor. On this one core its descriptor read and driver unpack
+  # share the CPU with the gadget's set-up, which may come up a little later for it; and it touches the chip only once
+  # that GPIO set-up has pulsed the Bluetooth reset line (radio_hal.sh gpio_wait), about 0.3 s into the boot's start.
+  # With no such mark (another start script) it starts after ocbmd and the supervisor, as it always did, so it never
+  # comes before that pulse; so it does with /script/radio_preload_late on flash, the bench's A/B and the owner's way
+  # back to the old start. docs/ops/02_TESTING.md, "Cold boot: real power cycles", measures what it costs the link.
+  radio_preload() {
+    if [ ! -e /script/radio_preload_off ] && [ ! -e /script/ocbm_trial ] && [ -r /script/radio_hal.sh ]; then
+      echo "[ocbm-boot] radio preload starting${OCBM_PRELOAD_AFTER:+ once the self-test passes}" >> /tmp/box.log
+      # Its states, with the uptime, for btd's [startup] record; radio_hal.sh adds the rest.
+      [ -n "${OCBM_PRELOAD_AFTER:-}" ] && echo "waiting $(cut -d" " -f1 /proc/uptime)" >> /tmp/radio_preload_state
+      setsid sh -c 'i=0; while [ -n "$1" ] && [ ! -e "$1" ]; do
+          [ "$i" -ge 120 ] && { echo "[ocbm-boot] radio preload skipped: no self-test pass in 120 s"
+            echo "skipped $(cut -d" " -f1 /proc/uptime)" >> /tmp/radio_preload_state; exit 0; }
+          i=$((i + 1)); sleep 1
+        done
+        exec sh /script/radio_hal.sh preload' preload "${OCBM_PRELOAD_AFTER:-}" >> /tmp/box.log 2>&1 </dev/null &
+    elif [ -e /script/radio_preload_off ]; then   # every boot, so no drive log misses it
+      if grep -q "^guard" /script/radio_preload_off 2>/dev/null; then
+        echo "[ocbm-boot] radio preload DISABLED by its guard ($(head -1 /script/radio_preload_off)); rm /script/radio_preload_off to re-enable" >> /tmp/box.log
+        echo "off_guard $(cut -d" " -f1 /proc/uptime)" >> /tmp/radio_preload_state
+      else
+        echo "[ocbm-boot] radio preload off (/script/radio_preload_off)" >> /tmp/box.log
+        echo "off_owner $(cut -d" " -f1 /proc/uptime)" >> /tmp/radio_preload_state
+      fi
+    fi
+  }
+  preload_early=0
+  [ -n "${OCBM_GPIO_DONE:-}" ] && [ ! -e /script/radio_preload_late ] && preload_early=1
+  [ "$preload_early" = 1 ] && radio_preload
   # stage + load the gadget modules (copy_to_tmp may not have run yet)
   [ -e /tmp/g_android_accessory.ko ] || { [ -e /script/ko.tar.gz ] && tar -xzf /script/ko.tar.gz -C /tmp 2>/dev/null; }
   grep -q storage_common /proc/modules || insmod /tmp/storage_common.ko 2>/dev/null
@@ -87,32 +130,19 @@ touch /tmp/UDiskPassThroughMode
   echo "[ocbm-boot] armed functions=$(cat $A/functions) class=$(cat $A/bDeviceClass) pid=$(cat $A/idProduct) state=$(cat $A/state) acc=$([ -e /dev/usb_accessory ] && echo yes) ocbmd=$OCBMD sup=$(pgrep -f session_supervisor)" >> "$L"
   echo "[ocbm-boot] armed functions=$(cat $A/functions) class=$(cat $A/bDeviceClass) pid=$(cat $A/idProduct) state=$(cat $A/state) acc=$([ -e /dev/usb_accessory ] && echo yes) ocbmd=$OCBMD sup=$(pgrep -f session_supervisor)" >> /tmp/box.log
 
-  # Boot radio preload, on unless /script/radio_preload_off (Scott, 13 Nov; it switches itself off after a preload
-  # that never finished): drivers + BT attach into the between-sessions state while the head
-  # unit boots (radio_hal.sh do_preload has the why and the wedge guards). Once it is done the supervisor arms
-  # Bluetooth for the first host, powered but invisible (session_supervisor.sh, "Armed Bluetooth"); without a
-  # preload Bluetooth is not attached at boot, and nothing is armed until a host's session has attached it. After ocbmd and the
-  # supervisor, backgrounded, so it can never delay the management link. A start with a self-test shares the boot
-  # with nothing new until it passes: the dispatcher names its pass file in OCBM_PRELOAD_AFTER, and the preload
-  # waits up to 120 s for it (a failure reverts or rolls back before then). Never on the legacy first-boot trial
-  # (/script/ocbm_trial), whose self-revert has no self-test to wait for.
-  if [ ! -e /script/radio_preload_off ] && [ ! -e /script/ocbm_trial ] && [ -r /script/radio_hal.sh ]; then
-    echo "[ocbm-boot] radio preload starting${OCBM_PRELOAD_AFTER:+ once the self-test passes}" >> /tmp/box.log
-    # Its states, with the uptime, for btd's [startup] record; radio_hal.sh adds the rest.
-    [ -n "${OCBM_PRELOAD_AFTER:-}" ] && echo "waiting $(cut -d" " -f1 /proc/uptime)" >> /tmp/radio_preload_state
-    setsid sh -c 'i=0; while [ -n "$1" ] && [ ! -e "$1" ]; do
-        [ "$i" -ge 120 ] && { echo "[ocbm-boot] radio preload skipped: no self-test pass in 120 s"
-          echo "skipped $(cut -d" " -f1 /proc/uptime)" >> /tmp/radio_preload_state; exit 0; }
-        i=$((i + 1)); sleep 1
-      done
-      exec sh /script/radio_hal.sh preload' preload "${OCBM_PRELOAD_AFTER:-}" >> /tmp/box.log 2>&1 </dev/null &
-  elif [ -e /script/radio_preload_off ]; then   # every boot, so no drive log misses it
-    if grep -q "^guard" /script/radio_preload_off 2>/dev/null; then
-      echo "[ocbm-boot] radio preload DISABLED by its guard ($(head -1 /script/radio_preload_off)); rm /script/radio_preload_off to re-enable" >> /tmp/box.log
-      echo "off_guard $(cut -d" " -f1 /proc/uptime)" >> /tmp/radio_preload_state
+  # The boot radio preload where no dispatcher marks the stock GPIO set-up's end, or /script/radio_preload_late asks
+  # for it: after ocbmd and the supervisor, as before 20 Nov (radio_preload, above, has the why).
+  if [ "$preload_early" = 0 ]; then
+    [ -e /script/radio_preload_late ] && echo "[ocbm-boot] radio preload starts after ocbmd and the supervisor (/script/radio_preload_late)" >> /tmp/box.log
+    radio_preload
+  fi
+  # The radio order's off switch, every boot, as the preload's (radio_hal.sh, "The order Bluetooth and the Wi-Fi
+  # driver come up in"): the owner's or its guard's /script/radio_together_off brings back the Wi-Fi-first order.
+  if [ -e /script/radio_together_off ]; then
+    if grep -q "^guard" /script/radio_together_off 2>/dev/null; then
+      echo "[ocbm-boot] radio order: the Bluetooth firmware beside the Wi-Fi driver DISABLED by its guard ($(head -1 /script/radio_together_off)); rm /script/radio_together_off to re-enable" >> /tmp/box.log
     else
-      echo "[ocbm-boot] radio preload off (/script/radio_preload_off)" >> /tmp/box.log
-      echo "off_owner $(cut -d" " -f1 /proc/uptime)" >> /tmp/radio_preload_state
+      echo "[ocbm-boot] radio order: Wi-Fi first (/script/radio_together_off)" >> /tmp/box.log
     fi
   fi
 

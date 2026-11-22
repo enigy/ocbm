@@ -133,6 +133,31 @@ is_new() {  # $1 dir: the update kept, its .prev copies gone, the program it ret
     && [ -z "$(find "$1/root" -name '*.prev' -o -name '*.new' | head -1)" ]
 }
 result_is() { grep -q "^$2" "$1/root/etc/ocbm/update_result" 2>/dev/null; }
+# The boot preload's two guards as the real radio_hal.sh keeps them, on starts that hang inside both (the preload and
+# its together attach never finish): ocbm_boot.sh becomes a stand-in that waits for the self-test's pass, as the real
+# one starts the preload in a trial (OCBM_PRELOAD_AFTER), then sources a path-moved radio_hal.sh for its functions and
+# runs the preload's guard and mark (do_preload, which "hangs" at its next step) and the order's guard and the attach's
+# mark (bt_order, write_empty). What each guard decided goes to $1/guards, one "start done" line a start.
+guard_boot() {  # $1 dir
+  local d="$1" R="$1/root"
+  sed -e "s#/script/#$R/script/#g; s#/etc/ocbm#$R/etc/ocbm#g; s#/tmp/#$d/run/#g; s#/proc/#$d/proc/#g; s#/sys/#$d/sys/#g" \
+    "$REPO/ccpa/rootfs/script/radio_hal.sh" > "$d/radio_hal.moved.sh"
+  cat > "$R/script/ocbm_boot.sh" <<EOF
+#!/bin/sh
+echo ran >> "$d/m.boot"
+(
+  i=0; while [ ! -e "$d/run/ocbm_selftest_passed" ] && [ \$i -lt 100 ]; do i=\$((i + 1)); sleep 0.1; done
+  RADIO_HAL_FUNCS=1 . "$d/radio_hal.moved.sh"
+  ( sdio_wait() { exit 0; }; do_preload; echo "preload rc=\$?" >> "$d/guards" )
+  ( RADIO_BT_AFTER_WLAN=1; RADIO_BT_TOGETHER=1; bt_order; echo "order=\$_bto off=\$_bto_off" >> "$d/guards"
+    if [ "\$_bto" = together ]; then write_empty "\$TOGETHER_MARK"; fi )
+  echo "start done" >> "$d/guards"
+) </dev/null >/dev/null 2>&1 &
+exit 0
+EOF
+  chmod 755 "$R/script/ocbm_boot.sh"
+}
+starts_done() { [ "$(grep -c '^start done' "$1/guards" 2>/dev/null)" -ge "$2" ]; }
 
 . "$HERE/test_shells.sh"
 for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
@@ -141,9 +166,16 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   echo "== $sh: an update on a final adapter that passes its self-test"
   d="$T/$sh-pass"; make_box "$d" final; make_pkg "$d/run/ocbm-update.tgz" dispatch
   echo "guard: 2 unfinished in a row" > "$d/root/script/radio_preload_off"; echo 1 > "$d/root/script/.radio_preload_unfinished"
+  echo "guard: 2 together attaches in a row failed" > "$d/root/script/radio_together_off"; echo 1 > "$d/root/script/.radio_together_failed"
+  : > "$d/root/script/.radio_together_inflight"; : > "$d/root/script/radio_preload_late"
+  : > "$d/root/script/radio_handover_off"; : > "$d/root/script/radio_handover_on"   # the handover's retired off file, an owner's opt-in
   update "$sh" "$d"; rc=$?
   check '[ $rc = 0 ] && [ -e "$d/rebooted" ] && grep -qx placed "$d/root/etc/ocbm/update_pending"' "placed, journalled, restarting"
+  check '[ ! -e "$d/root/script/radio_handover_off" ] && [ -e "$d/root/script/radio_handover_on" ]' \
+    "the handover's retired off file goes with the update; an owner's opt-in stays"
   check '[ ! -e "$d/root/script/radio_preload_off" ] && [ ! -e "$d/root/script/.radio_preload_unfinished" ]' "the new version starts with the boot radio preload on"
+  check '[ ! -e "$d/root/script/radio_together_off" ] && [ ! -e "$d/root/script/.radio_together_failed" ] && [ ! -e "$d/root/script/.radio_together_inflight" ] && [ -e "$d/root/script/radio_preload_late" ]' \
+    "and tries the radio order again: the guard's off file, its count and mark lifted; the owner's radio_preload_late kept"
   check '[ "$(content "$d" usr/sbin/ocbmd)" = new-ocbmd ] && [ "$(content "$d" usr/sbin/ocbmd.prev)" = old-ocbmd ]' \
     "the new ocbmd in place, the old one kept as .prev"
   check '! grep -q "usr/sbin/btd" "$d/root/etc/ocbm/update_pending"' "a file that did not change is left alone"
@@ -151,11 +183,58 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
     "the start script is swapped last"
   check '[ ! -e "$d/run/ocbm-update.tgz" ] && [ ! -d "$d/run/ocbm-update" ]' "the package and its unpacked copy go"
   : > "$d/root/script/radio_preload_off"   # an older updater's one-event flag, which it left behind
+  : > "$d/root/script/radio_handover_off"   # and the handover's retired off file, which an older updater keeps
+  echo "guard: 2 together attaches in a row failed" > "$d/root/script/radio_together_off"   # and the radio order's guard
+  : > "$d/root/script/.radio_together_inflight"; echo 1 > "$d/root/script/.radio_together_failed"
   restart "$d"; touch "$d/run/ocbmd_answered"; boot "$sh" "$d"   # a host answered: Carlink connected
   check 'waitfor "[ ! -e $d/root/script/radio_preload_off ]" 5' "the update's first start clears a flag an older updater left"
+  check 'waitfor "[ ! -e $d/root/script/radio_handover_off ]" 5 && [ -e "$d/root/script/radio_handover_on" ]' \
+    "  and the handover's retired off file, the owner's opt-in kept"
+  check '[ ! -e "$d/root/script/radio_together_off" ] && [ ! -e "$d/root/script/.radio_together_inflight" ] && [ ! -e "$d/root/script/.radio_together_failed" ]' \
+    "  and the radio order's guard (its off file, mark and count), which an older updater left"
   check 'waitfor "is_new \"$d\"" 5' "the trial passes and a host is answered: the update is kept, installed_version moves on"
   check 'result_is "$d" "committed $NEW (from $OLD)"' "update_result: committed"
   check '[ ! -e "$d/rebooted" ] && [ -e "$d/m.boot" ] && [ "$(cat "$d/root/script/ocbm_mode")" = final ]' "no restart; still final"
+
+  # The radio guards through an open trial (the 21 Nov review E, corrected). No host comes, so the trial stays open, and
+  # every start's self-test passes, which deletes update_attempts: until 21 Nov every start read as the first, and the
+  # lift there wiped what the start before had left, so neither guard could trip. Now the lift is once per update.
+  echo "== $sh: an open trial's radio guards count across its starts; the lift is once per update"
+  d="$T/$sh-guards"; make_box "$d" final; make_pkg "$d/run/ocbm-update.tgz" dispatch; update "$sh" "$d"; guard_boot "$d"
+  for k in 1 2 3; do
+    restart "$d"; boot "$sh" "$d"; waitfor "starts_done '$d' $k" 15
+    cp "$d/run/box.log" "$d/box.$k" 2>/dev/null
+    cp "$d/root/script/.radio_preload_unfinished" "$d/pre.$k" 2>/dev/null; cp "$d/root/script/.radio_together_failed" "$d/tog.$k" 2>/dev/null
+  done
+  check 'grep -q "the radio guards lifted for this update" "$d/box.1" && ! grep -q "radio guards lifted" "$d/box.2" "$d/box.3" && [ "$(grep -cx guards_lifted "$d/root/etc/ocbm/update_pending")" = 1 ]' \
+    "the trial's first start lifts both guards and records it in the journal; its later starts do not lift"
+  check '[ "$(cat "$d/pre.2" 2>/dev/null)" = 1 ] && [ "$(cat "$d/tog.2" 2>/dev/null)" = 1 ]' \
+    "start 2: the marks a hang at start 1 left are still there and counted (the preload's 1, the order's 1)"
+  check 'grep -q "^guard: 2 unfinished in a row" "$d/root/script/radio_preload_off" && grep -qx "preload rc=1" "$d/guards"' \
+    "start 3: the preload's guard trips (radio_preload_off: guard), the preload does not run"
+  check 'grep -q "^guard: 2 together attaches in a row" "$d/root/script/radio_together_off" && grep -qx "order=wlan_first off=guard" "$d/guards"' \
+    "  and the order's guard trips (radio_together_off: guard), Wi-Fi first"
+  check 'grep -qx placed "$d/root/etc/ocbm/update_pending" && [ -e "$d/root/usr/sbin/ocbmd.prev" ]' "  the trial still open (no host answered), nothing committed"
+  # A journal with no record (one an older updater placed, or a power cut between the lift and its record): lifted at
+  # its next start, and recorded then.
+  grep -vx guards_lifted "$d/root/etc/ocbm/update_pending" > "$d/j" && cp "$d/j" "$d/root/etc/ocbm/update_pending"
+  restart "$d"; boot "$sh" "$d"; waitfor "starts_done '$d' 4" 15
+  check 'grep -q "the radio guards lifted for this update" "$d/run/box.log" && [ ! -e "$d/root/script/radio_preload_off" ] && [ "$(grep -cx guards_lifted "$d/root/etc/ocbm/update_pending")" = 1 ]' \
+    "a journal with no record (an older updater's, or a power cut before the record): lifted at its next start, recorded"
+  check '[ "$(tail -2 "$d/guards" | head -1)" = "order=together off=-" ]' "  and the order is together again"
+
+  # The changed-file list on a full /tmp (the 21 Nov review, 2): an append that keeps nothing read as "no files changed",
+  # and the version moved on with nothing placed. A package whose work-file path is a link to /dev/null stands in for
+  # it (the list then keeps nothing of what is appended); /dev/full, where there is one, for an append that fails.
+  for sink in /dev/null /dev/full; do
+    [ -e "$sink" ] || continue
+    d="$T/$sh-list$(basename "$sink")"; make_box "$d" final; make_pkg "$d/run/ocbm-update.tgz" dispatch
+    w="$T/listpkg"; rm -rf "$w"; mkdir -p "$w"; ( cd "$w" && gzip -dc "$d/run/ocbm-update.tgz" | tar -xf - )
+    ln -s "$sink" "$w/changed"; ( cd "$w" && tar -cf - . ) | gzip -c > "$d/run/ocbm-update.tgz"; rm -rf "$w"
+    update "$sh" "$d"; rc=$?
+    check '[ $rc = 1 ] && is_old "$d" && result_is "$d" "refused $NEW: Could not write the update.s work files"' \
+      "the changed-file list cannot hold what is appended ($sink): refused, nothing changed"
+  done
 
   # The retire list (8 Nov): a commit a power cut stopped part way finishes at the next start, retired files and all.
   echo "== $sh: a power cut mid-commit: the next start finishes it, the retired program deleted"
@@ -172,9 +251,11 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   # answer_watch timeout after that "rolled back" nothing, with blank versions, and restarted).
   echo "== $sh: an update's trial is kept once a host is answered, and only then"
   d="$T/$sh-deaf"; make_box "$d" final; make_pkg "$d/run/ocbm-update.tgz" dispatch
-  update "$sh" "$d"; restart "$d"; boot "$sh" "$d" ANSWER_SECS=3
+  update "$sh" "$d"; : > "$d/root/script/radio_together_off"   # the owner's own radio order switch (empty: no guard)
+  restart "$d"; boot "$sh" "$d" ANSWER_SECS=3
   check 'waitfor "grep -q \"self-test passed; the update is kept once\" $d/run/box.log" 5 && [ -e "$d/root/usr/sbin/ocbmd.prev" ] && grep -qx placed "$d/root/etc/ocbm/update_pending"' \
     "the self-test passes with no host: not committed, the .prev copies kept"
+  check '[ -e "$d/root/script/radio_together_off" ]' "  the update's first start keeps an owner's own radio order switch (only a guard's goes)"
   echo 40 > "$d/run/ocbmd_heard"; echo "500.00 80.00" > "$d/proc/uptime"
   check 'waitfor "is_old \"$d\" && [ -e \"$d/rebooted\" ]" 8' "heard and never answered: the old version back, and a restart"
   check 'result_is "$d" "rolled_back $NEW: ocbmd heard the host for 460 s and never answered it (kept $OLD)"' \
@@ -373,9 +454,16 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   d="$T/$sh-bump"; make_box "$d" final; NEW_SAVE="$NEW"; NEW="1.0.1 ocbm bump"
   w="$T/bump"; rm -rf "$w"; mkdir -p "$w"; old_tree "$T/bumptree"; sums_of "$T/bumptree" > "$w/SHA256SUMS"; rm -rf "$T/bumptree"
   echo "$NEW" > "$w/VERSION"; echo 1.0.0 > "$w/FROM_MIN"; (cd "$w" && tar -cf - .) | gzip -c > "$d/run/ocbm-update.tgz"
+  : > "$d/root/script/radio_together_off"; echo 1 > "$d/root/script/.radio_together_failed"   # the owner's switch, a count
+  : > "$d/root/script/radio_handover_off"   # the handover's retired off file
+  : > "$d/root/script/radio_preload_late"   # an owner's switch for the preload's old start
   update "$sh" "$d"; rc=$?
   check '[ $rc = 0 ] && [ ! -e "$d/rebooted" ] && [ "$(content "$d" etc/ocbm/installed_version)" = "$NEW" ] && result_is "$d" "committed $NEW"' \
     "a new version with no new files: committed at once, no restart"
+  check '[ -e "$d/root/script/radio_together_off" ] && [ ! -e "$d/root/script/.radio_together_failed" ]' \
+    "an owner's own radio order switch stays through an update; the guard's count goes"
+  check '[ ! -e "$d/root/script/radio_handover_off" ]' "  and with no new files to place, the handover's retired off file goes all the same"
+  check '[ -e "$d/root/script/radio_preload_late" ]' "  and the owner's radio_preload_late stays (the 21 Nov review G)"
   NEW="$NEW_SAVE"
   d="$T/$sh-revert"; make_box "$d" trial; make_pkg "$d/run/ocbm-update.tgz" ""; update "$sh" "$d"
   env ROOT="$d/root" RUN="$d/run" REBOOT="touch $d/rebooted.revert" "$sh" "$d/root/script/ocbm_revert.sh" "Go back" > /dev/null 2>&1; rc=$?

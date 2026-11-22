@@ -66,6 +66,11 @@ make_box() {  # $1 backup dir, $2 box dir: what the converted adapter looks like
   echo "radio hal"   > "$b/script/radio_hal.sh"
   : > "$b/script/radio_preload"; : > "$b/script/radio_preload_off"
   : > "$b/script/.radio_preload_inflight"; echo 1 > "$b/script/.radio_preload_unfinished"
+  # The radio order's switch and guard state, the preload's late start, the kept descriptor (20 Nov 2026): OCBM's too.
+  : > "$b/script/radio_preload_late"; echo "guard: 2" > "$b/script/radio_together_off"
+  : > "$b/script/.radio_together_inflight"; echo 1 > "$b/script/.radio_together_failed"
+  : > "$b/script/radio_handover_on"; : > "$b/script/radio_handover_off"   # the handover's opt-in, its retired off file
+  printf 'RADIO_WIRELESS=yes\nRADIO_KEPT_END=1\n' > "$b/etc/ocbm/kept_radio_caps"
   : > "$b/script/ncm_wifi"
   echo "old copy"    > "$b/script/start_main_service.sh.pre"
   blob "$b/etc/ocbm/identity.tgz" 4000
@@ -169,6 +174,8 @@ make_trial() {  # $1 dir: an adapter in its one-file trial — stock kept, OCBM 
   blob "$r/etc/carplay_peers.bin" 200
   mkdir -p "$r/etc/carplay"; echo "bond: phone A (OCBM)" > "$r/etc/carplay/bt_link_keys"
   echo "crash"     > "$r/script/box_crash.log"
+  # The radio order's and the handover's switches (20 Nov 2026): OCBM's runtime files, radio_* though they are.
+  : > "$r/script/radio_together_off"; : > "$r/script/radio_handover_on"; : > "$r/script/radio_handover_off"
   echo 77          > "$r/var/run/ocbmd.pid"
 }
 
@@ -221,7 +228,8 @@ onefile_tests() {  # $1 shell
   check '[ $rc -eq 0 ] && grep -q TREE_OK "$T/out"' "tree: made from the trial archive"
   check '[ "$(cat "$T/tree/script/start_main_service.sh")" = "stock start_main_service" ] && [ ! -e "$T/tree/script/start_main_service.stock.sh" ]' "tree: the stock start script is back under its own name"
   check '[ ! -e "$T/tree/usr/sbin/ocbmd" ] && [ ! -e "$T/tree/script/ocbm_boot.sh" ] && [ ! -e "$T/tree/etc/ocbm" ] && [ ! -e "$T/tree/script/ocbm_mode" ]' "tree: OCBM's payload, /etc/ocbm and the mode are dropped"
-  check '[ ! -e "$T/tree/etc/carplay_ident" ] && [ ! -e "$T/tree/script/box_crash.log" ]' "tree: OCBM's runtime files are dropped"
+  check '[ ! -e "$T/tree/etc/carplay_ident" ] && [ ! -e "$T/tree/script/box_crash.log" ] && [ ! -e "$T/tree/script/radio_together_off" ] && [ ! -e "$T/tree/script/radio_handover_on" ] && [ ! -e "$T/tree/script/radio_handover_off" ]' \
+    "tree: OCBM's runtime files are dropped (the radio order's and the handover's switches among them)"
   left_ocbm=0; for p in $OCBM_PATHS; do [ -e "$T/tree/$p" ] && left_ocbm=$((left_ocbm + 1)); done
   check '[ $left_ocbm -eq 0 ]' "tree: every path of make_ocbm_installer.sh --list is dropped"
   check '[ "$(cat "$T/tree/etc/hostapd.conf")" = "wpa_passphrase=stock-original" ]' "tree: hostapd.conf comes from the identity archive"
@@ -370,6 +378,10 @@ onefile_tests() {  # $1 shell
   # The boot radio preload's state (radio_hal.sh do_preload): a later install must start with the preload on.
   echo "guard: 2 unfinished in a row" > "$T/box/script/radio_preload_off"
   : > "$T/box/script/.radio_preload_inflight"; echo 1 > "$T/box/script/.radio_preload_unfinished"
+  : > "$T/box/script/radio_preload_late"; : > "$T/box/script/radio_together_off"
+  : > "$T/box/script/.radio_together_inflight"; echo 1 > "$T/box/script/.radio_together_failed"
+  : > "$T/box/script/radio_handover_on"; : > "$T/box/script/radio_handover_off"
+  printf 'RADIO_WIRELESS=yes\nRADIO_KEPT_END=1\n' > "$T/box/etc/ocbm/kept_radio_caps"
   before=$(tree_sum "$T/box")
   run_onefile "$SH1" plan "$T/box"; rc=$?
   check '[ $rc -eq 0 ] && grep -q RESTORE_PLAN_OK "$T/out" && grep -q "switch      :" "$T/out"' "plan succeeds and names the switch"
@@ -393,6 +405,8 @@ onefile_tests() {  # $1 shell
   check '[ ! -e "$T/box/script/radio_hal.sh" ] && [ ! -e "$T/box/script/radio_detect.sh" ] && [ ! -e "$T/box/script/radio_ap_up.sh" ]' "OCBM's radio seam goes with OCBM: stock has none"
   check '[ ! -e "$T/box/script/radio_preload_off" ] && [ ! -e "$T/box/script/.radio_preload_inflight" ] && [ ! -e "$T/box/script/.radio_preload_unfinished" ]' \
     "the boot radio preload's flag, marker and count go, so a later install starts with it on"
+  check '[ ! -e "$T/box/script/radio_preload_late" ] && [ ! -e "$T/box/script/radio_together_off" ] && [ ! -e "$T/box/script/.radio_together_inflight" ] && [ ! -e "$T/box/script/.radio_together_failed" ] && [ ! -e "$T/box/script/radio_handover_on" ] && [ ! -e "$T/box/script/radio_handover_off" ]' \
+    "the preload's late start, the radio order's switch, mark and count, and the handover's switches go too"
   check '[ -e "$T/box/lib/firmware/nxp/added_after.bin" ] && grep -q "1 kept by the radio guard" "$T/out"' "the radio guard still keeps the unit's own radio files"
   check '[ ! -e "$T/box/etc/carplay" ] && grep -q "/etc/carplay removed" "$T/out"' "/etc/carplay, OCBM's bond store, is removed"
   check 'grep -q "5/5 OCBM scripts and settings: [0-9]* removed, 0 kept by the radio guard" "$T/out"' \
@@ -563,6 +577,8 @@ for SH in $SHELLS; do
   check '[ "$(readlink "$T/box/bin/ls")" = busybox ] && [ "$(readlink "$T/box/usr/lib/libssl.so")" = libssl.so.1.1 ]' "links restored and retargeted"
   check '[ -L "$T/box/usr/lib/libz.so" ] && [ -f "$T/box/usr/sbin/hfpd" ] && [ ! -L "$T/box/usr/sbin/hfpd" ]' "file/link type swaps undone"
   check '[ ! -e "$T/box/usr/sbin/ocbmd" ] && [ ! -e "$T/box/script/ocbm_boot.sh" ] && [ ! -e "$T/box/etc/ocbm" ]' "OCBM files and their directory removed"
+  check '[ ! -e "$T/box/script/radio_together_off" ] && [ ! -e "$T/box/script/radio_handover_on" ] && [ ! -e "$T/box/script/radio_handover_off" ]' \
+    "the radio order's and the handover's switches go, though radio_* is the radio guard's"
   check '[ -e "$T/box/script/ncm_wifi" ] && [ -e "$T/box/script/ncm_only" ]' "NCM flags survive"
   check '[ "$(cat "$T/box/var/log/box.log")" = "new log" ] && [ -e "$T/box/var/run/ocbmd.pid" ]' "volatile runtime files untouched"
   check '[ "$(cat "$T/box/etc/shadow")" = "root::0:0:99999:7:::" ]' "login file restored"

@@ -60,7 +60,7 @@ SMS_STOCK="$ROOT/script/start_main_service.stock.sh"
 MODE="$ROOT/script/ocbm_mode"
 EO="$ROOT/etc/ocbm"
 
-: > "$LOG"
+{ true >"$LOG"; } 2>/dev/null   # not `:`: a special built-in whose failed redirection would end the install unlogged
 say() { echo "[ocbm] $*" | tee -a "$LOG"; }
 up() { u=$(cut -d. -f1 "$PROC/uptime" 2>/dev/null); echo "${u:-0}"; }   # seconds since power-on
 T0=$(up)
@@ -493,7 +493,12 @@ fi
 rm -f "$EO/boot_attempts" "$EO/first_start.txt" "$EO/pending_result.txt" "$EO/acc_direct_io"   # Stage B state of an earlier try
 # The boot radio preload starts on, its guard counting afresh (radio_hal.sh do_preload): a flag from an earlier
 # install outlives a go-back to stock, and one unfinished preload there left the Mac's dev adapter off (13 Nov).
+# An owner's /script/radio_preload_late (the preload's old start) stays, as the other owners' switches do.
 rm -f "$ROOT/script/radio_preload_off" "$ROOT/script/.radio_preload_inflight" "$ROOT/script/.radio_preload_unfinished"
+# The radio order's guard too (radio_hal.sh, "The order Bluetooth and the Wi-Fi driver come up in"): its count, its
+# in-flight mark, and an off file it wrote ("guard: ..."). An owner's own off file stays, as the armed path's does.
+rm -f "$ROOT/script/.radio_together_inflight" "$ROOT/script/.radio_together_failed"
+grep -q '^guard' "$ROOT/script/radio_together_off" 2>/dev/null && rm -f "$ROOT/script/radio_together_off"
 { echo trial > "$MODE.new" && mv -f "$MODE.new" "$MODE"; } || abort "Could not write /script/ocbm_mode."
 echo "$VER" > "$EO/installed_version" || abort "Could not write /etc/ocbm/installed_version."
 # A new id for each install, which updates keep: Carlink's once-per-install records (a trial proven by

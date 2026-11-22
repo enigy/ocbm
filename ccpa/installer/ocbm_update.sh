@@ -76,6 +76,14 @@ refuse() {
   exit 1
 }
 
+# A new version tries the radio order again: the guard's count, its in-flight mark and an off file it wrote ("guard:
+# ..."), never an owner's own off file (radio_hal.sh, "The order Bluetooth and the Wi-Fi driver come up in").
+together_guard_lift() {
+  rm -f "$S/.radio_together_inflight" "$S/.radio_together_failed"
+  grep -q '^guard' "$S/radio_together_off" 2>/dev/null && rm -f "$S/radio_together_off"
+  return 0
+}
+
 target() {  # where a package path lives on the adapter: once.sh installs the dispatcher as the start script
   case "$1" in script/ocbm_dispatch.sh) echo script/start_main_service.sh ;; *) echo "$1" ;; esac
 }
@@ -157,15 +165,19 @@ newer "$from_min" "$have" && refuse "This package updates OCBM $from_min or newe
 
 # What changes: every file of the new version that the adapter does not already have as it should.
 list="$WORK/changed"
-: > "$list"
-need_kb=0
+{ true >"$list"; } 2>/dev/null || refuse "Could not write the update's work files (no room in /tmp?)."
+need_kb=0; listed=0
 while read -r want rel; do
   t=$(target "$rel")
   [ "$(sum_of "$ROOT/$t")" = "$want" ] && continue
   [ -e "$WORK/files/$rel" ] || refuse "The package lacks /$t, which this adapter needs: it updates from OCBM $from_min, and the adapter runs $have."
-  echo "$want $rel" >> "$list"
+  { echo "$want $rel" >> "$list"; } 2>/dev/null || refuse "Could not write the update's work files (no room in /tmp?)."
+  listed=$((listed + 1))
   need_kb=$((need_kb + $(kb_on_flash "$WORK/files/$rel")))
 done < "$WORK/SHA256SUMS"
+# Every changed file in the list, or nothing goes on (the 21 Nov review): a full /tmp can take an append and keep none
+# of it, and an empty list reads as "no files changed" below, which moves installed_version on with nothing placed.
+[ "$(grep -c '' "$list" 2>/dev/null)" = "$listed" ] || refuse "Could not write the update's work files (no room in /tmp?)."
 if [ ! -s "$list" ]; then   # a new version number with no new files
   { echo "$VER" > "$EO/installed_version.new" && mv -f "$EO/installed_version.new" "$EO/installed_version"; } \
     || refuse "Could not write /etc/ocbm/installed_version."
@@ -173,6 +185,8 @@ if [ ! -s "$list" ]; then   # a new version number with no new files
   result "committed $VER (from $have_line): no files changed"
   log "nothing to place: the adapter's files already match $VER"
   rm -f "$S/radio_preload_off" "$S/.radio_preload_inflight" "$S/.radio_preload_unfinished"   # a new version starts it on
+  together_guard_lift
+  rm -f "$S/radio_handover_off"   # retired (the handover is opt-in): read by nothing
   clean; unlock; exit 0
 fi
 if grep -q ' script/ocbm_dispatch.sh$' "$list"; then
@@ -221,8 +235,13 @@ if [ "$rc" != 0 ]; then   # no "placed" in the journal: the next start undoes wh
   sync; unlock; $REBOOT; exit 1
 fi
 echo placed >> "$U" && sync
-# A new version starts with the boot radio preload on: its guard counts afresh (radio_hal.sh do_preload).
+# A new version starts with the boot radio preload on: its guard counts afresh (radio_hal.sh do_preload). An owner's
+# /script/radio_preload_late (the old, later start) stays, as the other owners' switches do (the 21 Nov review G).
 rm -f "$S/radio_preload_off" "$S/.radio_preload_inflight" "$S/.radio_preload_unfinished"
+together_guard_lift
+# The handover's old off file is retired (the handover is opt-in, radio_hal.sh "OPT-IN"): read by nothing, gone. An
+# owner's /script/radio_handover_on stays, as the other owners' switches do.
+rm -f "$S/radio_handover_off"
 
 step restart
 result "trial $VER (from $have_line)"

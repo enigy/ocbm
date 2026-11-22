@@ -36,7 +36,9 @@ Issued by the owner on 2026-08-10 (EV-telematics research session):
    load its radio drivers and attach BT into the between-sessions state — no AP, `hci0` DOWN,
    nothing a phone can see — so the first connect after power-up skips the driver and firmware
    load. The AP and a discoverable radio still come up only on app command. Mechanism and wedge
-   guards: `radio_hal.sh` `do_preload`.
+   guards: `radio_hal.sh` `do_preload`. Since 20 Nov 2026 (branch `cold-boot`, not benched) it starts first in the
+   boot, from a descriptor kept on flash, and on the IW416 loads the Bluetooth firmware beside the Wi-Fi driver; the
+   same end state, sooner ([../wireless/01_BT_AND_RADIO.md](../wireless/01_BT_AND_RADIO.md), "The cold boot").
    **Second exception (owner decision 2026-11-16; off with `/script/radio_arm_off`):** between host sessions
    (after the preload, and after each session's teardown) Bluetooth may stay POWERED BUT INVISIBLE: page and inquiry
    scan off, no connection, nothing paging, a btd armed for the next host's go. Still nothing a phone can see or

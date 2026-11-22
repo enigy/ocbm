@@ -90,14 +90,21 @@ LOGIN_SET="etc/passwd etc/passwd- etc/shadow etc/shadow- etc/dropbear/dropbear_r
 PROTECT="script/ncm_only script/ncm_wifi"
 CONSOLE="usr/sbin/ocbmd"                          # onefile: the program the restore's own console needs
 SEAM="script/radio_ap_up.sh script/radio_detect.sh script/radio_hal.sh \
-script/radio_preload script/radio_preload_off script/.radio_preload_inflight script/.radio_preload_unfinished"
+script/radio_preload script/radio_preload_off script/.radio_preload_inflight script/.radio_preload_unfinished \
+script/radio_preload_late script/radio_together_off script/.radio_together_inflight script/.radio_together_failed \
+script/radio_handover_on script/radio_handover_off"
 # OCBM's radio seam, payload, and its boot preload's state (radio_hal.sh do_preload): radio_* to is_radio(), so the
-# guard kept the off flag, and an install after the go-back started with the preload off (the Mac, 13 Nov).
+# guard kept the off flag, and an install after the go-back started with the preload off (the Mac, 13 Nov). The radio
+# order's switch and its guard's state the same (20 Nov). The kept descriptor (/etc/ocbm/kept_radio_caps) goes with
+# /etc/ocbm, its name outside is_radio().
 OCBM_STATE="etc/carplay"                          # OCBM's Bluetooth bond store, written while it runs
 BT_FLAG="etc/.custom_bluetooth_name"              # the seam's Bluetooth name flag (ocbm_bt_flag)
 
 say() { echo "[restore] $*"; }
 die() { echo "[restore] ABORT: $*"; echo "RESTORE_ABORT"; exit 1; }
+# An empty work file, or the restore stops saying why: never `:`, a special built-in whose failed redirection ends the
+# script with no message and no RESTORE_ABORT (the 21 Nov review B).
+empty() { for _ef in "$@"; do { true >"$_ef"; } 2>/dev/null || die "could not write the work file $_ef (no room?)"; done; }
 
 in_list() {  # $1 word, $2 list
   for _w in $2; do [ "$_w" = "$1" ] && return 0; done
@@ -197,8 +204,8 @@ diff_trees() {
 
 # Split the action list into the ordered work lists apply walks.
 split_actions() {
-  : > "$W/extra_payload"; : > "$W/extra_late"; : > "$W/extra_dirs"; : > "$W/mkdir"
-  : > "$W/main"; : > "$W/boot"; : > "$W/login"; : > "$W/conflict"; : > "$W/protected"; : > "$W/switch"
+  empty "$W/extra_payload" "$W/extra_late" "$W/extra_dirs" "$W/mkdir"
+  empty "$W/main" "$W/boot" "$W/login" "$W/conflict" "$W/protected" "$W/switch"
   while IFS="$TAB" read -r act typ key p; do
     case "$p" in ''|/*|..|../*|*/..|*/../*) die "refusing an unsafe path in the plan: '$p'" ;; esac
     case "$act" in
@@ -220,7 +227,7 @@ split_actions() {
     esac
   done < "$W/actions"
   # The boot set goes in a fixed order: the scripts start_main_service calls, then the callers.
-  : > "$W/boot.ordered"
+  empty "$W/boot.ordered"
   for b in $BOOT_SET; do awk -F "$TAB" -v p="$b" '$3 == p' "$W/boot" >> "$W/boot.ordered"; done
 }
 
@@ -340,7 +347,7 @@ remove_list() {  # $1 list of paths, $2 label
 # is stopped, and nothing can start it again, its file being gone. The console's ocbmd is never
 # stopped, even running from a file an update replaced. $1 the list removed from, $2 the step's label.
 reap_removed() {
-  : > "$W/reaped"
+  empty "$W/reaped"
   for _e in "$PROC"/[0-9]*/exe; do
     _t=$(readlink "$_e" 2>/dev/null) || continue   # kernel threads have no exe
     case "$_t" in *" (deleted)") ;; *) continue ;; esac
@@ -470,7 +477,7 @@ do_apply_onefile() {
 }
 
 remaining() {  # $1 out: differences that still count (not the NCM flags; onefile: not radio files the guard keeps)
-  : > "$1"
+  empty "$1"
   while IFS="$TAB" read -r act typ key p; do
     in_list "$p" "$PROTECT" && continue
     if [ "$PROFILE" = onefile ] && [ "$act" = extra ]; then

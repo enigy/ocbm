@@ -24,6 +24,7 @@ mod box_identity;
 mod bt_bringup;
 mod bt_driver;
 mod control;
+mod handover;
 mod mfi_local;
 mod reconnect;
 mod sdp_client;
@@ -120,17 +121,45 @@ fn just_opened() -> bool {
     opened
 }
 
+/// A session's bring-up, by how this btd came to it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FirstBringUp<'a> {
+    /// After an armed go (`armed::run`): only the step the arm left, its name the arm's.
+    FromArmed(&'a str),
+    /// The boot preload's handover (opt-in, `handover`): one round trip, no DOWN/UP.
+    FromHandover(handover::Handover),
+    /// Past the handover wait's bound ([`handover::BOUND`]): the bring-up with its DOWN/UP, whatever bt_on's word.
+    Full,
+    /// Today's, the default: a btd started after bt_on (no wait), or bt_on over while it waited. Its DOWN/UP unless
+    /// bt_on just opened the controller (`just_opened`).
+    Today,
+}
+
+/// Which bring-up a session takes (the 21 Nov review, I): from the arm's name, if any, and how the handover wait
+/// ended, if this session waited (None: it did not, the default).
+fn first_bring_up(from_armed: Option<&str>, waited: Option<handover::Go>) -> FirstBringUp<'_> {
+    match (from_armed, waited) {
+        (Some(armed_name), _) => FirstBringUp::FromArmed(armed_name),
+        (None, Some(handover::Go::Handover(h))) => FirstBringUp::FromHandover(h),
+        (None, Some(handover::Go::Bound)) => FirstBringUp::Full,
+        (None, None | Some(handover::Go::BtOn | handover::Go::Exit)) => FirstBringUp::Today,
+    }
+}
+
 /// Run one active wireless session: bring Bluetooth up discoverable, serve SSP + SDP + RFCOMM/iAP2,
 /// and hold until either the arbiter preempts us (wired claimed) or SIGTERM. `arbiter` is the claim
 /// connection when a real arbiter granted us; `None` in standalone mode (no arbiter server present).
 /// `from_armed` is the name the armed bring-up wrote, for this btd's first session after a go
 /// (`armed::run`): its controller is up already, so the session's bring-up is only the step the arm left for the go.
+/// `cold_wait`: this btd started before Bluetooth was up (`handover`, a cold boot with the host waiting on the boot
+/// preload), so its first session waits for the controller after the session's start and before its bring-up.
 fn run_active_session(
     shutdown: &Arc<AtomicBool>,
     arbiter: Option<BufReader<UnixStream>>,
     ctrl: &Arc<control::Control>,
     session_active: &Arc<AtomicBool>,
     from_armed: Option<String>,
+    cold_wait: bool,
 ) {
     // Per-device name derived once per session (reads the Wi-Fi MAC / SoC serial). Used for the EIR
     // Complete Local Name (what the iPhone shows) and the wireless iAP2 identify.
@@ -138,14 +167,41 @@ fn run_active_session(
     // The connect timeline's AP events, for this session: hostapd's and udhcpd's lines as they land (ap_watch). It
     // ends at go-quiet below, or when this returns early.
     let ap_watch = ap_watch::start();
+    // The cold boot (R3-5): the controller is the preload's until it hands it over, or the host's bt_on's until that is
+    // over. Everything below starts after the wait, as in a btd started after bt_on (carplayd and the certificate read
+    // off the attach's CPU; the name once the Wi-Fi interface is in); the record and the AP watch began above, so the
+    // AP's enabling is seen.
+    let waited = if cold_wait {
+        let go = handover::wait(shutdown, HCI_DEV);
+        if go == handover::Go::Exit {
+            return;
+        }
+        log_radio_caps(); // not at the start: the preload may not have written it yet
+        Some(go)
+    } else {
+        None
+    };
     av::session_starting(); // carplayd and the MFi certificate cache, ready before the phone needs them (A2/A4)
     let accessory_name = carplay_iap2_core::message::accessory_name(ACCESSORY_BRAND);
-    let up = match &from_armed {
-        Some(armed_name) => bt_bringup::open_from_armed(HCI_DEV, &accessory_name, armed_name).inspect(|()| {
-            // The connect timeline: this connect started from the armed state (`bt_armed=1`; `bt_power` is `-`).
-            startup::stamp(box_common::timeline::ARMED_KEY);
-        }),
-        None => bt_bringup::bring_up(HCI_DEV, &accessory_name, just_opened()),
+    let up = match first_bring_up(from_armed.as_deref(), waited) {
+        FirstBringUp::FromArmed(armed_name) => {
+            bt_bringup::open_from_armed(HCI_DEV, &accessory_name, armed_name).inspect(|()| {
+                // The connect timeline: this connect started from the armed state (`bt_armed=1`; `bt_power` is `-`).
+                startup::stamp(box_common::timeline::ARMED_KEY);
+            })
+        }
+        FirstBringUp::FromHandover(h) => {
+            // Spent unread, as at an arm: the handover is this bring-up's proof of state, and a later session's
+            // bring-up must never take the word bt_on writes for a btd that goes on its return.
+            let _ = just_opened();
+            bt_bringup::from_handover(HCI_DEV, &accessory_name, h)
+        }
+        FirstBringUp::Full => {
+            // Past the wait's bound: nothing is known of the controller, so bt_on's word is spent unread too.
+            let _ = just_opened();
+            bt_bringup::bring_up(HCI_DEV, &accessory_name, false)
+        }
+        FirstBringUp::Today => bt_bringup::bring_up(HCI_DEV, &accessory_name, just_opened()),
     };
     if let Err(e) = up {
         log(&format!("Bluetooth bring-up failed: {e} -- retrying"));
@@ -363,7 +419,13 @@ fn main() {
     // return ECHILD and break bt_bringup + av::running(). See spawn_detached.)
 
     log("starting -- wireless CarPlay (Phase A1: Bluetooth discoverable + pairing + SDP)");
-    log_radio_caps();
+    // A btd the supervisor started before Bluetooth is up (`handover`): its first session waits for the controller.
+    let mut cold_wait = handover::requested();
+    if cold_wait {
+        log("started before Bluetooth is up (the boot preload is attaching it): the first session waits for the controller");
+    } else {
+        log_radio_caps();
+    }
 
     // ARMED (tools/session_supervisor.sh, "Armed Bluetooth"): started between host sessions, this btd brings the
     // controller up invisible and waits for the next host's go (armed.rs). Nothing below runs before the go, so
@@ -416,14 +478,16 @@ fn main() {
         match arbiter_client::try_claim(ARBITER_SOCK) {
             Ok(arbiter_client::ClaimResult::Granted(reader)) => {
                 denied_logged = false;
-                run_active_session(&shutdown, Some(reader), &ctrl, &session_active, from_armed.take());
+                let wait = std::mem::take(&mut cold_wait);
+                run_active_session(&shutdown, Some(reader), &ctrl, &session_active, from_armed.take(), wait);
             }
             Ok(arbiter_client::ClaimResult::GrantedStandalone) => {
                 if !standalone_logged {
                     log("no arbiter present -- running standalone (single-transport) until it is wired in");
                     standalone_logged = true;
                 }
-                run_active_session(&shutdown, None, &ctrl, &session_active, from_armed.take());
+                let wait = std::mem::take(&mut cold_wait);
+                run_active_session(&shutdown, None, &ctrl, &session_active, from_armed.take(), wait);
             }
             Ok(arbiter_client::ClaimResult::Denied) => {
                 if !denied_logged {
@@ -439,4 +503,23 @@ fn main() {
         }
     }
     log("SIGTERM received -- exiting");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// THE DEFAULT PATH, pinned (the 21 Nov review, I): no `OCBM_BTD_WAIT` (`handover::requested`, its own test) means
+    /// no wait, and a session that did not wait takes today's bring-up, never the handover's; the bound's end and only
+    /// it forces the DOWN/UP; an armed go goes first, as before.
+    #[test]
+    fn a_session_that_did_not_wait_takes_todays_bring_up() {
+        let h = handover::Handover { handed_ms: 6850, hci_up_ms: 6820 };
+        assert_eq!(first_bring_up(None, None), FirstBringUp::Today, "the default: no wait");
+        assert_eq!(first_bring_up(None, Some(handover::Go::BtOn)), FirstBringUp::Today, "bt_on over: today's");
+        assert_eq!(first_bring_up(None, Some(handover::Go::Handover(h))), FirstBringUp::FromHandover(h));
+        assert_eq!(first_bring_up(None, Some(handover::Go::Bound)), FirstBringUp::Full, "the bound: the DOWN/UP");
+        assert_eq!(first_bring_up(Some("CarLink"), None), FirstBringUp::FromArmed("CarLink"));
+        assert_eq!(first_bring_up(Some("CarLink"), Some(handover::Go::Handover(h))), FirstBringUp::FromArmed("CarLink"));
+    }
 }

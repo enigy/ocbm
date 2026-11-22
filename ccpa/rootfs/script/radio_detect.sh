@@ -32,7 +32,68 @@
 # side effect callers rely on not happening.
 ########################
 set -u
+
+# ---- 0. the key a kept copy of this descriptor is checked against (20 Nov 2026) -----------------
+# radio_hal.sh keeps the descriptor on flash (/etc/ocbm/kept_radio_caps) and, at a later boot, reuses it instead of
+# running this script (0.75 to 0.8 s on the IW416, timed by hand on the dev adapter) while this key still reads what it
+# read when the copy was made. The key is everything below reads, so A NEW INPUT BELOW MUST BE A NEW TERM HERE:
+#   sdio=   the SDIO ids (vendor/device/class) of the first SDIO function, as section 1 finds it;
+#   fw=     the firmware trees under /lib/firmware (section 2 picks one of them);
+#   has=    which attach and preload helpers (section 3) and which bring-up scripts (section 4) are there;
+#   gates=  each file test the dispatcher's gates make on this unit (`test -e PATH && var=1 || var=0`, resolve_var);
+#   sums=   one md5 over the md5sum of every file whose text or members this script reads (each file's name and sum):
+#           itself, the dispatcher, the attach script, and the driver tarballs (their member list names the modules).
+#           One hash and not each file's, so the key stays short: btd logs the whole descriptor as one line, and ocbmd
+#           clips a line at 1024 bytes (the truck's was 980 before this).
+# The post-load facts (section 5) are no input: they describe the boot they were read in, and a kept copy has none.
+# Built from the shell's own reads and globs plus one grep and one md5sum: a small part of a detection's cost.
+# A key with a character a descriptor cannot carry is "unkeepable", and radio_hal.sh keeps nothing then.
+# radio_hal.sh sources this file for the function alone (RADIO_DETECT_FUNCS=1), in a subshell.
+radio_detect_key() {
+  _rdk_sdio=none
+  for _rdk_d in /sys/bus/sdio/devices/*/; do
+    [ -e "$_rdk_d/device" ] || continue
+    _rdk_v=""; _rdk_dv=""; _rdk_c=""
+    read -r _rdk_dv 2>/dev/null <"$_rdk_d/device"
+    read -r _rdk_v 2>/dev/null <"$_rdk_d/vendor"
+    read -r _rdk_c 2>/dev/null <"$_rdk_d/class"
+    _rdk_sdio="${_rdk_v:-}/${_rdk_dv:-}/${_rdk_c:-}"; break
+  done
+  _rdk_fw=""
+  for _rdk_t in /lib/firmware/*/; do [ -d "$_rdk_t" ] && { _rdk_t=${_rdk_t%/}; _rdk_fw="$_rdk_fw,${_rdk_t##*/}"; }; done
+  _rdk_has=""
+  for _rdk_f in /usr/sbin/rtk_hciattach /usr/sbin/brcm_patchram_plus /usr/sbin/hciattach /usr/sbin/fw_loader_linux; do
+    if [ -x "$_rdk_f" ]; then _rdk_has="${_rdk_has}1"; else _rdk_has="${_rdk_has}0"; fi
+  done
+  for _rdk_f in /script/wlan_on.sh /script/bt_on.sh /script/init_bluetooth_wifi.sh /script/attach_bluetooth.sh; do
+    if [ -f "$_rdk_f" ]; then _rdk_has="${_rdk_has}1"; else _rdk_has="${_rdk_has}0"; fi
+  done
+  # Only the gate shape resolve_var reads: the dispatcher's other `test -e` lines name /tmp files that come and go.
+  _rdk_gates=""; _rdk_next=0
+  for _rdk_w in $(grep -oE 'test -e [^[:space:]]+ && [A-Za-z_][A-Za-z0-9_]*=1 \|\| [A-Za-z_][A-Za-z0-9_]*=0' \
+                  /script/init_bluetooth_wifi.sh 2>/dev/null); do
+    if [ "$_rdk_next" = 1 ]; then
+      if [ -e "$_rdk_w" ]; then _rdk_gates="$_rdk_gates,$_rdk_w=1"; else _rdk_gates="$_rdk_gates,$_rdk_w=0"; fi
+    fi
+    _rdk_next=0; [ "$_rdk_w" = -e ] && _rdk_next=1
+  done
+  _rdk_sums=$(md5sum /script/radio_detect.sh /script/init_bluetooth_wifi.sh /script/attach_bluetooth.sh \
+              /lib/firmware/*/*_ko.tar.gz 2>/dev/null | md5sum 2>/dev/null)
+  set -f; set -- $_rdk_sums; set +f
+  # No sums (no md5sum), the sums of nothing (none of the files readable: md5 of the empty input), or no SDIO card: no
+  # key a kept copy may be checked against (the 21 Nov reviews, D and L).
+  case "${1:-}" in ''|d41d8cd98f00b204e9800998ecf8427e) echo unkeepable; return 0 ;; esac
+  [ "$_rdk_sdio" = none ] && { echo unkeepable; return 0; }
+  _rdk_key="v1 sdio=$_rdk_sdio fw=${_rdk_fw#,} has=$_rdk_has gates=${_rdk_gates#,} sums=${1:-}"
+  case "$_rdk_key" in
+    *[!A-Za-z0-9._/:=,+\ -]*) echo unkeepable ;;
+    *) echo "$_rdk_key" ;;
+  esac
+}
+[ "${RADIO_DETECT_FUNCS:-}" = 1 ] && return 0
 OUT=${RADIO_CAPS:-/tmp/radio_caps}
+# Taken before anything below reads its inputs: one that changes during this run then reads as a change later.
+DETECT_KEY=$(radio_detect_key)
 
 # ---- 1. hardware identity -----------------------------------------------------------------
 # GLOB the sdio device node. The vendor dispatcher hardcodes mmc0:0001:1 (init_bluetooth_wifi.sh
@@ -221,7 +282,8 @@ BT_ATTACH_CMD=""
 [ -n "$BT_ATTACH" ] && BT_ATTACH_CMD=$(grep -hE "^[[:space:]]*$BT_ATTACH " /script/attach_bluetooth.sh 2>/dev/null \
                        | head -1 | sed 's/^[[:space:]]*//' | safe_cmd)
 # Ordering constraint: some parts wedge if BT attaches before the WLAN driver is up. The vendor
-# encodes this as a wait loop inside the attach script; its presence is the signal.
+# encodes this as a wait loop inside the attach script; its presence is the signal. Read off the
+# WHOLE file, so any branch's loop sets it; section 4d reads this unit's own branch (BT_TOGETHER).
 BT_AFTER_WLAN=0
 grep -qE 'while \[ ! -e /sys/class/net/' /script/attach_bluetooth.sh 2>/dev/null && BT_AFTER_WLAN=1
 
@@ -300,6 +362,79 @@ BT_SCO_ROUTE_CMD=$(echo "$_SCO_BRANCH" | awk '
     prev = $0
   }' | decomment | safe_cmd)
 
+# ---- 4d. WHETHER THIS UNIT'S OWN BRANCH WAITS FOR THE WI-FI DRIVER (20 Nov 2026; conservative since 21 Nov) --------
+# BT_AFTER_WLAN is read off the whole attach script, so one branch's wait loop sets it for every unit. In Carlinkit's
+# 2025.10.15.1127 attach script only the 0xc822 branch and the SD8987 one (0x9149/0x9141) wait for the Wi-Fi interface;
+# the IW416 branch (0x9159) pushes its Bluetooth firmware with fw_loader_linux and attaches without waiting, and that
+# unit's dispatcher starts the attach script in the background BEFORE it loads the Wi-Fi driver. So the stock firmware
+# loads the two side by side on every IW416 boot, and the dev adapter's bench did the same (20 Nov: both loads started
+# at one instant, hci0 answering 3.24 s on, the AP up after). BT_TOGETHER=1 (radio_hal.sh then loads the Wi-Fi driver
+# beside the Bluetooth firmware and attaches without waiting for the interface) only where the unit's own text shows
+# the stock bring-up doing that, and NO sign anywhere that its attach waits for the Wi-Fi side (the 21 Nov review C: the
+# first rule looked for one exact loop, and a wait before the dispatch, an `until`, a helper, a quoted path or a
+# dispatcher that starts the attach after the Wi-Fi driver all passed it). All of these, else 0 (today's order):
+#   - the whole file waits (BT_AFTER_WLAN=1), on the mapped backend, with a Wi-Fi mapping, and this unit's own branch
+#     pushes its own firmware (a preload line) before an attach this script could extract;
+#   - the dispatcher starts the attach script in the background (`... &`), at its top level (in no function or `{`
+#     group), on a line before any insert of this unit's Wi-Fi modules, and nothing before that line waits, sleeps,
+#     sources a file or names the Wi-Fi side (the stock firmware's own side-by-side start);
+#   - this unit's own branch has no loop and no sleep (`while`, `until`, `sleep`), sources nothing, calls none of the
+#     attach script's own functions, and names nothing of the Wi-Fi side;
+#   - the rest of the attach script, outside every sdioCardID branch (before the dispatch, after it, its functions and
+#     its top level), sources nothing and names nothing of the Wi-Fi side either, and its sdioCardID chains all close.
+# "The Wi-Fi side": /sys/class/net, an interface name (wlan<n>, sta<n>, uap<n>, p2p<n>), ifconfig, iwconfig, `iw dev`,
+# or a Wi-Fi module of this unit's own tarball (by its name), in any quoting, comments aside. No chipset table: the
+# module names come from the unit's tarball, and an id the dispatcher never names has no branch, so 0.
+_nocomment() { sed 's/[[:space:]]*#.*$//'; }
+_wsig='/sys/class/net|(^|[^A-Za-z0-9_])(wlan|sta|uap|p2p)[0-9]|(^|[^A-Za-z0-9_])(ifconfig|iwconfig)([^A-Za-z0-9_]|$)|(^|[^A-Za-z0-9_])iw[[:space:]]+dev'
+for _m in $WLAN_MODS; do _wsig="$_wsig|${_m%.ko}"; done
+# The attach script outside every sdioCardID branch; "UNCLOSED" where a chain never closes (then nothing is assumed).
+attach_outside() {
+  [ -f /script/attach_bluetooth.sh ] || return 0
+  _nocomment </script/attach_bluetooth.sh | awk '
+    function opens(l) { return l ~ /^[ \t]*if[ \t]/ && l !~ /(^|[; \t])fi[ \t;]*$/ }
+    {
+      if (!inchain) {
+        if ($0 ~ /sdioCardID/ && $0 ~ /^[ \t]*if[ \t]/) { inchain = 1; depth = 0; next }
+        print; next
+      }
+      if (depth == 0 && $0 ~ /^[ \t]*fi([ \t;]|$)/) { inchain = 0; next }
+      if (depth == 0 && $0 ~ /^[ \t]*(elif|else)([ \t]|$)/) next
+      if (opens($0)) depth++
+      else if ($0 ~ /^[ \t]*fi([ \t;]|$)/) depth--
+    }
+    END { if (inchain) print "UNCLOSED" }'
+}
+# The dispatcher's own order: 0 when it starts the attach script in the background, at its top level, before inserting
+# any Wi-Fi module of this unit, with no wait, sleep, sourced file or sign of the Wi-Fi side before it (the line itself
+# included). A line ending in `{` opens a body (a function's, a group's) and one starting with `}` closes it.
+dispatch_starts_attach_first() {
+  [ -f /script/init_bluetooth_wifi.sh ] && [ -n "$WLAN_MODS" ] || return 1
+  _dsa_mods=""; for _m in $WLAN_MODS; do _dsa_mods="$_dsa_mods|${_m%.ko}"; done
+  _nocomment </script/init_bluetooth_wifi.sh | awk -v mods="${_dsa_mods#|}" -v wsig="$_wsig" '
+    att == 0 && ($0 ~ wsig || $0 ~ /(^|[^A-Za-z0-9_])(while|until|sleep)([^A-Za-z0-9_]|$)/ || $0 ~ /^[ \t]*(\.|source)[ \t]/) { waits = 1 }
+    att == 0 && /attach_bluetooth/ { att = NR; bg = ($0 ~ /&[ \t]*$/); top = (depth == 0) }
+    ins == 0 && $0 ~ ("insmod[^;&|]*(" mods ")") { ins = NR }
+    /\{[ \t]*$/ { depth++ }
+    /^[ \t]*\}/ { if (depth > 0) depth-- }
+    END { exit !(att > 0 && bg && top && !waits && (ins == 0 || att < ins)) }'
+}
+BT_TOGETHER=0
+if [ "$BT_AFTER_WLAN" = 1 ] && [ "$BACKEND" = mapped ] && [ -n "$BT_PRELOAD_CMD" ] && [ -n "$BT_ATTACH_CMD" ] \
+   && [ -n "$WLAN_INSMOD" ] && [ -n "$_SCO_BRANCH" ] && dispatch_starts_attach_first; then
+  _tg_branch=$(echo "$_SCO_BRANCH" | _nocomment)
+  _tg_outside=$(attach_outside)
+  _tg_funcs=$(_nocomment </script/attach_bluetooth.sh | sed -n 's/^[[:space:]]*\([A-Za-z_][A-Za-z0-9_]*\)[[:space:]]*()[[:space:]]*{*[[:space:]]*$/\1/p')
+  _tg=1
+  echo "$_tg_branch" | grep -qE '(^|[^A-Za-z0-9_])(while|until|sleep)([^A-Za-z0-9_]|$)' && _tg=0
+  echo "$_tg_branch" | grep -qE "$_wsig" && _tg=0
+  printf '%s\n%s\n' "$_tg_branch" "$_tg_outside" | grep -qE '^[[:space:]]*(\.|source)[[:space:]]' && _tg=0
+  echo "$_tg_outside" | grep -qE "$_wsig" && _tg=0
+  echo "$_tg_outside" | grep -qx 'UNCLOSED' && _tg=0
+  for _f in $_tg_funcs; do echo "$_tg_branch" | grep -qw "$_f" && _tg=0; done
+  BT_TOGETHER=$_tg
+fi
+
 # ---- 5. post-load facts: enumerate, never assume -------------------------------------------
 # The WLAN interface name is an INSMOD PARAMETER that differs per chip - Realtek passes
 # if2name=sta0, Broadcom iface_name=sta, and on Broadcom STA units wlan0 does not exist until
@@ -326,6 +461,7 @@ BT_MAC=""
 # malformed descriptor as "absent" and fall back to their compiled defaults, never crash on it.
 {
   echo "RADIO_CHIP=$CHIP"
+  echo "RADIO_CAPS_FROM=detected"
   echo "RADIO_SDIO_NODE=$SDIO_NODE"
   echo "RADIO_SDIO_VENDOR=$SDIO_VEN"
   echo "RADIO_SDIO_DEVICE=$SDIO_DEV"
@@ -341,6 +477,7 @@ BT_MAC=""
   echo "RADIO_BT_ATTACH_CMD=\"$BT_ATTACH_CMD\""
   echo "RADIO_BT_PRELOAD_CMD=\"$BT_PRELOAD_CMD\""
   echo "RADIO_BT_AFTER_WLAN=$BT_AFTER_WLAN"
+  echo "RADIO_BT_TOGETHER=$BT_TOGETHER"
   echo "RADIO_BT_SCO_MTU_CMD=\"$BT_SCO_MTU_CMD\""
   echo "RADIO_BT_SCO_ROUTE_CMD=\"$BT_SCO_ROUTE_CMD\""
   echo "RADIO_WLAN_INSMOD=\"$(echo "$WLAN_INSMOD" | sed '/^$/d' | tr '\n' ';')\""
@@ -351,6 +488,7 @@ BT_MAC=""
   echo "RADIO_HCI_DEV=$HCI_DEV"
   echo "RADIO_BT_MAC=$BT_MAC"
   echo "RADIO_DETECTED_AT=$(cut -d. -f1 /proc/uptime 2>/dev/null)"
+  echo "RADIO_DETECT_KEY=\"$DETECT_KEY\""   # last: btd's log of this file is one line, and a clipped end loses least here
 } > "$OUT.new.$$" 2>/dev/null && mv "$OUT.new.$$" "$OUT"
 
 [ "${1:-}" = -q ] || cat "$OUT"

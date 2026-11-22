@@ -10,7 +10,8 @@
 # Covered: the arm's gate and its off switches; the go (its guards, the go file, the timeline stamps, the signal, the
 # AP launch); the go's answer and the fallback to today's path; an arm still under way at the host's arrival; the
 # armed btd's end; the fork-free predicates against the grep and cat forms they replaced; the one-awk config read
-# against the four functions it stands in for.
+# against the four functions it stands in for; the cold boot's early btd (R3-5: only when the handover is asked for,
+# today's wrapper by default) and the wrapper itself.
 set -u
 export LC_ALL=C
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -27,7 +28,8 @@ export SUP_PROC="$R/proc" SUP_SYS="$R/sys" CARPLAY_CFG_FILE="$R/cfg.yaml" FLAG="
 export BTD_ARMED_FILE="$R/btd_armed" BTD_GO_FILE="$R/btd_go" BTD_GO_RESULT="$R/btd_go_result" BT_PHASE_FILE="$R/bt_phase"
 export ARM_OFF_FILE="$R/radio_arm_off" ARM_BENCH_OFF="$R/bench_arm_off" STARTUP_MARKS="$R/startup_marks"
 export RADIO_LOCKS="$R/locks" WL_TEARDOWN_MARK="$R/wl_teardown" CARPLAY_TRANSPORT_FLAG="$R/carplay_transport"
-export RADIO_OFF_FLAG="$R/radio_off" OCBM_SUP_FUNCS=1
+export RADIO_OFF_FLAG="$R/radio_off" PRELOAD_STATE="$R/radio_preload_state" HANDOVER_ON_FILE="$R/radio_handover_on"
+export HANDOVER_BENCH_ON="$R/bench_handover_on" OCBM_SUP_FUNCS=1
 . "$2"
 CALLS="$R/calls"
 now() { echo "${FAKE_NOW:-100}"; }
@@ -51,6 +53,8 @@ pass() { echo "PASS $*"; }
 fail() { echo "FAIL $*"; }
 check() { if eval "$1"; then pass "$2"; else fail "$2"; fi; }
 called() { grep -qF -- "$1" "$CALLS" 2>/dev/null; }
+before() { _b1=$(grep -nF -- "$1" "$CALLS" | head -1 | cut -d: -f1); _b2=$(grep -nF -- "$2" "$CALLS" | head -1 | cut -d: -f1)
+           [ -n "$_b1" ] && [ -n "$_b2" ] && [ "$_b1" -lt "$_b2" ]; }
 settle() { wait 2>/dev/null; return 0; }   # the stubs a backgrounded call ran (env ... &) have written
 # A process in the scratch /proc: $1 pid, $2 name, $3 state.
 proc() { mkdir -p "$SUP_PROC/$1"; echo "$1 ($2) $3 1 1 1" > "$SUP_PROC/$1/stat"; }
@@ -195,6 +199,8 @@ check "called \"radio_hal.sh wifi_ap_prep\" && called \"exec /usr/sbin/btd\"" "t
 check "[ -s \"\$R/body\" ] && ! grep -q -e carplayd -e hostapd \"\$R/body\" && grep -q /usr/sbin/btd \"\$R/body\"" \
   "its body names no A/V daemon and no AP daemon (the teardown patterns), only btd, whose pattern ends an arm under way"
 check "called \"pkill -f carplayd\"" "a stray A/V daemon reaped first, as at a bring-up"
+_u=$(grep -n "unset OCBM_BTD_WAIT" "$R/body" | cut -d: -f1); _x=$(grep -n "exec /usr/sbin/btd" "$R/body" | cut -d: -f1)
+check "[ -n \"\$_u\" ] && [ \"\$_x\" = \"\$((_u + 1))\" ]" "an inherited OCBM_BTD_WAIT unset just before its btd starts (the 21 Nov review, I)"
 '
 
   run_case "$sh" '
@@ -221,6 +227,15 @@ check "called \"setsid sh /script/radio_hal.sh wifi_ap_on\" || { sleep_real=1; i
   "the AP launched after the signal"
 check "! called wireless_down && ! called \"OCBM_GO_FALLBACK=1\"" "no teardown, no fallback"
 check "[ \"\$wl_raised\" = 1 ]" "the radios raised: no teardown may take its early return until one has run"
+'
+
+  run_case "$sh" '
+# The go with its answer file unwritable (the 21 Nov review, B): its truncation was `:`, whose failed redirection ends
+# the supervisor under dash and ash. The go goes on.
+proc 321 btd S; arm_pid=321; echo 321 > "$BTD_ARMED_FILE"
+BTD_GO_RESULT="$R/no_such_dir/btd_go_result"
+wireless_up; settle
+check "called \"kill -USR1 321\" && [ \"\$go_pending\" = 1 ]" "the answer file unwritable: the go still goes, the supervisor still runs"
 '
 
   run_case "$sh" '
@@ -324,6 +339,77 @@ arm_pid=360; arm_since=10
 wireless_up; settle
 check "[ -z \"\$arm_pid\" ] && called \"OCBM_GO_FALLBACK=0\" && ! called \"kill -USR1\"" "no armed btd: today'"'"'s bring-up"
 check "[ \"\$wl_raised\" = 1 ]" "today'"'"'s bring-up raised the radios too: no early return until a teardown has run"
+check "called \"OCBM_BTD_EARLY=0\"" "  no boot preload running: btd after bt_on, as before"
+'
+
+  run_case "$sh" '
+# The cold boot (R3-5): the boot preload running, read off its last state with no fork.
+check "! preload_running" "no state file (no preload this boot, or not started): not running"
+echo "waiting 2.10" > "$PRELOAD_STATE"; check "! preload_running" "waiting for the self-test: not running (it stands down for a host)"
+echo "running 2.30" >> "$PRELOAD_STATE"; check "preload_running" "running"
+echo "done 7.51" >> "$PRELOAD_STATE"; check "! preload_running" "done: not running"
+printf "stood_down 3.00\n" > "$PRELOAD_STATE"; check "! preload_running" "stood down: not running"
+check "! handover_on" "no switch: the handover off (the default since 21 Nov)"
+: > "$R/radio_handover_off"; check "! handover_on" "the retired /script/radio_handover_off: read by nothing, still off"
+: > "$HANDOVER_BENCH_ON"; check "handover_on" "the bench hook, empty: on"
+echo off > "$HANDOVER_BENCH_ON"; check "! handover_on" "the bench hook reading off: off"
+rm "$HANDOVER_BENCH_ON"; : > "$HANDOVER_ON_FILE"; check "handover_on" "the owner'"'"'s opt-in on flash: on"
+'
+
+  run_case "$sh" '
+# A host while the boot preload attaches Bluetooth. By default (21 Nov) today'"'"'s wrapper: bt_on, then btd, no early btd,
+# whatever a retired off file says; btd first, waiting, only when the handover is asked for.
+printf "waiting 2.10\nrunning 2.30\n" > "$PRELOAD_STATE"
+wireless_up > "$R/sup.out"; settle
+check "called \"OCBM_BTD_EARLY=0\" && ! grep -q \"btd starts now\" \"$R/sup.out\"" "the preload running, nothing asked for: today'"'"'s wrapper (OCBM_BTD_EARLY=0)"
+: > "$CALLS"; : > "$R/radio_handover_off"
+wireless_up > "$R/sup.out"; settle
+check "called \"OCBM_BTD_EARLY=0\"" "  a leftover /script/radio_handover_off changes nothing"
+: > "$CALLS"; : > "$HANDOVER_ON_FILE"
+wireless_up > "$R/sup.out"; settle
+check "called \"OCBM_BTD_EARLY=1\" && grep -q \"btd starts now and waits for it\" \"$R/sup.out\"" "the owner'"'"'s opt-in: btd early (OCBM_BTD_EARLY=1), said so"
+rm "$HANDOVER_ON_FILE"; : > "$CALLS"; echo "on" > "$HANDOVER_BENCH_ON"
+wireless_up; settle
+check "called \"OCBM_BTD_EARLY=1\"" "the bench'"'"'s: btd early"
+echo off > "$HANDOVER_BENCH_ON"; : > "$CALLS"
+wireless_up; settle
+check "called \"OCBM_BTD_EARLY=0\"" "the bench'"'"'s reading off: today'"'"'s wrapper"
+: > "$HANDOVER_ON_FILE"; : > "$CALLS"
+wireless_up fallback; settle
+check "called \"OCBM_GO_FALLBACK=1\" && called \"OCBM_BTD_EARLY=0\"" "a failed armed go'"'"'s fallback: today'"'"'s wrapper, asked for or not"
+rm "$HANDOVER_ON_FILE"; : > "$CALLS"; echo "done 7.51" >> "$PRELOAD_STATE"; : > "$HANDOVER_ON_FILE"
+wireless_up; settle
+check "called \"OCBM_BTD_EARLY=0\"" "the preload over: today'"'"'s wrapper, asked for or not"
+'
+
+  run_case "$sh" '
+# The wrapper itself, run with its paths moved into the scratch root: stand-ins for radio_hal.sh (bt_on takes 0.4 s) and
+# for btd (it says how it was started, and when it saw the file that says bt_on is over).
+mkdir -p "$R/tmp" "$R/script" "$R/usr/sbin"
+printf "#!/bin/sh\necho \"radio_hal \$1 start\" >> \"%s/calls\"\n[ \"\$1\" = bt_on ] && sleep 0.4\necho \"radio_hal \$1 end\" >> \"%s/calls\"\n" "$R" "$R" > "$R/script/radio_hal.sh"
+printf "#!/bin/sh\necho \"btd start wait=\${OCBM_BTD_WAIT:-none} mode=\${BT_PAIRING_MODE:-}\" >> \"%s/calls\"\n_n=0\nwhile [ \$_n -lt 30 ] && [ ! -e \"%s/tmp/.btd_bt_on_done\" ]; do _n=\$((_n + 1)); sleep 0.1; done\n[ -e \"%s/tmp/.btd_bt_on_done\" ] && echo \"btd saw bt_on done\" >> \"%s/calls\"\n" "$R" "$R" "$R" "$R" > "$R/usr/sbin/btd"
+chmod 755 "$R/script/radio_hal.sh" "$R/usr/sbin/btd"
+printf "waiting 2.10\nrunning 2.30\n" > "$PRELOAD_STATE"
+wireless_up; settle
+sed -e "s#/tmp/#$R/tmp/#g; s#/proc/uptime#$R/proc/uptime#g; s#/script/#$R/script/#g; s#/usr/sbin/btd#$R/usr/sbin/btd#g" "$R/body" > "$R/body.run"
+: > "$CALLS"; echo "100.50 1.00" > "$R/proc/uptime"
+command env BT_PAIRING_MODE=just_works BT_SSP_INTERACTIVE=0 OCBM_WL_REAPED=0 OCBM_USB_EDGE= OCBM_GO_FALLBACK=0 \
+  OCBM_BTD_EARLY=1 sh "$R/body.run"
+i=0; while [ $i -lt 40 ] && ! called "btd saw bt_on done"; do i=$((i + 1)); command sleep 0.1; done
+check "called \"btd start wait=1 mode=just_works\" && before \"btd start wait=1\" \"radio_hal bt_on end\"" \
+  "early: btd started waiting (OCBM_BTD_WAIT=1, the session'"'"'s inputs), before bt_on was over"
+check "before \"radio_hal bt_on end\" \"btd saw bt_on done\" && [ -e \"$R/tmp/.btd_bt_on_done\" ]" \
+  "  the file that says bt_on is over, written once it is"
+check "grep -qx \"t sup_radios 100500\" \"$R/tmp/startup_marks\"" "  the timeline: sup_radios before both"
+: > "$CALLS"; rm -f "$R/tmp/.btd_bt_on_done"
+command env BT_PAIRING_MODE=just_works BT_SSP_INTERACTIVE=0 OCBM_WL_REAPED=0 OCBM_USB_EDGE= OCBM_GO_FALLBACK=0 \
+  OCBM_BTD_EARLY=0 sh "$R/body.run"
+check "before \"radio_hal bt_on end\" \"btd start wait=none\" && ! called \"btd saw bt_on done\" && [ ! -e \"$R/tmp/.btd_bt_on_done\" ]" \
+  "today'"'"'s: bt_on, then btd (no wait asked, no file)"
+: > "$CALLS"
+command env BT_PAIRING_MODE=just_works BT_SSP_INTERACTIVE=0 OCBM_WL_REAPED=0 OCBM_USB_EDGE= OCBM_GO_FALLBACK=0 \
+  OCBM_BTD_EARLY=0 OCBM_BTD_WAIT=1 sh "$R/body.run"
+check "called \"btd start wait=none\"" "  an OCBM_BTD_WAIT=1 the supervisor inherited: unset, this btd does not wait (the 21 Nov review, I)"
 '
 done
 [ "$fails" -eq 0 ] && echo "session_supervisor_test: all passed ($passes checks)" || { echo "session_supervisor_test: $fails failed"; exit 1; }

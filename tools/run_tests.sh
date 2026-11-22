@@ -74,6 +74,10 @@ run "radio-ap-up" bash tools/radio_ap_up_test.sh
 # The supervisor's armed Bluetooth (16 Nov 2026): the arm's gate, the go, its answer and the fallback to today's path,
 # against scratch /proc, /sys and /tmp with every side effect stubbed.
 run "supervisor" bash tools/session_supervisor_test.sh
+# The radio seam's cold path (20 Nov 2026): the descriptor kept across boots, the order Bluetooth and the Wi-Fi driver
+# come up in, its switches, fallback and guard, a host before, during and after the boot preload, the GPIO set-up's
+# mark, the boot line: radio_hal.sh's verbs as processes against stubbed hardware in a scratch root.
+run "radio-hal" bash tools/radio_hal_test.sh
 # The box scripts' suites again under BusyBox's sh and awk, the adapter's (v1.32.1); skipped without it.
 run "busybox (the adapter's sh and awk)" sh tools/busybox_suites.sh
 

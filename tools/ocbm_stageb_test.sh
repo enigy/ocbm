@@ -35,8 +35,8 @@ make_box() {  # $1 dir, $2 mode ('' = stock): a converted adapter, stick in and 
   cp "$INST/ocbm_revert.sh" "$R/script/ocbm_revert.sh"
   chmod 755 "$R/script/start_main_service.sh" "$R/script/ocbm_revert.sh"
   stand_in "$R/script/start_main_service.stock.sh" "$d/m.stock"
-  stand_in "$R/script/ocbm_boot.sh" "$d/m.boot"
-  stand_in "$R/script/init_gpio.sh" "$d/m.gpio"
+  stand_in "$R/script/ocbm_boot.sh" "$d/m.boot" "echo \"gpio_done=\${OCBM_GPIO_DONE:-}\" >> '$d/m.boot.env'"
+  stand_in "$R/script/init_gpio.sh" "$d/m.gpio" "sleep 0.3; echo gpio-end >> '$d/m.gpio'"
   for k in run_ocbmd run_supervisor; do stand_in "$R/script/$k.sh" "$d/m.$k" 'exec sleep 30'; done
   # the self-test stand-in: fails when $d/st.fail exists, hangs when $d/st.hang exists
   stand_in "$R/script/ocbm_selftest.sh" "$d/m.selftest" \
@@ -86,6 +86,8 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
     "OCBM starts, with stick sharing turned off first"
   check 'waitfor "[ -e $d/m.run_ocbmd ] && [ -e $d/m.run_supervisor ] && [ -e $d/m.gpio ]" 5' \
     "the ocbmd and supervisor respawn loops run, and stock init_gpio.sh"
+  check 'grep -qx "gpio_done=$d/run/ocbm_gpio_done" "$d/m.boot.env" && waitfor "[ -e $d/run/ocbm_gpio_done ]" 5 && grep -qx gpio-end "$d/m.gpio"' \
+    "ocbm_boot.sh is told where the stock GPIO set-up's end is marked, and the mark comes once init_gpio.sh is over"
   check 'waitfor "grep -q \"^--- first start\" $d/stick/OCBM_RESULT.txt" 5' \
     "the first start adds its verdict to OCBM_RESULT.txt on the stick"
   check 'grep -q "^self-test: PASSED, 42 s after power-on" "$d/stick/OCBM_RESULT.txt"' "the verdict says when, counted from power-on"
@@ -96,11 +98,20 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   d="$T/$sh-conf"; make_box "$d" confirmed; boot "$sh" "$d"
   check 'waitfor "[ -e $d/m.selftest ]" 5 && [ -e "$d/m.boot" ]' "confirmed starts OCBM and still runs the self-test"
 
+  echo "== $sh: no stock GPIO script: the boot radio preload's mark comes all the same"
+  d="$T/$sh-nogpio"; make_box "$d" trial; rm "$d/root/script/init_gpio.sh"; boot "$sh" "$d"
+  check 'waitfor "[ -e $d/run/ocbm_gpio_done ]" 5' "the mark is written, so the preload never waits out its 3 s for it"
+  reap
+
   echo "== $sh: a failed self-test goes back to stock"
-  d="$T/$sh-fail"; make_box "$d" trial; touch "$d/st.fail"; echo "guard: 2 unfinished in a row" > "$d/root/script/radio_preload_off"; boot "$sh" "$d"
+  d="$T/$sh-fail"; make_box "$d" trial; touch "$d/st.fail"; echo "guard: 2 unfinished in a row" > "$d/root/script/radio_preload_off"
+  : > "$d/root/script/radio_preload_late"; : > "$d/root/script/radio_together_off"; : > "$d/root/script/.radio_together_inflight"
+  echo 1 > "$d/root/script/.radio_together_failed"; : > "$d/root/script/radio_handover_off"; : > "$d/root/script/radio_handover_on"; boot "$sh" "$d"
   check 'waitfor "[ -e $d/rebooted ]" 5 && reverted "$d"' \
     "revert: mode removed, hostapd.conf put back, 'reverted version=' recorded, report pending, restart"
   check '[ ! -e "$d/root/script/radio_preload_off" ]' "the go-back drops the boot radio preload's state with the install"
+  check '[ ! -e "$d/root/script/radio_preload_late" ] && [ ! -e "$d/root/script/radio_together_off" ] && [ ! -e "$d/root/script/.radio_together_inflight" ] && [ ! -e "$d/root/script/.radio_together_failed" ] && [ ! -e "$d/root/script/radio_handover_off" ] && [ ! -e "$d/root/script/radio_handover_on" ]' \
+    "and the preload's late start, the radio order's switch, mark and count, and the handover's opt-in and retired off file (stock reads none of them)"
   check 'grep -q "self-test failed (FAILED after 30 s: ocbmd is not running)" "$d/root/etc/ocbm/last_result.txt" && grep -q "^FAILED" "$d/root/etc/ocbm/pending_result.txt"' \
     "the reason and the self-test output are in the record and the report"
   restart "$d"; boot "$sh" "$d"
