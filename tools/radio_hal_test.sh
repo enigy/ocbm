@@ -846,6 +846,41 @@ case_round4() {
   check '[ "$(rc preload)" = 0 ] && said preload "[bench] round4: attach_poll ($R/etc/ocbm/bench_attach_poll): hci0 looked at every 0.1 s"' \
     "on: the preload converges, and says the switch is on"
   check '[ $(( $(key hci_up) - $(key attach) )) -lt "$slow" ]' "  hci_up sooner after the attach than with the 0.5 s look"
+
+  echo "== $SH: round 4, page_trim: a host during the boot preload"
+  unit; : > "$R/etc/ocbm/bench_page_trim"
+  ( WLAN_SECS=0.8 FW_SECS=1.6 hal preload ) &
+  pre=$!
+  waitfor 'called "insmod moal start"' 50
+  WLAN_SECS=0.8 FW_SECS=1.6 AP_SECS=2.5 host_bringup
+  wait "$pre"
+  check '[ "$(rc preload)" = 0 ] && [ "$(rc bt_on)" = 2 ] && [ "$(rc wifi_ap_on)" = 0 ] && said bt_on "already converged"' \
+    "the preload converges, the host's bt_on confirms Bluetooth up (rc 2), the AP comes up"
+  check 'said preload "[bench] round4: page_trim ($R/etc/ocbm/bench_page_trim): a host is waiting - no SCO lines and no name set on hci0" && [ ! -e "$R/state/hci0.name" ]' \
+    "  no name set on the controller by the preload, said so"
+  check '[ "$(cat "$R/etc/.custom_bluetooth_name")" = CarLink-a1b2 ] && [ "$(cat "$R/etc/bluetooth_name")" = CarLink-a1b2 ]' \
+    "  the two name files written all the same"
+  check 'said preload "[bench] round4: page_trim: the together guard'"'"'s mark cleared after the locks went" && [ ! -e "$R/script/.radio_together_inflight" ] && [ ! -e "$R/script/.radio_together_failed" ]' \
+    "  the together guard's mark gone, after the locks"
+  check 'said bt_on "[bench] round4: page_trim ($R/etc/ocbm/bench_page_trim): the bt lock taken after about" && said bt_on "looked at every 0.05 s"' \
+    "  the host's bt_on waited for the bt lock with a look every 0.05 s"
+  check '! called "hciconfig hci0 down" && [ ! -e "$R/tmp/.radio_bt_handover" ] && [ ! -s "$R/tmp/.radio_bt_warm" ]' \
+    "  Bluetooth left up for the host, no handover, nothing opened (btd's DOWN/UP stays)"
+  i0=$(inode "$R/etc/bluetooth_name"); i1=$(inode "$R/etc/.custom_bluetooth_name")
+  reboot_unit
+  ( WLAN_SECS=0.4 FW_SECS=0.8 hal preload ) &
+  pre=$!
+  waitfor 'called "insmod moal start"' 50
+  host_comes; wait "$pre"
+  check '[ "$(rc preload)" = 0 ] && said preload "a host is waiting - no SCO lines and no name set" && [ "$(inode "$R/etc/bluetooth_name")" = "$i0" ] && [ "$(inode "$R/etc/.custom_bluetooth_name")" = "$i1" ]' \
+    "  the next boot's, with the name the files hold: neither written again"
+
+  echo "== $SH: round 4, page_trim: the boot preload alone"
+  unit; : > "$R/etc/ocbm/bench_page_trim"
+  WLAN_SECS=0.4 FW_SECS=0.4 hal preload
+  check '[ "$(rc preload)" = 0 ] && [ -e "$R/state/hci0.name" ] && ! said preload "a host is waiting" && ! said preload "mark cleared after the locks"' \
+    "no host: the name set and the mark cleared as before"
+  check 'called "hciconfig hci0 down" && [ ! -e "$R/script/.radio_together_inflight" ]' "  and powered down to the between-sessions state"
 }
 
 . "$HERE/test_shells.sh"

@@ -130,6 +130,10 @@ write_empty() { { true >"$1"; } 2>/dev/null; }
 # cat and mkdir each time. Still 30 s at most, and a lock is still reclaimed only when its holder is gone.
 lock_take() {  # $1 = subsystem
   _lk="/tmp/.radio_lock_$1"; _n=0
+  # Round 4, item 6 (bench page_trim): a look every 0.05 s while it waits (20 a round, 600 in all: still 30 s at most),
+  # so a host's bt_on goes on within 50 ms of the boot preload letting the lock go, not 200.
+  _lks=0.2; _lkr=5; _lkm=150
+  if r4_on page_trim; then _lks=0.05; _lkr=20; _lkm=600; fi
   while ! mkdir "$_lk" 2>/dev/null; do
     _holder=""; read -r _holder 2>/dev/null <"$_lk/pid"
     if [ -n "$_holder" ] && ! pid_live "$_holder"; then
@@ -140,13 +144,14 @@ lock_take() {  # $1 = subsystem
       log "lock $1 has no holder and is >20min old - reclaiming"
       rm -rf "$_lk"; continue
     fi
-    [ "$_n" -ge 150 ] && {
+    [ "$_n" -ge "$_lkm" ] && {
       log "lock $1 busy >30s (held by pid ${_holder:-unknown}) - refusing to stack bring-ups"; return 1; }
     # At least one sleep a round (a lock path that is no directory must not spin), up to five while it stays.
     _lkw=0
-    while :; do sleep 0.2; _lkw=$((_lkw + 1)); [ "$_lkw" -lt 5 ] && [ -d "$_lk" ] || break; done
+    while :; do sleep "$_lks"; _lkw=$((_lkw + 1)); [ "$_lkw" -lt "$_lkr" ] && [ -d "$_lk" ] || break; done
     _n=$((_n + _lkw))
   done
+  [ "$_lks" = 0.05 ] && [ "$_n" -gt 0 ] && log "[bench] round4: page_trim ($_r4f): the $1 lock taken after about $((_n * 50)) ms of waiting, looked at every 0.05 s"
   echo $$ > "$_lk/pid" 2>/dev/null
   lock_mine "$1" 1   # taken by this process, whether or not its pid could be written (lock_drop_own)
   # TWO traps, deliberately. In ash a trapped signal runs the handler and then RESUMES the
@@ -491,6 +496,17 @@ bt_set_name() {  # $1 = hci dev
     sleep 0.5
   done
   log "BT name=$_bn (asserted after $_n retries, now '${_cur:-unknown}')"
+}
+
+# The two name files bt_set_name writes, each only where it would change: round 4's page trim sets no name on the
+# controller, and a boot whose name they hold already writes nothing to flash.
+bt_name_files() {
+  _bnf=$(box_name)
+  for _bnf_f in /etc/.custom_bluetooth_name /etc/bluetooth_name; do
+    _bnf_c=""; read -r _bnf_c 2>/dev/null <"$_bnf_f"
+    [ "$_bnf_c" = "$_bnf" ] || echo "$_bnf" > "$_bnf_f" 2>/dev/null
+  done
+  return 0
 }
 
 # Load THIS unit's WLAN driver and nothing else - no AP, no addressing. Factored out of
@@ -863,6 +879,11 @@ do_preload() {
   # The seam's part is over: the locks go now, not after the bookkeeping below (a sync and a few forks), so a host's
   # bring-up waiting on them goes on at once. Only while they are still this preload's (lock_drop_own).
   trap - EXIT INT TERM HUP; lock_drop_own bt; lock_drop_own wlan
+  # Round 4's page trim: the together guard's mark, left for here by a converged attach a host was waiting on; one sync.
+  if [ "${_bt_mark_late:-0}" = 1 ]; then
+    rm -f "$TOGETHER_MARK" "$TOGETHER_FAILS"
+    log "[bench] round4: page_trim: the together guard's mark cleared after the locks went"
+  fi
   rm -f "$PRELOAD_MARK" "$PRELOAD_UNFINISHED"; sync
   # "done" only when Bluetooth came up (rc 0, or 2: already up); a failed attach says so, e.g. done_rc1, so the
   # [startup] line never reads "preload done" after one (the Mac's review, PRELOAD-DONE-ANY-RC).
@@ -1327,12 +1348,21 @@ bt_attach_loop() {
       return 0
     fi
     bt_power_stamp
-    # Vendor SCO tuning where the mapping carried it; non-fatal. Was a HARDCODED
-    # `scomtu 240:32` despite this comment -- which is the Realtek/NXP value and nobody
-    # else's, and which skipped the routing command the NXP and BCM4358 branches need.
-    # Now the extracted per-branch mapping.
-    apply_sco "$_d" >/dev/null 2>&1 || log "no SCO mapping for this chipset"
-    bt_set_name "$_d"
+    # Round 4, item 6 (bench page_trim), a host waiting on this preload: no SCO lines and no name set here (0.39 s of
+    # hci_up to the first page). The host's session resets the controller before it uses it (btd's DOWN/UP), and btd
+    # writes the name, class, Simple Pairing and EIR itself (bt_bringup.rs prepare); the vendor's SCO set-up never
+    # outlived that reset (apply_sco), as the handover's claim already relies on. The name files only where they change.
+    if [ "$VERB" = preload ] && host_here && r4_on page_trim; then
+      log "[bench] round4: page_trim ($_r4f): a host is waiting - no SCO lines and no name set on $_d (btd's bring-up resets the controller and writes the name)"
+      bt_name_files
+    else
+      # Vendor SCO tuning where the mapping carried it; non-fatal. Was a HARDCODED
+      # `scomtu 240:32` despite this comment -- which is the Realtek/NXP value and nobody
+      # else's, and which skipped the routing command the NXP and BCM4358 branches need.
+      # Now the extracted per-branch mapping.
+      apply_sco "$_d" >/dev/null 2>&1 || log "no SCO mapping for this chipset"
+      bt_set_name "$_d"
+    fi
     publish "$BT_STATE" "result=ok" "backend=mapped" "chipset=$RADIO_SDIO_DEVICE" "hci_dev=$_d" \
             "bt_mac=$(cat /sys/class/bluetooth/$_d/address 2>/dev/null)"
     log "BT converged: $_d responsive on attempt $_try"
@@ -1437,7 +1467,14 @@ bt_attach_together() {
   bt_handover_give
   if [ "$_btw_bt" = 0 ]; then
     if [ "$_btw_wl" = 0 ]; then
-      rm -f "$TOGETHER_MARK" "$TOGETHER_FAILS"; sync
+      # Round 4, item 6 (bench page_trim), a host waiting on this preload: the guard's mark and count go once the locks
+      # have (do_preload), so their flash sync is off the path the host's bt_on waits on. A power cut in between counts
+      # this attach as unfinished: more careful, never less.
+      if [ "$VERB" = preload ] && host_here && r4_on page_trim; then
+        _bt_mark_late=1
+      else
+        rm -f "$TOGETHER_MARK" "$TOGETHER_FAILS"; sync
+      fi
     else
       together_count "gave Bluetooth but no Wi-Fi interface" || :
     fi
