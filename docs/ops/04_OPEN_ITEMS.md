@@ -897,11 +897,18 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
   the scripts this branch changed, and a mark, count or off file that cannot be written never stops a bring-up (B); the
   together rule conservative, any sign of a wait for the Wi-Fi side today's order (C; on the 2025.10.15.1127 texts
   still 0x9159 alone); no descriptor without an SDIO id final or kept, the preload waiting up to 3 s for the card (D,
-  L); an update's first start lifting the together guard too (E); the guard's off file renamed in whole (F);
+  L); an update's trial lifting both radio guards once, at its first start, recorded in its journal (E: keyed on the
+  start count, which each passing self-test deletes, the lift had come at every start of an open trial, so neither guard
+  could trip there, the preload's at 2.6.5 too); the guard's off file renamed in whole (F);
   `/script/radio_preload_late` kept by installs and updates (G); the handover wait bounded at 30 s, and the other
   wrappers starting btd with no `OCBM_BTD_WAIT` (I); an answered attach never counted (J); a lock freed by its taker
   whose pid write failed (K). Still `:` with redirections in `ccpa/installer/ocbm_finish.sh` (lines 148 and 181), which
-  this branch did not change.
+  this branch did not change. Left as they are (the review's lows): section 4d reads text, so a wait it cannot see (a
+  script the attach runs without sourcing it, a function reached by `eval`) would pass it, and none of the texts read
+  has one; on a fallback boot `bt_on` stops every attach helper by name (`killall`), not only the preload's; the
+  handover wait's bound waits on behind any live holder of the seam's bt lock, so a stuck holder stretches it to that
+  holder's own limits (a `bt_on`'s tries: minutes; a lock with no pid: its 20 minutes); and an attach converges on one
+  answer within its polls (J), so a controller that answers once and then wedges is left to the session's own checks.
   **OPEN: the handover, 2 of 6 boots with link trouble against 0 of 9 without, cause not established, off by default.**
   On `4a6ce9c` (21 Nov, the dev adapter, real power cuts by hand) it did as designed (`handed - hci_up` 30 to 40 ms,
   `page_start - bt_power` 88 to 110 ms against 946 to 1045 without, the first frame 12.95 to 13.95 s on its clean
