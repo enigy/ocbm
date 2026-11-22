@@ -397,10 +397,12 @@ first, and the two kinds read it differently:
 
 2.7.0's behaviour on all of them at once: `off` in each of the six files (for a cold boot in `/etc/ocbm`), none of the
 five, and `/tmp/bench_screen_nudge_ms` at `500`; the firmware push's changes have no switch. A number that is not one,
-or out of its range, is refused with a line and the default stands. Every file read says so in a line holding
-`[bench] round4:` (btd's in `/tmp/wl.log`, carplayd's in `/tmp/carplayd_wl.log`, the scripts' in `/tmp/box.log`), `off`
-too; a switch off by default says so again where it acts, while the six on by default act with plain lines (below),
-which the scripts tag `[bench] round4: <name> (<file>):` when a file turned one on. For a cold boot put `btd_early`,
+or out of its range, is refused with a line and the default stands. A file that sets a switch or turns one off says so
+in a line holding `[bench] round4:` (btd's in `/tmp/wl.log`, carplayd's in `/tmp/carplayd_wl.log`, the scripts' in
+`/tmp/box.log`): btd for each file as its loop starts, `off` too; carplayd and the scripts where the switch acts. A
+switch off by default says so again where it acts; the six on by default act with plain lines (below), which the
+scripts tag `[bench] round4: <name> (<file>):` when a file turned one on, and their `off` says so where the switch
+would have acted (`attach_poll=off`, `page_trim=off`, `btd_early=off`). For a cold boot put `btd_early`,
 `page_trim`, `attach_poll` and `preload_nice` in `/etc/ocbm`: they act during the boot, while `/tmp` is still empty.
 Item 7's `gpio_first` (the stock GPIO set-up before ocbm_boot.sh) was benched 0.25 s slower at the start and dropped;
 its `preload_nice` stays.
