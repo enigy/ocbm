@@ -52,6 +52,26 @@ pub fn bench_flag(path: &str) -> bool {
     bench_text(path).is_some()
 }
 
+/// Where a round-4 bench switch is kept on flash (docs/ops/02_TESTING.md, "Round 4 switches"): OCBM's own state
+/// directory, which updates keep and the full way back to stock removes whole (radio_hal.sh, "The descriptor, kept"),
+/// so no remover has to name its files. A cold boot sees it; `/tmp` is empty then.
+pub const BENCH_FLASH_DIR: &str = "/etc/ocbm";
+
+/// A round-4 bench switch (docs/ops/02_TESTING.md, "Round 4 switches"): `/tmp/bench_<name>` when it is set, else
+/// `/etc/ocbm/bench_<name>` ([`BENCH_FLASH_DIR`]), each by [`bench_text`]'s rule. Its text and the file it came from;
+/// None when neither is set, which is the default behaviour. Nothing in a release writes either.
+pub fn bench_switch(name: &str) -> Option<(String, String)> {
+    bench_switch_in(&["/tmp", BENCH_FLASH_DIR], name)
+}
+
+/// [`bench_switch`] over `dirs`, in order (a test's own).
+pub fn bench_switch_in(dirs: &[&str], name: &str) -> Option<(String, String)> {
+    dirs.iter().find_map(|d| {
+        let path = format!("{d}/bench_{name}");
+        bench_text(&path).map(|text| (text, path))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -69,5 +89,26 @@ mod tests {
         std::fs::write(&path, " AA:BB:CC:DD:EE:01 1500\n").unwrap();
         assert_eq!(bench_text(p).as_deref(), Some("AA:BB:CC:DD:EE:01 1500"), "the text, trimmed");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Round 4: a switch in the first directory where it is set (/tmp before the flash), by bench_text's rule.
+    #[test]
+    fn a_round4_switch_is_read_from_tmp_then_flash() {
+        let root = std::env::temp_dir().join(format!("box_common_bench_switch_{}", std::process::id()));
+        let (tmp, flash) = (root.join("tmp"), root.join("flash"));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::create_dir_all(&flash).unwrap();
+        let dirs = [tmp.to_str().unwrap(), flash.to_str().unwrap()];
+        let at = |d: &std::path::Path| d.join("bench_x").to_str().unwrap().to_string();
+        assert_eq!(bench_switch_in(&dirs, "x"), None, "set nowhere: the default");
+        std::fs::write(flash.join("bench_x"), "8192\n").unwrap();
+        assert_eq!(bench_switch_in(&dirs, "x"), Some(("8192".to_string(), at(&flash))), "on flash only");
+        std::fs::write(tmp.join("bench_x"), " 1500 ").unwrap();
+        assert_eq!(bench_switch_in(&dirs, "x"), Some(("1500".to_string(), at(&tmp))), "/tmp first");
+        std::fs::write(tmp.join("bench_x"), "off").unwrap();
+        assert_eq!(bench_switch_in(&dirs, "x").map(|(_, p)| p), Some(at(&flash)), "off in /tmp: the flash's");
+        std::fs::write(flash.join("bench_x"), "off").unwrap();
+        assert_eq!(bench_switch_in(&dirs, "x"), None, "off in both");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
