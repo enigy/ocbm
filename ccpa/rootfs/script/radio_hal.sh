@@ -1300,9 +1300,11 @@ bt_ldisc_ready() {
 # boot loader (its own "Timeout: 4000"); one still running after RADIO_BTFW_WAIT seconds (10; a test hook) is sent TERM,
 # and KILL 2 s later. It ran unbounded before, under the bt lock.
 #
-# Its code: 0 pushed, with BT_FW_PUSHED written (bt_fw_push); 1 not, the loader having failed (its code and its last
-# lines go to the log, any address in them masked) or been stopped at the bound. The bench of 22 Nov (a cold boot, by
-# hand): the loader exited 255, the attach went on against a chip with no firmware, and the box went silent.
+# Its code: 0 pushed, with BT_FW_PUSHED written (bt_fw_push): the loader exited 0, or said "Download Complete" (and no
+# "Download Error") whatever its code, a stop at the bound after it included (the code logged); 1 not, the loader having
+# failed (its code and its last lines go to the log, any address in them masked) or been stopped at the bound (its
+# code, and that it was stopped). The bench of 22 Nov (a cold boot, by hand): the loader exited 255, the attach went on
+# against a chip with no firmware, and the box went silent.
 RADIO_BTFW_WAIT=${RADIO_BTFW_WAIT:-10}
 case "$RADIO_BTFW_WAIT" in ''|*[!0-9]*) RADIO_BTFW_WAIT=10 ;; esac
 # A firmware push that succeeded this boot (bt_fw_push). In /tmp, so a SoC restart or a power cut, which put the chip
@@ -1329,7 +1331,18 @@ bt_fw_preload() {
     match($0, /time:[ ]*[0-9]+/) { t = substr($0, RSTART, RLENGTH); sub(/time:[ ]*/, "", t) }
     END { v = "other"; if (c) v = "complete"; if (e) v = "error"; if (t == "") t = "-"; print v " " t }' \
     /tmp/radio_bt_fw.log 2>/dev/null)
-  boot_note btfw "${1:-other}"; boot_note btfw_ms "${2:--}"
+  _bfp_v=${1:-other}
+  boot_note btfw "$_bfp_v"; boot_note btfw_ms "${2:--}"
+  # The loader's own word stands over its code (the 2.7.1 review): "Download Complete" with no "Download Error" is the
+  # firmware pushed, whatever code followed it, from a loader the bound stopped after it said so too; the code is logged.
+  if [ "$_bfp_rc" != 0 ] && [ "$_bfp_v" = complete ]; then
+    if [ "$_bfp_ms" -ge $((RADIO_BTFW_WAIT * 1000)) ]; then
+      log "  firmware preload stopped at the bound (exit $_bfp_rc) after it said Download Complete - taken as pushed"
+    else
+      log "  firmware preload exited $_bfp_rc after it said Download Complete - taken as pushed"
+    fi
+    _bfp_rc=0
+  fi
   if [ "$_bfp_rc" = 0 ]; then
     # A builtin's redirection, no fork. Unwritten (a full /tmp), a later failed push stops the attach.
     write_empty "$BT_FW_PUSHED" || log "  the push's mark could not be written ($BT_FW_PUSHED)"

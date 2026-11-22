@@ -84,7 +84,13 @@ case " ${FW_FAIL:-} " in *" $n "*)
 esac
 echo "Download Complete"
 echo "time:${FW_OWN_MS:-2467}"
+# FW_DONE_HANG: runs that never return after saying so, ignoring TERM; FW_ODD: runs that exit 3 after it.
+case " ${FW_DONE_HANG:-} " in *" $n "*)
+  echo "fw done-hang $n" >> "$R/calls"; echo $$ > "$R/state/fw_loader_linux.pid"; trap '' TERM
+  while :; do sleep 0.1; done ;;
+esac
 echo "fw end" >> "$R/calls"
+case " ${FW_ODD:-} " in *" $n "*) exit 3 ;; esac
 EOF
 cat > "$S/hciattach" <<'EOF'
 #!/bin/sh
@@ -890,6 +896,24 @@ case_fwpush() {
   WLAN_SECS=0.2 FW_SECS=0.2 hal preload
   check '[ "$(rc preload)" = 0 ] && [ -e "$R/tmp/.radio_btfw_pushed" ] && [ "$(key btfw_tries)" = 1 ] && [ "$(key btfw)" = complete ]' \
     "the mark in /tmp; the boot line btfw=complete btfw_tries=1"
+
+  # The 2.7.1 review: the loader's own "Download Complete" stands over its exit code, and over the bound's stop.
+  echo "== $SH: the firmware push: Download Complete is a push, whatever the code after it"
+  unit
+  FW_ODD=1 WLAN_SECS=0.2 FW_SECS=0.2 hal preload
+  check '[ "$(rc preload)" = 0 ] && said preload "firmware preload exited 3 after it said Download Complete - taken as pushed" && [ "$(count "fw start")" = 1 ] && [ "$(count "attach ")" = 1 ]' \
+    "it said Download Complete and exited 3: taken as pushed (the code logged), no second push, the attach"
+  check '[ -e "$R/tmp/.radio_btfw_pushed" ] && [ "$(key btfw)" = complete ] && [ "$(key btfw_tries)" = 1 ] && [ "$(key rc)" = 0 ]' \
+    "  the push's mark; the boot line btfw=complete btfw_tries=1 rc=0"
+  unit
+  RADIO_BTFW_WAIT=1 FW_DONE_HANG=1 WLAN_SECS=0.2 FW_SECS=0.2 hal preload
+  check '[ "$(rc preload)" = 0 ] && said preload "firmware preload stopped at the bound (exit " && said preload "after it said Download Complete - taken as pushed" && [ "$(count "fw start")" = 1 ] && [ "$(count "attach ")" = 1 ]' \
+    "it said Download Complete and never returned: stopped at the bound, taken as pushed, the attach"
+  check '! { p=$(cat "$R/state/fw_loader_linux.pid" 2>/dev/null) && kill -0 "$p" 2>/dev/null; }' "  the loader gone"
+  unit
+  FW_FAIL=1 FW_SAY="Download Complete" WLAN_SECS=0.2 FW_SECS=0.2 hal preload
+  check '[ "$(rc preload)" = 0 ] && said preload "the firmware push failed - pushing it once more" && [ "$(key btfw)" = error ] && [ "$(key btfw_tries)" = 2 ]' \
+    "Download Complete beside a Download Error: a failure, pushed once more, as before"
 
   echo "== $SH: the firmware push: one that fails is pushed once more"
   unit

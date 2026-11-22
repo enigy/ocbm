@@ -790,8 +790,11 @@ verb returns (clause 1). Today's order (`bt_attach_mapped`) is the code of befor
   alone, as together is.
 - **No attach without firmware** (22 Nov 2026: a cold boot on the bench whose loader exited 255, whose attach went on
   against a chip with no firmware, and whose box then fell silent until a power cycle). `bt_fw_push` runs the loader
-  under a bound (10 s, then TERM, and KILL 2 s later; it had none), its code and last lines into box.log (an address in
-  them masked), and once more when it failed. Two failures attach nothing: no `hciattach`, no reclaim+reset, `rc=1`;
+  under a bound (10 s, then TERM, and KILL 2 s later; it had none), and once more when it failed. A push is good when
+  the loader exits 0 or says `Download Complete` (with no `Download Error`), whatever its code, the bound's stop after
+  it included (the code logged: the 2.7.1 review); a failure logs the loader's code into box.log, and its last lines
+  (an address in them masked) unless the bound stopped it, which says so instead. Two failures attach nothing: no
+  `hciattach`, no reclaim+reset, `rc=1`;
   in the together order the fallback mark and the guard's count as for any together attach that gave no responsive
   `hci0`, so the host's `bt_on` takes today's order with a push of its own. A good push leaves
   `/tmp/.radio_btfw_pushed`, and a failure after it that boot does not stop the attach: the chip runs that firmware,
