@@ -5,9 +5,11 @@
 //! preload to end, then for its own `bt_on` behind the seam's lock, then for btd's start and btd's DOWN/UP: on the dev
 //! adapter's bench of 20 Nov (`70caa3c`, real power cycles) the first page went out 1.6 to 1.9 s after hci0 answered.
 //!
-//! Opt-in since 21 Nov (`/script/radio_handover_on`; off by default): the supervisor starts this btd at the host's arrival
-//! while the boot preload runs (`OCBM_BTD_WAIT=1`, `wireless_up`), beside the host's `bt_on`. It does what a btd does at its start up to
-//! its first bring-up (the control port, the session's record, the AP watch), then [`wait`]s for the first of:
+//! The supervisor starts this btd at the host's arrival while the boot preload runs (`OCBM_BTD_WAIT=1`, `wireless_up`),
+//! beside the host's `bt_on`: by default since 2.7.1 (round 4's `btd_early`, with no handover asked for, so only
+//! `bt_on`'s end ends the wait), and with the handover asked for (opt-in since 21 Nov, `/script/radio_handover_on`; off
+//! by default). It does what a btd does at its start up to its first bring-up (the control port, the session's record,
+//! the AP watch), then [`wait`]s for the first of:
 //! - **the preload's handover** ([`HANDOVER`], written by `radio_hal.sh` `bt_handover_give`): the controller this
 //!   boot's attach registered, claimed by an HCIDEVUP (the kernel's auto power-off cancelled) and handed to the host
 //!   that came. `bt_bringup::from_handover` proves it with one round trip and brings it up with no DOWN/UP;

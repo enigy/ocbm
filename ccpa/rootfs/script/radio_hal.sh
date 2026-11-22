@@ -1123,10 +1123,12 @@ together_count() {
 #   out), against 0 of 9 with the DOWN/UP kept (70caa3c's 5 and 4a6ce9c's 4 with it off): suggestive, not proof, the
 #   cause not found (docs/wireless/01_BT_AND_RADIO.md, "The cold boot", 6). So the handover runs only when asked for:
 #   the owner's /script/radio_handover_on on flash, or the bench's /tmp/bench_handover_on (bench_flag's rule: set
-#   unless it reads "off"), read here at the attach and by the supervisor at the host's arrival. With neither, the cold
-#   path is 4a6ce9c's with its old off file: no claim, no handover file, no early btd, btd's DOWN/UP. That off file,
-#   /script/radio_handover_off, is retired: nothing reads it, and updates, an update's first start, reverts and the
-#   restores remove it. A teardown's bt_off removes $HANDOVER: it was for the session that ends.
+#   unless it reads "off"), read here at the attach and by the supervisor at the host's arrival. With neither, nothing
+#   of the handover runs: no claim, no handover file, btd's DOWN/UP. The supervisor still starts btd early (its
+#   btd_early, on by default since 2.7.1), and that btd waits for bt_on's end; with btd_early off too, the cold path is
+#   4a6ce9c's with its old off file. That off file, /script/radio_handover_off, is retired: nothing reads it, and
+#   updates, an update's first start, reverts and the restores remove it. A teardown's bt_off removes $HANDOVER: it was
+#   for the session that ends.
 HANDOVER=/tmp/.radio_bt_handover
 HANDOVER_ON=/script/radio_handover_on
 HANDOVER_BENCH_ON=/tmp/bench_handover_on

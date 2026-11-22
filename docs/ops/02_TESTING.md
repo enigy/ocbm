@@ -788,11 +788,14 @@ preload's handover ... it answers, scan 0x00`, then `handed over by the boot pre
     connects each time, `first_frame` compared with `70caa3c`'s 13.8 to 15.4 s after power-up. Over the console in one of them, 3 s after `handed`: `hciconfig hci0` still `UP RUNNING` (the claim
     held: the kernel's auto power-off did not fire).
 11. **A against B, the default:** `rm /script/radio_handover_on`, as many cold boots as in step 10. Those read
-    `handover=off handed=-`, `[sup] ... CLEAN bring-up of wireless stack (detached, pairing=...)` with no `btd starts now`, the host's
-    bt_on `already converged`, btd's `down (+` and `up (+` lines, `page_start - bt_power` near 1.0 s (946 to 1045 ms
-    on `4a6ce9c`; `bt_power` is then the host's `bt_on`'s, after the preload), and `hci_up` to the page near 1.6 to 1.9 s.
-    Compare `hci_up` (and `btfw_ms`) between the two sets: btd's earlier start must not cost the attach more than
-    about 100 ms.
+    `handover=off handed=-` and `[sup] ... CLEAN bring-up of wireless stack (detached, pairing=...; the boot preload is
+    attaching Bluetooth: btd starts now and waits for it)`: since 2.7.1 btd starts early by default (round 4's
+    `btd_early`, "Round 4 switches"), waits for `bt_on`'s end and keeps its DOWN/UP. Then the host's bt_on `already
+    converged`, btd's `down (+` and `up (+` lines. For `4a6ce9c`'s default exactly, `echo off >
+    /etc/ocbm/bench_btd_early` as well: the bring-up line then has no `btd starts now`, `page_start - bt_power` near
+    1.0 s (946 to 1045 ms on `4a6ce9c`; `bt_power` is then the host's `bt_on`'s, after the preload), and `hci_up` to
+    the page near 1.6 to 1.9 s. Compare `hci_up` (and `btfw_ms`) between the sets: btd's earlier start must not cost
+    the attach more than about 100 ms.
 12. **The kernel's auto power-off, seen once:** one cold boot with no host (Carlink closed) and
     `/script/radio_preload_off` on flash; over the console `: > /tmp/bench_arm_off` (or the supervisor arms the
     controller the next command attaches), then `sh /script/radio_hal.sh bt_on` and, 3 s after it returns,

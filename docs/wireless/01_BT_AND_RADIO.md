@@ -886,7 +886,10 @@ asked for (`btd_early`). The trace and figures above are 2.7.0's path.
 
 **6. The handover: a waiting host's session takes Bluetooth as `hci0` answers (R3-5; opt-in, off by default since
 21 Nov).** Everything below runs only when the owner asks for it (the opt-in, and the open question, at the end of this
-section); by default the cold path is section 4's. On the 20 Nov bench the
+section); by default the cold path is section 4's, but for the first item below: since 2.7.1 btd starts at the host's
+arrival and waits by default, by round 4's `btd_early` with no handover asked for, so its wait ends at `bt_on`'s end
+and its bring-up keeps the DOWN/UP ([../ops/02_TESTING.md](../ops/02_TESTING.md), "Round 4 switches"). On the 20 Nov
+bench the
 first page went out 1.60 to 1.93 s after `hci0` answered, in three parts (ms since the host subscribed, from
 `[timeline] v1`): `hci_up` to `bt_power` 0.72 to 0.85 s, the preload's name and SCO set-up (about 0.37 s on its own),
 its bookkeeping, then the host's `bt_on` behind the bt lock (a look every 0.2 s) and its confirmation; `bt_power` to
@@ -939,9 +942,11 @@ start and its DOWN/UP (`down +205 ms`, `up +520 ms`) on a controller the preload
   session in the same btd (a phone switch) does its DOWN/UP as before (the "opened" word is spent unread).
 - **Opt-in (21 Nov):** the owner's `/script/radio_handover_on` on flash, or the bench's `/tmp/bench_handover_on`
   (`box_common::bench_flag`'s rule: set unless it reads `off`), read by the preload at its attach and by the supervisor
-  at the host's arrival. With neither, nothing of this runs: no claim, no handover file, no early btd, the host's
-  `bt_on` and btd's DOWN/UP as in section 4, exactly the path `4a6ce9c` took with its old off file (the same hardware
-  calls, the same wrapper, byte for byte; the one log line reads `handover: off (not asked for ...)`). `radio_hal.sh
+  at the host's arrival. With neither, nothing of the handover runs: no claim, no handover file, the host's `bt_on` and
+  btd's DOWN/UP as in section 4. The early btd does, since 2.7.1, by `btd_early` (on by default; `off` in
+  `/etc/ocbm/bench_btd_early` takes it out), and it waits for `bt_on`'s end; with it off too, the path is exactly the
+  one `4a6ce9c` took with its old off file (the same hardware calls, the same wrapper, byte for byte; the one log line
+  reads `handover: off (not asked for ...)`). `radio_hal.sh
   probe` and the boot line say `handover=on_owner`, `on_bench` or `off`. That old off file, `/script/radio_handover_off`
   (4a6ce9c's switch; the dev adapter has one), is retired: nothing reads it, and an update, an update's first start
   (for a package an older updater placed), a revert and the restores remove it. A revert and the restores remove the
