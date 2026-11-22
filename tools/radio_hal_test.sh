@@ -459,8 +459,11 @@ case_host() {
   # The AP's bring-up outlasts the preload, so a preload that took the AP's lock as it ended would show (ap lock LOST).
   WLAN_SECS=0.8 FW_SECS=1.6 AP_SECS=2.5 host_bringup
   wait "$pre"; t1=$(date +%s)
-  check '[ "$(rc preload)" = 0 ] && [ "$(rc bt_on)" = 2 ] && [ "$(rc wifi_ap_on)" = 0 ] && [ $((t1 - t0)) -lt 12 ]' \
-    "the preload converges, the host's bt_on finds Bluetooth up (rc 2), its AP comes up, nothing deadlocks"
+  # "Nothing deadlocks": no lock wait ran out (lock_take refuses after 30 s and says so), and the whole took less than
+  # that 30 s, by the clock only as a backstop (it is about 5 s alone; a loaded host stretches it, a lock wait that ran
+  # out cannot be under 30 s).
+  check '[ "$(rc preload)" = 0 ] && [ "$(rc bt_on)" = 2 ] && [ "$(rc wifi_ap_on)" = 0 ] && ! grep -qs "busy >30s" "$R/out.preload" "$R/out.bt_on" "$R/out.wifi_ap_on" && [ $((t1 - t0)) -lt 29 ]' \
+    "the preload converges, the host's bt_on finds Bluetooth up (rc 2), its AP comes up, nothing deadlocks (no lock wait ran out)"
   check '[ "$(count "insmod moal start")" = 1 ] && [ "$(count "fw start")" = 1 ] && [ "$(count "attach ")" = 1 ] && [ "$(count "tar -x")" = 1 ]' \
     "no double load: one Wi-Fi driver load, one firmware push, one attach, one unpack"
   check 'before "insmod moal end" "ap start" && before "ap start" "fw end"' \
