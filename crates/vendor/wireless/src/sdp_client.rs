@@ -427,6 +427,56 @@ fn before_page(dev: u16, peer: [u8; 6], session_live: bool) -> Option<&'static s
     }
 }
 
+/// How long, with no link to the phone left, before a re-page that crossed one goes again (round 4, item 3): a phone
+/// that pages back lands its link in this, and a controller still letting the old one go is done with it.
+const CROSSED_SETTLE: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// What the wait after a crossed re-page does next ([`settle_crossed`]), from one look at the link to the phone.
+#[derive(Debug, PartialEq, Eq)]
+enum Crossed {
+    /// No link: [`CROSSED_SETTLE`] more, then page.
+    Settle,
+    /// An answered link (the phone's own, or btd's from the last cut, which the page tells apart, [`before_page`]): page
+    /// now, riding it.
+    Ride,
+    /// A link still coming up or going: look again.
+    Wait,
+    /// Still that past [`CUT_LINK_GONE`]: page anyway.
+    Over,
+}
+
+/// The decision for the link `acl` to the phone, `waited` into the wait.
+fn crossed_next(acl: Option<crate::hci::AclInfo>, waited: std::time::Duration) -> Crossed {
+    match acl {
+        None => Crossed::Settle,
+        Some(a) if a.answered() => Crossed::Ride,
+        Some(_) if waited >= CUT_LINK_GONE => Crossed::Over,
+        Some(_) => Crossed::Wait,
+    }
+}
+
+/// Round 4, item 3 (bench): before the same phone is paged again after its re-page failed with EALREADY, EMLINK or
+/// EBUSY (a link the controller still holds): up to [`CUT_LINK_GONE`] for the kernel's link to it to go or come up, and
+/// with none left, [`CROSSED_SETTLE`] more ([`crossed_next`]). What it found, for the walk's `[bench]` line.
+pub(crate) fn settle_crossed(peer: [u8; 6]) -> &'static str {
+    let Ok(dev) = crate::hci::dev_id(crate::HCI_DEV) else {
+        std::thread::sleep(CROSSED_SETTLE);
+        return "no controller to look at: paging it again after a pause";
+    };
+    let t = std::time::Instant::now();
+    loop {
+        match crossed_next(crate::hci::acl_info(dev, peer), t.elapsed()) {
+            Crossed::Settle => {
+                std::thread::sleep(CROSSED_SETTLE);
+                return "no link to it: paging it again after a pause";
+            }
+            Crossed::Ride => return "a link to it is up: paging it again on that link",
+            Crossed::Over => return "a link to it is still coming up or going: paging it again anyway",
+            Crossed::Wait => std::thread::sleep(POLL_SLICE),
+        }
+    }
+}
+
 /// Note the link a cut leaves: up after its Disconnect (`sent`), or with none sent; or gone (`up` false).
 fn note_left_link(peer: [u8; 6], handle: u16, up: bool, sent: bool) {
     let mut left = LEFT_LINK.lock().unwrap_or_else(|e| e.into_inner());
@@ -791,6 +841,18 @@ mod tests {
         note_left(&mut l, peer, 0x0b, true, false, now);
         note_left(&mut l, other, 0x0c, true, true, now);
         assert_eq!(whose(l), Some((other, 0x0c)), "another phone's cut whose link stayed up: the newer record");
+    }
+
+    /// Round 4, item 3: after a crossed re-page, no link waits a moment more, an answered one is ridden at once, one still
+    /// coming up or going is looked at again until CUT_LINK_GONE.
+    #[test]
+    fn a_crossed_re_page_waits_for_the_link_to_clear_or_come_up() {
+        let ms = std::time::Duration::from_millis;
+        let acl = |state| Some(crate::hci::AclInfo { handle: 0x0b, state });
+        assert_eq!(crossed_next(None, ms(0)), Crossed::Settle);
+        assert_eq!(crossed_next(acl(crate::hci::BT_CONNECTED), ms(0)), Crossed::Ride);
+        assert_eq!(crossed_next(acl(crate::hci::BT_CONNECT), ms(100)), Crossed::Wait, "coming up");
+        assert_eq!(crossed_next(acl(crate::hci::BT_CONNECT), CUT_LINK_GONE), Crossed::Over, "and past the wait: page anyway");
     }
 
     /// wait_connected's decision (the Mac's review, A3): a page that timed out fails with EHOSTDOWN, an answer with no SDP

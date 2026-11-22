@@ -60,6 +60,10 @@ struct Round4 {
     /// Item 5 (`early_gap_secs`, 1-60 s): the gap between rounds in the first [`EARLY_WINDOW`], for [`EARLY_GAP_SECS`].
     /// Not 0: a gap is the loop's floor against spinning on pages that fail at once (audit B5).
     early_gap_secs: Option<u64>,
+    /// Item 3 (`same_phone_repage`, a flag): a re-page after a reset or a cut that crosses a link the controller still
+    /// holds ([`Attempt::Crossed`]) waits for that link to clear and pages the same phone again, up to [`CROSSED_REPAGES`]
+    /// times ([`walk`]), before the walk goes on to the next phone as today.
+    same_phone_repage: bool,
 }
 
 impl Round4 {
@@ -88,6 +92,13 @@ impl Round4 {
             lines.push(format!(
                 "[bench] round4: early_gap_secs={s} ({at}): rounds {s} s apart in the first {} s (default {EARLY_GAP_SECS} s)",
                 EARLY_WINDOW.as_secs()
+            ));
+        }
+        if let Some((_, at)) = get("same_phone_repage") {
+            r.same_phone_repage = true;
+            lines.push(format!(
+                "[bench] round4: same_phone_repage ({at}): a re-page after a reset or a cut that crosses a link the controller \
+                 still holds (EALREADY, EMLINK, EBUSY) pages the same phone again, up to {CROSSED_REPAGES} times, before the next phone"
             ));
         }
         (r, lines)
@@ -391,11 +402,16 @@ enum Attempt {
     /// paging it again just produces another prompt it cannot accept. Hold off for the maximum
     /// backoff and let the operator re-pair from the iPhone.
     PairRejected,
+    /// The page failed with EALREADY, EMLINK or EBUSY (HCI 0x0B "ACL Connection Already Exists", 0x09/0x0A "Connection
+    /// Limit Exceeded", 0x0C "Command Disallowed"): the controller still holds a link to the phone, the one the last page
+    /// left or one the phone is bringing up itself (the truck, 21 Nov: right after a cut, then the other phone and about
+    /// 100 s lost). Everywhere exactly [`Attempt::Failed`], save one: as the re-page after a reset or a cut, round 4's
+    /// `same_phone_repage` (bench) pages the same phone again ([`walk`]).
+    Crossed,
 }
 
 /// [`Attempt::Cut`] for `sdp_client`'s cut, [`Attempt::Reset`] when the phone reset the link, [`Attempt::Absent`] when the
-/// page timed out, else
-/// [`Attempt::Failed`].
+/// page timed out, [`Attempt::Crossed`] for a link the controller still holds, else [`Attempt::Failed`].
 fn failure(e: &std::io::Error) -> Attempt {
     if sdp_client::is_cut(e) {
         Attempt::Cut
@@ -403,6 +419,8 @@ fn failure(e: &std::io::Error) -> Attempt {
         Attempt::Reset
     } else if e.raw_os_error() == Some(libc::EHOSTDOWN) {
         Attempt::Absent
+    } else if matches!(e.raw_os_error(), Some(libc::EALREADY | libc::EMLINK | libc::EBUSY)) {
+        Attempt::Crossed
     } else {
         Attempt::Failed
     }
@@ -481,7 +499,7 @@ impl ResetStreak {
                 self.runs.clear();
                 return false;
             }
-            Attempt::Failed | Attempt::Absent | Attempt::PairRejected => {
+            Attempt::Failed | Attempt::Crossed | Attempt::Absent | Attempt::PairRejected => {
                 self.runs.remove(&peer);
                 return false;
             }
@@ -516,9 +534,15 @@ fn bonds_written() -> Option<std::time::SystemTime> {
     std::fs::metadata(bt_common::ssp_agent::link_key_store()).and_then(|m| m.modified()).ok()
 }
 
+/// How many more times a re-page that crossed a link ([`Attempt::Crossed`]) pages the same phone, at most, before the
+/// walk goes on to the next (round 4, item 3).
+const CROSSED_REPAGES: u32 = 2;
+
 /// Page `targets` in order until `stop` says not to go on. A phone that answers and resets the link
 /// ([`Attempt::Reset`]) or is cut ([`Attempt::Cut`]) is paged once more, after `pause` (false: go no further), before
-/// the next one.
+/// the next one. That re-page crossing a link the controller holds ([`Attempt::Crossed`]) pages the phone again, up to
+/// [`CROSSED_REPAGES`] times, while `pause` says so for it (false: on to the next phone, as a failure; it says false
+/// without round 4's `same_phone_repage`).
 fn walk(
     targets: &[[u8; 6]],
     mut stop: impl FnMut() -> bool,
@@ -536,10 +560,15 @@ fn walk(
                 break;
             }
             result = page(peer);
+            let mut again = 0;
+            while result == Attempt::Crossed && again < CROSSED_REPAGES && pause(peer, result) {
+                again += 1;
+                result = page(peer);
+            }
         }
         match result {
             Attempt::Ran => out.ran = true,
-            Attempt::Failed | Attempt::Absent | Attempt::Reset | Attempt::Cut => {}
+            Attempt::Failed | Attempt::Crossed | Attempt::Absent | Attempt::Reset | Attempt::Cut => {}
             Attempt::PairRejected => {
                 out.rejected = true;
                 break; // do not page the next phone into the same rejection storm
@@ -672,6 +701,9 @@ trait Env {
     fn forget_left_link(&self);
     /// Round 4's bench switches ([`Round4`]), as this loop read them at its start.
     fn round4(&self) -> Round4;
+    /// Round 4, item 3 (bench): wait for the link a crossed re-page found to clear or come up
+    /// ([`sdp_client::settle_crossed`]): what it found.
+    fn settle_crossed(&self, peer: [u8; 6]) -> &'static str;
 }
 
 /// The real [`Env`].
@@ -742,6 +774,9 @@ impl Env for OnBox<'_> {
     }
     fn round4(&self) -> Round4 {
         self.round4
+    }
+    fn settle_crossed(&self, peer: [u8; 6]) -> &'static str {
+        sdp_client::settle_crossed(peer)
     }
 }
 
@@ -1027,6 +1062,18 @@ fn run_loop(env: &impl Env, ctrl: &Control) {
                     || bench_due(round_bench.as_ref(), round_started, env.elapsed())
             },
             |peer, result| {
+                // Round 4, item 3 (bench): a re-page that crossed a link the controller holds goes again only with the
+                // switch, once that link has cleared or come up; without it, as in 2.7.0, on to the next phone.
+                if result == Attempt::Crossed {
+                    if !round4.same_phone_repage || ctrl.has_request() || env.session_active() {
+                        return false;
+                    }
+                    let found = env.settle_crossed(peer);
+                    env.bench(&format!(
+                        "[bench] round4: same_phone_repage: the re-page crossed a link the controller holds; {found}"
+                    ));
+                    return !env.shutdown() && !ctrl.has_request() && !env.session_active();
+                }
                 // A request or a session first: no line that pages once more when it won't (the Mac's review, A6).
                 if ctrl.has_request() || env.session_active() {
                     return false;
@@ -1243,6 +1290,8 @@ mod tests {
         slots: std::cell::RefCell<Vec<(usize, u16)>>,
         /// Each round's gap in ms ([`Env::sleep_or_request_for`]); `gaps` has them in whole seconds, with the other sleeps.
         gaps_ms: std::cell::RefCell<Vec<u64>>,
+        /// The phones each [`Env::settle_crossed`] waited for.
+        settled: std::cell::RefCell<Vec<[u8; 6]>>,
     }
 
     impl<'a> Fake<'a> {
@@ -1266,6 +1315,7 @@ mod tests {
                 round4: Default::default(),
                 slots: Default::default(),
                 gaps_ms: Default::default(),
+                settled: Default::default(),
             }
         }
 
@@ -1353,6 +1403,10 @@ mod tests {
         }
         fn round4(&self) -> super::Round4 {
             self.round4
+        }
+        fn settle_crossed(&self, peer: [u8; 6]) -> &'static str {
+            self.settled.borrow_mut().push(peer);
+            "no link to it: paging it again after a pause"
         }
     }
 
@@ -2055,6 +2109,87 @@ mod tests {
         let (paged, walked) = walk_with(&[(&PHONE_A, Attempt::PairRejected)]);
         assert_eq!(paged, vec![PHONE_A]);
         assert!(walked.rejected && !walked.ran);
+    }
+
+    /// Round 4, item 3: EALREADY, EMLINK and EBUSY are a link the controller still holds; a crossing ends a phone's run
+    /// toward a forgotten pairing as a failure does.
+    #[test]
+    fn a_link_the_controller_still_holds_is_a_crossing_and_counts_as_a_failure() {
+        for errno in [libc::EALREADY, libc::EMLINK, libc::EBUSY] {
+            assert_eq!(failure(&std::io::Error::from_raw_os_error(errno)), Attempt::Crossed, "errno {errno}");
+        }
+        let mut s = ResetStreak::default();
+        let m = Instant::now();
+        let t = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let old = Some(t - Duration::from_secs(3600));
+        assert!(!s.note(PHONE_A, Attempt::Reset, old, t, m));
+        assert!(!s.note(PHONE_A, Attempt::Reset, old, t, m));
+        assert!(!s.note(PHONE_A, Attempt::Crossed, old, t, m), "a crossing ends its run");
+        assert!(!s.note(PHONE_A, Attempt::Reset, old, t, m));
+        assert!(!s.note(PHONE_A, Attempt::Reset, old, t, m), "so two resets after it are not three");
+    }
+
+    /// Round 4, item 3: the re-page after a reset or a cut that crossed pages the same phone again while `pause` says so,
+    /// CROSSED_REPAGES more times at most; a pause that says no (no switch) goes on to the next phone, as a failure did;
+    /// and a first page that crossed is never paged again.
+    #[test]
+    fn a_crossed_re_page_pages_the_same_phone_again_only_while_pause_says_so() {
+        let (paged, walked) = walk_with(&[(&PHONE_A, Attempt::Cut), (&PHONE_A, Attempt::Crossed), (&PHONE_A, Attempt::Ran)]);
+        assert_eq!(&paged[..3], &[PHONE_A, PHONE_A, PHONE_A]);
+        assert!(walked.ran);
+        let crossings = [(&PHONE_A, Attempt::Reset), (&PHONE_A, Attempt::Crossed), (&PHONE_A, Attempt::Crossed), (&PHONE_A, Attempt::Crossed),
+            (&PHONE_A, Attempt::Crossed), (&PHONE_B, Attempt::Ran)];
+        let (paged, walked) = walk_with(&crossings);
+        assert_eq!(paged, vec![PHONE_A, PHONE_A, PHONE_A, PHONE_A, PHONE_B], "two more at most, then the next phone");
+        assert!(walked.ran);
+        let mut paged = Vec::new();
+        let mut a = [Attempt::Cut, Attempt::Crossed].into_iter();
+        let walked = walk(&[PHONE_A, PHONE_B], || false, |_, r| r != Attempt::Crossed, |peer| {
+            paged.push(peer);
+            if peer == PHONE_A { a.next().unwrap_or(Attempt::Failed) } else { Attempt::Ran }
+        });
+        assert_eq!(paged, vec![PHONE_A, PHONE_A, PHONE_B], "pause says no for the crossing: the next phone");
+        assert!(walked.ran);
+        let (paged, _) = walk_with(&[(&PHONE_A, Attempt::Crossed), (&PHONE_B, Attempt::Ran)]);
+        assert_eq!(&paged[..2], &[PHONE_A, PHONE_B], "a first page that crossed: no re-page");
+    }
+
+    /// Round 4, item 3 through the loop: the truck's 21 Nov case, a cut and then a re-page that crossed. No switch: the other
+    /// phone next, as in 2.7.0. With it: the same phone again once the link is looked at, and it connects.
+    #[test]
+    fn round4_the_loop_pages_a_crossed_phone_again_only_with_the_switch() {
+        let answers = || {
+            let mut n = 0;
+            move |_: usize, peer: [u8; 6]| {
+                if peer != PHONE_A {
+                    return Attempt::Absent;
+                }
+                n += 1;
+                match n {
+                    1 => Attempt::Cut,
+                    2 => Attempt::Crossed,
+                    _ => Attempt::Ran,
+                }
+            }
+        };
+        let ctrl = Control::default();
+        set_order(&ctrl, &[PHONE_A, PHONE_B]);
+        let fake = Fake::new(&ctrl, 1, answers());
+        run_loop(&fake, &ctrl);
+        assert_eq!(fake.paged(0), vec![PHONE_A, PHONE_A, PHONE_B], "no switch: on to the other phone");
+        assert!(fake.settled.borrow().is_empty() && fake.logs.borrow().is_empty());
+
+        let ctrl = Control::default();
+        set_order(&ctrl, &[PHONE_A, PHONE_B]);
+        let mut fake = Fake::new(&ctrl, 1, answers());
+        fake.round4.same_phone_repage = true;
+        run_loop(&fake, &ctrl);
+        assert_eq!(&fake.paged(0)[..3], &[PHONE_A, PHONE_A, PHONE_A], "the same phone again");
+        assert_eq!(*fake.settled.borrow(), vec![PHONE_A], "once, after its link was looked at");
+        let logs = fake.logs.borrow();
+        assert!(logs.iter().any(|l| l.starts_with("[bench] round4: same_phone_repage: the re-page crossed")), "{logs:?}");
+        let (r, lines) = round4_from(&[("same_phone_repage", "")]);
+        assert!(r.same_phone_repage && lines[0].starts_with("[bench] round4: same_phone_repage (/etc/ocbm/bench_same_phone_repage)"));
     }
 
     #[test]
