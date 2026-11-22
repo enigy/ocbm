@@ -39,9 +39,14 @@ pub fn lever(name: &str, legacy: &str) -> Option<String> {
 /// builds write the flags over CH_FILE, which can write a file but not delete one, so they clear a flag by writing
 /// "off". Nothing in the product writes them, and /tmp clears at a reboot.
 pub fn bench_text(path: &str) -> Option<String> {
+    file_text(path).filter(|t| t != "off")
+}
+
+/// The trimmed content of the file at `path`, "off" included; None when there is no file. One that is there but cannot
+/// be read gives "", as a file that exists.
+fn file_text(path: &str) -> Option<String> {
     match std::fs::read_to_string(path) {
-        Ok(s) => Some(s.trim().to_string()).filter(|t| t != "off"),
-        // Present but unreadable: set, as a file that exists.
+        Ok(s) => Some(s.trim().to_string()),
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => Some(String::new()),
         Err(_) => None,
     }
@@ -57,9 +62,10 @@ pub fn bench_flag(path: &str) -> bool {
 /// so no remover has to name its files. A cold boot sees it; `/tmp` is empty then.
 pub const BENCH_FLASH_DIR: &str = "/etc/ocbm";
 
-/// A round-4 bench switch (docs/ops/02_TESTING.md, "Round 4 switches"): `/tmp/bench_<name>` when it is set, else
-/// `/etc/ocbm/bench_<name>` ([`BENCH_FLASH_DIR`]), each by [`bench_text`]'s rule. Its text and the file it came from;
-/// None when neither is set, which is the default behaviour. Nothing in a release writes either.
+/// A round-4 bench switch that is off by default (docs/ops/02_TESTING.md, "Round 4 switches"): `/tmp/bench_<name>` when
+/// it is set, else `/etc/ocbm/bench_<name>` ([`BENCH_FLASH_DIR`]), each by [`bench_text`]'s rule, so an "off" in /tmp
+/// reads as no file there and the flash's is read. Its text and the file it came from; None when neither is set, which
+/// is the default behaviour. Nothing in a release writes either.
 pub fn bench_switch(name: &str) -> Option<(String, String)> {
     bench_switch_in(&["/tmp", BENCH_FLASH_DIR], name)
 }
@@ -69,6 +75,23 @@ pub fn bench_switch_in(dirs: &[&str], name: &str) -> Option<(String, String)> {
     dirs.iter().find_map(|d| {
         let path = format!("{d}/bench_{name}");
         bench_text(&path).map(|text| (text, path))
+    })
+}
+
+/// A round-4 switch that is on by default since 2.7.1 (docs/ops/02_TESTING.md, "Round 4 switches"): the text of the
+/// first of `/tmp/bench_<name>` and `/etc/ocbm/bench_<name>` that exists, trimmed, "off" included, and that file; None
+/// when neither exists, which is the default. "off" asks for 2.7.0's behaviour, and one in /tmp overrides the flash,
+/// which [`bench_switch`] cannot do (it reads past an "off" to the flash's file). Any other text, an empty file or "on"
+/// among them, is the switch's own: on, or its number. Nothing in a release writes either.
+pub fn bench_override(name: &str) -> Option<(String, String)> {
+    bench_override_in(&["/tmp", BENCH_FLASH_DIR], name)
+}
+
+/// [`bench_override`] over `dirs`, in order (a test's own).
+pub fn bench_override_in(dirs: &[&str], name: &str) -> Option<(String, String)> {
+    dirs.iter().find_map(|d| {
+        let path = format!("{d}/bench_{name}");
+        file_text(&path).map(|text| (text, path))
     })
 }
 
@@ -109,6 +132,35 @@ mod tests {
         assert_eq!(bench_switch_in(&dirs, "x").map(|(_, p)| p), Some(at(&flash)), "off in /tmp: the flash's");
         std::fs::write(flash.join("bench_x"), "off").unwrap();
         assert_eq!(bench_switch_in(&dirs, "x"), None, "off in both");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 2.7.1: a switch on by default is decided by the first of its two files that exists, "off" included, so an "off" in
+    /// /tmp overrides the flash, which bench_switch reads past; a file the bench left on flash (empty) is the default's.
+    #[test]
+    fn a_default_switch_is_decided_by_the_first_file_there_off_included() {
+        let root = std::env::temp_dir().join(format!("box_common_bench_override_{}", std::process::id()));
+        let (tmp, flash) = (root.join("tmp"), root.join("flash"));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::create_dir_all(&flash).unwrap();
+        let dirs = [tmp.to_str().unwrap(), flash.to_str().unwrap()];
+        let at = |d: &std::path::Path| d.join("bench_x").to_str().unwrap().to_string();
+        let both = |text: &str, d: &std::path::Path| Some((text.to_string(), at(d)));
+        assert_eq!(bench_override_in(&dirs, "x"), None, "no file: the default");
+        std::fs::write(flash.join("bench_x"), "").unwrap();
+        assert_eq!(bench_override_in(&dirs, "x"), both("", &flash), "an empty file on flash, as the bench left it: on");
+        std::fs::write(flash.join("bench_x"), "off\n").unwrap();
+        assert_eq!(bench_override_in(&dirs, "x"), both("off", &flash), "off on flash: 2.7.0's");
+        std::fs::write(flash.join("bench_x"), "on").unwrap();
+        std::fs::write(tmp.join("bench_x"), " off \n").unwrap();
+        assert_eq!(bench_override_in(&dirs, "x"), both("off", &tmp), "off in /tmp overrides the flash's on");
+        assert_eq!(bench_switch_in(&dirs, "x"), both("on", &flash), "  where bench_switch reads past it to the flash");
+        std::fs::write(tmp.join("bench_x"), "1500").unwrap();
+        std::fs::write(flash.join("bench_x"), "off").unwrap();
+        assert_eq!(bench_override_in(&dirs, "x"), both("1500", &tmp), "/tmp first, whatever the flash says");
+        std::fs::remove_file(tmp.join("bench_x")).unwrap();
+        std::fs::create_dir(tmp.join("bench_x")).unwrap();
+        assert_eq!(bench_override_in(&dirs, "x"), both("", &tmp), "there but not readable: as an empty file");
         let _ = std::fs::remove_dir_all(&root);
     }
 }
