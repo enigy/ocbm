@@ -127,6 +127,9 @@ case "${2:-}" in
   up)   : > "$R/state/$d.up"; echo "hciconfig $d up" >> "$R/calls" ;;
   down) rm -f "$R/state/$d.up"; echo "hciconfig $d down" >> "$R/calls" ;;
   name) if [ $# -ge 3 ]; then echo "$3" > "$R/state/$d.name"; exit 0; fi
+        # Every name read counted (state/name_looks); NAME_SLOW: each takes that long, as against a wedged controller.
+        nl=$(( $(cat "$R/state/name_looks" 2>/dev/null || echo 0) + 1 )); echo "$nl" > "$R/state/name_looks"
+        [ -n "${NAME_SLOW:-}" ] && sleep "$NAME_SLOW"
         [ -e "$R/state/$d.up" ] && [ -e "$R/state/$d.answers" ] || exit 1
         if [ -n "${NAME_MISS_AFTER:-}" ]; then
           nr=$(( $(cat "$R/state/name_reads" 2>/dev/null || echo 0) + 1 )); echo "$nr" > "$R/state/name_reads"
@@ -989,6 +992,21 @@ case_round4() {
   WLAN_SECS=0.3 FW_SECS=0.2 hal preload
   check '[ "$(rc preload)" = 0 ] && said preload "[bench] round4: attach_poll=off ($R/tmp/bench_attach_poll)"' \
     "off in /tmp over the flash's on: off (the first file there decides)"
+
+  echo "== $SH: round 4, attach_poll: an attempt bounded by its time, against a controller whose name reads are slow"
+  # A wedged controller: hci0 there (0.1 s after the attach), never answering, each name read 0.4 s. RADIO_ATTACH_POLLS
+  # =3 (hal): 2.7.0's attempt is 3 looks 0.5 s apart and one last look, the first before hci0 is there, so 3 reads; by
+  # the count of its looks (15) attach_poll's made 14, by its uptime (1.5 s, 2.7.0's budget) about as many as 2.7.0's.
+  unit; echo off > "$R/etc/ocbm/bench_attach_poll"
+  ATTACH_STUCK=1 NAME_SLOW=0.4 WLAN_SECS=0.2 FW_SECS=0.2 hal preload
+  off_reads=$(cat "$R/state/name_looks" 2>/dev/null)
+  check '[ "$(rc preload)" = 1 ] && [ "$off_reads" -le 4 ] && said preload "attempt 1 did not converge"' \
+    "off: 2.7.0's attempt by its count of looks, $off_reads name reads, the attach failed"
+  unit
+  ATTACH_STUCK=1 NAME_SLOW=0.4 WLAN_SECS=0.2 FW_SECS=0.2 hal preload
+  on_reads=$(cat "$R/state/name_looks" 2>/dev/null)
+  check '[ "$(rc preload)" = 1 ] && [ "$on_reads" -le 8 ] && said preload "attempt 1 did not converge"' \
+    "the default: bounded by its uptime, $on_reads name reads, not the 14 a count of its looks made"
 
   echo "== $SH: round 4, page_trim: a host during the boot preload, by default"
   unit

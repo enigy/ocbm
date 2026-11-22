@@ -1380,15 +1380,27 @@ bt_fw_push() {
 # 0.1 s apart and five times as many.
 RADIO_ATTACH_POLLS=${RADIO_ATTACH_POLLS:-30}
 case "$RADIO_ATTACH_POLLS" in ''|*[!0-9]*) RADIO_ATTACH_POLLS=30 ;; esac
+# Whether an attempt of bt_attach_loop looks again: while its uptime since the attach (_bal_t0) is under _bal_ms, with
+# attach_poll; else, or with no uptime to read, while its looks (_n) are under _bal_n, 2.7.0's rule. No fork.
+bt_attach_looks_on() {
+  if [ -n "$_bal_ms" ] && [ -n "$_bal_t0" ]; then
+    up_ms
+    [ -n "$_um" ] && { [ $((_um - _bal_t0)) -lt "$_bal_ms" ]; return; }
+  fi
+  [ "$_n" -lt "$_bal_n" ]
+}
 bt_attach_loop() {
   _helper=${RADIO_BT_ATTACH_CMD%% *}
   _try=0; _d=""; _bal_ok=0
   # Round 4, item 8 (attach_poll, on by default since 2.7.1): a look every 0.1 s, not 0.5, as hci0 comes up, which put
-  # hci_up up to half a second after hci0 answered; an attempt keeps its 15 s (five times the looks). A look with no hci0
-  # forks one subshell (the glob's), and one with hci0 there but not up fails fast (ENETDOWN). Off: 2.7.0's 0.5 s look.
-  _bal_s=0.5; _bal_n=$RADIO_ATTACH_POLLS
+  # hci_up up to half a second after hci0 answered. A look with no hci0 forks one subshell (the glob's), and one with
+  # hci0 there but not up fails fast (ENETDOWN); but against a controller up and wedged each look's name read takes its
+  # 5 s timeout (bt_responsive), so the attempt is bounded by the uptime (_bal_ms, 2.7.0's RADIO_ATTACH_POLLS looks of
+  # 0.5 s: 15 s), not by a count of looks, which would make it up to five times 2.7.0's under the bt lock (the 2.7.1
+  # review). With no uptime to read, five times the looks, as before. Off: 2.7.0's 0.5 s look, by its count.
+  _bal_s=0.5; _bal_n=$RADIO_ATTACH_POLLS; _bal_ms=""
   if r4_on attach_poll; then
-    _bal_s=0.1; _bal_n=$((RADIO_ATTACH_POLLS * 5))
+    _bal_s=0.1; _bal_n=$((RADIO_ATTACH_POLLS * 5)); _bal_ms=$((RADIO_ATTACH_POLLS * 500))
     [ -n "$_r4t" ] && log "${_r4t}hci0 looked at every 0.1 s as the attach converges, not 0.5 s"
   else
     log "[bench] round4: attach_poll=off ($_r4f): hci0 looked at every 0.5 s as the attach converges, as in 2.7.0"
@@ -1405,8 +1417,8 @@ bt_attach_loop() {
     log "attach attempt $_try: $RADIO_BT_ATTACH_CMD"
     boot_mark attach
     setsid $RADIO_BT_ATTACH_CMD </dev/null >/tmp/radio_bt_attach.log 2>&1 &
-    _n=0
-    while [ "$_n" -lt "$_bal_n" ]; do
+    _n=0; up_ms; _bal_t0=$_um
+    while bt_attach_looks_on; do
       _d=$(hci_dev 2>/dev/null) && bt_responsive "$_d" && { _bal_ok=1; break; }
       _n=$((_n+1)); sleep "$_bal_s"
     done
