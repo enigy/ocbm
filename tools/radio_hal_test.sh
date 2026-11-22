@@ -793,8 +793,9 @@ case_boot() {
   # ocbm_boot.sh itself, its paths moved into $R and the stubs first on its PATH: a gadget whose sysfs is already
   # there, ocbmd, the supervisor and the preload (radio_hal.sh) stand-ins that write when they start.
   echo "== $SH: where ocbm_boot.sh starts the preload"
-  boot_run() {  # $1: the dispatcher's mark asked for (1) or not (0)
+  boot_run() {  # $1: the dispatcher's mark asked for (1) or not (0); $2: a file to create before the start (a switch)
     unit
+    [ -n "${2:-}" ] && : > "$2"
     mkdir -p "$R/sys/class/android_usb_accessory/android0" "$R/dev" "$R/usr/sbin"
     : > "$R/sys/class/android_usb_accessory/android0/enable"; : > "$R/dev/usb_accessory"; : > "$R/tmp/g_android_accessory.ko"
     printf '#!/bin/sh\necho "ocbmd" >> "%s/calls"\n' "$R" > "$R/usr/sbin/ocbmd"
@@ -815,7 +816,12 @@ case_boot() {
   boot_run 1
   check 'logged_before "radio preload starting" "gadget module:" && called "preload preload gpio=$R/tmp/ocbm_gpio_done"' \
     "the dispatcher marks the GPIO set-up's end: the preload starts first, before the gadget and ocbmd, told where the mark is"
-  check '[ "$(count "preload preload")" = 1 ]' "  once"
+  check '[ "$(count "preload preload")" = 1 ] && ! grep -q round4 "$R/tmp/box.log"' "  once, and no round-4 line"
+  # Round 4, item 7 (bench preload_nice): the preload's shell reniced to -5 before it execs radio_hal.sh. Here, unprivileged,
+  # the renice is refused: the preload starts all the same, and says which.
+  boot_run 1 "$R/etc/ocbm/bench_preload_nice"
+  check '[ "$(count "preload preload")" = 1 ] && grep -qE "\[bench\] round4: preload_nice \($R/etc/ocbm/bench_preload_nice\): (the boot radio preload at nice -5|renice refused - the preload at its own priority)" "$R/tmp/box.log"' \
+    "round 4's preload_nice on flash: the preload reniced (or the renice refused), started all the same, said so"
   boot_run 0
   check 'logged_before "armed functions=" "radio preload starting" && [ "$(count "preload preload")" = 1 ]' \
     "no mark (another start script): after ocbmd and the supervisor, as before"

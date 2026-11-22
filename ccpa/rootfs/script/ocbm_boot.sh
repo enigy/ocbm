@@ -46,6 +46,17 @@ touch /tmp/UDiskPassThroughMode
   # With no such mark (another start script) it starts after ocbmd and the supervisor, as it always did, so it never
   # comes before that pulse; so it does with /script/radio_preload_late on flash, the bench's A/B and the owner's way
   # back to the old start. docs/ops/02_TESTING.md, "Cold boot: real power cycles", measures what it costs the link.
+  # Round 4, item 7 (bench preload_nice, 22 Nov 2026; docs/ops/02_TESTING.md, "Round 4 switches"): the preload at nice -5,
+  # and with it what it runs (the Bluetooth firmware loader, insmod, whose module init runs in its context, the attach
+  # helper), ahead of the gadget's set-up, ocbmd and the supervisor on the boot's one core. renice on the preload's own
+  # shell just before it execs radio_hal.sh: refused, the preload runs at its own priority, as before. Off by default.
+  # On with /tmp/bench_preload_nice or, for a cold boot, /etc/ocbm/bench_preload_nice on flash (set unless "off").
+  preload_nice=""
+  for _pn in /tmp/bench_preload_nice /etc/ocbm/bench_preload_nice; do
+    [ -e "$_pn" ] || continue
+    _pnv=""; read -r _pnv 2>/dev/null <"$_pn"
+    [ "$_pnv" = off ] || { preload_nice=$_pn; break; }
+  done
   radio_preload() {
     if [ ! -e /script/radio_preload_off ] && [ ! -e /script/ocbm_trial ] && [ -r /script/radio_hal.sh ]; then
       echo "[ocbm-boot] radio preload starting${OCBM_PRELOAD_AFTER:+ once the self-test passes}" >> /tmp/box.log
@@ -56,7 +67,11 @@ touch /tmp/UDiskPassThroughMode
             echo "skipped $(cut -d" " -f1 /proc/uptime)" >> /tmp/radio_preload_state; exit 0; }
           i=$((i + 1)); sleep 1
         done
-        exec sh /script/radio_hal.sh preload' preload "${OCBM_PRELOAD_AFTER:-}" >> /tmp/box.log 2>&1 </dev/null &
+        if [ -n "$2" ]; then
+          if renice -n -5 -p $$ >/dev/null 2>&1; then echo "[ocbm-boot] [bench] round4: preload_nice ($2): the boot radio preload at nice -5"
+          else echo "[ocbm-boot] [bench] round4: preload_nice ($2): renice refused - the preload at its own priority"; fi
+        fi
+        exec sh /script/radio_hal.sh preload' preload "${OCBM_PRELOAD_AFTER:-}" "$preload_nice" >> /tmp/box.log 2>&1 </dev/null &
     elif [ -e /script/radio_preload_off ]; then   # every boot, so no drive log misses it
       if grep -q "^guard" /script/radio_preload_off 2>/dev/null; then
         echo "[ocbm-boot] radio preload DISABLED by its guard ($(head -1 /script/radio_preload_off)); rm /script/radio_preload_off to re-enable" >> /tmp/box.log
