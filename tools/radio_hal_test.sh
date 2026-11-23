@@ -897,6 +897,24 @@ case_fwpush() {
   check '[ -n "$hp" ] && [ -n "$lp" ] && [ "$alive" = no ] && [ ! -d "$R/tmp/.radio_lock_bt" ]' \
     "TERM to the preload: the loader (deaf to TERM) stopped and reaped, then the bt lock gone"
   check '[ "$(rc preload)" = 143 ]' "  and the preload ends there (143)"
+  # The hardware test of 22 Nov (4a552f3, BusyBox ash): a loader that exits at once, and the parent's TERM to the bound's
+  # watcher lost (it came before the fresh subshell had reset its parent's trapped TERM), so the parent waited out the
+  # watcher's 12 s and took them for the loader's. Deterministic here: the preload starts with TERM ignored, which every
+  # child inherits, so every watcher's TERM is lost. The pushes return at once, each said as exited, none as stopped;
+  # the watchers, told by their token, are gone at their next look, long before their bound, so none signals a pid.
+  echo "== $SH: the firmware push: a loader that exits at once returns at once, the watcher's kill lost"
+  unit
+  t0=$(date +%s)
+  ( trap '' TERM; RADIO_BTFW_WAIT=5 FW_FAIL="1 2" FW_SECS=0 WLAN_SECS=0.2 hal preload )
+  t1=$(date +%s)
+  check '[ "$(rc preload)" = 1 ] && [ "$(count "fw start")" = 2 ] && [ $((t1 - t0)) -lt 4 ]' \
+    "two loaders that fail at once: both pushes over in $((t1 - t0)) s, well under one 5 s bound"
+  check '[ "$(grep -c "firmware preload exited 255" "$R/out.preload")" = 2 ] && ! said preload "had not returned"' \
+    "  each said as exited 255, neither as stopped at the bound"
+  check '[ $(( $(key btfw_end) - $(key btfw_start) )) -lt 1000 ]' "  the boot line: the first run's own time ($(( $(key btfw_end) - $(key btfw_start) )) ms)"
+  waitfor '! pgrep -f "$R/script/radio_hal.sh" >/dev/null 2>&1' 30
+  check '! pgrep -f "$R/script/radio_hal.sh" >/dev/null 2>&1 && ! ls -a "$R/tmp" | grep -q "^\.radio_btfw_"' \
+    "  no watcher left within 3 s (their bound 5 s): none signals the loaders' pids; no token left"
   echo "== $SH: the firmware push: a loader that fails says why"
   unit
   FW_FAIL=1 WLAN_SECS=0.2 FW_SECS=0.2 hal preload

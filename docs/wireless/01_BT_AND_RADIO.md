@@ -790,7 +790,11 @@ verb returns (clause 1). Today's order (`bt_attach_mapped`) is the code of befor
   alone, as together is.
 - **No attach without firmware** (22 Nov 2026: a cold boot on the bench whose loader exited 255, whose attach went on
   against a chip with no firmware, and whose box then fell silent until a power cycle). `bt_fw_push` runs the loader
-  under a bound (10 s, then TERM, and KILL 2 s later; it had none), and once more when it failed. A push is good when
+  under a bound (10 s, then TERM, and KILL 2 s later; it had none), and once more when it failed. The bound is a
+  watcher that looks every 0.5 s and signals the loader only while that run's token is there; the token goes the moment
+  the loader returns, whose code and time are its own, and the watcher is never waited for (the hardware test of
+  22 Nov, BusyBox ash: a TERM to the old watcher, sent as a loader that failed at once returned, was lost, and the
+  bring-up waited out its 12 s and logged a stop at the bound). A push is good when
   the loader exits 0 or says `Download Complete` (with no `Download Error`), whatever its code, the bound's stop after
   it included (the code logged: the 2.7.1 review); a failure logs the loader's code into box.log, and its last lines
   (an address in them masked) unless the bound stopped it, which says so instead. The loader runs in the background

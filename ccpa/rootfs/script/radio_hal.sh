@@ -1302,7 +1302,7 @@ bt_ldisc_ready() {
 #
 # BOUNDED (22 Nov 2026): a push takes 2.2 to 3.2 s (every boot line logged), and the loader waits 4 s for the chip's
 # boot loader (its own "Timeout: 4000"); one still running after RADIO_BTFW_WAIT seconds (10; a test hook) is sent TERM,
-# and KILL 2 s later. It ran unbounded before, under the bt lock.
+# and KILL 2 s later, by its watcher (bt_fw_watch, a look every 0.5 s). It ran unbounded before, under the bt lock.
 #
 # Its code: 0 pushed, with BT_FW_PUSHED written (bt_fw_push): the loader exited 0, or said "Download Complete" (and no
 # "Download Error") whatever its code, a stop at the bound after it included (the code logged); 1 not, the loader having
@@ -1320,19 +1320,24 @@ bt_fw_preload() {
   [ -n "$RADIO_BT_PRELOAD" ] && [ -n "${RADIO_BT_PRELOAD_CMD:-}" ] || return 0
   log "firmware preload: $RADIO_BT_PRELOAD_CMD"
   _bt_fw_runs=$((${_bt_fw_runs:-0} + 1))
-  boot_mark btfw_start; _bfp_t0=${_um:-0}
-  # _bfp_live, _bfp_w: the loader and its watcher while they run, for a trapped signal to stop first (bt_fw_stop).
-  _bfp_w=""
+  boot_mark btfw_start; _bfp_t0=${_um:-}
+  # _bfp_live, _bfp_w, _bfp_tok: the loader, its watcher and the run's token while they run, for a trapped signal to
+  # stop first (bt_fw_stop). The token is this run's own (a lost-kill watcher of the run before must not take it).
+  _bfp_w=""; _bfp_tok=/tmp/.radio_btfw_run.$$.$_bt_fw_runs
+  write_empty "$_bfp_tok" || _bfp_tok=""
   $RADIO_BT_PRELOAD_CMD >/tmp/radio_bt_fw.log 2>&1 &
   _bfp_pid=$!; _bfp_live=$_bfp_pid
-  # The bound: TERM, then KILL. The watcher is stopped as soon as the loader has been reaped, so only in that instant
-  # could a signal of its own find the pid taken by another process; its sleep, left alone, ends by itself.
-  ( sleep "$RADIO_BTFW_WAIT"; kill -TERM "$_bfp_pid" 2>/dev/null; sleep 2; kill -KILL "$_bfp_pid" 2>/dev/null ) \
-    </dev/null >/dev/null 2>&1 &
+  bt_fw_watch "$_bfp_pid" "$_bfp_tok" $((RADIO_BTFW_WAIT * 1000)) "$_bfp_t0" </dev/null >/dev/null 2>&1 &
   _bfp_w=$!
+  # The loader's code and time are its own, taken as it returns, and the watcher is never waited for (the hardware test
+  # of 22 Nov, BusyBox ash: a TERM to the watcher, sent as a loader that failed at once returned, came before the fresh
+  # subshell had reset its parent's trapped TERM and was lost; the parent then waited out the watcher's 12 s and took
+  # them for a stop at the bound). Its token goes at once, and the kill only hurries it: one that missed the kill ends
+  # at its next look, signalling nothing. With no token (it could not be written) only a KILL ends it.
   wait "$_bfp_pid"; _bfp_rc=$?; _bfp_live=""
-  kill "$_bfp_w" 2>/dev/null; wait "$_bfp_w" 2>/dev/null; _bfp_w=""
-  boot_mark btfw_end; _bfp_ms=$(( ${_um:-0} - _bfp_t0 ))
+  boot_mark btfw_end; _bfp_ms=$(( ${_um:-0} - ${_bfp_t0:-0} ))
+  if [ -n "$_bfp_tok" ]; then rm -f "$_bfp_tok"; kill "$_bfp_w" 2>/dev/null; else kill -KILL "$_bfp_w" 2>/dev/null; fi
+  _bfp_w=""
   set -- $(awk '/Download Complete/ { c = 1 } /Download Error/ { e = 1 }
     match($0, /time:[ ]*[0-9]+/) { t = substr($0, RSTART, RLENGTH); sub(/time:[ ]*/, "", t) }
     END { v = "other"; if (c) v = "complete"; if (e) v = "error"; if (t == "") t = "-"; print v " " t }' \
@@ -1364,19 +1369,43 @@ bt_fw_preload() {
   return 1
 }
 
+# The loader's watcher (bt_fw_preload's bound, bt_fw_stop's stop): TERM to pid $1 once $3 ms have passed since $4 (ms
+# of uptime; "" counts its own looks instead), and KILL 2 s after that, each only while the run's token $2 is there
+# ("": none could be written, then always). It looks every 0.5 s and ends as soon as the token goes, which its parent
+# removes the moment the loader returns: so a watcher whose own kill was lost signals no pid after that (none taken by
+# another process since) and is gone within a look. Never waited for (the hardware test of 22 Nov). Its sleeps fork,
+# nothing else.
+bt_fw_watch() {  # $1 pid, $2 token, $3 after_ms, $4 start_ms
+  _bfw_at=$3; _bfw_sig=TERM; _bfw_n=0
+  while [ -z "$2" ] || [ -e "$2" ]; do
+    up_ms
+    if [ -n "$4" ] && [ -n "$_um" ]; then _bfw_e=$((_um - $4)); else _bfw_e=$((_bfw_n * 500)); fi
+    if [ "$_bfw_e" -ge "$_bfw_at" ]; then
+      { [ -z "$2" ] || [ -e "$2" ]; } && kill -"$_bfw_sig" "$1" 2>/dev/null
+      [ "$_bfw_sig" = KILL ] && return 0
+      _bfw_sig=KILL; _bfw_at=$((_bfw_at + 2000))
+    fi
+    _bfw_n=$((_bfw_n + 1)); sleep 0.5
+  done
+}
+
 # The loader in flight (bt_fw_preload), stopped before a trapped signal lets the bt lock go (lock_take's traps; the
 # 2.7.1 review): it runs in the background, so the wait for it ends at the signal, and it would go on holding the UART
-# that the lock's next holder pushes to or attaches on. Its watcher first, then TERM, and KILL 2 s later, as the bound
-# does, the loader reaped before the lock goes. The KILL's own timer is stopped with KILL: the trap ignores TERM by
-# then, and so does a child it starts. Nothing when no loader runs.
+# that the lock's next holder pushes to or attaches on. The bound's watcher first, told by its token and stopped with
+# KILL (the trap ignores TERM by then, and so do the children it starts), whether or not a loader still runs; then the
+# loader: TERM, and KILL 2 s later from a watcher of this stop's own, the loader reaped before the lock goes. That
+# watcher is told by its token too, never waited for.
 bt_fw_stop() {
+  [ -n "${_bfp_tok:-}" ] && rm -f "$_bfp_tok"
+  [ -n "${_bfp_w:-}" ] && kill -KILL "$_bfp_w" 2>/dev/null
+  _bfp_w=""
   [ -n "${_bfp_live:-}" ] || return 0
-  [ -n "${_bfp_w:-}" ] && kill "$_bfp_w" 2>/dev/null
-  kill -TERM "$_bfp_live" 2>/dev/null
-  ( sleep 2; kill -KILL "$_bfp_live" 2>/dev/null ) </dev/null >/dev/null 2>&1 &
-  _bfs_k=$!
+  up_ms; _bfs_tok=/tmp/.radio_btfw_stop.$$
+  write_empty "$_bfs_tok" || _bfs_tok=""
+  bt_fw_watch "$_bfp_live" "$_bfs_tok" 0 "$_um" </dev/null >/dev/null 2>&1 &
+  _bfs_w=$!
   wait "$_bfp_live" 2>/dev/null
-  kill -KILL "$_bfs_k" 2>/dev/null
+  if [ -n "$_bfs_tok" ]; then rm -f "$_bfs_tok"; else kill -KILL "$_bfs_w" 2>/dev/null; fi
   _bfp_live=""
 }
 
