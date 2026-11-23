@@ -1417,10 +1417,11 @@ bt_fw_stop() {
 # A failure after a push that succeeded earlier this boot (BT_FW_PUSHED) is no reason to stop: the chip still runs that
 # firmware, which only a SoC restart or a power cut takes away (both empty /tmp; the 13 Nov restarts each pushed in
 # full), not reclaim+reset's gpio1 pulse (20 Nov, by hand: after it hci0 answered within half a second, and the Wi-Fi
-# driver loaded in under 0.4 s, too quick for a download). A loader before such a chip finds no boot loader: most
-# likely it waits its 4 s for one and fails (not measured; that 20 Nov run's "at once, no output" was a result file
-# left by the run before it). So the attach goes on, as it always has there: the together fallback's, a host's bt_on
-# after the preload's attach failed, a try after a reset.
+# driver loaded in under 0.4 s, too quick for a download). A loader before such a chip finds no boot loader: measured
+# on the dev adapter on 22 Nov 2026, the real loader returns 255 after about 4.05 s (its 4 s wait for one), and with
+# the push's mark there the attach goes on and hci0 answers about 0.5 s later (that 20 Nov run's "at once, no output"
+# was a result file left by the run before it). So the attach goes on, as it always has there: the together
+# fallback's, a host's bt_on after the preload's attach failed, a try after a reset.
 bt_fw_push() {
   _bt_nofw=0
   bt_fw_preload && return 0
