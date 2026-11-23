@@ -1,0 +1,5 @@
+Carlink 3.31: the OCBM 2.7.1 update, a Bluetooth start that cannot leave the adapter without Bluetooth
+
+- Offers the adapter update to OCBM 2.7.1 in Settings › Adapter and about, from OCBM 1.0.1 or later, and installs 2.7.1 on a stock adapter from the connecting screen (Convert to OCBM).
+- 2.7.1 fixes a start where the Bluetooth firmware load failed and the adapter then stayed without Bluetooth until it lost power: the load now has a time limit and a second try. The adapter's first call to the phone lasts 5.12 s (was 3.75 s), so a phone that is slow to answer connects on the first try more often. On the bench the first CarPlay frame came 13.2 to 15.2 s after power-on with an iPhone 18,1.
+- Nothing else changes in Carlink since 3.30.
