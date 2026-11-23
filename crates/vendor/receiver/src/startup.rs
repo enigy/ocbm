@@ -17,7 +17,8 @@ pub const MARKS: &str = "/tmp/startup_marks";
 const STALE_MS: u64 = 10 * 60 * 1000;
 
 static PRINTED: AtomicBool = AtomicBool::new(false);
-/// This carplayd's screen nudges (`session.rs` nudge_screen_back): the 0.5 s one and the 3 s one.
+/// This carplayd's screen nudges (`session.rs` nudge_screen_back): the first (at once, or after the bench file's wait)
+/// and the second (3 s).
 static NUDGES: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
 
 /// The box log, scanned from where it stood when the host came (btd's `boxlog_at` mark) for the
@@ -25,7 +26,7 @@ static NUDGES: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
 const BOX_LOG: &str = "/tmp/box.log";
 const SCAN_MAX: u64 = 512 * 1024;
 
-/// A screen nudge sent: the first (0.5 s) or the second (3 s).
+/// A screen nudge sent: the first (at once, or after the bench file's wait) or the second (3 s).
 pub fn nudged(second: bool) {
     NUDGES[usize::from(second)].fetch_add(1, Ordering::Relaxed);
 }

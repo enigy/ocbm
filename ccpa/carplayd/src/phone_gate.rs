@@ -23,7 +23,8 @@
 //! - no phone named (no file): carplayd serves and dials nobody ([`Admit::Unnamed`], [`Dial::Unnamed`]);
 //! - discovery dials only the phone whose `_carplay-ctrl` TXT `id` is the named one (fix 1b); a TXT without an id is
 //!   dialled as before; never while that phone's session is live here ([`Dial::Live`]); and only once btd has sent
-//!   that phone its 0x5703 ([`Dial::Waiting`] until the mark), unless the bench lever [`BENCH_DIAL_EARLY`] is set;
+//!   that phone its 0x5703 ([`Dial::Waiting`] until the mark), unless the bench lever [`BENCH_DIAL_EARLY`] (or its
+//!   copy on flash, [`BENCH_DIAL_EARLY_FLASH`], round 4) is set;
 //! - a phase-1 SETUP whose `deviceID` is another phone is refused (HTTP 500, connection closed), before
 //!   the session publishes who the phone is, and that peer address is refused for the rest of this
 //!   name: its connections are dropped and discovery no longer dials it;
@@ -50,6 +51,12 @@ const WIFI_MARK: &str = "wifi";
 /// it its 0x5703, for one experiment (does the phone accept it?). Set unless absent or "off" (`box_common::bench_flag`);
 /// nothing in a release writes it, and a reboot clears it.
 pub const BENCH_DIAL_EARLY: &str = "/tmp/bench_dial_early";
+
+/// Round 4, item 9 (bench, docs/ops/02_TESTING.md, "Round 4 switches"): the same lever kept on flash, so a cold boot's
+/// dial sees it (`/tmp` is empty then); read after [`BENCH_DIAL_EARLY`], by the same rule. The early dial's auth-setup
+/// waits on the chip lock while btd's signature 1 holds it (`MfiLock`, 20 ms looks, 10 s at most), and pair-verify,
+/// which uses no chip, runs meanwhile: so signature 2 starts as signature 1 ends.
+pub const BENCH_DIAL_EARLY_FLASH: &str = "/etc/ocbm/bench_dial_early";
 
 /// What the accept thread does with a new control connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,6 +144,10 @@ struct State {
 pub struct PhoneGate {
     file: Option<PathBuf>,
     bench: PathBuf,
+    /// The lever on flash (round 4, [`BENCH_DIAL_EARLY_FLASH`]), read after `bench`; None for a test's gate.
+    bench_flash: Option<PathBuf>,
+    /// Whether this carplayd has said, once, that an early dial's lever is set ([`PhoneGate::dial`]).
+    said_early: std::sync::atomic::AtomicBool,
     state: Mutex<State>,
 }
 
@@ -147,12 +158,32 @@ impl PhoneGate {
     }
 
     pub fn new(file: Option<PathBuf>) -> Self {
-        Self::with_bench(file, PathBuf::from(BENCH_DIAL_EARLY))
+        Self::with_benches(file, PathBuf::from(BENCH_DIAL_EARLY), Some(PathBuf::from(BENCH_DIAL_EARLY_FLASH)))
     }
 
     /// With the bench lever at `bench` (a test's own).
+    #[cfg(test)]
     pub fn with_bench(file: Option<PathBuf>, bench: PathBuf) -> Self {
-        Self { file, bench, state: Mutex::new(State::default()) }
+        Self::with_benches(file, bench, None)
+    }
+
+    /// With the bench lever at `bench` and its copy on flash at `flash` (a test's own).
+    pub fn with_benches(file: Option<PathBuf>, bench: PathBuf, flash: Option<PathBuf>) -> Self {
+        Self {
+            file,
+            bench,
+            bench_flash: flash,
+            said_early: std::sync::atomic::AtomicBool::new(false),
+            state: Mutex::new(State::default()),
+        }
+    }
+
+    /// The early dial's lever that is set, if one is: [`BENCH_DIAL_EARLY`], else (round 4) its copy on flash.
+    fn dial_early(&self) -> Option<&Path> {
+        std::iter::once(&self.bench)
+            .chain(self.bench_flash.as_ref())
+            .find(|b| box_common::bench_flag(&b.to_string_lossy()))
+            .map(PathBuf::as_path)
     }
 
     /// Whether this carplayd gates at all: only the wireless spawn is handed the file's path.
@@ -296,8 +327,18 @@ impl PhoneGate {
             Some(id) if *id != expected.phone => Dial::Elsewhere,
             Some(id) if st.serving.as_ref().is_some_and(|(_, _, phone)| phone == id) => Dial::Live,
             _ if expected.wifi => Dial::Now,
-            _ if box_common::bench_flag(&self.bench.to_string_lossy()) => Dial::Early,
-            _ => Dial::Waiting,
+            _ => match self.dial_early() {
+                Some(at) => {
+                    if !self.said_early.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        eprintln!(
+                            "[bench] round4: dial_early ({}): the named phone is dialled at its first resolve, before btd has sent it its 0x5703 (each such dial says so too)",
+                            at.display()
+                        );
+                    }
+                    Dial::Early
+                }
+                None => Dial::Waiting,
+            },
         };
         (verdict, st.epoch)
     }
@@ -541,6 +582,28 @@ mod tests {
         assert_eq!(gate.dial(Some(OWNER)).0, Dial::Now, "with the mark it is no early dial");
         let _ = std::fs::remove_file(&lever);
         let _ = std::fs::remove_file(path);
+    }
+
+    /// Round 4, item 9: the lever's copy on flash dials early as the /tmp one does, after it; neither set, the dial waits.
+    #[test]
+    fn the_lever_on_flash_dials_early_too() {
+        let (path, lever, flash) = (scratch("expect"), scratch("bench"), scratch("flash"));
+        std::fs::write(&path, OWNER).unwrap();
+        let gate = PhoneGate::with_benches(Some(path.clone()), lever.clone(), Some(flash.clone()));
+        assert_eq!(gate.dial(Some(OWNER)).0, Dial::Waiting, "neither set");
+        std::fs::write(&flash, "").unwrap();
+        assert_eq!(gate.dial(Some(OWNER)).0, Dial::Early, "on flash: an early dial");
+        assert_eq!(gate.dial_early(), Some(flash.as_path()));
+        std::fs::write(&lever, "").unwrap();
+        assert_eq!(gate.dial_early(), Some(lever.as_path()), "/tmp's first");
+        std::fs::write(&lever, "off").unwrap();
+        std::fs::write(&flash, "off").unwrap();
+        assert_eq!(gate.dial(Some(OWNER)).0, Dial::Waiting, "both reading off");
+        assert_eq!(PhoneGate::with_bench(Some(path.clone()), lever.clone()).bench_flash, None, "a test's gate reads no flash");
+        assert_eq!(PhoneGate::new(None).bench_flash.as_deref(), Some(Path::new(BENCH_DIAL_EARLY_FLASH)), "the box's does");
+        for p in [path, lever, flash] {
+            let _ = std::fs::remove_file(p);
+        }
     }
 
     #[test]

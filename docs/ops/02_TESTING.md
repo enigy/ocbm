@@ -334,7 +334,7 @@ can write but not delete, so it clears one by writing `off`. From a debug build:
   with a `[bench]` line and removed; `off` is no order. An order dropped unused (the round ended or a phone
   connected first, nothing was left to page, a session, a Connect or a switch hold came first) says why in a
   `[bench]` line.
-- `/tmp/bench_skip_first_requestui`: carplayd skips the 0.5 s screen nudge's requestUI once (the file is removed
+- `/tmp/bench_skip_first_requestui`: carplayd skips the first screen nudge's requestUI once (the file is removed
   when used) and says so, so the 3 s second nudge fires.
 - `/tmp/bench_sdp_after_acl_ms` (whole ms): how long btd gives the SDP channel after a page is answered (the link
   BT_CONNECTED) before it cuts the connect; 700 without it, or with `off`. Read at each page; a window not the
@@ -371,6 +371,82 @@ phone session under it (btd carries them into each session it starts under the s
 that never reached CarPlay, a wired preempt), so a second session's line counts the first's too; the nudges are that
 session's carplayd's. The phantom's pages count as absent. When ocbmd rotated `box.log` (it empties it at its cap) between
 the host's arrival and the first frame, the PSK count is a lower bound: `PSK mismatches >=N (box.log cut)`.
+
+### Round 4 switches (22 Nov 2026; six on by default from 2.7.1)
+
+Round 4 (branch `round4`, from 2.7.0) built these for the bench. The owner's decisions of 22 Nov 2026 made six of them
+2.7.1's default (`first_page_slots` at 8192, `same_phone_repage`, `rfcomm_limit_ms` at 1500, `btd_early`, `page_trim`,
+`attach_poll`) and left five off (`first_retry_ms`, `early_gap_secs`, `screen_nudge_ms`, `dial_early`,
+`preload_nice`). Two changes are no switch: the Bluetooth firmware push bounded, pushed once more when it fails, no
+attach without firmware, and a push after each reclaim+reset (docs/wireless/01_BT_AND_RADIO.md, "No attach without
+firmware"); and the first screen nudge at once, where 2.7.0 waited 500 ms (`screen_nudge_ms`, below).
+
+**The files, and the rule.** A switch is a file: `/tmp/bench_<name>` (a reboot clears it; Carlink's debug builds can
+write it) or, kept across a power cut so a cold boot sees it, `/etc/ocbm/bench_<name>` on flash (OCBM's own state
+directory, which updates keep and the full way back to stock removes whole). With neither, the default. `/tmp` is read
+first, and the two kinds read it differently:
+
+- **On by default** (the six): the first of the two files that exists decides. `off` gives 2.7.0's behaviour; any
+  other text, an empty file or `on` among them, is on, and for a number sets its value. So an `off` in `/tmp` overrides
+  the flash for a run (Carlink's `box_flag ... --ez on false` writes it), and a file left on flash from the round 4
+  bench with its old content, empty or `on`, still means on. Read by `box_common::bench_override` (btd),
+  `r4_on` (radio_hal.sh) and `btd_early_on` (the supervisor).
+- **Off by default** (the five): set by the first file that is set by `bench_flag`'s rule (there, and not `off`), so
+  `off` reads as no file and an `off` in `/tmp` falls through to the flash's (`box_common::bench_switch`; carplayd's
+  `dial_early` and ocbm_boot.sh's `preload_nice` read the same way; `screen_nudge_ms` is `/tmp` only).
+
+2.7.0's behaviour on all of them at once: `off` in each of the six files (for a cold boot in `/etc/ocbm`), none of the
+five, and `/tmp/bench_screen_nudge_ms` at `500`; the firmware push's changes have no switch. A number that is not one,
+or out of its range, is refused with a line and the default stands. A file that sets a switch or turns one off says so
+in a line holding `[bench] round4:` (btd's in `/tmp/wl.log`, carplayd's in `/tmp/carplayd_wl.log`, the scripts' in
+`/tmp/box.log`): btd for each file as its loop starts, `off` too; carplayd and the scripts where the switch acts. A
+switch off by default says so again where it acts, but for `early_gap_secs`, whose gaps log nothing more; the six on by
+default act with plain lines (below), which the
+scripts tag `[bench] round4: <name> (<file>):` when a file turned one on, and their `off` says so where the switch
+would have acted (`attach_poll=off`, `page_trim=off`, `btd_early=off`). For a cold boot put `btd_early`,
+`page_trim`, `attach_poll` and `preload_nice` in `/etc/ocbm`: they act during the boot, while `/tmp` is still empty.
+Item 7's `gpio_first` (the stock GPIO set-up before ocbm_boot.sh) was benched 0.25 s slower at the start and dropped;
+its `preload_nice` stays.
+
+| Name | Value | Default (2.7.1); `off`, 2.7.0's | Read | Does |
+|---|---|---|---|---|
+| `first_page_slots` | 1-12800 slots (8 s), or `off` | 8192 (5.12 s); `off`: the round's (6000 over several phones in the first round, 0x2000 otherwise) | btd, each session | the first page of the first round this long; every other page the round's. `6000` gives a 3.75 s first page, which is 2.7.0's only over several phones. No more than 8 s: the SDP connect that carries the page has its own 8 s deadline, which would end a longer page there, as a failure rather than a page timeout |
+| `same_phone_repage` | flag, or `off` | on; `off`: the next phone | btd, each session | a re-page after a reset or cut whose page fails with EALREADY, EMLINK or EBUSY waits for the link (up to 1.5 s, then 0.3 s with none) and pages the same phone again, twice at most, then the next phone. The same errnos from the RFCOMM connect are no crossing (a channel still on the link): a failure, the next phone, as in 2.7.0 |
+| `rfcomm_limit_ms` | 1000-8000 ms, or `off` | 1500; `off` (or `8000`): no limit, the plain 8000 ms, then the next phone | btd, each session | the RFCOMM connect cut at this unless a pairing prompt holds it; its link dropped as a cut's, the phone paged once more, that re-page's RFCOMM connect with no limit (2.7.0's 8 s), so a phone that is only slow still connects; the cut counts nothing toward a forgotten pairing, the re-page's own result does |
+| `btd_early` | flag, or `off` | on; `off`: bt_on, then btd | the supervisor, at the host's arrival | with the boot preload running and the handover not asked for: btd started at once, waiting for bt_on's end, then today's bring-up |
+| `page_trim` | flag, or `off` | on; `off`: the name and SCO set, the mark cleared in the attach, the 0.2 s look | radio_hal.sh | with a host waiting on the preload: no SCO lines or name set on its attach, the together guard's mark cleared after its locks; and every lock wait looks every 0.05 s |
+| `attach_poll` | flag, or `off` | on; `off`: the 0.5 s look | radio_hal.sh, each attach | hci0 looked at every 0.1 s as the attach converges, not 0.5 s; an attempt bounded by its uptime, 2.7.0's 15 s, however long a look takes (a name read can take 5 s against a wedged controller) |
+| `first_retry_ms` | 0-60000 ms | off: 2000 | btd, each session | the pause after a failed first round, once |
+| `early_gap_secs` | 1-60 s | off: 5 | btd, each session | the gap between rounds in the first 120 s |
+| `screen_nudge_ms` | 0-2500 ms, `/tmp` only | 0 (2.7.0: 500) | carplayd, each nudge | the first screen nudge's wait. At 0 it goes at once, and nothing spares it; after a wait it is spared when the phone has set its screen up again by then (`500` benches 2.7.0). The 3 s second nudge as before |
+| `dial_early` | flag | off | carplayd, each dial | the existing early dial, now also from flash |
+| `preload_nice` | flag | off | ocbm_boot.sh, each start | the boot preload reniced to -5 before it starts |
+
+**The first page at 5.12 s** is the owner's decision of 22 Nov 2026, because the phone took over 2 s to answer on 3 of
+7 cold boots. It replaces the short first page of the 13 Nov rule; the rest of that rule stands: each phone in the
+driver's order, the first round's other pages 3.75 s each when it pages several, later rounds the full 5.12 s. With one
+bonded phone every page was 5.12 s already, so nothing changes there.
+
+**The six defaults' lines**, plain: btd `paging 5120 ms for the first page of the first round` and `paging 3750 ms
+again: the first page is over` (several phones), `the re-page crossed a link the controller holds; ...`, `RFCOMM
+connect to channel N not connected within its 1500 ms limit: closed; ...` and `... answered and opened no RFCOMM
+channel within the connect's limit -- paging it once more, its RFCOMM connect with no limit, before the next phone`;
+`RFCOMM connect to channel N failed: ... (the link still holds that channel: no page crossing, so no re-page)`;
+radio_hal.sh `the bt lock taken
+after about N ms of waiting, looked at every 0.05 s`, `a host is waiting - no SCO lines and no name set on hci0 (...)`
+and `the together guard's mark cleared after the locks went`; the supervisor's bring-up line, `... the boot preload is
+attaching Bluetooth: btd starts now and waits for it`.
+
+The first screen nudge at once is the owner's decision of 22 Nov 2026, after a bench of 40 wakes: an iPhone 7 set its
+screen stream up and tore it down 18-54 ms later with 0 frames on nearly every connect, then set it up again; with no
+wait the first frame came about 0.1 s after that second screen SETUP, against about 1.9 s with 500 ms, in every wake. A
+phone that never tears its screen down (an iPhone on iOS 27) never reaches the nudge. With no wait the "set its screen
+up again within N ms — no nudge" check is not made: the phone's next SETUP comes after the TEARDOWN on the control
+connection, so a look at once could only race it. carplayd's line for that nudge reads `the phone tore its screen
+stream down (streams live: [...]) — asked for its UI again at once`; after a wait, `no screen stream N ms after the
+phone tore it down ...` as before (`crates/vendor/receiver/src/session.rs`, `SCREEN_NUDGE_AFTER`).
+
+Not built in round 4: the AP configured ahead of the cold path, `noscan`, and anything in the handover itself.
 
 ### The connect timeline (16 Nov 2026; M1)
 
@@ -525,7 +601,7 @@ line adds its name and up to 13 digits to the widest: keep the 12-digit widest u
 One line per boot, beside the timeline but not in it, for the cold boot's radio path (docs/wireless/01_BT_AND_RADIO.md,
 "The cold boot"):
 
-    [radio-boot] v1 by=preload start=2050 caps=kept caps_ms=61 gpio=2330 order=together off=- wlan_start=2410 wlan_up=4460 wlan_free=4470 btfw_start=2420 btfw_end=4930 btfw=complete btfw_ms=2467 attach=4940 hci_up=5390 handover=on_owner handed=5420 tries=1 fallback=0 rc=0 host=3010
+    [radio-boot] v1 by=preload start=2050 caps=kept caps_ms=61 gpio=2330 order=together off=- wlan_start=2410 wlan_up=4460 wlan_free=4470 btfw_start=2420 btfw_end=4930 btfw=complete btfw_ms=2467 btfw_tries=1 attach=4940 hci_up=5390 handover=on_owner handed=5420 tries=1 fallback=0 rc=0 host=3010
 
 (the unit test's line, not a measurement). `radio_hal.sh` writes it into `/tmp/box.log` (and `/tmp/radio_boot`) once
 the first bring-up that attached Bluetooth this boot is over: the boot preload's, or a host's `bt_on` where no preload
@@ -547,6 +623,7 @@ timeline uses, but from power-up, not from the host's arrival; `-` is a value no
 | `wlan_free` | `together` in the preload: it let the wlan lock go, and a host's AP bring-up waiting on it may start |
 | `btfw_start`, `btfw_end` | the Bluetooth firmware push (`fw_loader_linux`) |
 | `btfw`, `btfw_ms` | what the loader said, `complete`, `error` or `other`, and its own time (`time:N`), `-` without one |
+| `btfw_tries` | the loader's runs in that bring-up (22 Nov 2026): `1`, and one more for each of: a push that failed and was pushed once more, the together fallback's own push (`fallback=1`), and each reclaim+reset. `btfw` and `btfw_ms` stay the first run's. A push is good when the loader exits 0 or says `Download Complete` with no `Download Error`, whatever its code (logged). Two failed pushes with no good one earlier this boot attach nothing (`attach=-`, `rc=1`: no `hciattach`, no reset after them; `radio_hal.sh` `bt_fw_push`); after a good one (`/tmp/.radio_btfw_pushed`) a failed push is not run again and the attach goes on (docs/wireless/01_BT_AND_RADIO.md, "No attach without firmware"). `-` on a part with no loader |
 | `attach`, `hci_up` | the first attach launched; `hci0` answered a name read |
 | `handover` | whether the handover (R3-5) was asked for as the attach started: `on_owner` (`/script/radio_handover_on`), `on_bench` (`/tmp/bench_handover_on`), or `off`, the default |
 | `handed` | the preload handed the controller to the waiting host's session (R3-5, docs/wireless/01_BT_AND_RADIO.md "The cold boot" 6): claimed as `hci0` answered, handed over once the attach's Wi-Fi side was in; `-`: the handover not asked for (the default), no host as it answered, or a `bt_on`'s line |
@@ -556,10 +633,14 @@ timeline uses, but from power-up, not from the host's arrival; `-` is a value no
 | `host` | the host's arrival, ocbmd's `/tmp/host_present_uptime`; `-` before one |
 
 **A cold boot or a restart.** A power cut downloads both firmwares: `btfw_end - btfw_start` about 2.2 to 2.7 s with
-`btfw=complete`, `wlan_up - wlan_start` about 2 s (the 20 Nov bench). A `reboot` keeps the chip's firmware, so both
-come out far shorter: such a line times no cold boot. The session's Bluetooth is about `max(hci_up, host)` plus the
-host's `bt_on` confirming it (a lock look and one name read); with the handover asked for (R3-5), `handed`, and the session's
-first page about 0.1 s after it (the timeline's `page_start - bt_power`).
+`btfw=complete`, `wlan_up - wlan_start` about 2 s (the 20 Nov bench). A `reboot` was taken to keep the chip's firmware,
+so that both would come out far shorter; but the three logged (13 Nov, `[bench] reboot under a running host`) each
+pushed in full, 2.75 to 2.83 s from the push to the attach: a SoC restart resets the chip too. What leaves the firmware
+running is less than that: an attach helper that died, or reclaim+reset's gpio1 pulse (20 Nov, by hand; that run's
+"the loader returned at once with no output" was a result file left by the run before it). The session's Bluetooth is
+about `max(hci_up, host)` plus the host's `bt_on` confirming it (a lock look and one name read); with the handover
+asked for (R3-5), `handed`, and the session's first page about 0.1 s after it (the timeline's
+`page_start - bt_power`).
 
 ### The armed path (16 Nov 2026; benched the same day)
 
@@ -567,8 +648,8 @@ Bluetooth powered but invisible between host sessions, the host's arrival a go (
 "Between host sessions: armed").
 
 **The first bench** (16 Nov, the dev adapter, `resident-bt` merged with `carplayd-early` as a local `round2`): 12 wakes
-and a cold boot (a restart by `reboot`, which keeps the radio chip's firmware: no cold boot for radio timing; "Cold
-boot: real power cycles", below) from the armed state, `sup_radios` about 50 ms, `bt_armed=1`, `page_start` about 100 ms, `ap_enabled`
+and a cold boot (a restart by `reboot`: no cold boot for radio timing, its firmware downloads in it but the host up
+already, docs/wireless/01_BT_AND_RADIO.md, "A cold boot is a power cut"; "Cold boot: real power cycles", below) from the armed state, `sup_radios` about 50 ms, `bt_armed=1`, `page_start` about 100 ms, `ap_enabled`
 about 1.16 s after the host's arrival; the no-host state as in step 1 below; arming about 1.0 s faster than
 `/tmp/bench_arm_off`; the forced fallback (step 4) as written. One bad wake, the first about 90 s after an update was
 committed: 24.8 s, of two delays (the Mac's second reading, 17 Nov). A late join, its cause open: `AP-ENABLED` 4.5 s
@@ -623,9 +704,10 @@ hci_up` 30 to 40 ms, `page_start - bt_power` 88 to 110 ms against 946 to 1045 wi
 trouble against 0 of 4 without (0 of 9 with `70caa3c`'s), so it ships off; with the host at 3.3 s (boot 10, the
 truck's timing) the loads ran about 1 s slower, `hci_up` 8.01 s, the first frame 16.85 s. `caps_ms` read 780 to 890 with `caps=kept` though the key
 takes 0.05 s by hand on the idle adapter: the first 3.4 s of a power-up are slow throughout (cold flash, one busy core). **Every boot here is a power cut**: pull the adapter's USB
-cable (it is powered from it) or switch its port, and give it power again. Never `reboot`: the IW416 keeps its firmware
-through one, so a restart skips both downloads and times nothing of a cold boot (20 Nov); the line tells them apart
-("The boot's radio line", above). Before each power cut, save the box log (Carlink's Save Logs, or `/tmp/box.log` over
+cable (it is powered from it) or switch its port, and give it power again. Never `reboot`: a SoC restart resets the
+IW416 too, so a restart downloads both firmwares as a cold boot does (the three 13 Nov restarts pushed the Bluetooth
+firmware in full), but with the host up already it times nothing of a cold boot, and the line's download times do not
+tell the two apart ("The boot's radio line", above, "A cold boot or a restart"). Before each power cut, save the box log (Carlink's Save Logs, or `/tmp/box.log` over
 the console): `/tmp` goes with the power. Read the boot line with `grep '^\[radio-boot\]' /tmp/box.log`. **On a final
 adapter** (`cat /script/ocbm_mode`): in a trial (and on an update's first start) the dispatcher runs the self-test at
 every start, whose `radio_detect.sh` fills `/tmp/radio_caps` (the boot line then reads `caps=detected`, and nothing is
@@ -679,7 +761,9 @@ order does. After an update, step 1 is the first cold boot once the update has b
    Bluetooth up. Clean up: `rm /script/radio_together_off /script/radio_preload_off`, and one cold boot back to
    `order=together`.
 9. **A restart is no cold boot:** `reboot` over the console once. Its boot line: `btfw_end - btfw_start` and
-   `wlan_up - wlan_start` a fraction of step 2's. Write that ratio here, so a later reader can tell the two apart.
+   `wlan_up - wlan_start` near step 2's, not a fraction of them (a SoC restart resets the chip: the 13 Nov restarts
+   pushed in full, 2.75 to 2.83 s; the 20 Nov reading that a restart keeps the firmware was a stale result file). So
+   the download times cannot tell a restart from a cold boot: only a power cut is one. Write its line here.
 
 **A preload attach that fails** (none is expected; read it wherever a boot line says `by=preload` with `rc=1`, step 8's
 cut boots aside): the box log's `preload: the attach failed - its helper stopped (no reset, no rmmod)`, then the host's
@@ -707,11 +791,14 @@ preload's handover ... it answers, scan 0x00`, then `handed over by the boot pre
     connects each time, `first_frame` compared with `70caa3c`'s 13.8 to 15.4 s after power-up. Over the console in one of them, 3 s after `handed`: `hciconfig hci0` still `UP RUNNING` (the claim
     held: the kernel's auto power-off did not fire).
 11. **A against B, the default:** `rm /script/radio_handover_on`, as many cold boots as in step 10. Those read
-    `handover=off handed=-`, `[sup] ... CLEAN bring-up of wireless stack (detached, pairing=...)` with no `btd starts now`, the host's
-    bt_on `already converged`, btd's `down (+` and `up (+` lines, `page_start - bt_power` near 1.0 s (946 to 1045 ms
-    on `4a6ce9c`; `bt_power` is then the host's `bt_on`'s, after the preload), and `hci_up` to the page near 1.6 to 1.9 s.
-    Compare `hci_up` (and `btfw_ms`) between the two sets: btd's earlier start must not cost the attach more than
-    about 100 ms.
+    `handover=off handed=-` and `[sup] ... CLEAN bring-up of wireless stack (detached, pairing=...; the boot preload is
+    attaching Bluetooth: btd starts now and waits for it)`: since 2.7.1 btd starts early by default (round 4's
+    `btd_early`, "Round 4 switches"), waits for `bt_on`'s end and keeps its DOWN/UP. Then the host's bt_on `already
+    converged`, btd's `down (+` and `up (+` lines. For `4a6ce9c`'s default exactly, `echo off >
+    /etc/ocbm/bench_btd_early` as well: the bring-up line then has no `btd starts now`, `page_start - bt_power` near
+    1.0 s (946 to 1045 ms on `4a6ce9c`; `bt_power` is then the host's `bt_on`'s, after the preload), and `hci_up` to
+    the page near 1.6 to 1.9 s. Compare `hci_up` (and `btfw_ms`) between the sets: btd's earlier start must not cost
+    the attach more than about 100 ms.
 12. **The kernel's auto power-off, seen once:** one cold boot with no host (Carlink closed) and
     `/script/radio_preload_off` on flash; over the console `: > /tmp/bench_arm_off` (or the supervisor arms the
     controller the next command attaches), then `sh /script/radio_hal.sh bt_on` and, 3 s after it returns,

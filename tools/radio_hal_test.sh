@@ -64,16 +64,33 @@ echo "rmmod $1" >> "$R/calls"
 EOF
 cat > "$S/fw_loader_linux" <<'EOF'
 #!/bin/sh
-# The Bluetooth firmware push: FW_SECS long, noting whether the Wi-Fi interface was there and moal still loading.
+# The Bluetooth firmware push: FW_SECS long, noting whether the Wi-Fi interface was there and moal still loading. Each
+# run this boot is numbered: FW_FAIL names runs that fail as a boot loader that never answers does (its message, rc 255:
+# a chip that already runs its firmware most likely answers so too), FW_HANG runs that never return and ignore TERM.
 R=$STUB_R
+n=$(( $(cat "$R/state/fw_runs" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$R/state/fw_runs"
 i=no; [ -e "$R/sys/class/net/sta0" ] && i=yes
 w=no; [ -e "$R/state/moal.loading" ] && w=yes
 h=no; p=$(cat "$R/state/hciattach.pid" 2>/dev/null) && kill -0 "$p" 2>/dev/null && h=yes
 echo "fw start iface=$i wlan_loading=$w helper=$h" >> "$R/calls"
+case " ${FW_HANG:-} " in *" $n "*)
+  echo "fw hang $n" >> "$R/calls"; echo $$ > "$R/state/fw_loader_linux.pid"; trap '' TERM
+  while :; do sleep 0.1; done ;;
+esac
 sleep "${FW_SECS:-0.8}"
+case " ${FW_FAIL:-} " in *" $n "*)
+  echo "0xa5,0xaa,0xab or 0xa7 is not received in 4000 ms"; [ -n "${FW_SAY:-}" ] && echo "$FW_SAY"; echo "Download Error"
+  echo "fw fail $n" >> "$R/calls"; exit 255 ;;
+esac
 echo "Download Complete"
 echo "time:${FW_OWN_MS:-2467}"
+# FW_DONE_HANG: runs that never return after saying so, ignoring TERM; FW_ODD: runs that exit 3 after it.
+case " ${FW_DONE_HANG:-} " in *" $n "*)
+  echo "fw done-hang $n" >> "$R/calls"; echo $$ > "$R/state/fw_loader_linux.pid"; trap '' TERM
+  while :; do sleep 0.1; done ;;
+esac
 echo "fw end" >> "$R/calls"
+case " ${FW_ODD:-} " in *" $n "*) exit 3 ;; esac
 EOF
 cat > "$S/hciattach" <<'EOF'
 #!/bin/sh
@@ -116,6 +133,9 @@ case "${2:-}" in
   up)   : > "$R/state/$d.up"; echo "hciconfig $d up" >> "$R/calls" ;;
   down) rm -f "$R/state/$d.up"; echo "hciconfig $d down" >> "$R/calls" ;;
   name) if [ $# -ge 3 ]; then echo "$3" > "$R/state/$d.name"; exit 0; fi
+        # Every name read counted (state/name_looks); NAME_SLOW: each takes that long, as against a wedged controller.
+        nl=$(( $(cat "$R/state/name_looks" 2>/dev/null || echo 0) + 1 )); echo "$nl" > "$R/state/name_looks"
+        [ -n "${NAME_SLOW:-}" ] && sleep "$NAME_SLOW"
         [ -e "$R/state/$d.up" ] && [ -e "$R/state/$d.answers" ] || exit 1
         if [ -n "${NAME_MISS_AFTER:-}" ]; then
           nr=$(( $(cat "$R/state/name_reads" 2>/dev/null || echo 0) + 1 )); echo "$nr" > "$R/state/name_reads"
@@ -361,8 +381,8 @@ case_order() {
   check '[ ! -e "$R/script/.radio_together_inflight" ] && [ ! -e "$R/script/.radio_together_failed" ]' "converged: no mark, no count left"
   check '[ "$(key order)" = together ] && [ "$(key off)" = - ] && [ "$(key by)" = bt_on ] && [ "$(key rc)" = 0 ]' \
     "its boot line: by=bt_on order=together off=- rc=0"
-  check '[ "$(key btfw)" = complete ] && [ "$(key btfw_ms)" = 2467 ] && [ "$(key tries)" = 1 ] && [ "$(key fallback)" = 0 ]' \
-    "  btfw=complete btfw_ms=2467 (the loader's own word and time) tries=1 fallback=0"
+  check '[ "$(key btfw)" = complete ] && [ "$(key btfw_ms)" = 2467 ] && [ "$(key btfw_tries)" = 1 ] && [ "$(key tries)" = 1 ] && [ "$(key fallback)" = 0 ]' \
+    "  btfw=complete btfw_ms=2467 (the loader's own word and time) btfw_tries=1 tries=1 fallback=0"
   check '[ "$(key btfw_start)" -lt "$(key wlan_up)" ] && [ "$(key attach)" -lt "$(key wlan_up)" ] && [ "$(key hci_up)" -ge "$(key attach)" ]' \
     "  its stamps in order: the firmware and the attach both before the Wi-Fi interface"
   # Today's order, unchanged, on the same chip switched off, on a chip whose branch waits, and on one that never waits.
@@ -472,13 +492,14 @@ case_host() {
   check '! called "hciconfig hci0 down"' "a host is here: the preload leaves Bluetooth up for its session"
   check '[ "$(key by)" = preload ] && [ "$(key wlan_free)" != - ] && [ "$(key wlan_free)" -lt "$(key hci_up)" ]' \
     "  the boot line: by=preload, the wlan lock free (wlan_free) before hci0 answered"
-  # By default nothing of the handover (R3-5) runs: no claim, no handover file, the name and SCO set as before, the
-  # host's bt_on confirming it, and nothing "opened" for btd, whose DOWN/UP stays (the owner's decision, 21 Nov).
+  # By default nothing of the handover (R3-5) runs: no claim, no handover file, the host's bt_on confirming it, and
+  # nothing "opened" for btd, whose DOWN/UP stays (the owner's decision, 21 Nov). No name or SCO set by the preload with
+  # a host waiting: round 4's page_trim, on by default since 2.7.1 (case_round4), btd writes the name.
   check '! called "hciconfig hci0 up" && [ ! -e "$R/tmp/.radio_bt_handover" ] && said preload "handover: off (not asked for"' \
     "the handover not asked for (the default): no claim, no handover file"
   check '[ "$(key handover)" = off ] && [ "$(key handed)" = - ]' "  the boot line says so: handover=off handed=-"
-  check 'said bt_on "already converged" && ! said bt_on "handed over" && [ ! -s "$R/tmp/.radio_bt_warm" ] && [ -e "$R/state/hci0.name" ]' \
-    "  the host's bt_on confirms Bluetooth as before, leaves no opened word (btd's DOWN/UP stays), the name set by the preload"
+  check 'said bt_on "already converged" && ! said bt_on "handed over" && [ ! -s "$R/tmp/.radio_bt_warm" ] && [ ! -e "$R/state/hci0.name" ]' \
+    "  the host's bt_on confirms Bluetooth as before, leaves no opened word (btd's DOWN/UP stays), no name set by the preload"
   check '[ "$(grep -c "^t bt_power" "$R/tmp/startup_marks")" = 1 ]' "  bt_power once, the host's bt_on's"
   echo "== $SH: a host before the boot preload"
   unit
@@ -569,8 +590,8 @@ case_handover() {
   wait "$pre"
   check '[ "$(rc preload)" = 0 ] && [ "$(rc bt_on)" = 2 ] && said preload "handover: off (not asked for" && said bt_on "already converged"' \
     "a leftover off file: today's path, the host's bt_on after the preload"
-  check '[ ! -e "$R/tmp/.radio_bt_handover" ] && [ "$(key handover)" = off ] && [ "$(key handed)" = - ] && ! called "hciconfig hci0 up" && [ -e "$R/state/hci0.name" ]' \
-    "  no claim, no handover, the name set as before"
+  check '[ ! -e "$R/tmp/.radio_bt_handover" ] && [ "$(key handover)" = off ] && [ "$(key handed)" = - ] && ! called "hciconfig hci0 up" && [ ! -e "$R/state/hci0.name" ]' \
+    "  no claim, no handover, no name set (page_trim, the default)"
   check '[ "$(grep -c "^t bt_power" "$R/tmp/startup_marks")" = 1 ]' "  bt_power once, the host's bt_on's"
 
   echo "== $SH: a handover from before this host came"
@@ -734,8 +755,8 @@ case_line() {
   printf 'start 2050\ncaps kept\ncaps_ms 61\ngpio 2330\norder together\noff -\nwlan_start 2410\nwlan_up 4460\nwlan_free 4470\nbtfw_start 2420\nbtfw_end 4930\nbtfw complete\nbtfw_ms 2467\nattach 4940\nhci_up 5390\nhandover on_owner\nhanded 5420\nstart 9999\n' \
     > "$R/tmp/radio_boot_marks"
   echo 3010 > "$R/tmp/host_present_uptime"
-  env RADIO_HAL_FUNCS=1 OCBM_TEST_PATH="$TESTPATH" STUB_R="$R" "$SH" -c '. "$1"; _bt_tries=1; boot_line preload 0' sh "$R/script/radio_hal.sh"
-  want='[radio-boot] v1 by=preload start=2050 caps=kept caps_ms=61 gpio=2330 order=together off=- wlan_start=2410 wlan_up=4460 wlan_free=4470 btfw_start=2420 btfw_end=4930 btfw=complete btfw_ms=2467 attach=4940 hci_up=5390 handover=on_owner handed=5420 tries=1 fallback=0 rc=0 host=3010'
+  env RADIO_HAL_FUNCS=1 OCBM_TEST_PATH="$TESTPATH" STUB_R="$R" "$SH" -c '. "$1"; _bt_tries=1; _bt_fw_runs=1; boot_line preload 0' sh "$R/script/radio_hal.sh"
+  want='[radio-boot] v1 by=preload start=2050 caps=kept caps_ms=61 gpio=2330 order=together off=- wlan_start=2410 wlan_up=4460 wlan_free=4470 btfw_start=2420 btfw_end=4930 btfw=complete btfw_ms=2467 btfw_tries=1 attach=4940 hci_up=5390 handover=on_owner handed=5420 tries=1 fallback=0 rc=0 host=3010'
   check '[ "$(line)" = "$want" ] && grep -qxF "$want" "$R/tmp/box.log"' "fixed keys in a fixed order, the first stamp of each key standing; in the box log too"
   check 'line | grep -qE "^\[radio-boot\] v1( [a-z_]+=[A-Za-z0-9_-]+)+$" && ! line | grep -qE "CarLink|([0-9a-f]{2}:){5}"' \
     "one grammar, no name and no address"
@@ -744,7 +765,7 @@ case_line() {
   check '[ "$(grep -c . "$R/tmp/radio_boot")" = 1 ]' "after a line with rc=0, no other that boot"
   rm -f "$R/tmp/radio_boot"
   env RADIO_HAL_FUNCS=1 OCBM_TEST_PATH="$TESTPATH" STUB_R="$R" "$SH" -c '. "$1"; boot_line bt_on 1' sh "$R/script/radio_hal.sh"
-  check '[ "$(line)" = "[radio-boot] v1 by=bt_on start=- caps=- caps_ms=- gpio=- order=- off=- wlan_start=- wlan_up=- wlan_free=- btfw_start=- btfw_end=- btfw=- btfw_ms=- attach=- hci_up=- handover=- handed=- tries=0 fallback=0 rc=1 host=-" ]' \
+  check '[ "$(line)" = "[radio-boot] v1 by=bt_on start=- caps=- caps_ms=- gpio=- order=- off=- wlan_start=- wlan_up=- wlan_free=- btfw_start=- btfw_end=- btfw=- btfw_ms=- btfw_tries=- attach=- hci_up=- handover=- handed=- tries=0 fallback=0 rc=1 host=-" ]' \
     "nothing stamped: every key there, each -"
 }
 
@@ -774,10 +795,20 @@ case_locks() {
   rel=$!
   t0=$(date +%s)
   env RADIO_HAL_FUNCS=1 OCBM_TEST_PATH="$TESTPATH" STUB_R="$R" "$SH" -c '. "$1"; lock_take bt && echo "taken" >> "$2/calls"; lock_drop bt' \
-    sh "$R/script/radio_hal.sh" "$R"
+    sh "$R/script/radio_hal.sh" "$R" > "$R/out.lock0" 2>&1
   t1=$(date +%s)
   wait "$rel"; wait "$holder" 2>/dev/null
   check 'before "released" "taken" && [ $((t1 - t0)) -le 3 ]' "a held lock is waited for, and taken once it goes"
+  check 'grep -q "the bt lock taken after about [0-9]* ms of waiting, looked at every 0.05 s" "$R/out.lock0" && ! grep -q round4 "$R/out.lock0"' \
+    "  looked at every 0.05 s while it waited (round 4's page_trim, on by default since 2.7.1), said in a plain line"
+  mkdir "$R/tmp/.radio_lock_bt"; sleep 30 & holder=$!; echo "$holder" > "$R/tmp/.radio_lock_bt/pid"
+  ( sleep 1; kill "$holder" 2>/dev/null; rm -rf "$R/tmp/.radio_lock_bt" ) &
+  rel=$!
+  echo off > "$R/tmp/bench_page_trim"
+  env RADIO_HAL_FUNCS=1 OCBM_TEST_PATH="$TESTPATH" STUB_R="$R" "$SH" -c '. "$1"; lock_take bt && echo "taken at 0.2" >> "$2/calls"; lock_drop bt' \
+    sh "$R/script/radio_hal.sh" "$R" > "$R/out.lock0" 2>&1
+  wait "$rel"; wait "$holder" 2>/dev/null; rm -f "$R/tmp/bench_page_trim"
+  check 'called "taken at 0.2" && ! grep -q "lock taken after" "$R/out.lock0"' "  with page_trim off: 2.7.0's 0.2 s look, no line"
   sh -c 'exit 0' & gone=$!; wait "$gone"
   mkdir "$R/tmp/.radio_lock_bt"; echo "$gone" > "$R/tmp/.radio_lock_bt/pid"
   env RADIO_HAL_FUNCS=1 OCBM_TEST_PATH="$TESTPATH" STUB_R="$R" "$SH" -c '. "$1"; lock_take bt && echo "taken again" >> "$2/calls"; lock_drop bt' \
@@ -793,8 +824,9 @@ case_boot() {
   # ocbm_boot.sh itself, its paths moved into $R and the stubs first on its PATH: a gadget whose sysfs is already
   # there, ocbmd, the supervisor and the preload (radio_hal.sh) stand-ins that write when they start.
   echo "== $SH: where ocbm_boot.sh starts the preload"
-  boot_run() {  # $1: the dispatcher's mark asked for (1) or not (0)
+  boot_run() {  # $1: the dispatcher's mark asked for (1) or not (0); $2: a file to create before the start (a switch)
     unit
+    [ -n "${2:-}" ] && : > "$2"
     mkdir -p "$R/sys/class/android_usb_accessory/android0" "$R/dev" "$R/usr/sbin"
     : > "$R/sys/class/android_usb_accessory/android0/enable"; : > "$R/dev/usb_accessory"; : > "$R/tmp/g_android_accessory.ko"
     printf '#!/bin/sh\necho "ocbmd" >> "%s/calls"\n' "$R" > "$R/usr/sbin/ocbmd"
@@ -815,7 +847,12 @@ case_boot() {
   boot_run 1
   check 'logged_before "radio preload starting" "gadget module:" && called "preload preload gpio=$R/tmp/ocbm_gpio_done"' \
     "the dispatcher marks the GPIO set-up's end: the preload starts first, before the gadget and ocbmd, told where the mark is"
-  check '[ "$(count "preload preload")" = 1 ]' "  once"
+  check '[ "$(count "preload preload")" = 1 ] && ! grep -q round4 "$R/tmp/box.log"' "  once, and no round-4 line"
+  # Round 4, item 7 (bench preload_nice): the preload's shell reniced to -5 before it execs radio_hal.sh. Here, unprivileged,
+  # the renice is refused: the preload starts all the same, and says which.
+  boot_run 1 "$R/etc/ocbm/bench_preload_nice"
+  check '[ "$(count "preload preload")" = 1 ] && grep -qE "\[bench\] round4: preload_nice \($R/etc/ocbm/bench_preload_nice\): (the boot radio preload at nice -5|renice refused - the preload at its own priority)" "$R/tmp/box.log"' \
+    "round 4's preload_nice on flash: the preload reniced (or the renice refused), started all the same, said so"
   boot_run 0
   check 'logged_before "armed functions=" "radio preload starting" && [ "$(count "preload preload")" = 1 ]' \
     "no mark (another start script): after ocbmd and the supervisor, as before"
@@ -833,11 +870,264 @@ case_boot() {
   rm -f "$S/pkill"
 }
 
+case_fwpush() {
+  # ---- the Bluetooth firmware push (22 Nov 2026): bounded, and what the loader said -----------------------------------
+  echo "== $SH: the firmware push: a loader that never returns is stopped"
+  unit
+  t0=$(date +%s)
+  RADIO_BTFW_WAIT=1 FW_HANG=1 WLAN_SECS=0.2 FW_SECS=0.2 hal preload
+  t1=$(date +%s)
+  check 'said preload "firmware preload exited" && said preload "the loader had not returned after 1 s - stopped" && [ $((t1 - t0)) -lt 20 ]' \
+    "stopped at the bound, TERM then KILL (it ignores TERM), and the preload ends"
+  check '! { p=$(cat "$R/state/fw_loader_linux.pid" 2>/dev/null) && kill -0 "$p" 2>/dev/null; }' "  the loader is gone"
+  check '[ "$(rc preload)" = 0 ] && [ "$(key btfw_tries)" = 2 ] && [ "$(count "attach ")" = 1 ]' \
+    "  then pushed once more, and the boot converges (btfw_tries=2)"
+  # The 2.7.1 review: a TERM during the loader's wait. The loader runs in the background, so the wait ends at the signal;
+  # the trap stops it (it ignores TERM here: KILL 2 s later) and reaps it before the bt lock goes.
+  echo "== $SH: the firmware push: a signal during the loader's wait stops the loader before the bt lock goes"
+  unit
+  ( RADIO_BTFW_WAIT=30 FW_HANG=1 WLAN_SECS=0.2 FW_SECS=0.2 hal preload ) &
+  pre=$!
+  waitfor 'called "fw hang 1"' 100
+  hp=$(cat "$R/tmp/.radio_lock_bt/pid" 2>/dev/null); lp=$(cat "$R/state/fw_loader_linux.pid" 2>/dev/null)
+  kill -TERM "$hp" 2>/dev/null
+  waitfor '[ ! -d "$R/tmp/.radio_lock_bt" ]' 100
+  alive=no; [ -n "$lp" ] && kill -0 "$lp" 2>/dev/null && alive=yes
+  wait "$pre"
+  check '[ -n "$hp" ] && [ -n "$lp" ] && [ "$alive" = no ] && [ ! -d "$R/tmp/.radio_lock_bt" ]' \
+    "TERM to the preload: the loader (deaf to TERM) stopped and reaped, then the bt lock gone"
+  check '[ "$(rc preload)" = 143 ]' "  and the preload ends there (143)"
+  # The hardware test of 22 Nov (4a552f3, BusyBox ash): a loader that exits at once, and the parent's TERM to the bound's
+  # watcher lost (it came before the fresh subshell had reset its parent's trapped TERM), so the parent waited out the
+  # watcher's 12 s and took them for the loader's. Deterministic here: the preload starts with TERM ignored, which every
+  # child inherits, so every watcher's TERM is lost. The pushes return at once, each said as exited, none as stopped;
+  # the watchers, told by their token, are gone at their next look, long before their bound, so none signals a pid.
+  echo "== $SH: the firmware push: a loader that exits at once returns at once, the watcher's kill lost"
+  unit
+  t0=$(date +%s)
+  ( trap '' TERM; RADIO_BTFW_WAIT=5 FW_FAIL="1 2" FW_SECS=0 WLAN_SECS=0.2 hal preload )
+  t1=$(date +%s)
+  check '[ "$(rc preload)" = 1 ] && [ "$(count "fw start")" = 2 ] && [ $((t1 - t0)) -lt 4 ]' \
+    "two loaders that fail at once: both pushes over in $((t1 - t0)) s, well under one 5 s bound"
+  check '[ "$(grep -c "firmware preload exited 255" "$R/out.preload")" = 2 ] && ! said preload "had not returned"' \
+    "  each said as exited 255, neither as stopped at the bound"
+  check '[ $(( $(key btfw_end) - $(key btfw_start) )) -lt 1000 ]' "  the boot line: the first run's own time ($(( $(key btfw_end) - $(key btfw_start) )) ms)"
+  waitfor '! pgrep -f "$R/script/radio_hal.sh" >/dev/null 2>&1' 30
+  check '! pgrep -f "$R/script/radio_hal.sh" >/dev/null 2>&1 && ! ls -a "$R/tmp" | grep -q "^\.radio_btfw_"' \
+    "  no watcher left within 3 s (their bound 5 s): none signals the loaders' pids; no token left"
+  echo "== $SH: the firmware push: a loader that fails says why"
+  unit
+  FW_FAIL=1 WLAN_SECS=0.2 FW_SECS=0.2 hal preload
+  check 'said preload "firmware preload exited 255" && said preload "the loader'"'"'s last lines:" && grep -q "^\[radio_hal\]   0xa5,0xaa,0xab or 0xa7 is not received in 4000 ms$" "$R/out.preload"' \
+    "its exit code and its last lines in the log"
+  unit
+  FW_FAIL=1 FW_SAY="ChipID 7201 at 02:00:00:00:00:0a" WLAN_SECS=0.2 FW_SECS=0.2 hal preload
+  check 'grep -q "^\[radio_hal\]   ChipID 7201 at <addr>$" "$R/out.preload" && ! grep -q "02:00:00:00:00:0a" "$R/out.preload"' \
+    "  an address in its lines masked"
+  echo "== $SH: the firmware push: a good one leaves its mark for this boot"
+  unit
+  WLAN_SECS=0.2 FW_SECS=0.2 hal preload
+  check '[ "$(rc preload)" = 0 ] && [ -e "$R/tmp/.radio_btfw_pushed" ] && [ "$(key btfw_tries)" = 1 ] && [ "$(key btfw)" = complete ]' \
+    "the mark in /tmp; the boot line btfw=complete btfw_tries=1"
+
+  # The 2.7.1 review: the loader's own "Download Complete" stands over its exit code, and over the bound's stop.
+  echo "== $SH: the firmware push: Download Complete is a push, whatever the code after it"
+  unit
+  FW_ODD=1 WLAN_SECS=0.2 FW_SECS=0.2 hal preload
+  check '[ "$(rc preload)" = 0 ] && said preload "firmware preload exited 3 after it said Download Complete - taken as pushed" && [ "$(count "fw start")" = 1 ] && [ "$(count "attach ")" = 1 ]' \
+    "it said Download Complete and exited 3: taken as pushed (the code logged), no second push, the attach"
+  check '[ -e "$R/tmp/.radio_btfw_pushed" ] && [ "$(key btfw)" = complete ] && [ "$(key btfw_tries)" = 1 ] && [ "$(key rc)" = 0 ]' \
+    "  the push's mark; the boot line btfw=complete btfw_tries=1 rc=0"
+  unit
+  RADIO_BTFW_WAIT=1 FW_DONE_HANG=1 WLAN_SECS=0.2 FW_SECS=0.2 hal preload
+  check '[ "$(rc preload)" = 0 ] && said preload "firmware preload stopped at the bound (exit " && said preload "after it said Download Complete - taken as pushed" && [ "$(count "fw start")" = 1 ] && [ "$(count "attach ")" = 1 ]' \
+    "it said Download Complete and never returned: stopped at the bound, taken as pushed, the attach"
+  check '! { p=$(cat "$R/state/fw_loader_linux.pid" 2>/dev/null) && kill -0 "$p" 2>/dev/null; }' "  the loader gone"
+  unit
+  FW_FAIL=1 FW_SAY="Download Complete" WLAN_SECS=0.2 FW_SECS=0.2 hal preload
+  check '[ "$(rc preload)" = 0 ] && said preload "the firmware push failed - pushing it once more" && [ "$(key btfw)" = error ] && [ "$(key btfw_tries)" = 2 ]' \
+    "Download Complete beside a Download Error: a failure, pushed once more, as before"
+
+  echo "== $SH: the firmware push: one that fails is pushed once more"
+  unit
+  FW_FAIL=1 WLAN_SECS=0.2 FW_SECS=0.2 hal preload
+  check '[ "$(rc preload)" = 0 ] && said preload "the firmware push failed - pushing it once more" && [ "$(count "fw start")" = 2 ] && [ "$(count "attach ")" = 1 ]' \
+    "the second push, then the attach: the boot converges"
+  check '[ "$(key btfw_tries)" = 2 ] && [ "$(key btfw)" = error ] && [ "$(key attach)" != - ] && [ "$(key rc)" = 0 ]' \
+    "  the boot line: btfw_tries=2, the first run's word (btfw=error), the attach stamped"
+  check '! said preload "reclaim+reset" && ! called "rmmod"' "  no reset"
+
+  echo "== $SH: the firmware push: one that fails twice attaches nothing"
+  unit
+  FW_FAIL="1 2" WLAN_SECS=0.2 FW_SECS=0.2 hal preload
+  check '[ "$(rc preload)" = 1 ] && [ "$(count "fw start")" = 2 ] && said preload "the firmware push failed twice - no attach, and no reset after it"' \
+    "two pushes, then rc 1"
+  check '! called "attach " && ! called "rmmod" && ! said preload "reclaim+reset" && ! said preload "its helper stopped" && [ ! -e "$R/tmp/.radio_btfw_pushed" ]' \
+    "  no hciattach, no reset pulse, no helper to stop, and no mark"
+  check '[ -e "$R/tmp/.radio_together_fell_back" ] && [ "$(cat "$R/script/.radio_together_failed")" = 1 ] && [ ! -e "$R/script/.radio_together_inflight" ] && said preload "together gave no responsive hci0"' \
+    "  the marks as today: this boot's fallback, the guard's count 1, no in-flight mark"
+  check '[ "$(key by)" = preload ] && [ "$(key rc)" = 1 ] && [ "$(key btfw_tries)" = 2 ] && [ "$(key attach)" = - ] && grep -q "^done_rc1 " "$R/tmp/radio_preload_state"' \
+    "  the boot line: rc=1 btfw_tries=2 attach=-; the preload done_rc1"
+  echo "== $SH: the firmware push: the host's bt_on after it takes its normal path"
+  host_comes
+  FW_FAIL="1 2" WLAN_SECS=0.2 FW_SECS=0.2 hal bt_on
+  check '[ "$(rc bt_on)" = 0 ] && said bt_on "a together bring-up this boot gave no responsive hci0 (the fallback)" && [ "$(count "fw start")" = 3 ] && [ "$(count "attach ")" = 1 ]' \
+    "Wi-Fi first (the fallback), a fresh push, one attach: Bluetooth up"
+  check '[ "$(key by)" = bt_on ] && [ "$(key order)" = wlan_first ] && [ "$(key off)" = fallback ] && [ "$(key btfw_tries)" = 1 ] && [ "$(key rc)" = 0 ]' \
+    "  its boot line: by=bt_on order=wlan_first off=fallback btfw_tries=1 rc=0"
+  echo "== $SH: the firmware push: a host's bt_on whose own pushes fail too"
+  unit
+  FW_FAIL="1 2" WLAN_SECS=0.2 FW_SECS=0.2 hal preload
+  host_comes
+  FW_FAIL="1 2 3 4" WLAN_SECS=0.2 FW_SECS=0.2 hal bt_on
+  check '[ "$(rc bt_on)" = 1 ] && [ "$(count "fw start")" = 4 ] && ! called "attach " && ! called "rmmod" && ! said bt_on "reclaim+reset"' \
+    "two pushes of its own, then rc 1: no hciattach, and none of the reclaim+reset tries"
+
+  # A push that succeeded earlier this boot: the chip runs that firmware, and a loader then fails (most likely); the
+  # attach goes on, as it always has.
+  echo "== $SH: the firmware push: a failure after a good push this boot is no reason to stop"
+  unit
+  ATTACH_DEAD=1 FW_FAIL=2 WLAN_SECS=0.4 FW_SECS=0.2 hal bt_on
+  check '[ "$(rc bt_on)" = 0 ] && said bt_on "together gave no responsive hci0" && said bt_on "the chip runs the firmware pushed earlier this boot - the attach goes on" && called "attach 2 iface=yes"' \
+    "the together fallback's push fails: the attach goes on, and converges"
+  check '[ "$(count "fw start")" = 2 ] && ! said bt_on "pushing it once more" && [ "$(key btfw_tries)" = 2 ] && [ "$(key rc)" = 0 ]' \
+    "  no second run of its own (two in the bring-up: btfw_tries=2)"
+  unit
+  ATTACH_DEAD=1 WLAN_SECS=0.3 FW_SECS=0.2 hal preload
+  check '[ "$(rc preload)" = 1 ] && [ -e "$R/tmp/.radio_btfw_pushed" ] && said preload "its helper stopped"' \
+    "a preload whose push was good and whose attach failed: rc 1, the mark kept"
+  host_comes
+  FW_FAIL=2 WLAN_SECS=0.3 FW_SECS=0.2 hal bt_on
+  check '[ "$(rc bt_on)" = 0 ] && said bt_on "the chip runs the firmware pushed earlier this boot - the attach goes on" && [ "$(count "fw start")" = 2 ] && called "attach 2 iface=yes"' \
+    "  the host's bt_on: its push fails, the attach goes on (Wi-Fi first), Bluetooth up"
+
+  # The reclaim+reset tries (a host's bt_on, today's order): a push after each reset, before its attach.
+  echo "== $SH: the firmware push: a reset is followed by a push before its attach"
+  nth() { grep -nF -- "$1" "$R/calls" | sed -n "${2}p" | cut -d: -f1; }
+  unit; : > "$R/script/radio_together_off"
+  ATTACH_DEAD=1 WLAN_SECS=0.3 FW_SECS=0.2 hal bt_on
+  check '[ "$(rc bt_on)" = 0 ] && said bt_on "reclaim+reset (attempt 2)" && [ "$(count "fw start")" = 2 ] && called "attach 2 iface=yes"' \
+    "attempt 2: reclaim+reset, a push, the attach: converges"
+  check '[ "$(nth "rmmod hci_uart" 1)" -lt "$(nth "fw start" 2)" ] && [ "$(nth "fw start" 2)" -lt "$(nth "attach 2" 1)" ]' \
+    "  in that order: the reset (rmmod), the push, the attach"
+  check '[ "$(key order)" = wlan_first ] && [ "$(key tries)" = 2 ] && [ "$(key btfw_tries)" = 2 ] && [ "$(key rc)" = 0 ]' \
+    "  its boot line: tries=2 btfw_tries=2 rc=0"
+  unit; : > "$R/script/radio_together_off"
+  ATTACH_DEAD=1 FW_FAIL=2 WLAN_SECS=0.3 FW_SECS=0.2 hal bt_on
+  check '[ "$(rc bt_on)" = 0 ] && said bt_on "the chip runs the firmware pushed earlier this boot - the attach goes on" && [ "$(count "fw start")" = 2 ] && called "attach 2 iface=yes"' \
+    "the push after the reset fails, with a good one earlier this boot: the attach goes on, as before"
+  # No good push this boot (its mark unwritable here, as on a full /tmp): no firmware after the reset, no attach.
+  unit; : > "$R/script/radio_together_off"; ln -s "$R/nowhere/pushed" "$R/tmp/.radio_btfw_pushed"
+  ATTACH_DEAD=1 FW_FAIL="2 3" WLAN_SECS=0.3 FW_SECS=0.2 hal bt_on
+  check '[ "$(rc bt_on)" = 1 ] && said bt_on "the push'"'"'s mark could not be written" && said bt_on "attempt 2 attaches nothing: no firmware after its reset"' \
+    "no firmware after the reset (two failures, no good push this boot): rc 1"
+  check '! called "attach 2" && [ "$(count "fw start")" = 3 ] && [ "$(count "rmmod hci_uart")" = 1 ] && ! said bt_on "reclaim+reset (attempt 3)"' \
+    "  no attach after it, and no further reset"
+  check '[ "$(key rc)" = 1 ] && [ "$(key tries)" = 1 ] && [ "$(key btfw_tries)" = 3 ]' "  its boot line: rc=1 tries=1 btfw_tries=3"
+}
+
+case_round4() {
+  # ---- round 4's switches here (22 Nov 2026): attach_poll and page_trim, on by default since 2.7.1; "off" in a file for
+  # 2.7.0's path, the first of /tmp/bench_<name> and /etc/ocbm/bench_<name> that is there deciding --------------------
+  echo "== $SH: round 4, attach_poll: hci0 looked at every 0.1 s by default"
+  # The scratch clock is coarse and runs a little slow, so the two looks are compared with each other, not with a figure.
+  unit; echo off > "$R/etc/ocbm/bench_attach_poll"
+  WLAN_SECS=0.3 FW_SECS=0.2 hal preload
+  slow=$(( $(key hci_up) - $(key attach) ))
+  check '[ "$(rc preload)" = 0 ] && said preload "[bench] round4: attach_poll=off ($R/etc/ocbm/bench_attach_poll): hci0 looked at every 0.5 s as the attach converges, as in 2.7.0"' \
+    "off on flash: the 0.5 s look, as in 2.7.0, said so"
+  unit
+  WLAN_SECS=0.3 FW_SECS=0.2 hal preload
+  check '[ "$(rc preload)" = 0 ] && ! said preload "attach_poll" && ! said preload "round4"' \
+    "no file: on, the preload converges, and no round-4 line"
+  check '[ $(( $(key hci_up) - $(key attach) )) -lt "$slow" ]' "  hci_up sooner after the attach than with the 0.5 s look"
+  unit; : > "$R/etc/ocbm/bench_attach_poll"
+  WLAN_SECS=0.3 FW_SECS=0.2 hal preload
+  check '[ "$(rc preload)" = 0 ] && said preload "[bench] round4: attach_poll ($R/etc/ocbm/bench_attach_poll): hci0 looked at every 0.1 s"' \
+    "an empty file on flash, as the bench left it: on, and says the file"
+  unit; : > "$R/etc/ocbm/bench_attach_poll"; echo off > "$R/tmp/bench_attach_poll"
+  WLAN_SECS=0.3 FW_SECS=0.2 hal preload
+  check '[ "$(rc preload)" = 0 ] && said preload "[bench] round4: attach_poll=off ($R/tmp/bench_attach_poll)"' \
+    "off in /tmp over the flash's on: off (the first file there decides)"
+
+  echo "== $SH: round 4, attach_poll: an attempt bounded by its time, against a controller whose name reads are slow"
+  # A wedged controller: hci0 there (0.1 s after the attach), never answering, each name read 0.4 s. RADIO_ATTACH_POLLS
+  # =3 (hal): 2.7.0's attempt is 3 looks 0.5 s apart and one last look, the first before hci0 is there, so 3 reads; by
+  # the count of its looks (15) attach_poll's made 14, by its uptime (1.5 s, 2.7.0's budget) about as many as 2.7.0's.
+  unit; echo off > "$R/etc/ocbm/bench_attach_poll"
+  ATTACH_STUCK=1 NAME_SLOW=0.4 WLAN_SECS=0.2 FW_SECS=0.2 hal preload
+  off_reads=$(cat "$R/state/name_looks" 2>/dev/null)
+  check '[ "$(rc preload)" = 1 ] && [ "$off_reads" -le 4 ] && said preload "attempt 1 did not converge"' \
+    "off: 2.7.0's attempt by its count of looks, $off_reads name reads, the attach failed"
+  unit
+  ATTACH_STUCK=1 NAME_SLOW=0.4 WLAN_SECS=0.2 FW_SECS=0.2 hal preload
+  on_reads=$(cat "$R/state/name_looks" 2>/dev/null)
+  check '[ "$(rc preload)" = 1 ] && [ "$on_reads" -le 8 ] && said preload "attempt 1 did not converge"' \
+    "the default: bounded by its uptime, $on_reads name reads, not the 14 a count of its looks made"
+
+  echo "== $SH: round 4, page_trim: a host during the boot preload, by default"
+  unit
+  ( WLAN_SECS=0.8 FW_SECS=1.6 hal preload ) &
+  pre=$!
+  waitfor 'called "insmod moal start"' 50
+  WLAN_SECS=0.8 FW_SECS=1.6 AP_SECS=2.5 host_bringup
+  wait "$pre"
+  check '[ "$(rc preload)" = 0 ] && [ "$(rc bt_on)" = 2 ] && [ "$(rc wifi_ap_on)" = 0 ] && said bt_on "already converged"' \
+    "the preload converges, the host's bt_on confirms Bluetooth up (rc 2), the AP comes up"
+  check 'said preload "a host is waiting - no SCO lines and no name set on hci0" && [ ! -e "$R/state/hci0.name" ] && ! said preload "round4"' \
+    "  no name set on the controller by the preload, said in a plain line"
+  check '[ "$(cat "$R/etc/.custom_bluetooth_name")" = CarLink-a1b2 ] && [ "$(cat "$R/etc/bluetooth_name")" = CarLink-a1b2 ]' \
+    "  the two name files written all the same"
+  check 'said preload "the together guard'"'"'s mark cleared after the locks went" && [ ! -e "$R/script/.radio_together_inflight" ] && [ ! -e "$R/script/.radio_together_failed" ]' \
+    "  the together guard's mark gone, after the locks"
+  check 'said bt_on "the bt lock taken after about" && said bt_on "looked at every 0.05 s" && ! said bt_on "round4"' \
+    "  the host's bt_on waited for the bt lock with a look every 0.05 s"
+  check '! called "hciconfig hci0 down" && [ ! -e "$R/tmp/.radio_bt_handover" ] && [ ! -s "$R/tmp/.radio_bt_warm" ]' \
+    "  Bluetooth left up for the host, no handover, nothing opened (btd's DOWN/UP stays)"
+  i0=$(inode "$R/etc/bluetooth_name"); i1=$(inode "$R/etc/.custom_bluetooth_name")
+  reboot_unit
+  ( WLAN_SECS=0.4 FW_SECS=0.8 hal preload ) &
+  pre=$!
+  waitfor 'called "insmod moal start"' 50
+  host_comes; wait "$pre"
+  check '[ "$(rc preload)" = 0 ] && said preload "a host is waiting - no SCO lines and no name set" && [ "$(inode "$R/etc/bluetooth_name")" = "$i0" ] && [ "$(inode "$R/etc/.custom_bluetooth_name")" = "$i1" ]' \
+    "  the next boot's, with the name the files hold: neither written again"
+
+  echo "== $SH: round 4, page_trim: on by a file on flash, off by one in /tmp"
+  unit; : > "$R/etc/ocbm/bench_page_trim"
+  ( WLAN_SECS=0.8 FW_SECS=1.6 hal preload ) &
+  pre=$!
+  waitfor 'called "insmod moal start"' 50
+  WLAN_SECS=0.8 FW_SECS=1.6 AP_SECS=2.5 host_bringup
+  wait "$pre"
+  check 'said preload "[bench] round4: page_trim ($R/etc/ocbm/bench_page_trim): a host is waiting - no SCO lines and no name set on hci0" && [ ! -e "$R/state/hci0.name" ]' \
+    "an empty file on flash, as the bench left it: on, and says the file"
+  check 'said bt_on "[bench] round4: page_trim ($R/etc/ocbm/bench_page_trim): the bt lock taken after about"' "  its lock wait's line too"
+  unit; : > "$R/etc/ocbm/bench_page_trim"; echo off > "$R/tmp/bench_page_trim"
+  ( WLAN_SECS=0.8 FW_SECS=1.6 hal preload ) &
+  pre=$!
+  waitfor 'called "insmod moal start"' 50
+  WLAN_SECS=0.8 FW_SECS=1.6 AP_SECS=2.5 host_bringup
+  wait "$pre"
+  check '[ "$(rc preload)" = 0 ] && [ "$(rc bt_on)" = 2 ] && said preload "[bench] round4: page_trim=off ($R/tmp/bench_page_trim): a host is waiting - SCO lines and the name set on hci0, as in 2.7.0"' \
+    "off in /tmp over the flash's on: 2.7.0's preload, said so"
+  check '[ -e "$R/state/hci0.name" ] && ! said preload "mark cleared after the locks" && [ ! -e "$R/script/.radio_together_inflight" ]' \
+    "  the name set on the controller, the guard's mark cleared before the locks went, as in 2.7.0"
+  check '! said bt_on "looked at every 0.05 s"' "  the host's bt_on: no 0.05 s look"
+
+  echo "== $SH: round 4, page_trim: the boot preload alone"
+  unit
+  WLAN_SECS=0.4 FW_SECS=0.4 hal preload
+  check '[ "$(rc preload)" = 0 ] && [ -e "$R/state/hci0.name" ] && ! said preload "a host is waiting" && ! said preload "mark cleared after the locks"' \
+    "no host: the name set and the mark cleared as before"
+  check 'called "hciconfig hci0 down" && [ ! -e "$R/script/.radio_together_inflight" ]' "  and powered down to the between-sessions state"
+}
+
 . "$HERE/test_shells.sh"
 for SH in ${SHELLS:-$(distinct_shells sh dash)}; do
   command -v "$SH" >/dev/null 2>&1 || { echo "== $SH: not installed, skipped"; continue; }
   R="$T/$(basename "$SH").root"
-  for c in ${RH_ONLY:-kept order switches fallback host handover review gpio line unpack locks boot}; do "case_$c"; done
+  for c in ${RH_ONLY:-kept order switches fallback host handover review gpio line unpack locks boot round4 fwpush}; do "case_$c"; done
   reap
 done
 [ "$fails" -eq 0 ] && echo "radio_hal_test: all passed ($passes checks)" || { echo "radio_hal_test: $fails failed"; exit 1; }

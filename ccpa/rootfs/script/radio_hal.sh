@@ -127,9 +127,15 @@ write_empty() { { true >"$1"; } 2>/dev/null; }
 # for each (its wifi_ap_on for wlan, its bt_on for bt), and a look every 0.5 s put up to half a second between the
 # preload letting go and the host's bring-up going on. Between looks only the sleep forks (the shell's own test sees
 # the lock go; the pid is read with `read`), so five looks a second cost no more than the two of before, which forked
-# cat and mkdir each time. Still 30 s at most, and a lock is still reclaimed only when its holder is gone.
+# cat and mkdir each time. Still 30 s at most, and a lock is still reclaimed only when its holder is gone. Since 2.7.1
+# every 0.05 s by default (round 4's page_trim, below).
 lock_take() {  # $1 = subsystem
   _lk="/tmp/.radio_lock_$1"; _n=0
+  # Round 4, item 6 (page_trim, on by default since 2.7.1): a look every 0.05 s while it waits (20 a round, 600 in all:
+  # still 30 s at most), so a host's bt_on goes on within 50 ms of the boot preload letting the lock go, not 200. Off
+  # (2.7.0's): the 0.2 s look. _lkt: the line's tag when a file turned it on.
+  _lks=0.2; _lkr=5; _lkm=150; _lkt=""
+  if r4_on page_trim; then _lks=0.05; _lkr=20; _lkm=600; _lkt=$_r4t; fi
   while ! mkdir "$_lk" 2>/dev/null; do
     _holder=""; read -r _holder 2>/dev/null <"$_lk/pid"
     if [ -n "$_holder" ] && ! pid_live "$_holder"; then
@@ -140,21 +146,24 @@ lock_take() {  # $1 = subsystem
       log "lock $1 has no holder and is >20min old - reclaiming"
       rm -rf "$_lk"; continue
     fi
-    [ "$_n" -ge 150 ] && {
+    [ "$_n" -ge "$_lkm" ] && {
       log "lock $1 busy >30s (held by pid ${_holder:-unknown}) - refusing to stack bring-ups"; return 1; }
     # At least one sleep a round (a lock path that is no directory must not spin), up to five while it stays.
     _lkw=0
-    while :; do sleep 0.2; _lkw=$((_lkw + 1)); [ "$_lkw" -lt 5 ] && [ -d "$_lk" ] || break; done
+    while :; do sleep "$_lks"; _lkw=$((_lkw + 1)); [ "$_lkw" -lt "$_lkr" ] && [ -d "$_lk" ] || break; done
     _n=$((_n + _lkw))
   done
+  [ "$_lks" = 0.05 ] && [ "$_n" -gt 0 ] && log "${_lkt}the $1 lock taken after about $((_n * 50)) ms of waiting, looked at every 0.05 s"
   echo $$ > "$_lk/pid" 2>/dev/null
   lock_mine "$1" 1   # taken by this process, whether or not its pid could be written (lock_drop_own)
   # TWO traps, deliberately. In ash a trapped signal runs the handler and then RESUMES the
   # script: a single combined trap would release the lock on SIGTERM while the bring-up carried
   # on running, so the next caller would take the lock and stack a second attach on top of a
-  # still-live one. The signal trap must therefore also exit.
-  trap 'rm -rf "/tmp/.radio_lock_'"$1"'" 2>/dev/null' EXIT
-  trap 'rm -rf "/tmp/.radio_lock_'"$1"'" 2>/dev/null; trap - EXIT; exit 143' INT TERM HUP
+  # still-live one. The signal trap must therefore also exit. Both stop a Bluetooth firmware loader in
+  # flight before the lock goes (bt_fw_stop: it holds the UART); the signal trap ignores a second
+  # signal meanwhile, so the stop ends before the lock does (2.7.1 review).
+  trap 'bt_fw_stop; rm -rf "/tmp/.radio_lock_'"$1"'" 2>/dev/null' EXIT
+  trap 'trap "" INT TERM HUP; bt_fw_stop; rm -rf "/tmp/.radio_lock_'"$1"'" 2>/dev/null; trap - EXIT; exit 143' INT TERM HUP
   return 0
 }
 lock_drop() { trap - EXIT INT TERM HUP; rm -rf "/tmp/.radio_lock_$1" 2>/dev/null; lock_mine "$1" 0; }
@@ -491,6 +500,17 @@ bt_set_name() {  # $1 = hci dev
     sleep 0.5
   done
   log "BT name=$_bn (asserted after $_n retries, now '${_cur:-unknown}')"
+}
+
+# The two name files bt_set_name writes, each only where it would change: round 4's page trim sets no name on the
+# controller, and a boot whose name they hold already writes nothing to flash.
+bt_name_files() {
+  _bnf=$(box_name)
+  for _bnf_f in /etc/.custom_bluetooth_name /etc/bluetooth_name; do
+    _bnf_c=""; read -r _bnf_c 2>/dev/null <"$_bnf_f"
+    [ "$_bnf_c" = "$_bnf" ] || echo "$_bnf" > "$_bnf_f" 2>/dev/null
+  done
+  return 0
 }
 
 # Load THIS unit's WLAN driver and nothing else - no AP, no addressing. Factored out of
@@ -852,7 +872,8 @@ do_preload() {
   # the gpio1 pulse) with the Wi-Fi driver loaded, the step radio_detect.sh's preload note records as wedging the kernel.
   # So the preload stops its own helper (bt_helper_stop: SIGTERM, then -9 on the helper; no reset, no rmmod), which takes
   # hci0 with it. In either order: 2.6.5 left the same helper after a failed Wi-Fi-first preload.
-  if [ "$_pr" = 1 ] && [ "${_bt_attached:-0}" = 1 ]; then
+  # No firmware pushed (_bt_nofw): no attach was started, so there is no helper to stop.
+  if [ "$_pr" = 1 ] && [ "${_bt_attached:-0}" = 1 ] && [ "${_bt_nofw:-0}" != 1 ]; then
     log "preload: the attach failed - its helper stopped (no reset, no rmmod): the host's bring-up starts on a free UART"
     bt_helper_stop
   fi
@@ -863,6 +884,11 @@ do_preload() {
   # The seam's part is over: the locks go now, not after the bookkeeping below (a sync and a few forks), so a host's
   # bring-up waiting on them goes on at once. Only while they are still this preload's (lock_drop_own).
   trap - EXIT INT TERM HUP; lock_drop_own bt; lock_drop_own wlan
+  # Round 4's page trim: the together guard's mark, left for here by a converged attach a host was waiting on; one sync.
+  if [ "${_bt_mark_late:-0}" = 1 ]; then
+    rm -f "$TOGETHER_MARK" "$TOGETHER_FAILS"
+    log "the together guard's mark cleared after the locks went"
+  fi
   rm -f "$PRELOAD_MARK" "$PRELOAD_UNFINISHED"; sync
   # "done" only when Bluetooth came up (rc 0, or 2: already up); a failed attach says so, e.g. done_rc1, so the
   # [startup] line never reads "preload done" after one (the Mac's review, PRELOAD-DONE-ANY-RC).
@@ -928,10 +954,11 @@ boot_line() {  # $1 = by (preload | bt_on), $2 = its exit code
   _bl_h=""; read -r _bl_h 2>/dev/null </tmp/host_present_uptime
   case "$_bl_h" in ''|0|*[!0-9]*) _bl_h=- ;; esac
   boot_note tries "${_bt_tries:-0}"
+  boot_note btfw_tries "${_bt_fw_runs:--}"   # the loader's runs (bt_fw_push; one more after each reclaim+reset)
   _bl=$(awk -v by="$1" -v rc="$2" -v host="$_bl_h" '
     NF >= 2 && !($1 in s) { s[$1] = $2 }
     END {
-      n = split("start caps caps_ms gpio order off wlan_start wlan_up wlan_free btfw_start btfw_end btfw btfw_ms attach hci_up handover handed tries fallback", k, " ")
+      n = split("start caps caps_ms gpio order off wlan_start wlan_up wlan_free btfw_start btfw_end btfw btfw_ms btfw_tries attach hci_up handover handed tries fallback", k, " ")
       line = "[radio-boot] v1 by=" by
       for (i = 1; i <= n; i++) {
         val = "-"
@@ -993,6 +1020,25 @@ TOGETHER_GUARD_AFTER=2
 
 # A bench flag: there, and not reading "off" (an empty file is set). The first line, with the shell's own read.
 bench_flag() { [ -e "$1" ] || return 1; _bfl=""; read -r _bfl 2>/dev/null <"$1"; [ "$_bfl" != off ]; }
+
+# ---- Round 4's switches here (22 Nov 2026; docs/ops/02_TESTING.md, "Round 4 switches") -------------------------------
+# attach_poll and page_trim, both ON BY DEFAULT since 2.7.1 (the owner's decision of 22 Nov 2026). Each goes back to
+# 2.7.0's path, exactly, with "off" in /tmp/bench_<name> (a reboot clears it) or, for a cold boot, whose /tmp is empty,
+# in /etc/ocbm/bench_<name> on flash (OCBM's own state directory: updates keep it, the full way back to stock removes it
+# whole, so no remover names it). The first of the two that exists decides, so an "off" in /tmp overrides the flash
+# (box_common::bench_override's rule); any other text, an empty file or "on", is on. 0: on, 1: off. _r4f: the file that
+# decided, "" for the default; _r4t: "[bench] round4: <name> (<file>): " when a file turned it on, the tag its lines
+# carry then, else "" (the default's lines are plain). Its "off" says so where it would have acted.
+r4_on() {
+  _r4t=""
+  for _r4f in "/tmp/bench_$1" "/etc/ocbm/bench_$1"; do
+    [ -e "$_r4f" ] || continue
+    _r4v=""; read -r _r4v 2>/dev/null <"$_r4f"
+    [ "$_r4v" = off ] && return 1
+    _r4t="[bench] round4: $1 ($_r4f): "; return 0
+  done
+  _r4f=""; return 0
+}
 
 # The order the next attach takes: _bto = together | wlan_first | bt_alone, and _bto_off = why a part that could take
 # together does not (owner | guard | bench | fallback), else "-". $1 = peek: count nothing (the probe verb).
@@ -1077,10 +1123,12 @@ together_count() {
 #   out), against 0 of 9 with the DOWN/UP kept (70caa3c's 5 and 4a6ce9c's 4 with it off): suggestive, not proof, the
 #   cause not found (docs/wireless/01_BT_AND_RADIO.md, "The cold boot", 6). So the handover runs only when asked for:
 #   the owner's /script/radio_handover_on on flash, or the bench's /tmp/bench_handover_on (bench_flag's rule: set
-#   unless it reads "off"), read here at the attach and by the supervisor at the host's arrival. With neither, the cold
-#   path is 4a6ce9c's with its old off file: no claim, no handover file, no early btd, btd's DOWN/UP. That off file,
-#   /script/radio_handover_off, is retired: nothing reads it, and updates, an update's first start, reverts and the
-#   restores remove it. A teardown's bt_off removes $HANDOVER: it was for the session that ends.
+#   unless it reads "off"), read here at the attach and by the supervisor at the host's arrival. With neither, nothing
+#   of the handover runs: no claim, no handover file, btd's DOWN/UP. The supervisor still starts btd early (its
+#   btd_early, on by default since 2.7.1), and that btd waits for bt_on's end; with btd_early off too, the cold path is
+#   4a6ce9c's with its old off file. That off file, /script/radio_handover_off, is retired: nothing reads it, and
+#   updates, an update's first start, reverts and the restores remove it. A teardown's bt_off removes $HANDOVER: it was
+#   for the session that ends.
 HANDOVER=/tmp/.radio_bt_handover
 HANDOVER_ON=/script/radio_handover_on
 HANDOVER_BENCH_ON=/tmp/bench_handover_on
@@ -1250,45 +1298,194 @@ bt_ldisc_ready() {
 }
 
 # The firmware this unit's branch pushes over the UART before its attach, where it has one (the NXP parts), timed for
-# the boot line, with what the loader said: its verdict, and its own time (a chip that kept its firmware through a
-# restart answers in a fraction of a cold download's 2.2 s).
+# the boot line, with what the loader said: its verdict, and its own time. The first run's stamps stand.
+#
+# BOUNDED (22 Nov 2026): a push takes 2.2 to 3.2 s (every boot line logged), and the loader waits 4 s for the chip's
+# boot loader (its own "Timeout: 4000"); one still running after RADIO_BTFW_WAIT seconds (10; a test hook) is sent TERM,
+# and KILL 2 s later, by its watcher (bt_fw_watch, a look every 0.5 s). It ran unbounded before, under the bt lock.
+#
+# Its code: 0 pushed, with BT_FW_PUSHED written (bt_fw_push): the loader exited 0, or said "Download Complete" (and no
+# "Download Error") whatever its code, a stop at the bound after it included (the code logged); 1 not, the loader having
+# failed (its code and its last lines go to the log, any address in them masked) or been stopped at the bound (its
+# code, and that it was stopped). The bench of 22 Nov (a cold boot, by hand): the loader exited 255, the attach went on
+# against a chip with no firmware, and the box went silent.
+RADIO_BTFW_WAIT=${RADIO_BTFW_WAIT:-10}
+case "$RADIO_BTFW_WAIT" in ''|*[!0-9]*) RADIO_BTFW_WAIT=10 ;; esac
+# A firmware push that succeeded this boot (bt_fw_push). In /tmp, so a SoC restart or a power cut, which put the chip
+# back in its boot loader, take it away with the firmware.
+BT_FW_PUSHED=/tmp/.radio_btfw_pushed
+# A BR/EDR address in the loader's lines, masked: it prints none that we know of (chip id, file, baud rates, sizes).
+MAC_MASK='s/[0-9A-Fa-f][0-9A-Fa-f]\(:[0-9A-Fa-f][0-9A-Fa-f]\)\{5\}/<addr>/g'
 bt_fw_preload() {
   [ -n "$RADIO_BT_PRELOAD" ] && [ -n "${RADIO_BT_PRELOAD_CMD:-}" ] || return 0
   log "firmware preload: $RADIO_BT_PRELOAD_CMD"
-  boot_mark btfw_start
-  $RADIO_BT_PRELOAD_CMD >/tmp/radio_bt_fw.log 2>&1; _bfp_rc=$?
-  boot_mark btfw_end
-  [ "$_bfp_rc" = 0 ] || log "  firmware preload exited $_bfp_rc"
+  _bt_fw_runs=$((${_bt_fw_runs:-0} + 1))
+  boot_mark btfw_start; _bfp_t0=${_um:-}
+  # _bfp_live, _bfp_w, _bfp_tok: the loader, its watcher and the run's token while they run, for a trapped signal to
+  # stop first (bt_fw_stop). The token is this run's own (a lost-kill watcher of the run before must not take it).
+  _bfp_w=""; _bfp_tok=/tmp/.radio_btfw_run.$$.$_bt_fw_runs
+  write_empty "$_bfp_tok" || _bfp_tok=""
+  $RADIO_BT_PRELOAD_CMD >/tmp/radio_bt_fw.log 2>&1 &
+  _bfp_pid=$!; _bfp_live=$_bfp_pid
+  bt_fw_watch "$_bfp_pid" "$_bfp_tok" $((RADIO_BTFW_WAIT * 1000)) "$_bfp_t0" </dev/null >/dev/null 2>&1 &
+  _bfp_w=$!
+  # The loader's code and time are its own, taken as it returns, and the watcher is never waited for (the hardware test
+  # of 22 Nov, BusyBox ash: a TERM to the watcher, sent as a loader that failed at once returned, came before the fresh
+  # subshell had reset its parent's trapped TERM and was lost; the parent then waited out the watcher's 12 s and took
+  # them for a stop at the bound). Its token goes at once, and the kill only hurries it: one that missed the kill ends
+  # at its next look, signalling nothing. With no token (it could not be written) only a KILL ends it.
+  wait "$_bfp_pid"; _bfp_rc=$?; _bfp_live=""
+  boot_mark btfw_end; _bfp_ms=$(( ${_um:-0} - ${_bfp_t0:-0} ))
+  if [ -n "$_bfp_tok" ]; then rm -f "$_bfp_tok"; kill "$_bfp_w" 2>/dev/null; else kill -KILL "$_bfp_w" 2>/dev/null; fi
+  _bfp_w=""
   set -- $(awk '/Download Complete/ { c = 1 } /Download Error/ { e = 1 }
     match($0, /time:[ ]*[0-9]+/) { t = substr($0, RSTART, RLENGTH); sub(/time:[ ]*/, "", t) }
     END { v = "other"; if (c) v = "complete"; if (e) v = "error"; if (t == "") t = "-"; print v " " t }' \
     /tmp/radio_bt_fw.log 2>/dev/null)
-  boot_note btfw "${1:-other}"; boot_note btfw_ms "${2:--}"
-  return 0
+  _bfp_v=${1:-other}
+  boot_note btfw "$_bfp_v"; boot_note btfw_ms "${2:--}"
+  # The loader's own word stands over its code (the 2.7.1 review): "Download Complete" with no "Download Error" is the
+  # firmware pushed, whatever code followed it, from a loader the bound stopped after it said so too; the code is logged.
+  if [ "$_bfp_rc" != 0 ] && [ "$_bfp_v" = complete ]; then
+    if [ "$_bfp_ms" -ge $((RADIO_BTFW_WAIT * 1000)) ]; then
+      log "  firmware preload stopped at the bound (exit $_bfp_rc) after it said Download Complete - taken as pushed"
+    else
+      log "  firmware preload exited $_bfp_rc after it said Download Complete - taken as pushed"
+    fi
+    _bfp_rc=0
+  fi
+  if [ "$_bfp_rc" = 0 ]; then
+    # A builtin's redirection, no fork. Unwritten (a full /tmp), a later failed push stops the attach.
+    write_empty "$BT_FW_PUSHED" || log "  the push's mark could not be written ($BT_FW_PUSHED)"
+    return 0
+  fi
+  log "  firmware preload exited $_bfp_rc"
+  if [ "$_bfp_ms" -ge $((RADIO_BTFW_WAIT * 1000)) ]; then
+    log "  the loader had not returned after $RADIO_BTFW_WAIT s - stopped"
+    return 1
+  fi
+  log "  the loader's last lines:"
+  tail -5 /tmp/radio_bt_fw.log 2>/dev/null | cut -c1-160 | sed -e "$MAC_MASK" -e "s/^/$LOGP   /"
+  return 1
+}
+
+# The loader's watcher (bt_fw_preload's bound, bt_fw_stop's stop): TERM to pid $1 once $3 ms have passed since $4 (ms
+# of uptime; "" counts its own looks instead), and KILL 2 s after that, each only while the run's token $2 is there
+# ("": none could be written, then always). It looks every 0.5 s and ends as soon as the token goes, which its parent
+# removes the moment the loader returns: so a watcher whose own kill was lost signals no pid after that (none taken by
+# another process since) and is gone within a look. Never waited for (the hardware test of 22 Nov). Its sleeps fork,
+# nothing else.
+bt_fw_watch() {  # $1 pid, $2 token, $3 after_ms, $4 start_ms
+  _bfw_at=$3; _bfw_sig=TERM; _bfw_n=0
+  while [ -z "$2" ] || [ -e "$2" ]; do
+    up_ms
+    if [ -n "$4" ] && [ -n "$_um" ]; then _bfw_e=$((_um - $4)); else _bfw_e=$((_bfw_n * 500)); fi
+    if [ "$_bfw_e" -ge "$_bfw_at" ]; then
+      { [ -z "$2" ] || [ -e "$2" ]; } && kill -"$_bfw_sig" "$1" 2>/dev/null
+      [ "$_bfw_sig" = KILL ] && return 0
+      _bfw_sig=KILL; _bfw_at=$((_bfw_at + 2000))
+    fi
+    _bfw_n=$((_bfw_n + 1)); sleep 0.5
+  done
+}
+
+# The loader in flight (bt_fw_preload), stopped before a trapped signal lets the bt lock go (lock_take's traps; the
+# 2.7.1 review): it runs in the background, so the wait for it ends at the signal, and it would go on holding the UART
+# that the lock's next holder pushes to or attaches on. The bound's watcher first, told by its token and stopped with
+# KILL (the trap ignores TERM by then, and so do the children it starts), whether or not a loader still runs; then the
+# loader: TERM, and KILL 2 s later from a watcher of this stop's own, the loader reaped before the lock goes. That
+# watcher is told by its token too, never waited for.
+bt_fw_stop() {
+  [ -n "${_bfp_tok:-}" ] && rm -f "$_bfp_tok"
+  [ -n "${_bfp_w:-}" ] && kill -KILL "$_bfp_w" 2>/dev/null
+  _bfp_w=""
+  [ -n "${_bfp_live:-}" ] || return 0
+  up_ms; _bfs_tok=/tmp/.radio_btfw_stop.$$
+  write_empty "$_bfs_tok" || _bfs_tok=""
+  bt_fw_watch "$_bfp_live" "$_bfs_tok" 0 "$_um" </dev/null >/dev/null 2>&1 &
+  _bfs_w=$!
+  wait "$_bfp_live" 2>/dev/null
+  if [ -n "$_bfs_tok" ]; then rm -f "$_bfs_tok"; else kill -KILL "$_bfs_w" 2>/dev/null; fi
+  _bfp_live=""
+}
+
+# The firmware push (22 Nov 2026): the loader once, and once more when it failed. 0: pushed (or none to push); 1: not,
+# and the caller attaches nothing, with no hciattach and no reclaim+reset: an attach against a chip left without its
+# firmware is what preceded the silent box of the 22 Nov bench. _bt_nofw says so to the preload's end (no helper to
+# stop), and the boot line counts the runs (btfw_tries).
+#
+# A failure after a push that succeeded earlier this boot (BT_FW_PUSHED) is no reason to stop: the chip still runs that
+# firmware, which only a SoC restart or a power cut takes away (both empty /tmp; the 13 Nov restarts each pushed in
+# full), not reclaim+reset's gpio1 pulse (20 Nov, by hand: after it hci0 answered within half a second, and the Wi-Fi
+# driver loaded in under 0.4 s, too quick for a download). A loader before such a chip finds no boot loader: measured
+# on the dev adapter on 22 Nov 2026, the real loader returns 255 after about 4.05 s (its 4 s wait for one), and with
+# the push's mark there the attach goes on and hci0 answers about 0.5 s later (that 20 Nov run's "at once, no output"
+# was a result file left by the run before it). So the attach goes on, as it always has there: the together
+# fallback's, a host's bt_on after the preload's attach failed, a try after a reset.
+bt_fw_push() {
+  _bt_nofw=0
+  bt_fw_preload && return 0
+  if [ -e "$BT_FW_PUSHED" ]; then
+    log "  the chip runs the firmware pushed earlier this boot - the attach goes on"
+    return 0
+  fi
+  log "  the firmware push failed - pushing it once more"
+  bt_fw_preload && return 0
+  _bt_nofw=1
+  log "  the firmware push failed twice - no attach, and no reset after it"
+  publish "$BT_STATE" "result=fail" "backend=mapped" "chipset=$RADIO_SDIO_DEVICE" "detail=no-firmware"
+  return 1
 }
 
 # Attach and converge, $1 tries. Clause 1: the attach runs detached so a helper that blocks cannot hang this verb, but
 # we DO NOT return until it converges. That is the whole difference from the vendor path, which forks the attach and
 # returns immediately. RADIO_BT_MAX_TRIES: the boot preload passes 1, so it never reaches reclaim+reset (attempt 1 only
 # reclaims a helper that is already running, which at boot none is). RADIO_ATTACH_POLLS is a test hook
-# (tools/radio_hal_test.sh): the looks, 0.5 s apart, an attempt gets to converge (30).
+# (tools/radio_hal_test.sh): the looks an attempt gets to converge at 0.5 s apart (30); attach_poll, below, makes them
+# 0.1 s apart and five times as many.
 RADIO_ATTACH_POLLS=${RADIO_ATTACH_POLLS:-30}
 case "$RADIO_ATTACH_POLLS" in ''|*[!0-9]*) RADIO_ATTACH_POLLS=30 ;; esac
+# Whether an attempt of bt_attach_loop looks again: while its uptime since the attach (_bal_t0) is under _bal_ms, with
+# attach_poll; else, or with no uptime to read, while its looks (_n) are under _bal_n, 2.7.0's rule. No fork.
+bt_attach_looks_on() {
+  if [ -n "$_bal_ms" ] && [ -n "$_bal_t0" ]; then
+    up_ms
+    [ -n "$_um" ] && { [ $((_um - _bal_t0)) -lt "$_bal_ms" ]; return; }
+  fi
+  [ "$_n" -lt "$_bal_n" ]
+}
 bt_attach_loop() {
   _helper=${RADIO_BT_ATTACH_CMD%% *}
   _try=0; _d=""; _bal_ok=0
+  # Round 4, item 8 (attach_poll, on by default since 2.7.1): a look every 0.1 s, not 0.5, as hci0 comes up, which put
+  # hci_up up to half a second after hci0 answered. A look with no hci0 forks one subshell (the glob's), and one with
+  # hci0 there but not up fails fast (ENETDOWN); but against a controller up and wedged each look's name read takes its
+  # 5 s timeout (bt_responsive), so the attempt is bounded by the uptime (_bal_ms, 2.7.0's RADIO_ATTACH_POLLS looks of
+  # 0.5 s: 15 s), not by a count of looks, which would make it up to five times 2.7.0's under the bt lock (the 2.7.1
+  # review). With no uptime to read, five times the looks, as before. Off: 2.7.0's 0.5 s look, by its count.
+  _bal_s=0.5; _bal_n=$RADIO_ATTACH_POLLS; _bal_ms=""
+  if r4_on attach_poll; then
+    _bal_s=0.1; _bal_n=$((RADIO_ATTACH_POLLS * 5)); _bal_ms=$((RADIO_ATTACH_POLLS * 500))
+    [ -n "$_r4t" ] && log "${_r4t}hci0 looked at every 0.1 s as the attach converges, not 0.5 s"
+  else
+    log "[bench] round4: attach_poll=off ($_r4f): hci0 looked at every 0.5 s as the attach converges, as in 2.7.0"
+  fi
   while [ "$_try" -lt "$1" ]; do
-    _try=$((_try+1)); _bt_tries=$((${_bt_tries:-0} + 1))
+    _try=$((_try+1))
     if [ "$_try" -gt 1 ] || pgrep -x "$_helper" >/dev/null 2>&1 || ps | grep -v grep | grep -qw "$_helper"; then
       log "reclaim+reset (attempt $_try)"; bt_reclaim_reset
+      # A push after each reset, before its attach (22 Nov 2026). With none (bt_fw_push: two failures and no push earlier
+      # this boot) this attempt attaches nothing, and none follows: no further reset.
+      bt_fw_push || { log "  attempt $_try attaches nothing: no firmware after its reset"; return 1; }
     fi
+    _bt_tries=$((${_bt_tries:-0} + 1))
     log "attach attempt $_try: $RADIO_BT_ATTACH_CMD"
     boot_mark attach
     setsid $RADIO_BT_ATTACH_CMD </dev/null >/tmp/radio_bt_attach.log 2>&1 &
-    _n=0
-    while [ "$_n" -lt "$RADIO_ATTACH_POLLS" ]; do
+    _n=0; up_ms; _bal_t0=$_um
+    while bt_attach_looks_on; do
       _d=$(hci_dev 2>/dev/null) && bt_responsive "$_d" && { _bal_ok=1; break; }
-      _n=$((_n+1)); sleep 0.5
+      _n=$((_n+1)); sleep "$_bal_s"
     done
     # One last look once the looks ran out. An answer above stands: two further name reads (a healthy RTL8822CS missed
     # about one in four, bt_responsive_confirmed) used to undo it, and a preload's one try then counted toward the
@@ -1309,12 +1506,27 @@ bt_attach_loop() {
       return 0
     fi
     bt_power_stamp
-    # Vendor SCO tuning where the mapping carried it; non-fatal. Was a HARDCODED
-    # `scomtu 240:32` despite this comment -- which is the Realtek/NXP value and nobody
-    # else's, and which skipped the routing command the NXP and BCM4358 branches need.
-    # Now the extracted per-branch mapping.
-    apply_sco "$_d" >/dev/null 2>&1 || log "no SCO mapping for this chipset"
-    bt_set_name "$_d"
+    # Round 4, item 6 (page_trim, on by default since 2.7.1), a host waiting on this preload: no SCO lines and no name set
+    # here (0.39 s of hci_up to the first page). The host's session resets the controller before it uses it (btd's
+    # DOWN/UP), and btd writes the name, class, Simple Pairing and EIR itself (bt_bringup.rs prepare); the vendor's SCO
+    # set-up never outlived that reset (apply_sco), as the handover's claim already relies on. The name files only where
+    # they change. Off (2.7.0's): both set, as with no host.
+    _bal_trim=0
+    if [ "$VERB" = preload ] && host_here; then
+      if r4_on page_trim; then _bal_trim=1
+      else log "[bench] round4: page_trim=off ($_r4f): a host is waiting - SCO lines and the name set on $_d, as in 2.7.0"; fi
+    fi
+    if [ "$_bal_trim" = 1 ]; then
+      log "${_r4t}a host is waiting - no SCO lines and no name set on $_d (btd's bring-up resets the controller and writes the name)"
+      bt_name_files
+    else
+      # Vendor SCO tuning where the mapping carried it; non-fatal. Was a HARDCODED
+      # `scomtu 240:32` despite this comment -- which is the Realtek/NXP value and nobody
+      # else's, and which skipped the routing command the NXP and BCM4358 branches need.
+      # Now the extracted per-branch mapping.
+      apply_sco "$_d" >/dev/null 2>&1 || log "no SCO mapping for this chipset"
+      bt_set_name "$_d"
+    fi
     publish "$BT_STATE" "result=ok" "backend=mapped" "chipset=$RADIO_SDIO_DEVICE" "hci_dev=$_d" \
             "bt_mac=$(cat /sys/class/bluetooth/$_d/address 2>/dev/null)"
     log "BT converged: $_d responsive on attempt $_try"
@@ -1364,8 +1576,12 @@ bt_attach_mapped() {
 
   ko_unpack || log "driver tarball ${RADIO_KO_TARBALL:-<none>} did not unpack"
   bt_ldisc_ready
-  bt_fw_preload
-  bt_attach_loop "$1"; _bam_rc=$?
+  # No firmware pushed (bt_fw_push, twice): no attach, so none of the reclaim+reset tries either.
+  if bt_fw_push; then
+    bt_attach_loop "$1"; _bam_rc=$?
+  else
+    _bam_rc=1
+  fi
   bt_handover_give   # nothing left to join: wlan_first brought the Wi-Fi interface up first, bt_alone brings none
   return $_bam_rc
 }
@@ -1408,8 +1624,13 @@ bt_attach_together() {
     exit $((_btw_rc + 2 * _btw_freed))
   ) &
   _btw_job=$!
-  bt_fw_preload
-  bt_attach_loop 1; _btw_bt=$?
+  # No firmware pushed (bt_fw_push, twice): no attach, and the fallback, its mark and the guard's count as for any
+  # together attach that gave no responsive hci0 (below).
+  if bt_fw_push; then
+    bt_attach_loop 1; _btw_bt=$?
+  else
+    _btw_bt=1
+  fi
   # Clause 1: nothing this verb started still in flight when it returns. The Wi-Fi driver has been the shorter of the
   # two (2.0 s against 3.24 on the bench), so this rarely waits.
   wait "$_btw_job"; _btw_wl=$?
@@ -1419,7 +1640,14 @@ bt_attach_together() {
   bt_handover_give
   if [ "$_btw_bt" = 0 ]; then
     if [ "$_btw_wl" = 0 ]; then
-      rm -f "$TOGETHER_MARK" "$TOGETHER_FAILS"; sync
+      # Round 4, item 6 (page_trim, on by default since 2.7.1), a host waiting on this preload: the guard's mark and count
+      # go once the locks have (do_preload), so their flash sync is off the path the host's bt_on waits on. A power cut
+      # in between counts this attach as unfinished: more careful, never less. Off (2.7.0's): cleared here.
+      if [ "$VERB" = preload ] && host_here && r4_on page_trim; then
+        _bt_mark_late=1
+      else
+        rm -f "$TOGETHER_MARK" "$TOGETHER_FAILS"; sync
+      fi
     else
       together_count "gave Bluetooth but no Wi-Fi interface" || :
     fi

@@ -500,8 +500,8 @@ because BT attach waits for WLAN on this part, Bluetooth with it. Both forms now
 ## Between host sessions: armed (Bluetooth powered, invisible)
 
 **Status: built and benched 16 Nov 2026** (branch `resident-bt` merged with `carplayd-early` into a local `round2`,
-on the dev adapter, IW416). 12 wakes and a cold boot connected from the armed state (that boot a restart by `reboot`,
-which keeps the radio chip's firmware: no cold boot for radio timing, "The cold boot" below): `sup_radios` about 50 ms,
+on the dev adapter, IW416). 12 wakes and a cold boot connected from the armed state (that boot a restart by `reboot`:
+no cold boot for radio timing, its firmware downloads in it but the host up already, "The cold boot" below): `sup_radios` about 50 ms,
 `bt_armed=1`, `page_start` about 100 ms and `ap_enabled` about 1.16 s after the host's arrival. With no host the armed
 state read over the console as built: `hci0` `UP RUNNING` with neither `PSCAN` nor `ISCAN`, no link, no hostapd, udhcpd
 or carplayd, the AP interface (`sta0`) down. Against `/tmp/bench_arm_off` arming saved about 1.0 s per connect. The
@@ -692,11 +692,15 @@ by hand); the Wi-Fi driver first 3.90-6.54 (insmod 4.08, firmware over 4.75, "WL
 the Bluetooth firmware 6.58-9.35 (`fw_loader_linux`'s own timer about 2.2 s); `hciattach` to `hci0` answering
 9.35-10.11; "preload: done rc=0 in 7.5 s" 10.44.
 
-**A cold boot is a power cut, never a `reboot`.** The IW416 keeps its firmware through a `reboot`, so a restart skips
-both firmware downloads (Wi-Fi and Bluetooth) and times nothing of a cold boot; and it cannot be put back into its boot
-loader from the adapter (a gpio1 pulse did not do it, 20 Nov). Only removing power gives a cold boot. The benches
-before 20 Nov that said "a cold boot" (the armed path's, above, among them) were restarts of that kind, by the
-coordinating session's reading of 20 Nov: their radio timings are a restart's.
+**A cold boot is a power cut, never a `reboot`.** A `reboot` was read on 20 Nov as keeping the IW416's firmware, but
+the three restarts logged on 13 Nov (`[bench] reboot under a running host`, the connect-speed benches) each pushed the
+Bluetooth firmware in full, 2.75 to 2.83 s from the push to the attach, and loaded the Wi-Fi driver in about 2.5 s: a
+SoC restart resets the chip (22 Nov, from those logs). What the adapter cannot do without one is put the chip back into
+its boot loader: reclaim+reset's gpio1 pulse did not (20 Nov, by hand: after it `hci0` answered within half a second,
+and the Wi-Fi driver loaded in under 0.4 s, too quick for a download; that run's "the loader returned at once with no
+output" was a result file left by the run before it). The benches before 20 Nov that said "a cold boot" (the armed path's,
+above, among them) were restarts, with the downloads in them but the host already up: only removing power gives a
+cold boot.
 
 **1. The descriptor, kept across boots.** `/tmp` is empty at every power-up, so every boot ran `radio_detect.sh`
 again, though its answer changes only when what it reads changes. `radio_hal.sh` `caps` now keeps the last descriptor
@@ -784,6 +788,30 @@ verb returns (clause 1). Today's order (`bt_attach_mapped`) is the code of befor
   Wi-Fi-first preload, so there a host's `bt_on` after a failed preload now begins with a plain push and attach where
   it began with a reclaim+reset, and its attempts 2 to 4 reclaim and reset as before. The second half is the IW416's
   alone, as together is.
+- **No attach without firmware** (22 Nov 2026: a cold boot on the bench whose loader exited 255, whose attach went on
+  against a chip with no firmware, and whose box then fell silent until a power cycle). `bt_fw_push` runs the loader
+  under a bound (10 s, then TERM, and KILL 2 s later; it had none), and once more when it failed. The bound is a
+  watcher that looks every 0.5 s and signals the loader only while that run's token is there; the token goes the moment
+  the loader returns, whose code and time are its own, and the watcher is never waited for (the hardware test of
+  22 Nov, BusyBox ash: a TERM to the old watcher, sent as a loader that failed at once returned, was lost, and the
+  bring-up waited out its 12 s and logged a stop at the bound). A push is good when
+  the loader exits 0 or says `Download Complete` (with no `Download Error`), whatever its code, the bound's stop after
+  it included (the code logged: the 2.7.1 review); a failure logs the loader's code into box.log, and its last lines
+  (an address in them masked) unless the bound stopped it, which says so instead. The loader runs in the background
+  under the bt lock, so a signal to the bring-up (a teardown's TERM) stops it, and reaps it, before the lock goes
+  (`bt_fw_stop`, from `lock_take`'s traps). Two failures attach nothing: no `hciattach`, no reclaim+reset, `rc=1`;
+  in the together order the fallback mark and the guard's count as for any together attach that gave no responsive
+  `hci0`, so the host's `bt_on` takes today's order with a push of its own. A good push leaves
+  `/tmp/.radio_btfw_pushed`, and a failure after it that boot does not stop the attach: the chip runs that firmware,
+  which a SoC restart or a power cut takes away (both empty `/tmp`) and reclaim+reset's gpio1 pulse does not (20 Nov),
+  and a loader before it finds no boot loader: on the dev adapter (22 Nov) the real loader returned 255 after about
+  4.05 s, its 4 s wait for one, and with the push's mark there the attach went on and `hci0` answered about 0.5 s
+  later. That is the together
+  fallback's push, a host's `bt_on` after a preload whose attach failed, and a try after a reset, where the attach
+  always went on, failed loader or not. Each reclaim+reset is followed by a push before its attach, a loader run per
+  reset that 2.7.0 did not make: a full push if the pulse took the firmware away, else (most likely, as the pulse did
+  not take it on 20 Nov) that 4 s wait for a boot loader, then the attach. The boot line counts the runs
+  (`btfw_tries`).
 - **The guard**, as the preload's: a together attach is bracketed by `/script/.radio_together_inflight` (written and
   synced before it, removed after), so one that never finished (power lost or the box hung inside it) is found at the
   next attach; each failed or unfinished one counts in `/script/.radio_together_failed`, two in a row write the owner's
@@ -853,12 +881,22 @@ host's own start-up sharing the one core with them. So on the truck expect `hci_
 handover), a cold picture near 16.5 s of uptime (that boot: 16.85), against about 19 s on 2.6.5; the estimate above
 for a host at 3.0 s (`hci0` at 5.8 to 6.4 s) was too early.
 
+**From 2.7.1** (round 4, the owner's decisions of 22 Nov 2026; each on by default, with `off` in its file for 2.7.0's
+path: [../ops/02_TESTING.md](../ops/02_TESTING.md), "Round 4 switches"): `lock_take` looks every 0.05 s and the attach
+every 0.1 s (`page_trim`, `attach_poll`); with a host waiting, the preload sets no SCO lines and no name on its attach
+(btd's bring-up resets the controller and writes the name) and clears the together guard's mark after its locks
+(`page_trim`); and the supervisor starts btd at the host's arrival, waiting for `bt_on`'s end, with the handover not
+asked for (`btd_early`). The trace and figures above are 2.7.0's path.
+
 **5. The boot line** (`[radio-boot] v1`, one per boot): its keys are documented beside the timeline's in
 [../ops/02_TESTING.md](../ops/02_TESTING.md), "The boot's radio line".
 
 **6. The handover: a waiting host's session takes Bluetooth as `hci0` answers (R3-5; opt-in, off by default since
 21 Nov).** Everything below runs only when the owner asks for it (the opt-in, and the open question, at the end of this
-section); by default the cold path is section 4's. On the 20 Nov bench the
+section); by default the cold path is section 4's, but for the first item below: since 2.7.1 btd starts at the host's
+arrival and waits by default, by round 4's `btd_early` with no handover asked for, so its wait ends at `bt_on`'s end
+and its bring-up keeps the DOWN/UP ([../ops/02_TESTING.md](../ops/02_TESTING.md), "Round 4 switches"). On the 20 Nov
+bench the
 first page went out 1.60 to 1.93 s after `hci0` answered, in three parts (ms since the host subscribed, from
 `[timeline] v1`): `hci_up` to `bt_power` 0.72 to 0.85 s, the preload's name and SCO set-up (about 0.37 s on its own),
 its bookkeeping, then the host's `bt_on` behind the bt lock (a look every 0.2 s) and its confirmation; `bt_power` to
@@ -911,9 +949,11 @@ start and its DOWN/UP (`down +205 ms`, `up +520 ms`) on a controller the preload
   session in the same btd (a phone switch) does its DOWN/UP as before (the "opened" word is spent unread).
 - **Opt-in (21 Nov):** the owner's `/script/radio_handover_on` on flash, or the bench's `/tmp/bench_handover_on`
   (`box_common::bench_flag`'s rule: set unless it reads `off`), read by the preload at its attach and by the supervisor
-  at the host's arrival. With neither, nothing of this runs: no claim, no handover file, no early btd, the host's
-  `bt_on` and btd's DOWN/UP as in section 4, exactly the path `4a6ce9c` took with its old off file (the same hardware
-  calls, the same wrapper, byte for byte; the one log line reads `handover: off (not asked for ...)`). `radio_hal.sh
+  at the host's arrival. With neither, nothing of the handover runs: no claim, no handover file, the host's `bt_on` and
+  btd's DOWN/UP as in section 4. The early btd does, since 2.7.1, by `btd_early` (on by default; `off` in
+  `/etc/ocbm/bench_btd_early` takes it out), and it waits for `bt_on`'s end; with it off too, the path is exactly the
+  one `4a6ce9c` took with its old off file (the same hardware calls, the same wrapper, byte for byte; the one log line
+  reads `handover: off (not asked for ...)`). `radio_hal.sh
   probe` and the boot line say `handover=on_owner`, `on_bench` or `off`. That old off file, `/script/radio_handover_off`
   (4a6ce9c's switch; the dev adapter has one), is retired: nothing reads it, and an update, an update's first start
   (for a package an older updater placed), a revert and the restores remove it. A revert and the restores remove the

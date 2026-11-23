@@ -98,6 +98,19 @@ fn open_listener(channel: u8) -> std::io::Result<std::fs::File> {
 /// socket is CLOEXEC for the same reason `open_listener` is — it is live across `av::ensure_av_layer`'s
 /// fork+exec of the detached daemons.
 pub fn connect_to(peer: [u8; 6], channel: u8, connect_timeout_secs: i64) -> std::io::Result<std::fs::File> {
+    connect_to_limited(peer, channel, connect_timeout_secs, None)
+}
+
+/// [`connect_to`], its connect's own wait cut at `limit` when one is given (btd's round-4 limit, `rfcomm_limit_ms`,
+/// 1.5 s by default since 2.7.1): an error [`is_limited`] tells apart from the plain timeout. Never while a pairing
+/// prompt is up for this attempt, which holds the connect as before ([`PAIRING_HOLD_SECS`]); a rejection still ends it
+/// at once. `None`, or a limit not under `connect_timeout_secs`: exactly [`connect_to`].
+pub fn connect_to_limited(
+    peer: [u8; 6],
+    channel: u8,
+    connect_timeout_secs: i64,
+    limit: Option<std::time::Duration>,
+) -> std::io::Result<std::fs::File> {
     let fd = unsafe {
         libc::socket(
             AF_BLUETOOTH as libc::c_int,
@@ -147,6 +160,7 @@ pub fn connect_to(peer: [u8; 6], channel: u8, connect_timeout_secs: i64) -> std:
         &addr as *const SockaddrRc as *const libc::sockaddr,
         std::mem::size_of::<SockaddrRc>() as libc::socklen_t,
         connect_timeout_secs,
+        limit,
     ) {
         unsafe { libc::close(fd) };
         return Err(e);
@@ -239,6 +253,37 @@ fn connect_wait_decision(
     }
 }
 
+/// Whether a connect with `limit` has passed it at `elapsed`: never while a pairing prompt holds it (`held`), so
+/// [`connect_wait_decision`]'s hold stands. No limit: never.
+fn past_limit(elapsed: std::time::Duration, limit: Option<std::time::Duration>, held: bool) -> bool {
+    !held && limit.is_some_and(|l| elapsed >= l)
+}
+
+/// The error of a connect past its limit ([`connect_to_limited`]): timed out, of its own kind ([`is_limited`]).
+#[derive(Debug)]
+struct Limited(std::time::Duration);
+
+impl std::fmt::Display for Limited {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "not connected within its {} ms limit", self.0.as_millis())
+    }
+}
+
+impl std::error::Error for Limited {}
+
+/// Whether `e` is a connect past its limit ([`connect_to_limited`]), not the plain timeout.
+pub fn is_limited(e: &std::io::Error) -> bool {
+    e.get_ref().is_some_and(|inner| inner.is::<Limited>())
+}
+
+/// How long one look of the connect wait sleeps: 250 ms, or to the limit when it is nearer.
+fn wait_slice(elapsed: std::time::Duration, limit: Option<std::time::Duration>) -> libc::c_int {
+    match limit {
+        Some(l) => l.saturating_sub(elapsed).as_millis().clamp(1, 250) as libc::c_int,
+        None => 250,
+    }
+}
+
 /// True when `path` exists and was modified at or after `since` (a flag left by an EARLIER attempt
 /// must not steer this one).
 fn flag_fresh(path: &str, since: std::time::SystemTime) -> bool {
@@ -252,12 +297,14 @@ fn flag_fresh(path: &str, since: std::time::SystemTime) -> bool {
 /// with [`connect_wait_decision`] each 250 ms: a plain `connect_timeout_secs` deadline, stretched to
 /// [`PAIRING_HOLD_SECS`] while a numeric-comparison prompt is outstanding for this attempt, and cut
 /// short with `PermissionDenied` once `ssp_agent` reports the phone rejected the re-pair. The socket
-/// is returned to blocking mode on success.
+/// is returned to blocking mode on success. `limit` ([`connect_to_limited`]): cut there too, as
+/// [`Limited`], unless a prompt has held it ([`past_limit`]); the looks then end at the limit.
 fn pairing_aware_connect(
     fd: libc::c_int,
     addr: *const libc::sockaddr,
     addr_len: libc::socklen_t,
     connect_timeout_secs: i64,
+    limit: Option<std::time::Duration>,
 ) -> std::io::Result<()> {
     let fl = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     unsafe { libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK) };
@@ -271,6 +318,8 @@ fn pairing_aware_connect(
         // 1 s of slack so a flag written in the same tick as our start still counts as ours.
         let since = std::time::SystemTime::now() - std::time::Duration::from_secs(1);
         let base = std::time::Duration::from_secs(connect_timeout_secs.max(1) as u64);
+        // A limit at or past the plain deadline changes nothing.
+        let limit = limit.filter(|l| *l < base);
         let mut held_logged = false;
         // Latched once a prompt has been seen: the bond forming clears the code flag a moment BEFORE
         // the connect completes (device-proven 2026-09-03: NEW_LINK_KEY at +12 s, connect reported
@@ -279,7 +328,8 @@ fn pairing_aware_connect(
         let mut held = false;
         loop {
             let mut pfd = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
-            let n = unsafe { libc::poll(&mut pfd, 1, 250) };
+            let slice = if held { 250 } else { wait_slice(start.elapsed(), limit) };
+            let n = unsafe { libc::poll(&mut pfd, 1, slice) };
             if n < 0 {
                 let e = std::io::Error::last_os_error();
                 if e.kind() == std::io::ErrorKind::Interrupted {
@@ -307,6 +357,10 @@ fn pairing_aware_connect(
             let code_fresh = flag_fresh(PAIRING_CODE_FLAG, since);
             held |= code_fresh;
             let rejected = flag_fresh(PAIR_REJECTED_FLAG, since);
+            if !rejected && past_limit(start.elapsed(), limit, held) {
+                let l = limit.unwrap_or(base);
+                return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, Limited(l)));
+            }
             match connect_wait_decision(start.elapsed(), base, held, rejected) {
                 WaitDecision::Wait => {
                     if code_fresh && !held_logged {
@@ -384,6 +438,25 @@ mod tests {
         assert_eq!(connect_wait_decision(D::from_secs(1), base, true, true), WaitDecision::Rejected);
         // A caller timeout longer than the hold is respected as-is.
         assert_eq!(connect_wait_decision(D::from_secs(70), D::from_secs(90), true, false), WaitDecision::Wait);
+    }
+
+    /// btd's round-4 limit (`rfcomm_limit_ms`): the connect is cut at the limit unless a pairing prompt has held it, the
+    /// looks end at the limit, and the error is told from the plain timeout. No limit: nothing changes.
+    #[test]
+    fn a_connect_limit_cuts_the_wait_but_never_a_pairing_prompt() {
+        use std::time::Duration as D;
+        let limit = Some(D::from_millis(1500));
+        assert!(!past_limit(D::from_millis(1499), limit, false));
+        assert!(past_limit(D::from_millis(1500), limit, false), "at the limit");
+        assert!(!past_limit(D::from_secs(30), limit, true), "a prompt up: the hold stands");
+        assert!(!past_limit(D::from_secs(30), None, false), "no limit: never");
+        assert_eq!(wait_slice(D::from_millis(0), None), 250, "no limit: the 250 ms looks");
+        assert_eq!(wait_slice(D::from_millis(0), limit), 250);
+        assert_eq!(wait_slice(D::from_millis(1400), limit), 100, "the last look ends at the limit");
+        assert_eq!(wait_slice(D::from_millis(1600), limit), 1, "past it: at once");
+        let e = std::io::Error::new(std::io::ErrorKind::TimedOut, Limited(D::from_millis(1500)));
+        assert!(is_limited(&e) && e.to_string() == "not connected within its 1500 ms limit");
+        assert!(!is_limited(&std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timed out")), "the plain timeout");
     }
 
     #[test]

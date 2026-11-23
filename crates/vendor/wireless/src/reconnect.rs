@@ -41,7 +41,192 @@ const FIRST_RETRY_SECS: u64 = 2;
 /// driver's order, page each phone briefly in turn first, and give later rounds the full default, so a phone slow
 /// to answer is still reached. 2.5 s was tight: a present iPhone answered in 0.23-2.58 s and missed it once in 11 (the
 /// Mac's 13 Nov bench, at times a 2.56 s page-scan interval), which cost 9.7 s. 3.75 s covers that interval.
+/// Since 2.7.1 the first round's first page is [`FIRST_PAGE_SLOTS`] long, and its other pages this.
 const FIRST_ROUND_PAGE_SLOTS: u16 = 6_000;
+
+/// The first page of the loop's first round, by default since 2.7.1 ([`Round4::first_page_slots`]): 8192 slots, the
+/// controller's 5.12 s, where 2.7.0 paged it as the round's others (3.75 s over several phones). The owner chose 5.12 s
+/// on 22 Nov 2026 because the phone took over 2 s to answer on 3 of 7 cold boots. The rest of the 13 Nov rule stands:
+/// each phone in the driver's order, the first round's other pages 3.75 s, later rounds the full default.
+const FIRST_PAGE_SLOTS: u16 = 8_192;
+
+/// The longest first page a file may ask for ([`Round4::first_page_slots`]): 12800 slots, 8 s. The SDP connect that
+/// carries the page has its own [`CONNECT_TIMEOUT_SECS`] deadline (`sdp_client::wait_connected`), which would end a
+/// longer page there, and as a failure, not a page timeout (the 2.7.1 review).
+const FIRST_PAGE_SLOTS_MAX: u64 = CONNECT_TIMEOUT_SECS as u64 * 1000 * 8 / 5;
+
+/// The RFCOMM connect's limit by default since 2.7.1 ([`Round4::rfcomm_limit_ms`]): 1.5 s, the owner's decision of 22
+/// Nov 2026. 2.7.0 had none: the connect's plain [`CONNECT_TIMEOUT_SECS`], then the next phone.
+const RFCOMM_LIMIT_MS: u64 = 1_500;
+
+/// Round 4's switches for this loop (docs/ops/02_TESTING.md, "Round 4 switches"), read once as it starts
+/// ([`Round4::read`]): each at `/tmp/bench_<name>` or, kept across a power cut for a cold boot, at
+/// `/etc/ocbm/bench_<name>`. Three are on by default since 2.7.1 (the owner's decisions of 22 Nov 2026,
+/// [`Round4::default`]: the first page 5.12 s, the same phone paged again after a crossing, the RFCOMM connect's 1.5 s
+/// limit), each turned back to 2.7.0's by "off" in its file ([`box_common::bench_override`]: the first file there
+/// decides, so an "off" in /tmp overrides the flash); two stay off, set by their file ([`box_common::bench_switch`]).
+/// Each file read says so once, in a `[bench] round4:` line; `first_retry_ms` says so again where it acts
+/// (`early_gap_secs` does not: its gaps log nothing more), and the defaults act with plain lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Round4 {
+    /// Item 1 (`first_page_slots`, 1-12800 slots of 0.625 ms, [`FIRST_PAGE_SLOTS_MAX`]; default [`FIRST_PAGE_SLOTS`]):
+    /// the first page of the first round, at this length; every later page at the round's ([`round_page_slots`]). None
+    /// ("off", 2.7.0's): that page at the round's length too. 8192 is the controller's 5.12 s: a phone that answers a
+    /// cold page late (3.4-4.3 s on the truck) is reached on that first page.
+    first_page_slots: Option<u16>,
+    /// Item 2 (`first_retry_ms`, 0-60000 ms; off by default): the pause after a failed first round, for
+    /// [`FIRST_RETRY_SECS`]. Still once per loop, and a round pages at least one phone, so 0 cannot spin.
+    first_retry_ms: Option<u64>,
+    /// Item 5 (`early_gap_secs`, 1-60 s; off by default): the gap between rounds in the first [`EARLY_WINDOW`], for
+    /// [`EARLY_GAP_SECS`]. Not 0: a gap is the loop's floor against spinning on pages that fail at once (audit B5).
+    early_gap_secs: Option<u64>,
+    /// Item 3 (`same_phone_repage`, a flag; on by default): a re-page after a reset or a cut that crosses a link the
+    /// controller still holds ([`Attempt::Crossed`]) waits for that link to clear and pages the same phone again, up to
+    /// [`CROSSED_REPAGES`] times ([`walk`]), before the walk goes on to the next phone. Off (2.7.0's): the next phone.
+    same_phone_repage: bool,
+    /// Item 4 (`rfcomm_limit_ms`, 1000-8000 ms; default [`RFCOMM_LIMIT_MS`]): the RFCOMM connect after SDP gave the
+    /// channel is cut at this, never while a pairing prompt holds it (`rfcomm::connect_to_limited`); its link is
+    /// dropped and the phone paged once more, that re-page's connect with no limit ([`Attempt::Stalled`]): the limit
+    /// cuts a phone's first connect only, so one whose channel is slow every time still connects. Not under 1 s: a
+    /// normal connect takes up to about 0.8 s (sdp to rfcomm, cold boots). None ("off", or 8000: 2.7.0's): the plain
+    /// [`CONNECT_TIMEOUT_SECS`], then the next phone.
+    rfcomm_limit_ms: Option<u64>,
+}
+
+impl Default for Round4 {
+    /// 2.7.1's loop: the three on by default, the two bench-only ones off.
+    fn default() -> Round4 {
+        Round4 {
+            first_page_slots: Some(FIRST_PAGE_SLOTS),
+            first_retry_ms: None,
+            early_gap_secs: None,
+            same_phone_repage: true,
+            rfcomm_limit_ms: Some(RFCOMM_LIMIT_MS),
+        }
+    }
+}
+
+impl Round4 {
+    /// 2.7.0's loop: every switch off, as "off" in the three default files gives it (the bench's A against B).
+    #[cfg(test)]
+    const AS_2_7_0: Round4 =
+        Round4 { first_page_slots: None, first_retry_ms: None, early_gap_secs: None, same_phone_repage: false, rfcomm_limit_ms: None };
+
+    /// The switches as read: the two off by default through `set` ([`box_common::bench_switch`]: a name to its text and
+    /// the file it came from, an "off" reading as no file), the three on by default through `over`
+    /// ([`box_common::bench_override`]: the first file there, "off" included, which gives 2.7.0's). One line for each
+    /// file read: what it does, or why its text was refused (the default then stands).
+    fn from(
+        set: impl Fn(&str) -> Option<(String, String)>,
+        over: impl Fn(&str) -> Option<(String, String)>,
+    ) -> (Round4, Vec<String>) {
+        let mut r = Round4::default();
+        let mut lines = Vec::new();
+        if let Some((text, at)) = over("first_page_slots") {
+            if text == "off" {
+                r.first_page_slots = None;
+                lines.push(format!("[bench] round4: first_page_slots=off ({at}): every page the round's, as in 2.7.0"));
+            } else if let Some(n) = number(&text, &at, &mut lines, 1, FIRST_PAGE_SLOTS_MAX, "slots") {
+                let n = n as u16;
+                r.first_page_slots = Some(n);
+                lines.push(format!(
+                    "[bench] round4: first_page_slots={n} ({at}): the first page of the first round {} ms; every other page \
+                     the round's (default {} ms)",
+                    slots_ms(n),
+                    slots_ms(FIRST_PAGE_SLOTS)
+                ));
+            }
+        }
+        if let Some((text, at)) = set("first_retry_ms") {
+            if let Some(ms) = number(&text, &at, &mut lines, 0, 60_000, "ms") {
+                r.first_retry_ms = Some(ms);
+                lines.push(format!(
+                    "[bench] round4: first_retry_ms={ms} ({at}): after a failed first round the next one in {ms} ms, once (default {} ms)",
+                    FIRST_RETRY_SECS * 1000
+                ));
+            }
+        }
+        if let Some((text, at)) = set("early_gap_secs") {
+            if let Some(s) = number(&text, &at, &mut lines, 1, 60, "s") {
+                r.early_gap_secs = Some(s);
+                lines.push(format!(
+                    "[bench] round4: early_gap_secs={s} ({at}): rounds {s} s apart in the first {} s (default {EARLY_GAP_SECS} s)",
+                    EARLY_WINDOW.as_secs()
+                ));
+            }
+        }
+        if let Some((text, at)) = over("same_phone_repage") {
+            r.same_phone_repage = text != "off";
+            lines.push(if r.same_phone_repage {
+                format!(
+                    "[bench] round4: same_phone_repage ({at}): a re-page after a reset or a cut that crosses a link the \
+                     controller still holds (EALREADY, EMLINK, EBUSY) pages the same phone again, up to {CROSSED_REPAGES} \
+                     times, before the next phone (the default)"
+                )
+            } else {
+                format!(
+                    "[bench] round4: same_phone_repage=off ({at}): a re-page that crosses a link the controller still holds \
+                     goes on to the next phone, as in 2.7.0"
+                )
+            });
+        }
+        // "off", or a limit at the plain deadline, which connect_to_limited would not apply: no limit, 2.7.0's.
+        let base_ms = CONNECT_TIMEOUT_SECS as u64 * 1000;
+        if let Some((text, at)) = over("rfcomm_limit_ms") {
+            let ms = if text == "off" { Some(base_ms) } else { number(&text, &at, &mut lines, 1000, base_ms, "ms") };
+            match ms {
+                Some(ms) if ms >= base_ms => {
+                    r.rfcomm_limit_ms = None;
+                    lines.push(format!(
+                        "[bench] round4: rfcomm_limit_ms={text} ({at}): no limit, the RFCOMM connect's plain {base_ms} ms, \
+                         then the next phone, as in 2.7.0"
+                    ));
+                }
+                Some(ms) => {
+                    r.rfcomm_limit_ms = Some(ms);
+                    lines.push(format!(
+                        "[bench] round4: rfcomm_limit_ms={ms} ({at}): an RFCOMM connect not up in {ms} ms (and no pairing \
+                         prompt up) is closed, its link dropped and the phone paged once more, that connect with no limit \
+                         (default {RFCOMM_LIMIT_MS} ms; off: {base_ms} ms, then the next phone)"
+                    ));
+                }
+                None => {}
+            }
+        }
+        (r, lines)
+    }
+
+    /// The box's switches, each line logged.
+    fn read() -> Round4 {
+        let (r, lines) = Round4::from(box_common::bench_switch, box_common::bench_override);
+        for l in &lines {
+            log(l);
+        }
+        r
+    }
+}
+
+/// A switch's `text` (from the file `at`) as a whole number in `lo..=hi` (`unit`); a text that is not one is refused,
+/// with a line in `lines`.
+fn number(text: &str, at: &str, lines: &mut Vec<String>, lo: u64, hi: u64, unit: &str) -> Option<u64> {
+    match text.parse::<u64>() {
+        Ok(n) if (lo..=hi).contains(&n) => Some(n),
+        _ => {
+            lines.push(refused(at, text, &format!("{unit} {lo}-{hi}")));
+            None
+        }
+    }
+}
+
+/// A switch's text that is not one: the line that says so.
+fn refused(at: &str, text: &str, want: &str) -> String {
+    format!("[bench] round4: {at} refused ({text:?}: want {want}): the default")
+}
+
+/// A page length in slots of 0.625 ms, in whole ms.
+fn slots_ms(slots: u16) -> u64 {
+    u64::from(slots) * 5 / 8
+}
 
 /// `order` with the phones whose page timed out last round moved last, in their order. After a failed first round the
 /// next one paged the absent first-listed phone first again, now for the full 5.12 s; and the present phone,
@@ -89,7 +274,7 @@ impl Rounds {
     /// two most likely crossed, and it is not counted toward a forgotten pairing (the Mac, 13 Nov).
     fn paged(&mut self, peer: [u8; 6], result: Attempt) -> bool {
         self.paged.push(peer);
-        let crossing = matches!(result, Attempt::Reset | Attempt::Cut) && self.prev_absent;
+        let crossing = matches!(result, Attempt::Reset | Attempt::Cut | Attempt::Stalled) && self.prev_absent;
         self.prev_absent = result == Attempt::Absent;
         if self.prev_absent && !self.absent_now.contains(&peer) {
             self.absent_now.push(peer);
@@ -130,17 +315,19 @@ impl Rounds {
 
 /// The wait before the next round: [`FIRST_RETRY_SECS`] once after a failed first round; [`EARLY_GAP_SECS`] in the
 /// first [`EARLY_WINDOW`] after a host came (`early`); else the backoff, which starts doubling only after that window.
-fn round_gap(quick: bool, early: bool, backoff: u64) -> u64 {
+/// Round 4's bench switches `r4` may set the first two ([`Round4::first_retry_ms`], [`Round4::early_gap_secs`]).
+fn round_gap(quick: bool, early: bool, backoff: u64, r4: &Round4) -> Duration {
     if quick {
-        FIRST_RETRY_SECS
+        r4.first_retry_ms.map_or(Duration::from_secs(FIRST_RETRY_SECS), Duration::from_millis)
     } else if early {
-        EARLY_GAP_SECS.min(backoff)
+        Duration::from_secs(r4.early_gap_secs.unwrap_or(EARLY_GAP_SECS).min(backoff))
     } else {
-        backoff
+        Duration::from_secs(backoff)
     }
 }
 
-/// The page timeout for a round: the short one for the first walk over more than one phone, else the default.
+/// The page timeout for a round: the short one for the first walk over more than one phone, else the default. The first
+/// page of the first round has its own since 2.7.1 ([`FIRST_PAGE_SLOTS`], `run_loop`).
 fn round_page_slots(first_round: bool, phones: usize) -> u16 {
     if first_round && phones > 1 {
         FIRST_ROUND_PAGE_SLOTS
@@ -159,12 +346,12 @@ fn round_page_slots(first_round: bool, phones: usize) -> u16 {
 /// None since the Mac's 13 Nov brief (item 11): the re-page 2 s later connected about 1 s in, every time, and a reset
 /// is now caught 0.7 s after the answer (`sdp_client`'s watch), so the re-page goes at once.
 const RESET_RETRY_SECS: u64 = 0;
-/// What the walk's pause says of a page it repeats: a reset, or a cut.
+/// What the walk's pause says of a page it repeats: a reset, a cut, or (round 4) an RFCOMM connect past its limit.
 fn retry_words(result: Attempt) -> &'static str {
-    if result == Attempt::Cut {
-        "answered and opened no SDP channel"
-    } else {
-        "answered and reset the link"
+    match result {
+        Attempt::Cut => "answered and opened no SDP channel",
+        Attempt::Stalled => "answered and opened no RFCOMM channel within the connect's limit",
+        _ => "answered and reset the link",
     }
 }
 
@@ -259,6 +446,20 @@ fn sleep_or_request(secs: u64, shutdown: &AtomicBool, ctrl: &Control) -> bool {
     !shutdown.load(Ordering::Relaxed)
 }
 
+/// [`sleep_or_request`] to the millisecond, for a round's gap (round 4's bench switches can set one under a second): its
+/// whole seconds as [`sleep_or_request`] sleeps them, then the rest unless a request came first. A gap of whole seconds
+/// sleeps exactly as before.
+fn sleep_or_request_for(gap: Duration, shutdown: &AtomicBool, ctrl: &Control) -> bool {
+    if !sleep_or_request(gap.as_secs(), shutdown, ctrl) {
+        return false;
+    }
+    let rest = gap.saturating_sub(Duration::from_secs(gap.as_secs()));
+    if !rest.is_zero() && !ctrl.has_request() {
+        thread::sleep(rest);
+    }
+    !shutdown.load(Ordering::Relaxed)
+}
+
 /// One reconnect attempt against `peer`: SDP-query → RFCOMM-connect → hand to the iAP2 driver.
 /// Returns `true` if a session actually ran (so the caller resets its backoff); `false` also covers
 /// losing the single-session claim to the accept path. The slot is CLAIMED via `compare_exchange` right
@@ -286,11 +487,34 @@ enum Attempt {
     /// paging it again just produces another prompt it cannot accept. Hold off for the maximum
     /// backoff and let the operator re-pair from the iPhone.
     PairRejected,
+    /// The page (the SDP connect that pages) failed with EALREADY, EMLINK or EBUSY (HCI 0x0B "ACL Connection Already
+    /// Exists", 0x09/0x0A "Connection Limit Exceeded", 0x0C "Command Disallowed"): the controller still holds a link to
+    /// the phone, the one the last page left or one the phone is bringing up itself (the truck, 21 Nov: right after a
+    /// cut, then the other phone and about 100 s lost). The same errnos from the RFCOMM connect are no crossing
+    /// ([`rfcomm_failure`]: Failed). Everywhere exactly [`Attempt::Failed`], save one: as the re-page after a reset or a
+    /// cut, round 4's `same_phone_repage` (on by default since 2.7.1) pages the same phone again ([`walk`]).
+    Crossed,
+    /// Round 4, item 4 (`rfcomm_limit_ms`, 1.5 s by default since 2.7.1): the phone answered, SDP gave its iAP2
+    /// channel, and the RFCOMM connect was not up within the limit, so btd closed it and dropped the link
+    /// (`sdp_client::drop_stalled_link`). Paged once more like a reset, that re-page's RFCOMM connect with no limit
+    /// ([`walk`], `run_loop`), and counted nothing toward a forgotten pairing ([`ResetStreak::note`]): btd gave up on
+    /// it, and the re-page says what the phone does. Never with the limit off (2.7.0's).
+    Stalled,
+}
+
+/// [`failure`] for the RFCOMM connect, after SDP gave the channel: the page is over and its link up, so EALREADY,
+/// EMLINK or EBUSY there are no page crossing. On the 3.14 kernel `__rfcomm_dlc_open` answers EBUSY for a DLC that is
+/// still on the link (the attempt just closed, on a link that was kept), which no page clears: [`Attempt::Failed`], as
+/// 2.7.0 had them, so none of [`Attempt::Crossed`]'s re-pages is spent on it (the 2.7.1 review).
+fn rfcomm_failure(e: &std::io::Error) -> Attempt {
+    match failure(e) {
+        Attempt::Crossed => Attempt::Failed,
+        other => other,
+    }
 }
 
 /// [`Attempt::Cut`] for `sdp_client`'s cut, [`Attempt::Reset`] when the phone reset the link, [`Attempt::Absent`] when the
-/// page timed out, else
-/// [`Attempt::Failed`].
+/// page timed out, [`Attempt::Crossed`] for a link the controller still holds, else [`Attempt::Failed`].
 fn failure(e: &std::io::Error) -> Attempt {
     if sdp_client::is_cut(e) {
         Attempt::Cut
@@ -298,6 +522,8 @@ fn failure(e: &std::io::Error) -> Attempt {
         Attempt::Reset
     } else if e.raw_os_error() == Some(libc::EHOSTDOWN) {
         Attempt::Absent
+    } else if matches!(e.raw_os_error(), Some(libc::EALREADY | libc::EMLINK | libc::EBUSY)) {
+        Attempt::Crossed
     } else {
         Attempt::Failed
     }
@@ -372,11 +598,15 @@ impl ResetStreak {
                 }
                 run.cut_round = Some(self.round);
             }
+            // Round 4's stalled RFCOMM connect counts nothing, and ends no run: btd gave up on it at the limit, and the
+            // re-page after it, with no limit, says what the phone does (the 2.7.1 review: a stall and then a session is
+            // no forgotten pairing, nor is a phone whose channel is only slow).
+            Attempt::Stalled => return false,
             Attempt::Ran => {
                 self.runs.clear();
                 return false;
             }
-            Attempt::Failed | Attempt::Absent | Attempt::PairRejected => {
+            Attempt::Failed | Attempt::Crossed | Attempt::Absent | Attempt::PairRejected => {
                 self.runs.remove(&peer);
                 return false;
             }
@@ -411,30 +641,43 @@ fn bonds_written() -> Option<std::time::SystemTime> {
     std::fs::metadata(bt_common::ssp_agent::link_key_store()).and_then(|m| m.modified()).ok()
 }
 
+/// How many more times a re-page that crossed a link ([`Attempt::Crossed`]) pages the same phone, at most, before the
+/// walk goes on to the next (round 4, item 3).
+const CROSSED_REPAGES: u32 = 2;
+
 /// Page `targets` in order until `stop` says not to go on. A phone that answers and resets the link
-/// ([`Attempt::Reset`]) or is cut ([`Attempt::Cut`]) is paged once more, after `pause` (false: go no further), before
-/// the next one.
+/// ([`Attempt::Reset`]) or is cut ([`Attempt::Cut`], or round 4's [`Attempt::Stalled`]) is paged once more, after `pause`
+/// (false: go no further), before the next one. That re-page crossing a link the controller holds ([`Attempt::Crossed`])
+/// pages the phone again, up to [`CROSSED_REPAGES`] times, while `pause` says so for it (false: on to the next phone, as
+/// a failure; it says false with round 4's `same_phone_repage` off). `page` is told what a page repeats: None for a
+/// phone's first page, else the result that started its re-pages (a re-page after a stall runs with no RFCOMM limit).
 fn walk(
     targets: &[[u8; 6]],
     mut stop: impl FnMut() -> bool,
     mut pause: impl FnMut([u8; 6], Attempt) -> bool,
-    mut page: impl FnMut([u8; 6]) -> Attempt,
+    mut page: impl FnMut([u8; 6], Option<Attempt>) -> Attempt,
 ) -> Walk {
     let mut out = Walk::default();
     for &peer in targets {
         if stop() {
             break;
         }
-        let mut result = page(peer);
-        if matches!(result, Attempt::Reset | Attempt::Cut) {
-            if !pause(peer, result) {
+        let first = page(peer, None);
+        let mut result = first;
+        if matches!(first, Attempt::Reset | Attempt::Cut | Attempt::Stalled) {
+            if !pause(peer, first) {
                 break;
             }
-            result = page(peer);
+            result = page(peer, Some(first));
+            let mut again = 0;
+            while result == Attempt::Crossed && again < CROSSED_REPAGES && pause(peer, result) {
+                again += 1;
+                result = page(peer, Some(first));
+            }
         }
         match result {
             Attempt::Ran => out.ran = true,
-            Attempt::Failed | Attempt::Absent | Attempt::Reset | Attempt::Cut => {}
+            Attempt::Failed | Attempt::Crossed | Attempt::Absent | Attempt::Reset | Attempt::Cut | Attempt::Stalled => {}
             Attempt::PairRejected => {
                 out.rejected = true;
                 break; // do not page the next phone into the same rejection storm
@@ -450,6 +693,7 @@ fn attempt(
     shutdown: &AtomicBool,
     session_active: &AtomicBool,
     ctrl: &Control,
+    rfcomm_limit: Option<Duration>,
 ) -> Attempt {
     let services = match sdp_client::query(peer, CONNECT_TIMEOUT_SECS, &sdp_client::Watch { shutdown, session_active }) {
         Ok(s) => s,
@@ -466,7 +710,7 @@ fn attempt(
             return Attempt::Failed;
         }
     };
-    let sock = match crate::rfcomm_connect(peer, channel, CONNECT_TIMEOUT_SECS) {
+    let sock = match crate::rfcomm_connect(peer, channel, CONNECT_TIMEOUT_SECS, rfcomm_limit) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
             log(&format!(
@@ -475,9 +719,21 @@ fn attempt(
             ));
             return Attempt::PairRejected;
         }
+        // Round 4, item 4 (on by default since 2.7.1): past the limit, the socket closed; the page's link dropped as a
+        // cut drops it, so the re-page neither rides a half-open link nor meets it as EALREADY. One up before the page,
+        // or a live session's, stays.
+        Err(e) if crate::rfcomm::is_limited(&e) => {
+            let keep = services.link_before.or_else(|| session_active.load(Ordering::Relaxed).then_some("a session is live"));
+            let dropped = sdp_client::drop_stalled_link(peer, keep);
+            log(&format!("RFCOMM connect to channel {channel} {e}: closed; {dropped}"));
+            return Attempt::Stalled;
+        }
         Err(e) => {
-            log(&format!("RFCOMM connect to channel {channel} failed: {e}"));
-            return failure(&e);
+            let result = rfcomm_failure(&e);
+            let busy = result != failure(&e);
+            let why = if busy { " (the link still holds that channel: no page crossing, so no re-page)" } else { "" };
+            log(&format!("RFCOMM connect to channel {channel} failed: {e}{why}"));
+            return result;
         }
     };
     log(&format!("RFCOMM connected OUT to the phone (ch {channel}) — starting iAP2 handshake"));
@@ -529,7 +785,7 @@ pub fn run(
     if !interruptible_sleep(settle, shutdown) {
         return;
     }
-    let env = OnBox { name, shutdown, session_active, ctrl, started: Instant::now() };
+    let env = OnBox { name, shutdown, session_active, ctrl, started: Instant::now(), round4: Round4::read() };
     run_loop(&env, ctrl);
     log("reconnect loop exiting");
 }
@@ -539,14 +795,16 @@ pub fn run(
 trait Env {
     /// The bonded phones in the policy's order ([`Control::ordered_bonds`]).
     fn bonds(&self) -> Vec<[u8; 6]>;
-    /// One page and connect ([`attempt`]).
-    fn attempt(&self, peer: [u8; 6]) -> Attempt;
+    /// One page and connect ([`attempt`]), its RFCOMM connect under round 4's limit when `limited`.
+    fn attempt(&self, peer: [u8; 6], limited: bool) -> Attempt;
     fn shutdown(&self) -> bool;
     fn session_active(&self) -> bool;
     /// Sleep `secs`, false on shutdown ([`interruptible_sleep`]).
     fn sleep(&self, secs: u64) -> bool;
     /// Sleep `secs`, cut short by a connect request, false on shutdown ([`sleep_or_request`]).
     fn sleep_or_request(&self, secs: u64) -> bool;
+    /// A round's gap, to the millisecond ([`sleep_or_request_for`]).
+    fn sleep_or_request_for(&self, gap: Duration) -> bool;
     /// Since the loop started (a host has just come).
     fn elapsed(&self) -> Duration;
     /// The monotonic and wall clocks and the link-key store's last write, for [`ResetStreak::note`].
@@ -559,10 +817,16 @@ trait Env {
     fn phantom(&self) -> Option<[u8; 6]>;
     /// The bench's call order for the round about to start ([`BENCH_ORDER_FILE`]), taken once.
     fn bench_order(&self) -> Option<BenchOrder>;
-    /// A [bench] line about the call order: btd's log on the box, kept by a test's fake.
+    /// A [bench] line about the call order, or a line of round 4's switches where they act: btd's log on the box, kept by
+    /// a test's fake.
     fn bench(&self, line: &str);
     /// Forget the link a cut left ([`sdp_client::forget_left_link`]): btd's bring-up just reset the controller.
     fn forget_left_link(&self);
+    /// Round 4's switches ([`Round4`]), as this loop read them at its start.
+    fn round4(&self) -> Round4;
+    /// Round 4, item 3 (`same_phone_repage`): wait for the link a crossed re-page found to clear or come up
+    /// ([`sdp_client::settle_crossed`]): what it found.
+    fn settle_crossed(&self, peer: [u8; 6]) -> &'static str;
 }
 
 /// The real [`Env`].
@@ -572,18 +836,21 @@ struct OnBox<'a> {
     session_active: &'a Arc<AtomicBool>,
     ctrl: &'a Arc<Control>,
     started: Instant,
+    round4: Round4,
 }
 
 impl Env for OnBox<'_> {
     fn bonds(&self) -> Vec<[u8; 6]> {
         self.ctrl.ordered_bonds()
     }
-    fn attempt(&self, peer: [u8; 6]) -> Attempt {
-        let result = attempt(peer, self.name, self.shutdown, self.session_active, self.ctrl);
+    fn attempt(&self, peer: [u8; 6], limited: bool) -> Attempt {
+        let limit = self.round4.rfcomm_limit_ms.filter(|_| limited).map(Duration::from_millis);
+        let result = attempt(peer, self.name, self.shutdown, self.session_active, self.ctrl, limit);
         match result {
             Attempt::Absent => crate::startup::tally("absent"),
-            // A cut is a reset on the [startup] line, with its own count beside it (sdp_client tallies it).
-            Attempt::Reset | Attempt::Cut => crate::startup::tally("reset"),
+            // A cut is a reset on the [startup] line, with its own count beside it (sdp_client tallies it). So is round 4's
+            // stalled RFCOMM connect, which has a line of its own.
+            Attempt::Reset | Attempt::Cut | Attempt::Stalled => crate::startup::tally("reset"),
             _ => {}
         }
         result
@@ -599,6 +866,9 @@ impl Env for OnBox<'_> {
     }
     fn sleep_or_request(&self, secs: u64) -> bool {
         sleep_or_request(secs, self.shutdown, self.ctrl)
+    }
+    fn sleep_or_request_for(&self, gap: Duration) -> bool {
+        sleep_or_request_for(gap, self.shutdown, self.ctrl)
     }
     fn elapsed(&self) -> Duration {
         self.started.elapsed()
@@ -626,6 +896,12 @@ impl Env for OnBox<'_> {
     }
     fn forget_left_link(&self) {
         sdp_client::forget_left_link();
+    }
+    fn round4(&self) -> Round4 {
+        self.round4
+    }
+    fn settle_crossed(&self, peer: [u8; 6]) -> &'static str {
+        sdp_client::settle_crossed(peer)
     }
 }
 
@@ -718,13 +994,32 @@ fn take_bench_order(path: &str) -> Option<BenchOrder> {
     }
 }
 
+/// Round 4, item 1 (`first_page_slots`): Write_Page_Timeout `slots` unless the controller has it already (`*now`),
+/// saying so. True when the controller pages with it now; a write that failed leaves the length as it was.
+fn set_page_slots(env: &impl Env, now: &mut u16, slots: u16, why: &str) -> bool {
+    if *now != slots {
+        if let Err(e) = env.page_slots(slots) {
+            env.bench(&format!("page timeout {slots} not set {why} ({e}); paging with the controller's"));
+            return false;
+        }
+        *now = slots;
+    }
+    env.bench(&format!("paging {} ms {why}", slots_ms(slots)));
+    true
+}
+
 /// [`run`]'s loop, against `env`: see [`run`].
 fn run_loop(env: &impl Env, ctrl: &Control) {
+    let round4 = env.round4();
     let mut backoff = BACKOFF_START_SECS;
     let mut streak = ResetStreak::default();
     let mut first_round = true;
     // What the controller pages with now: the reset default, until a round asks for another.
     let mut page_slots = crate::hci::PAGE_TIMEOUT_DEFAULT;
+    // Round 4, item 1 (5.12 s by default since 2.7.1): the first page's own length, until the loop's first page goes; and
+    // whether the controller pages with it now rather than with the round's.
+    let mut first_page = round4.first_page_slots;
+    let mut first_paged = false;
     // Log only on a change in the bonded/idle state, so the per-round re-read below doesn't spam the log.
     // `None` = nothing logged yet; `Some(true)` = had bonds; `Some(false)` = idle.
     let mut last_state: Option<bool> = None;
@@ -892,15 +1187,41 @@ fn run_loop(env: &impl Env, ctrl: &Control) {
                     || bench_due(round_bench.as_ref(), round_started, env.elapsed())
             },
             |peer, result| {
+                // Round 4, item 3 (on by default since 2.7.1): a re-page that crossed a link the controller holds goes
+                // again, once that link has cleared or come up; with the switch off, as in 2.7.0, on to the next phone.
+                if result == Attempt::Crossed {
+                    if !round4.same_phone_repage || ctrl.has_request() || env.session_active() {
+                        return false;
+                    }
+                    let found = env.settle_crossed(peer);
+                    env.bench(&format!("the re-page crossed a link the controller holds; {found}"));
+                    return !env.shutdown() && !ctrl.has_request() && !env.session_active();
+                }
                 // A request or a session first: no line that pages once more when it won't (the Mac's review, A6).
                 if ctrl.has_request() || env.session_active() {
                     return false;
                 }
-                log(&format!("{} {} -- paging it once more before the next phone", control::fmt_addr(&peer), retry_words(result)));
+                let how = if result == Attempt::Stalled { ", its RFCOMM connect with no limit," } else { "" };
+                log(&format!(
+                    "{} {} -- paging it once more{how} before the next phone",
+                    control::fmt_addr(&peer),
+                    retry_words(result)
+                ));
                 env.sleep_or_request(RESET_RETRY_SECS) && !ctrl.has_request() && !env.session_active()
             },
-            |peer| {
-                let result = env.attempt(peer);
+            |peer, repeats| {
+                // Round 4, item 1 (5.12 s by default since 2.7.1): the first round's first page at its own length, the
+                // round's again for the page after it. With the switch off nothing here runs: the round's length was
+                // written above, as in 2.7.0.
+                if let Some(n) = first_page.take().filter(|_| first_round) {
+                    first_paged = set_page_slots(env, &mut page_slots, n, "for the first page of the first round");
+                } else if std::mem::take(&mut first_paged) && page_slots != want {
+                    set_page_slots(env, &mut page_slots, want, "again: the first page is over");
+                }
+                // Round 4, item 4: the re-page after a stalled RFCOMM connect (and any it crosses) runs with no limit, as
+                // 2.7.0's did (the 2.7.1 review): a phone whose channel takes longer than the limit every time still
+                // connects on its second page, and the limit only cuts the first.
+                let result = env.attempt(peer, repeats != Some(Attempt::Stalled));
                 let (mono, wall, bonds_at) = env.now();
                 // A reset straight after another phone's page timed out is most likely the two crossing, not a
                 // forgotten pairing: the phone was up on the next page every time (the Mac, 13 Nov). Not counted.
@@ -980,10 +1301,13 @@ fn run_loop(env: &impl Env, ctrl: &Control) {
         let quick = first_round && !ran && !rejected;
         first_round = false;
         if quick {
-            log(&format!("first page round failed -- one quick retry in {FIRST_RETRY_SECS}s"));
+            match round4.first_retry_ms {
+                None => log(&format!("first page round failed -- one quick retry in {FIRST_RETRY_SECS}s")),
+                Some(ms) => env.bench(&format!("[bench] round4: first_retry_ms: first page round failed -- one quick retry in {ms} ms")),
+            }
         }
         let early = !rejected && env.elapsed() < EARLY_WINDOW;
-        if !env.sleep_or_request(round_gap(quick, early, backoff)) {
+        if !env.sleep_or_request_for(round_gap(quick, early, backoff, &round4)) {
             break;
         }
         if rejected {
@@ -999,7 +1323,7 @@ fn run_loop(env: &impl Env, ctrl: &Control) {
 #[cfg(test)]
 mod tests {
     use super::{absent_last, round_gap, round_page_slots, run_loop, Env, Rounds, FIRST_ROUND_PAGE_SLOTS};
-    use super::{BACKOFF_START_SECS, EARLY_GAP_SECS, FIRST_RETRY_SECS};
+    use super::{BACKOFF_START_SECS, EARLY_GAP_SECS, FIRST_PAGE_SLOTS, FIRST_RETRY_SECS, RFCOMM_LIMIT_MS};
     use crate::control::Control;
     use super::{default_settle_secs, failure, walk, Attempt, ResetStreak, Walk, INITIAL_SETTLE_DEFAULT_SECS};
     use std::time::{Duration, Instant};
@@ -1030,7 +1354,7 @@ mod tests {
             &[PHONE_A, PHONE_B],
             || false,
             |_, _| true,
-            |peer| {
+            |peer, _| {
                 paged.push(peer);
                 match queue.iter().position(|(p, _)| *p == peer) {
                     Some(i) => queue.remove(i).1,
@@ -1055,7 +1379,7 @@ mod tests {
         let bonds = ctrl.policy().order;
         let targets = r.order(bonds.clone(), |b| ctrl.call_order(b));
         let (mut paged, mut counted) = (Vec::new(), Vec::new());
-        let walked = walk(&targets, || ctrl.policy_changed(), |_, _| true, |peer| {
+        let walked = walk(&targets, || ctrl.policy_changed(), |_, _| true, |peer, _| {
             let result = answer(peer);
             paged.push(peer);
             counted.push(r.paged(peer, result));
@@ -1092,6 +1416,19 @@ mod tests {
         logs: std::cell::RefCell<Vec<String>>,
         /// How many pages had gone at each [`Env::forget_left_link`].
         forgot_left: std::cell::RefCell<Vec<usize>>,
+        /// Round 4's switches ([`Env::round4`]).
+        round4: super::Round4,
+        /// Each Write_Page_Timeout ([`Env::page_slots`]): how many pages had gone, and the length.
+        slots: std::cell::RefCell<Vec<(usize, u16)>>,
+        /// Each round's gap in ms ([`Env::sleep_or_request_for`]); `gaps` has them in whole seconds, with the other sleeps.
+        gaps_ms: std::cell::RefCell<Vec<u64>>,
+        /// The phones each [`Env::settle_crossed`] waited for.
+        settled: std::cell::RefCell<Vec<[u8; 6]>>,
+        /// Whether each page's RFCOMM connect ran under round 4's limit ([`Env::attempt`]), in order.
+        limited: std::cell::RefCell<Vec<bool>>,
+        /// Phones whose RFCOMM channel opens later than any limit: a page under one stalls ([`Attempt::Stalled`]), one
+        /// with none gets `answer`'s.
+        slow_channel: Vec<[u8; 6]>,
     }
 
     impl<'a> Fake<'a> {
@@ -1112,6 +1449,12 @@ mod tests {
                 policy_at: Vec::new(),
                 logs: Default::default(),
                 forgot_left: Default::default(),
+                round4: Default::default(),
+                slots: Default::default(),
+                gaps_ms: Default::default(),
+                settled: Default::default(),
+                limited: Default::default(),
+                slow_channel: Vec::new(),
             }
         }
 
@@ -1119,16 +1462,33 @@ mod tests {
         fn paged(&self, round: usize) -> Vec<[u8; 6]> {
             self.pages.borrow().iter().filter(|(r, _)| *r == round).map(|(_, p)| *p).collect()
         }
+
+        /// A gap of `secs` ends: the clock on, the next round, and the app's policy as it becomes there.
+        fn next_round(&self, secs: u64) {
+            self.gaps.borrow_mut().push(secs);
+            self.clock.set(self.clock.get() + secs);
+            self.round.set(self.round.get() + 1);
+            for (round, auto_connect, order) in &self.policy_at {
+                if *round == self.round.get() {
+                    self.ctrl.set_policy(crate::control::Policy { auto_connect: *auto_connect, order: order.clone() });
+                }
+            }
+        }
     }
 
     impl Env for Fake<'_> {
         fn bonds(&self) -> Vec<[u8; 6]> {
             self.ctrl.policy().order
         }
-        fn attempt(&self, peer: [u8; 6]) -> Attempt {
+        fn attempt(&self, peer: [u8; 6], limited: bool) -> Attempt {
             let round = self.round.get();
             self.pages.borrow_mut().push((round, peer));
-            let a = (self.answer.borrow_mut())(round, peer);
+            self.limited.borrow_mut().push(limited);
+            let a = if limited && self.round4.rfcomm_limit_ms.is_some() && self.slow_channel.contains(&peer) {
+                Attempt::Stalled
+            } else {
+                (self.answer.borrow_mut())(round, peer)
+            };
             self.clock.set(self.clock.get() + if a == Attempt::Absent { 4 } else { 1 });
             a
         }
@@ -1143,15 +1503,14 @@ mod tests {
         }
         fn sleep_or_request(&self, secs: u64) -> bool {
             if secs > 0 {
-                self.gaps.borrow_mut().push(secs);
-                self.clock.set(self.clock.get() + secs);
-                self.round.set(self.round.get() + 1);
-                for (round, auto_connect, order) in &self.policy_at {
-                    if *round == self.round.get() {
-                        self.ctrl.set_policy(crate::control::Policy { auto_connect: *auto_connect, order: order.clone() });
-                    }
-                }
+                self.next_round(secs);
             }
+            !self.shutdown()
+        }
+        /// A round's gap: always the next round, one of 0 ms too (round 4's first_retry_ms).
+        fn sleep_or_request_for(&self, gap: Duration) -> bool {
+            self.gaps_ms.borrow_mut().push(gap.as_millis() as u64);
+            self.next_round(gap.as_secs());
             !self.shutdown()
         }
         fn elapsed(&self) -> Duration {
@@ -1161,7 +1520,8 @@ mod tests {
             let wall = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000 + self.clock.get());
             (self.base + self.elapsed(), wall, Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(900_000)))
         }
-        fn page_slots(&self, _slots: u16) -> std::io::Result<()> {
+        fn page_slots(&self, slots: u16) -> std::io::Result<()> {
+            self.slots.borrow_mut().push((self.pages.borrow().len(), slots));
             Ok(())
         }
         fn bond_lost(&self) {
@@ -1184,6 +1544,13 @@ mod tests {
         }
         fn forget_left_link(&self) {
             self.forgot_left.borrow_mut().push(self.pages.borrow().len());
+        }
+        fn round4(&self) -> super::Round4 {
+            self.round4
+        }
+        fn settle_crossed(&self, peer: [u8; 6]) -> &'static str {
+            self.settled.borrow_mut().push(peer);
+            "no link to it: paging it again after a pause"
         }
     }
 
@@ -1210,6 +1577,142 @@ mod tests {
         run_loop(&fake, &ctrl);
         assert_eq!(fake.paged(0), vec![PHONE_A]);
         assert_eq!(*fake.forgot_left.borrow(), vec![0], "once, with no page gone");
+    }
+
+    // ---- Round 4's switches (docs/ops/02_TESTING.md, "Round 4 switches") ---------------------------------------------
+
+    /// The switches as read from `set` (a name and its text), each as if from its file on flash: the two off by default
+    /// as box_common::bench_switch gives them ("off" reads as no file), the three on by default as bench_override does.
+    fn round4_from(set: &[(&str, &str)]) -> (super::Round4, Vec<String>) {
+        let file = |name: &str| {
+            set.iter().find(|(n, _)| *n == name).map(|(_, text)| (text.to_string(), format!("/etc/ocbm/bench_{name}")))
+        };
+        super::Round4::from(|name| file(name).filter(|(text, _)| text != "off"), file)
+    }
+
+    /// 2.7.1's defaults, the owner's decisions of 22 Nov 2026: the first page 5.12 s, the same phone paged again after a
+    /// crossing, the RFCOMM connect cut at 1.5 s; the two bench-only switches off. No file: those, and no line.
+    #[test]
+    fn round4_with_no_file_is_2_7_1_s_defaults_and_says_nothing() {
+        let (r, lines) = round4_from(&[]);
+        let defaults = super::Round4 {
+            first_page_slots: Some(8192),
+            first_retry_ms: None,
+            early_gap_secs: None,
+            same_phone_repage: true,
+            rfcomm_limit_ms: Some(1500),
+        };
+        assert_eq!(r, defaults);
+        assert_eq!(super::Round4::default(), defaults);
+        assert_eq!(u64::from(FIRST_PAGE_SLOTS) * 5 / 8, 5_120, "5.12 s");
+        assert_eq!(RFCOMM_LIMIT_MS, 1_500);
+        assert!(lines.is_empty(), "{lines:?}");
+    }
+
+    /// The off scheme: "off" in each default's file gives 2.7.0's loop, each saying so; "off" in a bench-only switch's file
+    /// is no file. A default's file with any other text (as the bench left them: empty, or "on") is the default.
+    #[test]
+    fn round4_off_in_each_default_s_file_gives_2_7_0_s_loop() {
+        let (r, lines) = round4_from(&[
+            ("first_page_slots", "off"),
+            ("same_phone_repage", "off"),
+            ("rfcomm_limit_ms", "off"),
+            ("first_retry_ms", "off"),
+            ("early_gap_secs", "off"),
+        ]);
+        assert_eq!(r, super::Round4::AS_2_7_0);
+        assert_eq!(
+            lines,
+            [
+                "[bench] round4: first_page_slots=off (/etc/ocbm/bench_first_page_slots): every page the round's, as in 2.7.0",
+                "[bench] round4: same_phone_repage=off (/etc/ocbm/bench_same_phone_repage): a re-page that crosses a link the \
+                 controller still holds goes on to the next phone, as in 2.7.0",
+                "[bench] round4: rfcomm_limit_ms=off (/etc/ocbm/bench_rfcomm_limit_ms): no limit, the RFCOMM connect's plain 8000 \
+                 ms, then the next phone, as in 2.7.0",
+            ]
+        );
+        let (r, lines) = round4_from(&[("same_phone_repage", ""), ("rfcomm_limit_ms", "8000")]);
+        assert_eq!(r, super::Round4 { rfcomm_limit_ms: None, ..Default::default() }, "8000 for the limit: none, as off");
+        assert!(
+            lines[0].starts_with("[bench] round4: same_phone_repage (/etc/ocbm/bench_same_phone_repage): ") && lines[0].ends_with("(the default)"),
+            "{lines:?}"
+        );
+        assert!(lines[1].starts_with("[bench] round4: rfcomm_limit_ms=8000 (/etc/ocbm/bench_rfcomm_limit_ms): no limit"), "{lines:?}");
+        assert_eq!(round4_from(&[("same_phone_repage", "on"), ("first_page_slots", "8192")]).0, super::Round4::default(), "on: the default");
+    }
+
+    #[test]
+    fn round4_first_page_slots_is_taken_or_refused() {
+        let (r, lines) = round4_from(&[("first_page_slots", "6000")]);
+        assert_eq!(r.first_page_slots, Some(6000));
+        assert_eq!(
+            lines,
+            ["[bench] round4: first_page_slots=6000 (/etc/ocbm/bench_first_page_slots): the first page of the first round 3750 ms; \
+              every other page the round's (default 5120 ms)"]
+        );
+        assert_eq!(super::FIRST_PAGE_SLOTS_MAX, 12_800, "8 s, the SDP connect's own deadline");
+        assert_eq!(round4_from(&[("first_page_slots", "12800")]).0.first_page_slots, Some(12_800));
+        for bad in ["0", "12801", "65535", "65536", "-1", "5.12", "soon", ""] {
+            let (r, lines) = round4_from(&[("first_page_slots", bad)]);
+            assert_eq!(r, super::Round4::default(), "{bad:?}");
+            assert!(lines.len() == 1 && lines[0].contains("refused") && lines[0].ends_with("the default"), "{bad:?}: {lines:?}");
+        }
+    }
+
+    /// Round 4, item 1: by default (2.7.1) the first round's first page 5.12 s, the round's again for the page after it,
+    /// later rounds as before. Off (2.7.0's): the round's length alone, written before each round.
+    #[test]
+    fn round4_the_first_page_alone_takes_its_own_length() {
+        let default = crate::hci::PAGE_TIMEOUT_DEFAULT;
+        let ctrl = Control::default();
+        set_order(&ctrl, &[PHONE_A, PHONE_B]);
+        let fake = Fake::new(&ctrl, 2, |_, _| Attempt::Absent);
+        run_loop(&fake, &ctrl);
+        assert_eq!(fake.paged(0), vec![PHONE_A, PHONE_B], "still the driver's order");
+        assert_eq!(
+            *fake.slots.borrow(),
+            vec![(0, FIRST_ROUND_PAGE_SLOTS), (0, FIRST_PAGE_SLOTS), (1, FIRST_ROUND_PAGE_SLOTS), (2, default)],
+            "the default: the first page 5.12 s, the second phone's 3.75 s, round 2 the default"
+        );
+        let logs = fake.logs.borrow();
+        assert!(logs.iter().any(|l| l == "paging 5120 ms for the first page of the first round"), "{logs:?}");
+        assert!(logs.iter().any(|l| l == "paging 3750 ms again: the first page is over"), "{logs:?}");
+        assert!(!logs.iter().any(|l| l.contains("[bench]")), "a default's lines are no [bench] lines: {logs:?}");
+        drop(logs);
+
+        let ctrl = Control::default();
+        set_order(&ctrl, &[PHONE_A, PHONE_B]);
+        let mut fake = Fake::new(&ctrl, 2, |_, _| Attempt::Absent);
+        fake.round4 = super::Round4::AS_2_7_0;
+        run_loop(&fake, &ctrl);
+        assert_eq!(*fake.slots.borrow(), vec![(0, FIRST_ROUND_PAGE_SLOTS), (2, default)], "off: 3.75 s in round 1, then 5.12, as 2.7.0");
+        assert!(fake.logs.borrow().is_empty(), "and no line");
+
+        // One phone: its first page takes the switch's length too (7.5 s here; 8 s at most, the SDP connect's own
+        // deadline). At the default, the controller's own 5.12 s: nothing written, as in 2.7.0.
+        let ctrl = Control::default();
+        set_order(&ctrl, &[PHONE_A]);
+        let mut fake = Fake::new(&ctrl, 2, |_, _| Attempt::Absent);
+        fake.round4.first_page_slots = Some(12_000);
+        run_loop(&fake, &ctrl);
+        assert_eq!(*fake.slots.borrow(), vec![(0, 12_000), (1, default)]);
+        let ctrl = Control::default();
+        set_order(&ctrl, &[PHONE_A]);
+        let fake = Fake::new(&ctrl, 2, |_, _| Attempt::Absent);
+        run_loop(&fake, &ctrl);
+        assert!(fake.slots.borrow().is_empty(), "one phone at the default: {:?}", fake.slots.borrow());
+
+        // The first page answered and reset: its re-page at the round's length.
+        let ctrl = Control::default();
+        set_order(&ctrl, &[PHONE_A, PHONE_B]);
+        let mut pages = 0;
+        let fake = Fake::new(&ctrl, 1, move |_, _| {
+            pages += 1;
+            if pages == 1 { Attempt::Reset } else { Attempt::Absent }
+        });
+        run_loop(&fake, &ctrl);
+        assert_eq!(fake.paged(0), vec![PHONE_A, PHONE_A, PHONE_B]);
+        assert_eq!(*fake.slots.borrow(), vec![(0, FIRST_ROUND_PAGE_SLOTS), (0, FIRST_PAGE_SLOTS), (1, FIRST_ROUND_PAGE_SLOTS)]);
     }
 
     /// R2 and R3 through the loop: only the timed-out phone goes last next round; a lost claim moves nobody.
@@ -1575,9 +2078,83 @@ mod tests {
     /// The Mac, 13 Nov: rounds 5 s apart in the early window, and a backoff that starts at its window's end.
     #[test]
     fn rounds_are_5_s_apart_early_then_back_off_from_the_start() {
-        assert_eq!(round_gap(true, true, 10), FIRST_RETRY_SECS);
-        assert_eq!(round_gap(false, true, 10), EARLY_GAP_SECS);
-        assert_eq!(round_gap(false, false, BACKOFF_START_SECS), BACKOFF_START_SECS);
+        let s = Duration::from_secs;
+        let none = super::Round4::default();
+        assert_eq!(round_gap(true, true, 10, &none), s(FIRST_RETRY_SECS));
+        assert_eq!(round_gap(false, true, 10, &none), s(EARLY_GAP_SECS));
+        assert_eq!(round_gap(false, false, BACKOFF_START_SECS, &none), s(BACKOFF_START_SECS));
+    }
+
+    /// Round 4, item 2 (bench): the quick retry's pause as the switch says, once; nothing else moves.
+    #[test]
+    fn round4_first_retry_ms_sets_the_quick_retry_alone() {
+        let ms = Duration::from_millis;
+        let r4 = super::Round4 { first_retry_ms: Some(0), ..Default::default() };
+        assert_eq!(round_gap(true, true, 10, &r4), ms(0));
+        assert_eq!(round_gap(false, true, 10, &r4), Duration::from_secs(EARLY_GAP_SECS), "the early gap as before");
+        assert_eq!(round_gap(false, false, 40, &r4), Duration::from_secs(40), "the backoff as before");
+        let (r, lines) = round4_from(&[("first_retry_ms", "0")]);
+        assert_eq!(r.first_retry_ms, Some(0));
+        assert_eq!(
+            lines,
+            ["[bench] round4: first_retry_ms=0 (/etc/ocbm/bench_first_retry_ms): after a failed first round the next one in 0 ms, once (default 2000 ms)"]
+        );
+        for bad in ["60001", "-5", "2s", ""] {
+            assert_eq!(round4_from(&[("first_retry_ms", bad)]).0, super::Round4::default(), "{bad:?}");
+        }
+    }
+
+    /// Round 4, item 5 (bench): the early window's gap as the switch says, still under the backoff; then the backoff from
+    /// the window's end, as before.
+    #[test]
+    fn round4_early_gap_secs_sets_the_early_window_s_gap() {
+        let s = Duration::from_secs;
+        let r4 = super::Round4 { early_gap_secs: Some(1), ..Default::default() };
+        assert_eq!(round_gap(false, true, 10, &r4), s(1));
+        assert_eq!(round_gap(false, false, 20, &r4), s(20), "past the window: the backoff");
+        assert_eq!(round_gap(true, true, 10, &r4), s(FIRST_RETRY_SECS), "the quick retry as before");
+        let r4 = super::Round4 { early_gap_secs: Some(30), ..Default::default() };
+        assert_eq!(round_gap(false, true, 10, &r4), s(10), "never past the backoff");
+        let (r, lines) = round4_from(&[("early_gap_secs", "1")]);
+        assert_eq!(r.early_gap_secs, Some(1));
+        assert_eq!(
+            lines,
+            ["[bench] round4: early_gap_secs=1 (/etc/ocbm/bench_early_gap_secs): rounds 1 s apart in the first 120 s (default 5 s)"]
+        );
+        for bad in ["0", "61", "0.5", ""] {
+            assert_eq!(round4_from(&[("early_gap_secs", bad)]).0, super::Round4::default(), "{bad:?}");
+        }
+
+        let ctrl = Control::default();
+        set_order(&ctrl, &[PHONE_A]);
+        let mut fake = Fake::new(&ctrl, 60, |_, _| Attempt::Absent);
+        fake.round4.early_gap_secs = Some(1);
+        run_loop(&fake, &ctrl);
+        let gaps = fake.gaps.borrow().clone();
+        assert_eq!(gaps[0], FIRST_RETRY_SECS, "the quick retry first");
+        let early = gaps[1..].iter().take_while(|g| **g == 1).count();
+        assert!(early >= 20, "1 s apart while early: {gaps:?}");
+        assert_eq!(&gaps[1 + early..1 + early + 5], &[10, 20, 40, 60, 60], "then the backoff, as before: {gaps:?}");
+    }
+
+    /// Round 4, item 2 through the loop: 0 ms, the next round at once and only once; no switch, 2 s as in 2.7.0.
+    #[test]
+    fn round4_the_loop_retries_a_failed_first_round_as_the_switch_says() {
+        let ctrl = Control::default();
+        set_order(&ctrl, &[PHONE_A]);
+        let fake = Fake::new(&ctrl, 3, |_, _| Attempt::Absent);
+        run_loop(&fake, &ctrl);
+        assert_eq!(fake.gaps_ms.borrow()[..2], [2000, 5000], "no switch: 2 s, then the early window's 5 s");
+
+        let ctrl = Control::default();
+        set_order(&ctrl, &[PHONE_A]);
+        let mut fake = Fake::new(&ctrl, 3, |_, _| Attempt::Absent);
+        fake.round4.first_retry_ms = Some(0);
+        run_loop(&fake, &ctrl);
+        assert_eq!(fake.gaps_ms.borrow()[..2], [0, 5000], "at once, once");
+        assert_eq!((fake.paged(1), fake.paged(2)), (vec![PHONE_A], vec![PHONE_A]), "each round pages");
+        let logs = fake.logs.borrow();
+        assert!(logs.iter().any(|l| l == "[bench] round4: first_retry_ms: first page round failed -- one quick retry in 0 ms"), "{logs:?}");
     }
 
     /// The dev bench, 2 Nov: after a power cut the first-called iPhone answered and reset the link, and the
@@ -1681,7 +2258,7 @@ mod tests {
             let mut s = ResetStreak::default();
             let mut told = Vec::new();
             for round in 1..=3 {
-                walk(&order, || false, |_, _| true, |peer| {
+                walk(&order, || false, |_, _| true, |peer, _| {
                     let result = if peer == PHONE_A { Attempt::Reset } else { Attempt::Failed };
                     if s.note(peer, result, old, t, m) {
                         told.push((round, peer));
@@ -1720,7 +2297,7 @@ mod tests {
     #[test]
     fn a_request_or_a_session_during_the_pause_ends_the_walk() {
         let mut paged = Vec::new();
-        let walked = walk(&[PHONE_A, PHONE_B], || false, |_, _| false, |peer| {
+        let walked = walk(&[PHONE_A, PHONE_B], || false, |_, _| false, |peer, _| {
             paged.push(peer);
             Attempt::Reset
         });
@@ -1735,6 +2312,188 @@ mod tests {
         assert!(walked.rejected && !walked.ran);
     }
 
+    /// Round 4, item 3: EALREADY, EMLINK and EBUSY are a link the controller still holds; a crossing ends a phone's run
+    /// toward a forgotten pairing as a failure does.
+    #[test]
+    fn a_link_the_controller_still_holds_is_a_crossing_and_counts_as_a_failure() {
+        for errno in [libc::EALREADY, libc::EMLINK, libc::EBUSY] {
+            assert_eq!(failure(&std::io::Error::from_raw_os_error(errno)), Attempt::Crossed, "errno {errno}");
+        }
+        let mut s = ResetStreak::default();
+        let m = Instant::now();
+        let t = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let old = Some(t - Duration::from_secs(3600));
+        assert!(!s.note(PHONE_A, Attempt::Reset, old, t, m));
+        assert!(!s.note(PHONE_A, Attempt::Reset, old, t, m));
+        assert!(!s.note(PHONE_A, Attempt::Crossed, old, t, m), "a crossing ends its run");
+        assert!(!s.note(PHONE_A, Attempt::Reset, old, t, m));
+        assert!(!s.note(PHONE_A, Attempt::Reset, old, t, m), "so two resets after it are not three");
+    }
+
+    /// Round 4, item 3: the re-page after a reset or a cut that crossed pages the same phone again while `pause` says so,
+    /// CROSSED_REPAGES more times at most; a pause that says no (no switch) goes on to the next phone, as a failure did;
+    /// and a first page that crossed is never paged again.
+    #[test]
+    fn a_crossed_re_page_pages_the_same_phone_again_only_while_pause_says_so() {
+        let (paged, walked) = walk_with(&[(&PHONE_A, Attempt::Cut), (&PHONE_A, Attempt::Crossed), (&PHONE_A, Attempt::Ran)]);
+        assert_eq!(&paged[..3], &[PHONE_A, PHONE_A, PHONE_A]);
+        assert!(walked.ran);
+        let crossings = [(&PHONE_A, Attempt::Reset), (&PHONE_A, Attempt::Crossed), (&PHONE_A, Attempt::Crossed), (&PHONE_A, Attempt::Crossed),
+            (&PHONE_A, Attempt::Crossed), (&PHONE_B, Attempt::Ran)];
+        let (paged, walked) = walk_with(&crossings);
+        assert_eq!(paged, vec![PHONE_A, PHONE_A, PHONE_A, PHONE_A, PHONE_B], "two more at most, then the next phone");
+        assert!(walked.ran);
+        let mut paged = Vec::new();
+        let mut a = [Attempt::Cut, Attempt::Crossed].into_iter();
+        let walked = walk(&[PHONE_A, PHONE_B], || false, |_, r| r != Attempt::Crossed, |peer, _| {
+            paged.push(peer);
+            if peer == PHONE_A { a.next().unwrap_or(Attempt::Failed) } else { Attempt::Ran }
+        });
+        assert_eq!(paged, vec![PHONE_A, PHONE_A, PHONE_B], "pause says no for the crossing: the next phone");
+        assert!(walked.ran);
+        let (paged, _) = walk_with(&[(&PHONE_A, Attempt::Crossed), (&PHONE_B, Attempt::Ran)]);
+        assert_eq!(&paged[..2], &[PHONE_A, PHONE_B], "a first page that crossed: no re-page");
+    }
+
+    /// Round 4, item 3 through the loop: the truck's 21 Nov case, a cut and then a re-page that crossed. By default (2.7.1):
+    /// the same phone again once the link is looked at, and it connects. Off (2.7.0's): the other phone next.
+    #[test]
+    fn round4_the_loop_pages_a_crossed_phone_again_unless_off() {
+        let answers = || {
+            let mut n = 0;
+            move |_: usize, peer: [u8; 6]| {
+                if peer != PHONE_A {
+                    return Attempt::Absent;
+                }
+                n += 1;
+                match n {
+                    1 => Attempt::Cut,
+                    2 => Attempt::Crossed,
+                    _ => Attempt::Ran,
+                }
+            }
+        };
+        let ctrl = Control::default();
+        set_order(&ctrl, &[PHONE_A, PHONE_B]);
+        let fake = Fake::new(&ctrl, 1, answers());
+        run_loop(&fake, &ctrl);
+        assert_eq!(&fake.paged(0)[..3], &[PHONE_A, PHONE_A, PHONE_A], "the default: the same phone again");
+        assert_eq!(*fake.settled.borrow(), vec![PHONE_A], "once, after its link was looked at");
+        let logs = fake.logs.borrow();
+        assert!(logs.iter().any(|l| l == "the re-page crossed a link the controller holds; no link to it: paging it again after a pause"), "{logs:?}");
+        drop(logs);
+
+        let ctrl = Control::default();
+        set_order(&ctrl, &[PHONE_A, PHONE_B]);
+        let mut fake = Fake::new(&ctrl, 1, answers());
+        fake.round4.same_phone_repage = false;
+        run_loop(&fake, &ctrl);
+        assert_eq!(fake.paged(0), vec![PHONE_A, PHONE_A, PHONE_B], "off: on to the other phone, as in 2.7.0");
+        assert!(fake.settled.borrow().is_empty() && !fake.logs.borrow().iter().any(|l| l.contains("crossed")));
+        let (r, lines) = round4_from(&[("same_phone_repage", "")]);
+        assert!(r.same_phone_repage && lines[0].starts_with("[bench] round4: same_phone_repage (/etc/ocbm/bench_same_phone_repage)"));
+    }
+
+    /// Round 4, item 4: the limit 1.5 s by default (2.7.1); a file takes 1000-8000 ms, "off" or 8000 none (2.7.0's). An
+    /// RFCOMM connect past it is paged once more as a reset is (that re-page with no limit: the next test), and counts
+    /// nothing toward a forgotten pairing: neither a run of its own nor the end of a run of resets (the 2.7.1 review).
+    #[test]
+    fn round4_a_stalled_rfcomm_connect_is_paged_again_and_counts_nothing() {
+        assert_eq!(super::Round4::default().rfcomm_limit_ms, Some(RFCOMM_LIMIT_MS));
+        let (r, lines) = round4_from(&[("rfcomm_limit_ms", "2500")]);
+        assert_eq!(r.rfcomm_limit_ms, Some(2500));
+        assert!(lines[0].starts_with("[bench] round4: rfcomm_limit_ms=2500 (/etc/ocbm/bench_rfcomm_limit_ms): an RFCOMM connect not up in 2500 ms"), "{lines:?}");
+        assert!(lines[0].ends_with("(default 1500 ms; off: 8000 ms, then the next phone)"), "{lines:?}");
+        for bad in ["999", "8001", "1.5", ""] {
+            assert_eq!(round4_from(&[("rfcomm_limit_ms", bad)]).0, super::Round4::default(), "{bad:?}");
+        }
+        for off in ["off", "8000"] {
+            assert_eq!(round4_from(&[("rfcomm_limit_ms", off)]).0.rfcomm_limit_ms, None, "{off:?}: no limit, 2.7.0's");
+        }
+
+        let (paged, walked) = walk_with(&[(&PHONE_A, Attempt::Stalled), (&PHONE_A, Attempt::Ran)]);
+        assert_eq!(&paged[..2], &[PHONE_A, PHONE_A], "paged once more");
+        assert!(walked.ran);
+        let (paged, _) = walk_with(&[(&PHONE_A, Attempt::Stalled), (&PHONE_A, Attempt::Stalled), (&PHONE_B, Attempt::Ran)]);
+        assert_eq!(paged, vec![PHONE_A, PHONE_A, PHONE_B], "only once: then the next phone");
+
+        let m = Instant::now();
+        let t = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let old = Some(t - Duration::from_secs(3600));
+        let mut s = ResetStreak::default();
+        for _ in 0..5 {
+            s.new_round();
+            assert!(!s.note(PHONE_A, Attempt::Stalled, old, t, m), "a stall alone never tells");
+        }
+        // Two rounds of resets, then a stall whose unlimited re-page connects: no BOND_LOST at the stall, and the session
+        // ends the run.
+        let mut s = ResetStreak::default();
+        for _ in 0..2 {
+            s.new_round();
+            assert!(!s.note(PHONE_A, Attempt::Reset, old, t, m));
+        }
+        s.new_round();
+        assert!(!s.note(PHONE_A, Attempt::Stalled, old, t, m), "the third round's stall: not the third in a row");
+        assert!(!s.note(PHONE_A, Attempt::Ran, old, t, m));
+        assert!(!s.note(PHONE_A, Attempt::Reset, old, t, m), "and a reset after the session starts a new run");
+        // A stall ends no run either: the re-page's own reset is the third.
+        let mut s = ResetStreak::default();
+        for _ in 0..2 {
+            s.new_round();
+            assert!(!s.note(PHONE_A, Attempt::Reset, old, t, m));
+        }
+        s.new_round();
+        assert!(!s.note(PHONE_A, Attempt::Stalled, old, t, m));
+        assert!(s.note(PHONE_A, Attempt::Reset, old, t, m), "the re-page's reset, the third in a row: tells");
+
+        let mut r = Rounds::default();
+        r.begin();
+        r.paged(PHONE_A, Attempt::Absent);
+        assert!(!r.paged(PHONE_B, Attempt::Stalled), "straight after another phone's timeout: a crossing, not counted");
+        assert_eq!(super::retry_words(Attempt::Stalled), "answered and opened no RFCOMM channel within the connect's limit");
+    }
+
+    /// The 2.7.1 review: the limit cuts a phone's first RFCOMM connect only. A phone whose channel opens later than the
+    /// limit every time stalls on its first page, and its re-page, with no limit, connects; round after round, it is never
+    /// told as a forgotten pairing. A re-page that then really fails goes on to the next phone, as before. Every other
+    /// page runs under the limit; with the limit off (2.7.0's) none does, and a slow phone connects at once.
+    #[test]
+    fn round4_the_re_page_after_a_stall_runs_with_no_limit() {
+        let ctrl = Control::default();
+        set_order(&ctrl, &[PHONE_A, PHONE_B]);
+        let mut fake = Fake::new(&ctrl, 3, |_, peer| if peer == PHONE_A { Attempt::Ran } else { Attempt::Absent });
+        fake.slow_channel = vec![PHONE_A];
+        run_loop(&fake, &ctrl);
+        assert_eq!(&fake.paged(0)[..2], &[PHONE_A, PHONE_A], "stalled, then paged once more");
+        assert_eq!(&fake.limited.borrow()[..2], &[true, false], "the first under the limit, the re-page with none");
+        assert_eq!(fake.paged(0)[2..], [PHONE_B], "the session over, the walk goes on as before");
+        assert_eq!(fake.bond_lost.get(), 0, "stall and session, three rounds: no forgotten pairing");
+        let pages = fake.pages.borrow().clone();
+        let limited = fake.limited.borrow().clone();
+        for (i, ((_, peer), lim)) in pages.iter().zip(&limited).enumerate() {
+            let after_stall = i > 0 && pages[i - 1].1 == *peer && limited[i - 1] && *peer == PHONE_A;
+            assert_eq!(*lim, !after_stall, "page {i}: only a stalled phone's re-page runs with no limit ({pages:?}, {limited:?})");
+        }
+
+        // A stall, then a real failure: the next phone, as before, and no run of resets begun.
+        let ctrl = Control::default();
+        set_order(&ctrl, &[PHONE_A, PHONE_B]);
+        let mut fake = Fake::new(&ctrl, 1, |_, _| Attempt::Failed);
+        fake.slow_channel = vec![PHONE_A];
+        run_loop(&fake, &ctrl);
+        assert_eq!(fake.paged(0), vec![PHONE_A, PHONE_A, PHONE_B], "the re-page failed: on to the next phone");
+        assert_eq!(*fake.limited.borrow(), vec![true, false, true], "the next phone under the limit again");
+
+        // The limit off (2.7.0's): no page under one, and the slow phone connects at its first page.
+        let ctrl = Control::default();
+        set_order(&ctrl, &[PHONE_A, PHONE_B]);
+        let mut fake = Fake::new(&ctrl, 1, |_, peer| if peer == PHONE_A { Attempt::Ran } else { Attempt::Absent });
+        fake.slow_channel = vec![PHONE_A];
+        fake.round4 = super::Round4::AS_2_7_0;
+        run_loop(&fake, &ctrl);
+        assert_eq!(fake.paged(0), vec![PHONE_A, PHONE_B], "connected at once");
+    }
+
     #[test]
     fn only_a_reset_link_counts_as_a_reset() {
         let reset = std::io::Error::from_raw_os_error(libc::ECONNRESET);
@@ -1743,5 +2502,20 @@ mod tests {
         for errno in [libc::ETIMEDOUT, libc::ECONNREFUSED] {
             assert_eq!(failure(&std::io::Error::from_raw_os_error(errno)), Attempt::Failed, "errno {errno}");
         }
+    }
+
+    /// The 2.7.1 review: EALREADY, EMLINK and EBUSY are a crossing only from the page; from the RFCOMM connect, a channel
+    /// still on the link, Failed, as in 2.7.0. Everything else the RFCOMM connect reports classifies as from the page.
+    #[test]
+    fn a_busy_rfcomm_connect_is_no_page_crossing() {
+        use super::rfcomm_failure;
+        let os = std::io::Error::from_raw_os_error;
+        for errno in [libc::EALREADY, libc::EMLINK, libc::EBUSY] {
+            assert_eq!(failure(&os(errno)), Attempt::Crossed, "the page's errno {errno}");
+            assert_eq!(rfcomm_failure(&os(errno)), Attempt::Failed, "the RFCOMM connect's errno {errno}");
+        }
+        assert_eq!(rfcomm_failure(&os(libc::ECONNRESET)), Attempt::Reset, "a reset is a reset at either stage");
+        assert_eq!(rfcomm_failure(&os(libc::ETIMEDOUT)), Attempt::Failed);
+        assert_eq!(rfcomm_failure(&os(libc::EHOSTDOWN)), Attempt::Absent);
     }
 }

@@ -287,6 +287,57 @@ fn cut(
     error
 }
 
+/// What [`drop_stalled_link`] does with the link to the phone (`acl`) after an RFCOMM connect past its limit.
+#[derive(Debug, PartialEq, Eq)]
+enum Stalled {
+    /// No link left: nothing to drop.
+    Gone,
+    /// Not this page's to drop (why): left as it is, as a cut leaves one.
+    Keep(&'static str),
+    /// The page's own link (this handle): its Disconnect.
+    Drop(u16),
+}
+
+/// The decision for `acl`, with `keep` the reason the link is not this page's, when it is not.
+fn stalled_link(acl: Option<crate::hci::AclInfo>, keep: Option<&'static str>) -> Stalled {
+    match (acl, keep) {
+        (None, _) => Stalled::Gone,
+        (Some(_), Some(why)) => Stalled::Keep(why),
+        (Some(a), None) => Stalled::Drop(a.handle),
+    }
+}
+
+/// Round 4, item 4 (on by default since 2.7.1): the RFCOMM connect after this page passed btd's limit and its socket is
+/// closed. The link the page brought up goes as a cut's does ([`cut`]): its Disconnect, up to [`CUT_LINK_GONE`] for it
+/// to go, and a link still up, or one whose Disconnect could not be sent, noted as the left link, so the re-page tells it
+/// from the phone's own and sends its Disconnect again rather than riding a half-open link ([`before_page`]), and a
+/// crossing it still meets is item 3's. `keep` (why): a link up before the page, or one a live session rides, is left
+/// alone. What it did.
+pub(crate) fn drop_stalled_link(peer: [u8; 6], keep: Option<&'static str>) -> String {
+    let Ok(dev) = crate::hci::dev_id(crate::HCI_DEV) else {
+        return "no controller to look at".into();
+    };
+    let handle = match stalled_link(crate::hci::acl_info(dev, peer), keep) {
+        Stalled::Gone => return "the link was gone already".into(),
+        Stalled::Keep(why) => return format!("{why}: the link is left up"),
+        Stalled::Drop(handle) => handle,
+    };
+    let sent = match crate::hci::disconnect(dev, handle) {
+        Ok(()) => true,
+        Err(e) => {
+            log(&format!("Disconnect of the stalled RFCOMM connect's link not sent: {e}"));
+            false
+        }
+    };
+    let t = std::time::Instant::now();
+    while t.elapsed() < CUT_LINK_GONE && crate::hci::acl_info(dev, peer).is_some() {
+        std::thread::sleep(POLL_SLICE);
+    }
+    let gone = crate::hci::acl_info(dev, peer).is_none();
+    note_left_link(peer, handle, !gone, sent);
+    format!("the link {} {} ms after its Disconnect", if gone { "went" } else { "was still up" }, t.elapsed().as_millis())
+}
+
 /// The link a cut left behind (the Mac's review of 8a3a8b2, item 5): still up after its Disconnect, or its Disconnect
 /// never sent. The next page to that phone would ride it and take it for the phone's own; it is told apart by its
 /// handle, forgotten once a read finds no link to the phone or a page to it connects, and its Disconnect is sent again
@@ -427,6 +478,56 @@ fn before_page(dev: u16, peer: [u8; 6], session_live: bool) -> Option<&'static s
     }
 }
 
+/// How long, with no link to the phone left, before a re-page that crossed one goes again (round 4, item 3): a phone
+/// that pages back lands its link in this, and a controller still letting the old one go is done with it.
+const CROSSED_SETTLE: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// What the wait after a crossed re-page does next ([`settle_crossed`]), from one look at the link to the phone.
+#[derive(Debug, PartialEq, Eq)]
+enum Crossed {
+    /// No link: [`CROSSED_SETTLE`] more, then page.
+    Settle,
+    /// An answered link (the phone's own, or btd's from the last cut, which the page tells apart, [`before_page`]): page
+    /// now, riding it.
+    Ride,
+    /// A link still coming up or going: look again.
+    Wait,
+    /// Still that past [`CUT_LINK_GONE`]: page anyway.
+    Over,
+}
+
+/// The decision for the link `acl` to the phone, `waited` into the wait.
+fn crossed_next(acl: Option<crate::hci::AclInfo>, waited: std::time::Duration) -> Crossed {
+    match acl {
+        None => Crossed::Settle,
+        Some(a) if a.answered() => Crossed::Ride,
+        Some(_) if waited >= CUT_LINK_GONE => Crossed::Over,
+        Some(_) => Crossed::Wait,
+    }
+}
+
+/// Round 4, item 3 (on by default since 2.7.1): before the same phone is paged again after its re-page failed with
+/// EALREADY, EMLINK or EBUSY (a link the controller still holds): up to [`CUT_LINK_GONE`] for the kernel's link to it to
+/// go or come up, and with none left, [`CROSSED_SETTLE`] more ([`crossed_next`]). What it found, for the walk's line.
+pub(crate) fn settle_crossed(peer: [u8; 6]) -> &'static str {
+    let Ok(dev) = crate::hci::dev_id(crate::HCI_DEV) else {
+        std::thread::sleep(CROSSED_SETTLE);
+        return "no controller to look at: paging it again after a pause";
+    };
+    let t = std::time::Instant::now();
+    loop {
+        match crossed_next(crate::hci::acl_info(dev, peer), t.elapsed()) {
+            Crossed::Settle => {
+                std::thread::sleep(CROSSED_SETTLE);
+                return "no link to it: paging it again after a pause";
+            }
+            Crossed::Ride => return "a link to it is up: paging it again on that link",
+            Crossed::Over => return "a link to it is still coming up or going: paging it again anyway",
+            Crossed::Wait => std::thread::sleep(POLL_SLICE),
+        }
+    }
+}
+
 /// Note the link a cut leaves: up after its Disconnect (`sent`), or with none sent; or gone (`up` false).
 fn note_left_link(peer: [u8; 6], handle: u16, up: bool, sent: bool) {
     let mut left = LEFT_LINK.lock().unwrap_or_else(|e| e.into_inner());
@@ -445,8 +546,13 @@ fn note_left(left: &mut Option<LeftLink>, peer: [u8; 6], handle: u16, up: bool, 
 
 /// L2CAP-connect to `peer`'s SDP PSM (implicitly pages the phone in BlueZ). `timeout_secs` bounds both
 /// the connect and each subsequent read so a quiet phone can't wedge the reconnect thread. The connect itself is
-/// non-blocking, watched by [`wait_connected`].
-fn connect_sdp(peer: [u8; 6], timeout_secs: i64, watch: &Watch<'_>) -> std::io::Result<std::fs::File> {
+/// non-blocking, watched by [`wait_connected`]. With the channel, why the page rode a link up before it, when it did
+/// ([`before_page`]).
+fn connect_sdp(
+    peer: [u8; 6],
+    timeout_secs: i64,
+    watch: &Watch<'_>,
+) -> std::io::Result<(std::fs::File, Option<&'static str>)> {
     use std::os::fd::AsRawFd;
     let raw = unsafe {
         libc::socket(
@@ -528,7 +634,7 @@ fn connect_sdp(peer: [u8; 6], timeout_secs: i64, watch: &Watch<'_>) -> std::io::
     crate::startup::stamp("acl");
     // Blocking again, for the SDP exchange and its SO_RCVTIMEO-bounded reads.
     set_nonblocking(fd.as_raw_fd(), false)?;
-    Ok(std::fs::File::from(fd))
+    Ok((std::fs::File::from(fd), link_before))
 }
 
 /// The iAP2 UUID128 search pattern: `DES { UUID128 iAP2 }`.
@@ -660,6 +766,9 @@ fn scan_rfcomm_channel(blob: &[u8]) -> Option<u8> {
 pub struct Services {
     /// RFCOMM channel of the phone's "Wireless iAP v2" service — an iPhone.
     pub iap2: Option<u8>,
+    /// Why the page rode a link that was up before it (the phone's own, or btd's from the last cut), when it did: not
+    /// this page's to drop, so an RFCOMM connect past round 4's limit leaves it, as a cut does ([`drop_stalled_link`]).
+    pub link_before: Option<&'static str>,
 }
 
 /// Discover what the bonded `peer` exposes, over ONE SDP channel: its iAP2 service (an iPhone). `Err`
@@ -671,7 +780,7 @@ pub fn query(peer: [u8; 6], timeout_secs: i64, watch: &Watch<'_>) -> std::io::Re
     disp.reverse(); // human-readable bdaddr for the log only
     let human = disp.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(":");
     log(&format!("querying SDP on {human} (PSM 0x{SDP_PSM:04x})"));
-    let mut sock = connect_sdp(peer, timeout_secs, watch)?;
+    let (mut sock, link_before) = connect_sdp(peer, timeout_secs, watch)?;
     log("L2CAP SDP channel up (phone paged)");
 
     // (1) Targeted: the accessory-side iAP2 UUID. If iOS exposes an iAP2 RFCOMM service by this UUID,
@@ -682,7 +791,7 @@ pub fn query(peer: [u8; 6], timeout_secs: i64, watch: &Watch<'_>) -> std::io::Re
         log(&format!("iAP2 RFCOMM channel on the phone = {ch}"));
         // The timeline's `sdp`: the phone's iAP2 channel is known.
         crate::startup::stamp("sdp");
-        return Ok(Services { iap2: Some(ch) });
+        return Ok(Services { iap2: Some(ch), link_before });
     }
 
     // (2) Browse-all (L2CAP UUID): dump the peer's ENTIRE SDP catalog so we can see what it DOES
@@ -706,7 +815,7 @@ pub fn query(peer: [u8; 6], timeout_secs: i64, watch: &Watch<'_>) -> std::io::Re
             "browse-all: the peer exposes RFCOMM channel(s) {chans:?} — but none under the iAP2 UUID; raw catalog above identifies the service UUIDs"
         ));
     }
-    Ok(Services::default())
+    Ok(Services { link_before, ..Services::default() })
 }
 
 #[cfg(test)]
@@ -791,6 +900,40 @@ mod tests {
         note_left(&mut l, peer, 0x0b, true, false, now);
         note_left(&mut l, other, 0x0c, true, true, now);
         assert_eq!(whose(l), Some((other, 0x0c)), "another phone's cut whose link stayed up: the newer record");
+    }
+
+    /// Round 4, item 4: after an RFCOMM connect past its limit, the page's own link is disconnected; one up before the
+    /// page (or a live session's) is left; none, nothing. The link a Disconnect leaves up is noted for the re-page.
+    #[test]
+    fn a_stalled_rfcomm_connect_drops_only_its_own_link() {
+        let acl = Some(crate::hci::AclInfo { handle: 0x0c, state: crate::hci::BT_CONNECTED });
+        assert_eq!(stalled_link(acl, None), Stalled::Drop(0x0c));
+        assert_eq!(stalled_link(acl, Some("the link was up before the page")), Stalled::Keep("the link was up before the page"));
+        assert_eq!(stalled_link(None, None), Stalled::Gone);
+        let peer = [1, 2, 3, 4, 5, 6];
+        let now = std::time::Instant::now();
+        let mut l = None;
+        note_left(&mut l, peer, 0x0c, true, true, now);
+        assert_eq!(
+            link_before_page(peer, acl, &mut l, now, false),
+            Before::OwnLink { resend: false },
+            "the re-page knows the stalled link as btd's own, not the phone's"
+        );
+        let mut l = None;
+        note_left(&mut l, peer, 0x0c, true, false, now);
+        assert_eq!(link_before_page(peer, acl, &mut l, now, false), Before::OwnLink { resend: true }, "its Disconnect never went: sent again");
+    }
+
+    /// Round 4, item 3: after a crossed re-page, no link waits a moment more, an answered one is ridden at once, one still
+    /// coming up or going is looked at again until CUT_LINK_GONE.
+    #[test]
+    fn a_crossed_re_page_waits_for_the_link_to_clear_or_come_up() {
+        let ms = std::time::Duration::from_millis;
+        let acl = |state| Some(crate::hci::AclInfo { handle: 0x0b, state });
+        assert_eq!(crossed_next(None, ms(0)), Crossed::Settle);
+        assert_eq!(crossed_next(acl(crate::hci::BT_CONNECTED), ms(0)), Crossed::Ride);
+        assert_eq!(crossed_next(acl(crate::hci::BT_CONNECT), ms(100)), Crossed::Wait, "coming up");
+        assert_eq!(crossed_next(acl(crate::hci::BT_CONNECT), CUT_LINK_GONE), Crossed::Over, "and past the wait: page anyway");
     }
 
     /// wait_connected's decision (the Mac's review, A3): a page that timed out fails with EHOSTDOWN, an answer with no SDP
