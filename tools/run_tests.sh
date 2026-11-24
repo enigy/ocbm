@@ -23,6 +23,8 @@ run() {
 run "iap2-core"  cargo test -p carplay-iap2-core --quiet
 run "receiver"   cargo test --manifest-path crates/vendor/receiver/Cargo.toml --no-default-features --quiet
 run "ocbm-proto" cargo test -p ocbm-proto --quiet
+# The Wi-Fi link's wire formats, OCBW v1 and the set-up exchange OCBS v1, against fixed vectors (24 Nov 2026).
+run "ocbm-link"  cargo test -p ocbm-link --quiet
 run "ocbmd"      cargo test -p ocbmd --quiet
 run "iap2d"      cargo test -p iap2d --quiet
 # These are excluded from the workspace too, and were missing from this script until 2026-07-29 —

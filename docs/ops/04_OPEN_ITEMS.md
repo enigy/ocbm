@@ -808,15 +808,20 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
 - **The Wi-Fi link (branch `wifi-link`, 24 Nov 2026): built and unit-tested, NOT benched.** Open: (1) no WPA supplicant
   on the stock image: one must be bundled as `/usr/sbin/ocbm-wpa_supplicant` + `ocbm-wpa_cli` (never
   `/usr/sbin/wpa_supplicant`, which flips the IW416 driver mode on every unit) or pushed to `/tmp/bin` for the bench; a
-  build needs downloaded sources (wpa_supplicant 2.11, libnl 3.12.0; `tools/build_wpa_supplicant.sh` refuses until their
-  SHA-256 are pinned at the first download); (2) the AP on `wlan0` (uAP BSS) beside the station on
-  `sta0` is inferred from the stock driver configuration, not measured; (3) what the driver does when the hotspot and the
+  build needs downloaded sources (wpa_supplicant 2.11, libnl 3.12.0; `tools/build_wpa_supplicant.sh` checks them against
+  the SHA-256 pinned 24 Nov). Its size decides the room: without it the update package needs 3,445 KB (from 1.0.1)
+  against `final_kb` 3,900, so the two binaries get about 455 KB on flash (~650 KB raw at the package's 0.7); the
+  one-file installer's BUDGET is 2,821 KB, which with the 384 KB spare leaves about 0.55-0.6 MB of the ~3.8 MB the
+  factory adapter had after making room (28 Oct). Measure both once it is built; (2) the AP on `wlan0` (uAP BSS)
+  beside the station on `sta0` is inferred from the stock driver configuration, not measured; (3) what the driver does
+  when the hotspot and the
   AP sit on different channels; (4) WPA3-only hotspots are not supported in this version (WPA2 and mixed are; the box
   gets the PBKDF2 hash, the supplicant has no SAE); (5) M2's self-started session: the phone's audio goes nowhere while no host is attached (60 s / 180 s holds);
   the AP's channel pinned from the hotspot's last one is a design note only; (6) M3 (the set-up network) is built, not
   benched: whether the stock hostapd takes `ap_isolate=1` (it refuses an unknown key, and then no set-up network is
   offered), and what the set-up AP raised 20 s into a boot with no host yet costs a head unit that connects later; (7)
-  the supplicant's build (`tools/build_wpa_supplicant.sh`, its archives pinned) has not been run in the agent's session.
+  the supplicant's build (`tools/build_wpa_supplicant.sh`, its archives pinned) has not been run in the agent's session:
+  it runs the archives' own configure and make, which is for the owner to start.
 
 - **An inbound RCS `'sync'` obliges a `'rply'`; the box logs and does not send one — BLOCKED, not
   merely unstarted.** `_controlServer_sendResponseInternal` writes `messageType = 0` while the
