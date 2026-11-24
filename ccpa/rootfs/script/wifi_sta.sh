@@ -193,6 +193,12 @@ while :; do
     fi
     log "station interface: $IF"
   fi
+  # The interface gone (the driver unloaded): its supplicant and DHCP client with it; looked for again.
+  if [ ! -e "$SYS/class/net/$IF" ]; then
+    log "$IF is gone: the station starts again when an interface is back"
+    stop_pidfile "$DHCP_PID"; stop_pidfile "$WPA_PID"; IF=""; joined_at=""; publish joining 0 2>/dev/null
+    [ -n "${WIFI_STA_ONCE:-}" ] && exit 0; sleep "$TICK"; continue
+  fi
   # An AP raised before the link was set up may still run on the station's interface: it goes at the session's end.
   if ap_up && [ "$(ap_iface_conf)" = "$IF" ]; then
     [ "$said_ap_on_sta" = 0 ] && log "the AP runs on $IF (raised before the link was set up): the station waits for it to go"

@@ -790,6 +790,8 @@ pub struct Side {
     pub via: Option<Via>,
     /// When the holder's last frame came (the [`HOLD_SILENCE`] rule).
     pub last_host_frame: Option<Instant>,
+    /// When the listener was last told the box is held ([`Side::publish_busy`]).
+    pub busy_published: Option<Instant>,
     /// USB's output while USB does not hold the box (None on a Direct unit, whose loop owns the device).
     pub usb_out: Option<File>,
     /// This unit's accessory I/O is the loop's own ([`crate::AccIo::Direct`]): a USB host taking the box restarts
@@ -807,7 +809,8 @@ pub struct Side {
 
 impl Side {
     /// Tell the listener whether a host holds the box now: until `HOLD_SILENCE` after `last` (None: nobody).
-    pub fn publish_busy(&self, last: Option<Instant>) {
+    pub fn publish_busy(&mut self, last: Option<Instant>) {
+        self.busy_published = last;
         if let Some(s) = self.shared.as_ref() {
             let until = last.map_or(0, |t| {
                 let left = (t + HOLD_SILENCE).saturating_duration_since(Instant::now());
@@ -826,6 +829,7 @@ impl Side {
             links: Vec::new(),
             via: None,
             last_host_frame: None,
+            busy_published: None,
             usb_out: None,
             usb_direct: false,
             usb_gone: false,
@@ -1082,6 +1086,34 @@ mod tests {
         let mut link = start_link(l.rx.recv_timeout(Duration::from_secs(3)).unwrap()).unwrap();
         drop(h);
         assert!(eof_within(&mut link.from_host, 2));
+        shared.stop.store(true, Ordering::Release);
+    }
+
+    /// A box another host holds closes a new connection before its hello (Carlink reads that as busy); a wrong key is
+    /// closed only after the host's proof.
+    #[test]
+    fn a_busy_box_closes_before_its_hello_and_a_wrong_key_after_the_proof() {
+        let key = LinkKey([3u8; 32]);
+        let shared = Shared::new(Some(key.clone()));
+        let l = start_listener(shared.clone(), Bind::Fixed(loopback0())).unwrap();
+        let addr = l.fixed.unwrap();
+        shared.busy_until_ms.store(crate::mono_ms() + 10_000, Ordering::Release);
+        let mut c = TcpStream::connect(addr).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut hello = [0u8; ocbm_link::HELLO_LEN];
+        let n = c.read(&mut hello).unwrap_or(0);
+        assert_eq!(n, 0, "busy: EOF before any byte of the box's hello");
+        shared.busy_until_ms.store(0, Ordering::Release);
+        let mut w = TcpStream::connect(addr).unwrap();
+        w.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        w.read_exact(&mut hello).unwrap();
+        assert_eq!(&hello[..4], b"OCBW", "free: the box's hello");
+        let mut reply = [0u8; ocbm_link::REPLY_LEN];
+        reply[..4].copy_from_slice(b"OCBW");
+        reply[4] = 1;
+        w.write_all(&reply).unwrap(); // a proof with no key behind it
+        let mut b = [0u8; 32];
+        assert!(matches!(w.read(&mut b), Ok(0) | Err(_)), "a wrong proof: closed, no proof from the box");
         shared.stop.store(true, Ordering::Release);
     }
 

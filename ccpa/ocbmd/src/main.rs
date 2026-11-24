@@ -4164,7 +4164,7 @@ impl Daemon {
     fn admit(&mut self, via: Via, ch: u16, pl: &[u8], now: Instant) -> Admit {
         if self.wifi.via == Some(via) {
             // The listener's view of "busy" follows, at most once a second (a frame can come thousands of times a second).
-            if self.wifi.last_host_frame.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(1)) {
+            if self.wifi.busy_published.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(1)) {
                 self.wifi.publish_busy(Some(now));
             }
             self.wifi.last_host_frame = Some(now);
