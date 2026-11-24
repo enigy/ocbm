@@ -279,8 +279,19 @@ fn wait_for_ap_at(lock: &std::path::Path, max: std::time::Duration, abort: &dyn 
 
 // ---- On-target AP glue: fill AccessoryWiFiConfig from the box's live hostapd.conf --------------
 
+/// The configuration the AP runs from where it followed the station's channel (radio_ap_up.sh, ADDENDUM 6 of the
+/// Wi-Fi link plan): hostapd.conf with that channel, band and HT40 side, in tmpfs, there only while that AP is.
+const AP_SESSION_CONF: &str = "/tmp/hostapd_session.conf";
+
+/// The file the running AP's configuration is read from: `session` while it is there, else `/etc/hostapd.conf`. The
+/// phone is told the channel the AP runs on, not the one the flash file pins.
+fn ap_conf_path(session: &str) -> String {
+    if std::path::Path::new(session).exists() { session } else { "/etc/hostapd.conf" }.to_string()
+}
+
 /// Read the box's hosted-AP configuration from `/etc/hostapd.conf` (the same file
-/// `start_bluetooth_wifi.sh` raises the AP from) into the `AccessoryWiFiConfig` reported over 0x5703,
+/// `start_bluetooth_wifi.sh` raises the AP from), or from [`AP_SESSION_CONF`] while the AP runs from it,
+/// into the `AccessoryWiFiConfig` reported over 0x5703,
 /// so the credentials handed to the iPhone are exactly what hostapd is broadcasting. Missing fields
 /// fall back to sane defaults. `wpa=`/`wpa_key_mgmt=` present + a passphrase ⇒ WPA2/WPA3-Personal.
 ///
@@ -297,7 +308,7 @@ pub fn read_hostapd_ap_config() -> Option<AccessoryWiFiConfig> {
     // to join. It MUST describe the AP that is actually running, or the phone leaves Bluetooth and
     // never arrives.
     let path = box_common::lever("BOX_HOSTAPD_CONF", "CARPLAY_HOSTAPD_CONF")
-        .unwrap_or_else(|| "/etc/hostapd.conf".to_string());
+        .unwrap_or_else(|| ap_conf_path(AP_SESSION_CONF));
     let text = std::fs::read_to_string(&path).unwrap_or_default();
     if text.is_empty() {
         eprintln!("[wifi_handoff] WARNING: {path} is empty or unreadable — 0x5703 will carry no credentials");
@@ -431,6 +442,23 @@ mod tests {
         let crlf = "ssid=CarLink-b0df\r\nwpa=2\r\nwpa_passphrase=a/b&c\\d#e\"f'g h \r\n";
         let cfg = parse_hostapd_conf(crlf, "test").unwrap();
         assert_eq!(cfg.passphrase.as_deref(), Some("a/b&c\\d#e\"f'g h "), "a CRLF file: only the line end goes");
+    }
+
+    /// ADDENDUM 6: the 0x5703 describes the AP that runs, its per-session configuration where it followed the station.
+    #[test]
+    fn the_0x5703_reads_the_configuration_the_ap_runs_from() {
+        let dir = std::env::temp_dir().join(format!("ap_session_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let session = dir.join("hostapd_session.conf");
+        let s = session.to_str().unwrap();
+        assert_eq!(ap_conf_path(s), "/etc/hostapd.conf", "no session configuration: the flash file");
+        let conf = "interface=wlan0\nssid=CarLink-0a1b\nwpa=3\nwpa_passphrase=a made-up key\nhw_mode=a\nchannel=149\n";
+        std::fs::write(&session, conf).unwrap();
+        assert_eq!(ap_conf_path(s), s, "the AP followed the station: its session's configuration");
+        let cfg = parse_hostapd_conf(&std::fs::read_to_string(&session).unwrap(), s).unwrap();
+        assert_eq!((cfg.ssid.as_str(), cfg.channel), ("CarLink-0a1b", Some(149)));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
