@@ -29,7 +29,7 @@ secret() {  # $1 path: true when the file may hold a secret (names from a stock 
   case "$1" in
     */shadow*|*/passwd-|*/dropbear/*|*/.ssh/*|*.pem|*.key|*link_key*|\
     /etc/hostapd*.conf|*supplicant*.conf|/etc/riddle.conf|/etc/bluetooth/*.tar.gz|/var/lib/bluetooth/*|\
-    /etc/RiddleBoxData/*|/var/lib/lockdown/*) return 0 ;;
+    /etc/RiddleBoxData/*|/var/lib/lockdown/*|/etc/ocbm/wifi_link*|/etc/ocbm/wifi_psk*) return 0 ;;
   esac
   return 1
 }

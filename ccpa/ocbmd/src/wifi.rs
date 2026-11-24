@@ -97,27 +97,31 @@ pub struct LinkConf {
     pub psk: String,
 }
 
-/// [`LINK_FILE`]'s text. One value a line: [`parse_provision`] refuses line breaks inside one.
+/// [`LINK_FILE`]'s text: `key=` (64 hex), and with a hotspot `ssid_hex=` (the name's bytes in hex, as the station
+/// keeper hands them to wpa_supplicant: no quoting, and no hexdump needed on the adapter) and `psk=` (as received:
+/// 64 hex digits, or a passphrase [`parse_provision`] checked, or empty).
 pub fn link_file_text(c: &LinkConf) -> String {
     let mut t = format!(
         "# OCBM Wi-Fi link (MGMT_WIFI_LINK). Secret: never into a log, a backup or a stick.\nkey={}\n",
         c.key.to_hex()
     );
     if !c.ssid.is_empty() {
-        t.push_str(&format!("ssid={}\npsk={}\n", c.ssid, c.psk));
+        t.push_str(&format!("ssid_hex={}\npsk={}\n", ocbm_link::hex(c.ssid.as_bytes()), c.psk));
     }
     t
 }
 
-/// The file's text read back: the `key=` line must be 64 hex digits; `ssid=` and `psk=` are optional.
+/// The file's text read back: the `key=` line must be 64 hex digits; `ssid_hex=` and `psk=` are optional.
 pub fn parse_link_file(text: &str) -> Option<LinkConf> {
     let mut key = None;
     let (mut ssid, mut psk) = (String::new(), String::new());
     for l in text.lines() {
         if let Some(v) = l.strip_prefix("key=") {
             key = LinkKey::from_hex(v);
-        } else if let Some(v) = l.strip_prefix("ssid=") {
-            ssid = v.to_string();
+        } else if let Some(v) = l.strip_prefix("ssid_hex=") {
+            let v = v.trim();
+            let bytes: Option<Vec<u8>> = (0..v.len() / 2).map(|i| u8::from_str_radix(v.get(2 * i..2 * i + 2)?, 16).ok()).collect();
+            ssid = bytes.and_then(|b| String::from_utf8(b).ok()).filter(|_| v.len() % 2 == 0)?;
         } else if let Some(v) = l.strip_prefix("psk=") {
             psk = v.to_string();
         }
@@ -363,6 +367,9 @@ pub struct Shared {
     pub bound: Mutex<Option<SocketAddrV4>>,
     /// Set to end the listener and the advert for good (the link was removed).
     pub stop: AtomicBool,
+    /// While `crate::mono_ms()` is below this, a host holds the box ([`HOLD_SILENCE`] after its last frame): a new
+    /// connection is closed before the box's hello, which Carlink reads as "busy", not as a wrong key (notes, 3b).
+    pub busy_until_ms: AtomicU64,
     next_id: AtomicU64,
     handshakes: AtomicUsize,
     inflight: Mutex<Vec<IpAddr>>,
@@ -375,6 +382,7 @@ impl Shared {
             key: Mutex::new(key),
             bound: Mutex::new(None),
             stop: AtomicBool::new(false),
+            busy_until_ms: AtomicU64::new(0),
             next_id: AtomicU64::new(1),
             handshakes: AtomicUsize::new(0),
             inflight: Mutex::new(Vec::new()),
@@ -514,6 +522,16 @@ fn listen_loop(shared: Arc<Shared>, fixed: Option<TcpListener>, tx: mpsc::Sender
             }
         };
         let Some(key) = shared.key() else { continue };
+        // Another host holds the box: closed before the box's hello (a wrong key is closed after the host's proof).
+        if crate::mono_ms() < shared.busy_until_ms.load(Ordering::Acquire) {
+            let n = shared.refused.fetch_add(1, Ordering::AcqRel) + 1;
+            if last_refusal_log.elapsed() >= Duration::from_secs(5) {
+                last_refusal_log = Instant::now();
+                eprintln!("[ocbmd] wifi: refused a connection from {}: another host holds the box ({n} refused so far)", peer_short(&peer));
+            }
+            drop(s);
+            continue;
+        }
         // The caps: all peers together, and one at a time per peer address.
         let busy_peer = {
             let mut inf = shared.inflight.lock().unwrap_or_else(|e| e.into_inner());
@@ -788,6 +806,17 @@ pub struct Side {
 }
 
 impl Side {
+    /// Tell the listener whether a host holds the box now: until `HOLD_SILENCE` after `last` (None: nobody).
+    pub fn publish_busy(&self, last: Option<Instant>) {
+        if let Some(s) = self.shared.as_ref() {
+            let until = last.map_or(0, |t| {
+                let left = (t + HOLD_SILENCE).saturating_duration_since(Instant::now());
+                crate::mono_ms() + left.as_millis() as u64
+            });
+            s.busy_until_ms.store(until, Ordering::Release);
+        }
+    }
+
     /// No link set up: 2.7.1's daemon.
     pub fn off() -> Side {
         Side {

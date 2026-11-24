@@ -4,7 +4,7 @@
 # the Rust daemons) asks for "wifi up" / "bt up" and never names a chip, a module, a firmware
 # path or an attach helper.
 #
-# VERBS   probe | status | wifi_ap_on | wifi_ap_off | wifi_ap_prep | bt_on | bt_off | preload
+# VERBS   probe | status | wifi_ap_on | wifi_ap_off | wifi_ap_prep | wifi_sta_up | bt_on | bt_off | preload
 # EXIT    0 converged now   1 ran and failed   2 already converged   3 unsupported on this unit
 #
 # wifi_ap_prep (16 Nov 2026) writes the AP's configuration ahead, with no host here and nothing raised: the files
@@ -387,6 +387,40 @@ wlan_iface() {
   return 1
 }
 
+# ---- the Wi-Fi link's station (24 Nov 2026; /script/wifi_sta.sh, ocbmd src/wifi.rs) ----------------------------------
+# With a hotspot in /etc/ocbm/wifi_link (an ssid_hex= line) the adapter also joins the phone's hotspot as a station. One
+# radio, and two interfaces from one driver load: on the IW416 its stock wifi_mod_para.conf (drv_mode=3) names the STA
+# BSS sta0 (sta_name=sta) and the uAP BSS wlan0 (uap_name=wlan), and stock's own STA mode (when a supplicant exists)
+# runs its station on sta0. So in STA mode the station keeps the interface named sta* and the AP takes the OTHER
+# wireless interface: each BSS in its own role. Without the line nothing here changes: the AP takes the first
+# interface, as before (sta0 on the IW416, by name order). A unit whose driver makes one interface only has no station
+# beside the AP: the AP keeps it, and the keeper says so. RADIO_STA_IF names the station's interface outright.
+WIFI_LINK_FILE=/etc/ocbm/wifi_link
+sta_mode() { grep -q '^ssid_hex=' "$WIFI_LINK_FILE" 2>/dev/null; }
+sta_iface() {
+  if [ -n "${RADIO_STA_IF:-}" ]; then [ -e "/sys/class/net/$RADIO_STA_IF" ] && { echo "$RADIO_STA_IF"; return 0; }; return 1; fi
+  _sti_s=""; _sti_o=""
+  for _sti_d in /sys/class/net/*/; do
+    [ -e "$_sti_d/wireless" ] || [ -e "$_sti_d/phy80211" ] || continue
+    _sti_n=$(basename "$_sti_d")
+    case "$_sti_n" in sta*) [ -z "$_sti_s" ] && _sti_s=$_sti_n ;; *) _sti_o=$_sti_n ;; esac
+  done
+  [ -n "$_sti_s" ] && [ -n "$_sti_o" ] && { echo "$_sti_s"; return 0; }
+  return 1
+}
+# The AP's interface: in STA mode the wireless interface that is not the station's (when there is one), else wlan_iface.
+ap_iface() {
+  sta_mode || { wlan_iface; return; }
+  _apf_s=$(sta_iface) || { wlan_iface; return; }
+  for _apf_d in /sys/class/net/*/; do
+    [ -e "$_apf_d/wireless" ] || [ -e "$_apf_d/phy80211" ] || continue
+    _apf_n=$(basename "$_apf_d")
+    [ "$_apf_n" = "$_apf_s" ] && continue
+    echo "$_apf_n"; return 0
+  done
+  wlan_iface
+}
+
 hci_dev() {
   for _hcid_d in /sys/class/bluetooth/hci*/; do
     [ -d "$_hcid_d" ] && { basename "${_hcid_d%/}"; return 0; }
@@ -623,7 +657,7 @@ do_wifi_ap_prep() {
   caps || { log "AP prep: no descriptor - nothing prepared"; return 3; }
   [ "$RADIO_BACKEND" = mapped ] || {
     log "AP prep: backend=$RADIO_BACKEND brings its AP up with its own scripts - nothing prepared"; return 3; }
-  _i=$(wlan_iface 2>/dev/null) || {
+  _i=$(ap_iface 2>/dev/null) || {
     rm -f "$AP_PREPARED"; log "AP prep: no WLAN interface - the AP is configured at its bring-up"; return 3; }
   [ -x /script/radio_ap_up.sh ] || { log "AP prep: the owned AP layer (/script/radio_ap_up.sh) is not installed"; return 1; }
   if ap_running; then
@@ -642,7 +676,7 @@ do_wifi_ap_on() {
   # FAST PATH (16 Nov 2026). The configuration was written ahead (wifi_ap_prep) and the WLAN driver is loaded (its
   # interface is there): straight to the owned AP layer, whose first launch is then hostapd. No descriptor read, no
   # driver step, no configuration writes: about 0.9 s of every connect went there before hostapd started.
-  if ap_prepared_iface && [ -x /script/radio_ap_up.sh ]; then
+  if ap_prepared_iface && [ -x /script/radio_ap_up.sh ] && { ! sta_mode || [ "$_api" = "$(ap_iface 2>/dev/null)" ]; }; then
     log "AP configured ahead on $_api - launching it"
     ONDEMAND_WIFI=1 RADIO_WLAN_IF="$_api" sh /script/radio_ap_up.sh AP 2>&1 | sed "s/^/$LOGP   /"
     _n=0; while [ "$_n" -lt 50 ]; do ap_running && break; _n=$((_n+1)); sleep 0.2; done
@@ -663,7 +697,7 @@ do_wifi_ap_on() {
   caps || { publish "$WLAN_STATE" "result=unsupported" "detail=no-descriptor"; return 3; }
 
   if ap_running && wlan_iface >/dev/null 2>&1; then
-    _i=$(wlan_iface)
+    _i=$(ap_iface)
     log "already converged (AP running on $_i)"
     publish "$WLAN_STATE" "result=ok" "backend=$RADIO_BACKEND" "chipset=$RADIO_SDIO_DEVICE" \
             "ap_iface=$_i" "ap_ip=$(ap_ip_of "$_i")" "wlan_mac=$(cat /sys/class/net/$_i/address 2>/dev/null)"
@@ -695,9 +729,13 @@ do_wifi_ap_on() {
       wlan_driver_up || {
         publish "$WLAN_STATE" "result=fail" "backend=mapped" "chipset=$RADIO_SDIO_DEVICE" "detail=driver-load"
         return 1; }
-      # Converge on the interface appearing, discovered by enumeration.
-      _n=0; while [ "$_n" -lt 100 ]; do wlan_iface >/dev/null 2>&1 && break; _n=$((_n+1)); sleep 0.1; done
-      _i=$(wlan_iface 2>/dev/null) || {
+      # Converge on the interface appearing, discovered by enumeration. In STA mode on both of the driver's interfaces
+      # (the station's and the AP's) for as long, then the AP takes whatever there is, as before.
+      _n=0; while [ "$_n" -lt 100 ]; do
+        if sta_mode; then sta_iface >/dev/null 2>&1 && break; else wlan_iface >/dev/null 2>&1 && break; fi
+        _n=$((_n+1)); sleep 0.1
+      done
+      _i=$(ap_iface 2>/dev/null) || {
         log "driver loaded but no wireless interface appeared"
         publish "$WLAN_STATE" "result=fail" "backend=mapped" "chipset=$RADIO_SDIO_DEVICE" "detail=no-iface"
         return 1; }
@@ -769,6 +807,21 @@ ap_dhcp_stop() {
   return 1
 }
 
+# The Wi-Fi link's station (wifi_sta.sh): this unit's WLAN driver loaded, and the station's interface (sta_iface: one
+# beside the AP's) up. Never an AP, an address or a scan. 2: already there; 3: no mapped backend or no STA mode.
+do_wifi_sta_up() {
+  sta_mode || { log "wifi_sta_up: no hotspot in $WIFI_LINK_FILE"; return 3; }
+  _wsu=$(sta_iface 2>/dev/null) && { ifconfig "$_wsu" up 2>/dev/null; return 2; }
+  caps || return 3
+  [ "$RADIO_BACKEND" = mapped ] || { log "wifi_sta_up: backend ${RADIO_BACKEND:-none} has no station path"; return 3; }
+  wlan_driver_up || return 1
+  _n=0; while [ "$_n" -lt 100 ] && ! sta_iface >/dev/null 2>&1; do _n=$((_n+1)); sleep 0.1; done
+  _wsu=$(sta_iface 2>/dev/null) || { log "wifi_sta_up: the driver is up, but no station interface beside the AP's"; return 1; }
+  ifconfig "$_wsu" up 2>/dev/null
+  log "wifi_sta_up: station interface $_wsu up"
+  return 0
+}
+
 do_wifi_ap_off() {
   caps || true
   # Chipset-neutral teardown. Deliberately NO module unload: whether rmmod is safe (and whether
@@ -789,7 +842,15 @@ do_wifi_ap_off() {
   # that never was. Its pidfile's pid is no longer killed blind: the server is found by its config path
   # as above, and a stale pidfile can name any process.
   ap_dhcp_stop
-  _i=$(wlan_iface 2>/dev/null) && ifconfig "$_i" down 2>/dev/null
+  if sta_mode; then
+    # The interface the AP ran on; the station's (an AP raised there before the link was set up) only loses the AP's
+    # address: the station keeper brings it up for the hotspot.
+    _i=$(sed -n 's/^interface=//p' /etc/hostapd.conf 2>/dev/null | head -1); [ -n "$_i" ] || _i=$(ap_iface 2>/dev/null)
+    if [ -n "$_i" ] && [ "$_i" = "$(sta_iface 2>/dev/null)" ]; then ifconfig "$_i" 0.0.0.0 2>/dev/null
+    elif [ -n "$_i" ]; then ifconfig "$_i" down 2>/dev/null; fi
+  else
+    _i=$(wlan_iface 2>/dev/null) && ifconfig "$_i" down 2>/dev/null
+  fi
   _n=0; while [ "$_n" -lt 25 ] && ap_running; do _n=$((_n+1)); sleep 0.2; done
   ap_running && { log "hostapd still running after teardown"; publish "$WLAN_STATE" "result=fail" "detail=ap-survived"; return 1; }
   rm -f "$WLAN_STATE"
@@ -1833,10 +1894,13 @@ case "$VERB" in
                [ "${_bt_attached:-0}" = 1 ] && boot_line bt_on "$_r"   # a bt_on that attached (no preload did)
                exit $_r ;;
   bt_off)      lock_take bt   || exit 1; do_bt_off;      _r=$?; lock_drop bt;   exit $_r ;;
+  # The Wi-Fi link's station (wifi_sta.sh): the WLAN driver loaded and the station's interface up, nothing else (no AP,
+  # no address). Under the wlan lock, so it never meets a session's wifi_ap_on or the boot preload.
+  wifi_sta_up) lock_take wlan || exit 1; do_wifi_sta_up; _r=$?; lock_drop wlan; exit $_r ;;
   # Both locks, wlan first (the supervisor's own order, one at a time, so no deadlock): bt_on loads
   # the WLAN driver, which an app-driven wifi_ap_on arriving mid-preload must not race. Each lock may have gone
   # earlier (do_preload, and the Wi-Fi side of a together attach), so each goes here only while it is still this one's.
   preload)     lock_take wlan || exit 1; lock_take bt || { lock_drop wlan; exit 1; }
                do_preload; _r=$?; trap - EXIT INT TERM HUP; lock_drop_own bt; lock_drop_own wlan; exit $_r ;;
-  *) echo "$LOGP usage: radio_hal.sh probe|status|wifi_ap_on|wifi_ap_off|wifi_ap_prep|bt_on|bt_off|preload" >&2; exit 64 ;;
+  *) echo "$LOGP usage: radio_hal.sh probe|status|wifi_ap_on|wifi_ap_off|wifi_ap_prep|wifi_sta_up|bt_on|bt_off|preload" >&2; exit 64 ;;
 esac

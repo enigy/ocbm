@@ -33,7 +33,7 @@ printf '#!/bin/sh\nPATH="%s:$PATH" exec "%s" sh "$@"\n' "$T/applets" "$BB" > "$T
 chmod 755 "$T/shell/busybox-sh"
 
 fail=0
-for s in ocbm_stageb_test.sh ocbm_installer_test.sh ocbm_update_test.sh radio_ap_up_test.sh session_supervisor_test.sh radio_hal_test.sh; do
+for s in ocbm_stageb_test.sh ocbm_installer_test.sh ocbm_update_test.sh radio_ap_up_test.sh session_supervisor_test.sh radio_hal_test.sh wifi_sta_test.sh; do
   echo "=== $s under $ver"
   OCBM_TEST_PATH="$T/applets" SHELLS="$T/shell/busybox-sh" bash "$HERE/$s" || fail=1
 done

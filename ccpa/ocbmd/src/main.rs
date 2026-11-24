@@ -4066,6 +4066,10 @@ impl Daemon {
     /// HELLO carries its own instance nonce: then it is the same host on another transport, which takes the box.
     fn admit(&mut self, via: Via, ch: u16, pl: &[u8], now: Instant) -> Admit {
         if self.wifi.via == Some(via) {
+            // The listener's view of "busy" follows, at most once a second (a frame can come thousands of times a second).
+            if self.wifi.last_host_frame.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(1)) {
+                self.wifi.publish_busy(Some(now));
+            }
             self.wifi.last_host_frame = Some(now);
             return Admit::Take;
         }
@@ -4121,6 +4125,7 @@ impl Daemon {
         self.clear_output();
         self.wifi.via = Some(via);
         self.wifi.last_host_frame = Some(now);
+        self.wifi.publish_busy(Some(now));
         let peer = match via {
             Via::Wifi(id) => self.wifi.link_index(id).map(|i| format!(" from {}", wifi::peer_short(&self.wifi.links[i].peer))).unwrap_or_default(),
             Via::Usb => String::new(),
@@ -4131,6 +4136,7 @@ impl Daemon {
     /// Nobody holds the box now: the loop's output goes to the sink, so nothing queues for a host that is not there.
     fn release_box(&mut self, why: &str) {
         let Some(old) = self.wifi.via.take() else { return };
+        self.wifi.publish_busy(None);
         let prev = std::mem::replace(&mut self.acc, wifi::sink());
         if old == Via::Usb {
             self.wifi.usb_out = Some(prev);

@@ -151,6 +151,14 @@ touch /tmp/UDiskPassThroughMode
     [ -e /script/radio_preload_late ] && echo "[ocbm-boot] radio preload starts after ocbmd and the supervisor (/script/radio_preload_late)" >> /tmp/box.log
     radio_preload
   fi
+  # The Wi-Fi link's station keeper (wifi_sta.sh, 24 Nov 2026): with a hotspot set up in /etc/ocbm/wifi_link, the adapter
+  # looks for the phone's hotspot from power-up and keeps the station joined (its header says what it scans, and when).
+  # After the preload's start, so the driver load goes through the preload's locks first. Backgrounded; with no such
+  # line nothing starts and this boot is 2.7.1's (the test is the shell's own: no fork without the file).
+  if [ -e /etc/ocbm/wifi_link ] && grep -q '^ssid_hex=' /etc/ocbm/wifi_link 2>/dev/null && [ -r /script/wifi_sta.sh ]; then
+    echo "[ocbm-boot] wifi link: station keeper starting" >> /tmp/box.log
+    setsid sh /script/wifi_sta.sh >> /tmp/box.log 2>&1 </dev/null &
+  fi
   # The radio order's off switch, every boot, as the preload's (radio_hal.sh, "The order Bluetooth and the Wi-Fi
   # driver come up in"): the owner's or its guard's /script/radio_together_off brings back the Wi-Fi-first order.
   if [ -e /script/radio_together_off ]; then

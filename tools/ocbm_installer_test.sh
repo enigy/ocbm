@@ -57,6 +57,8 @@ script/radio_hal.sh
 script/run_ocbmd.sh
 script/run_supervisor.sh
 script/session_supervisor.sh
+script/wifi_sta.sh
+script/wifi_sta_dhcp.sh
 usr/bin/iap_role_switch
 usr/sbin/btd
 usr/sbin/carplayd
@@ -64,6 +66,8 @@ usr/sbin/iap2d
 usr/sbin/ocbmd"
 have="$(bash "$HERE/make_ocbm_installer.sh" --list | grep -vE '^script/(ocbm_(dispatch|selftest|revert|finish|update|restore)|stock_restore_box)\.sh$' | LC_ALL=C sort -u)"
 check '[ "$want" = "$have" ]' "the payload is the pinned file set"
+check '! bash "$HERE/make_ocbm_installer.sh" --list | grep -qx "usr/sbin/wpa_supplicant"' \
+  "never usr/sbin/wpa_supplicant: the vendor's dispatcher reads it as STA mode on every unit"
 mkdir -p "$T/noinst"; cp "$REPO/ccpa/installer/"* "$T/noinst/"; rm -f "$T/noinst/ocbm_dispatch.sh"
 check '! BIN_DIR="$T/bin" IRS_BIN="$T/irs" INSTALLER_DIR="$T/noinst" bash "$HERE/make_ocbm_installer.sh" "$T/out2" >/dev/null 2>&1' \
   "the builder refuses without the Stage B scripts"

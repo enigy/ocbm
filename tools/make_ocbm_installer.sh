@@ -28,6 +28,10 @@ payload() {  # SOURCE|PATH-ON-BOX: the programs and boot scripts, then Stage B/C
   echo "$REPO/ccpa/rootfs/script/ocbm_boot.sh|script/ocbm_boot.sh"
   echo "$REPO/tools/run_ocbmd.sh|script/run_ocbmd.sh"
   for s in radio_detect radio_hal radio_ap_up; do echo "$REPO/ccpa/rootfs/script/$s.sh|script/$s.sh"; done
+  # The Wi-Fi link's station keeper and its DHCP hook: inert until /etc/ocbm/wifi_link names a hotspot. No supplicant
+  # here: OCBM's own would go to usr/sbin/ocbm-wpa_supplicant (never usr/sbin/wpa_supplicant: the vendor's dispatcher
+  # reads that path as "STA mode" and loads the IW416's driver in another mode on every unit).
+  for s in wifi_sta wifi_sta_dhcp; do echo "$REPO/ccpa/rootfs/script/$s.sh|script/$s.sh"; done
   for s in session_supervisor projection_up phone_reset run_supervisor; do echo "$REPO/tools/$s.sh|script/$s.sh"; done
   for s in ocbm_dispatch ocbm_selftest ocbm_revert ocbm_finish ocbm_update ocbm_restore; do echo "$INSTALLER_DIR/$s.sh|script/$s.sh"; done
   echo "$REPO/tools/stock_restore_box.sh|script/stock_restore_box.sh"   # ocbm_restore.sh's engine: back to stock from a stick

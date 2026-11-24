@@ -15,7 +15,8 @@
 #   3 /etc/ocbm/pending_result.txt, the report the dispatcher copies to the next stick plugged in
 #   4 remove /script/ocbm_mode, then the start counter
 #
-# OCBM's own files stay on flash, and the extras the install removed stay removed.
+# OCBM's own files stay on flash, and the extras the install removed stay removed, save the Wi-Fi link's secrets
+# (/etc/ocbm/wifi_link and its kin): stock answers a passwordless telnetd on its AP.
 # Exit 0: on stock now (or already was). Exit 1: refused, nothing changed (mode final: the Carlinkit
 # stack is gone; start_main_service.stock.sh is missing; ocbm_finish.sh holds the lock; or an update is
 # in its trial, which the dispatcher settles first).
@@ -113,7 +114,10 @@ rm -f "$MODE"; sync
 rm -f "$S/radio_preload_off" "$S/.radio_preload_inflight" "$S/.radio_preload_unfinished" "$S/radio_preload_late"
 rm -f "$S/radio_together_off" "$S/.radio_together_inflight" "$S/.radio_together_failed" "$S/radio_handover_on" \
   "$S/radio_handover_off"
-rm -f "$EO/boot_attempts"; sync
+rm -f "$EO/boot_attempts"
+# The Wi-Fi link (24 Nov 2026): its link key and the hotspot's WPA key (the hash IS the key) must not stay on a stock
+# unit, whose rcS starts a passwordless telnetd on its AP; its session config and channel go with them.
+rm -f "$EO/wifi_link" "$EO/wifi_link.tmp" "$EO/wifi_link_channel" "$EO/wifi_session.yaml"; sync
 log "on stock from the next start"
 [ "$restart" = 1 ] && { sync; $REBOOT; }
 done_ 0
