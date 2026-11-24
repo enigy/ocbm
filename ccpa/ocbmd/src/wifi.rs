@@ -346,15 +346,33 @@ fn bench_iface() -> Option<String> {
     (!v.is_empty() && v != "off").then(|| v.to_string())
 }
 
-/// Where the listener should be now: the station's address (or the bench lever's interface's), port 7020; None while
-/// there is none, or when it lies on the AP's or NCM's subnet.
-pub fn listen_addr(sta: Option<&Sta>) -> Option<SocketAddrV4> {
+/// Where the listener should be now: the station's address (or the bench lever's interface's), port 7020, and that
+/// interface; None while there is none, or when it lies on the AP's or NCM's subnet.
+pub fn listen_addr(sta: Option<&Sta>) -> Option<(SocketAddrV4, String)> {
     let iface = bench_iface().or_else(|| sta.filter(|s| s.joined).map(|s| s.iface.clone()))?;
     let (ip, _) = iface_v4(&iface)?;
     if reserved_subnet(ip) || ip.is_loopback() || ip.is_unspecified() {
         return None;
     }
-    Some(SocketAddrV4::new(ip, ocbm_link::PORT))
+    Some((SocketAddrV4::new(ip, ocbm_link::PORT), iface))
+}
+
+/// Take connections from `iface` only (SO_BINDTODEVICE): under Linux's weak-host model a socket bound to one
+/// interface's address answers that address arriving on any interface, the AP's and USB's network included, so the
+/// address alone does not keep a client of the box's own AP out (the review of 24 Nov, I). Nothing elsewhere (macOS,
+/// the tests' host, has no such option and no such need here).
+pub fn only_on(l: &TcpListener, iface: &str) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let name = std::ffi::CString::new(iface).map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        let len = name.as_bytes_with_nul().len() as libc::socklen_t;
+        // SAFETY: SO_BINDTODEVICE on the listener's own socket, with the interface's NUL-terminated name.
+        if unsafe { libc::setsockopt(l.as_raw_fd(), libc::SOL_SOCKET, libc::SO_BINDTODEVICE, name.as_ptr().cast(), len) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    let _ = (l, iface);
+    Ok(())
 }
 
 // ---- the state the threads share ------------------------------------------------------------------------------------
@@ -475,7 +493,7 @@ pub fn start_listener(shared: Arc<Shared>, bind: Bind) -> std::io::Result<Listen
 
 fn listen_loop(shared: Arc<Shared>, fixed: Option<TcpListener>, tx: mpsc::Sender<Authed>, wake: File) {
     let fixed_mode = fixed.is_some();
-    let mut cur: Option<(SocketAddrV4, TcpListener)> = None;
+    let mut cur: Option<((SocketAddrV4, String), TcpListener)> = None;
     let fixed_l = fixed;
     let mut last_look = Instant::now() - Duration::from_secs(10);
     let mut last_refusal_log = Instant::now() - Duration::from_secs(10);
@@ -483,19 +501,19 @@ fn listen_loop(shared: Arc<Shared>, fixed: Option<TcpListener>, tx: mpsc::Sender
         if !fixed_mode && last_look.elapsed() >= Duration::from_secs(1) {
             last_look = Instant::now();
             let want = listen_addr(read_sta(STA_STATE).as_ref());
-            if cur.as_ref().map(|(a, _)| *a) != want {
-                if let Some((a, _)) = cur.take() {
+            if cur.as_ref().map(|(w, _)| w) != want.as_ref() {
+                if let Some(((a, _), _)) = cur.take() {
                     eprintln!("[ocbmd] wifi: listener on {a} closed (the station's address went or changed)");
                 }
                 *shared.bound.lock().unwrap_or_else(|e| e.into_inner()) = None;
-                if let Some(a) = want {
-                    match TcpListener::bind(a) {
+                if let Some((a, i)) = want {
+                    match TcpListener::bind(a).and_then(|l| only_on(&l, &i).map(|()| l)) {
                         Ok(l) => {
-                            eprintln!("[ocbmd] wifi: listening on {a} (OCBW v1, the station's address only)");
+                            eprintln!("[ocbmd] wifi: listening on {a} (OCBW v1, the station's address, from {i} only)");
                             *shared.bound.lock().unwrap_or_else(|e| e.into_inner()) = Some(a);
-                            cur = Some((a, l));
+                            cur = Some(((a, i), l));
                         }
-                        Err(e) => eprintln!("[ocbmd] wifi: could not listen on {a} ({e}); trying again"),
+                        Err(e) => eprintln!("[ocbmd] wifi: could not listen on {a} from {i} ({e}); trying again"),
                     }
                 }
             }

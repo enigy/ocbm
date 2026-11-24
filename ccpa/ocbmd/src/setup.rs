@@ -126,8 +126,11 @@ impl Setup {
                 Some("no Wi-Fi link and no host: raising the set-up network (CarLink-Setup-xxxx, 10 minutes)".into())
             }
             Phase::Raising(since) => {
-                if std::fs::read_to_string(AP_MARK).is_ok_and(|m| m.starts_with("ok")) {
-                    match self.start_listener(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 43, 1), SETUP_PORT))) {
+                // "ok <the AP's interface>": the listener takes connections from that interface only.
+                if let Some(m) = std::fs::read_to_string(AP_MARK).ok().filter(|m| m.starts_with("ok")) {
+                    let iface = m[2..].trim();
+                    let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 43, 1), SETUP_PORT));
+                    match self.start_listener(addr, Some(iface).filter(|i| !i.is_empty())) {
                         Ok(()) => {
                             self.phase = Phase::Offered(now + WINDOW);
                             let _ = std::fs::remove_file(format!("{ROOT}{SETUP_ONCE}")); // a reset's leave is spent
@@ -165,9 +168,12 @@ impl Setup {
         self.phase = Phase::Over;
     }
 
-    /// The listener: one client at a time, the exchange within [`HANDSHAKE_LIMIT`].
-    pub fn start_listener(&mut self, addr: SocketAddr) -> std::io::Result<()> {
+    /// The listener: one client at a time, the exchange within [`HANDSHAKE_LIMIT`], from `iface` only when named.
+    pub fn start_listener(&mut self, addr: SocketAddr, iface: Option<&str>) -> std::io::Result<()> {
         let l = TcpListener::bind(addr)?;
+        if let Some(i) = iface {
+            crate::wifi::only_on(&l, i)?;
+        }
         let fixed = l.local_addr().ok();
         let (tx, rx) = mpsc::channel();
         let (wake, wake_tx) = crate::cloexec_pipe()?;
@@ -380,7 +386,7 @@ mod tests {
 
     fn listening() -> (Setup, SocketAddr) {
         let mut s = Setup::waiting(Instant::now());
-        s.start_listener("127.0.0.1:0".parse().unwrap()).unwrap();
+        s.start_listener("127.0.0.1:0".parse().unwrap(), None).unwrap();
         s.phase = Phase::Offered(Instant::now() + WINDOW);
         let addr = s.listener.as_ref().unwrap().fixed.unwrap();
         (s, addr)

@@ -20,11 +20,16 @@
 //! when the address comes or changes, says goodbye when it goes, and nothing else: no probing (the name carries the
 //! box's own suffix), no known-answer suppression.
 //!
-//! SHARING :5353 with carplayd's `mdns-sd`, which binds it with SO_REUSEADDR and SO_REUSEPORT; so does this, so the
-//! kernel hands every multicast query to both. This socket joins the group on the station's address only, sends
-//! there only, and on Linux sets IP_MULTICAST_ALL to 0 so it hears only the groups it joined itself (by default a
-//! Linux socket hears a group joined by ANY socket on ANY interface, the AP's included). A query from outside the
-//! station's subnet is not answered. So nothing of `_ocbm._tcp` reaches the phone on the box's own AP.
+//! SHARING :5353 with carplayd's `mdns-sd`, whose sockets (0.11.5: one per interface) are bound to 0.0.0.0:5353 with
+//! SO_REUSEADDR and SO_REUSEPORT. This one binds 224.0.0.251:5353 instead (with both options, to share the port): a
+//! socket bound to the group address takes only datagrams sent to the group, so a unicast datagram to :5353 (a direct
+//! query, a unicast reply to carplayd's own) never lands here, where with 0.0.0.0 and SO_REUSEPORT the kernel would
+//! have spread unicast ones over every socket of the port, carplayd's and this one alike. Every multicast query still
+//! reaches both. It joins the group on the station's address only, sends there only (replies go from the address the
+//! route picks, the station's: a socket bound to a group address has no source address of its own), and on Linux sets
+//! IP_MULTICAST_ALL to 0 so it hears only the groups it joined itself (by default a Linux socket hears a group joined
+//! by ANY socket on ANY interface, the AP's included). A query from outside the station's subnet is not answered. So
+//! nothing of `_ocbm._tcp` reaches the phone on the box's own AP.
 
 use crate::wifi::Shared;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
@@ -107,17 +112,17 @@ fn put_rr(out: &mut Vec<u8>, name: &str, rtype: u16, class: u16, ttl: u32, rdata
 }
 
 /// The whole record set as one response. `goodbye` sets every TTL to 0. `legacy` is a unicast answer to a one-shot
-/// query from a port other than 5353 (RFC 6762 §6.7): its id and question echoed, no cache-flush bit, TTLs of 10 s.
-pub fn response(a: &Advert, goodbye: bool, legacy: Option<(u16, &[u8])>) -> Vec<u8> {
-    let id = legacy.map_or(0, |(id, _)| id);
-    let qd = u16::from(legacy.is_some_and(|(_, q)| !q.is_empty()));
+/// query from a port other than 5353 (RFC 6762 §6.7): its id and its questions echoed, all of them and counted as many
+/// in QDCOUNT, no cache-flush bit, TTLs of 10 s.
+pub fn response(a: &Advert, goodbye: bool, legacy: Option<(u16, Questions)>) -> Vec<u8> {
+    let (id, qd) = legacy.map_or((0, 0), |(id, (n, _))| (id, n));
     let mut out = Vec::with_capacity(256);
     out.extend_from_slice(&id.to_be_bytes());
     out.extend_from_slice(&[0x84, 0]); // QR | AA
     out.extend_from_slice(&qd.to_be_bytes());
     out.extend_from_slice(&5u16.to_be_bytes());
     out.extend_from_slice(&[0, 0, 0, 0]);
-    if let Some((_, q)) = legacy.filter(|(_, q)| !q.is_empty()) {
+    if let Some((_, (_, q))) = legacy {
         out.extend_from_slice(q);
     }
     let ttl = |long: u32| if goodbye { 0 } else if legacy.is_some() { long.min(10) } else { long };
@@ -166,9 +171,12 @@ fn read_name(msg: &[u8], mut off: usize) -> Option<(String, usize)> {
     None
 }
 
-/// Whether `msg` is a query with a question this advert answers; Some(the question section's bytes) when it is, for a
-/// legacy answer to echo (empty when it could not be cut out whole).
-pub fn asks_for_us<'m>(msg: &'m [u8], a: &Advert) -> Option<&'m [u8]> {
+/// A query's question section: how many questions, and their bytes (for a legacy answer to echo whole).
+pub type Questions<'m> = (u16, &'m [u8]);
+
+/// Whether `msg` is a query with a question this advert answers; Some(its whole question section) when it is. A
+/// question that does not parse ends it: None.
+pub fn asks_for_us<'m>(msg: &'m [u8], a: &Advert) -> Option<Questions<'m>> {
     if msg.len() < 12 || msg[2] & 0x80 != 0 {
         return None; // too short, or a response
     }
@@ -188,7 +196,7 @@ pub fn asks_for_us<'m>(msg: &'m [u8], a: &Advert) -> Option<&'m [u8]> {
             _ => false,
         };
     }
-    hit.then(|| msg.get(12..off).unwrap_or(&[]))
+    Some((qd, msg.get(12..off)?)).filter(|_| hit)
 }
 
 fn same_subnet(a: Ipv4Addr, b: Ipv4Addr, mask: Ipv4Addr) -> bool {
@@ -218,7 +226,7 @@ fn open_socket(ip: Ipv4Addr) -> std::io::Result<UdpSocket> {
     let addr = libc::sockaddr_in {
         sin_family: libc::AF_INET as libc::sa_family_t,
         sin_port: PORT.to_be(),
-        sin_addr: libc::in_addr { s_addr: 0 },
+        sin_addr: libc::in_addr { s_addr: u32::from(GROUP).to_be() }, // the group's datagrams only (the header)
         sin_zero: [0; 8],
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         sin_len: std::mem::size_of::<libc::sockaddr_in>() as u8,
@@ -351,7 +359,11 @@ mod tests {
         q.extend_from_slice(&[0, 33, 0, 1]);
         assert_eq!(read_name(&q, 12 + 18 + 4).unwrap().0, "carlink-1a2b._ocbm._tcp.local");
         let qs = asks_for_us(&q, &advert()).unwrap();
-        assert_eq!(qs.len(), q.len() - 12, "the whole question section, for a legacy answer to echo");
+        assert_eq!(qs, (2, &q[12..]), "the whole question section and its count, for a legacy answer to echo");
+        // Echoed whole in a legacy answer, and counted as two (it said one: the second question read as an answer).
+        let r = response(&advert(), false, Some((7, qs)));
+        assert_eq!(u16::from_be_bytes([r[4], r[5]]), 2);
+        assert_eq!(&r[12..q.len()], &q[12..]);
     }
 
     #[test]
@@ -386,7 +398,7 @@ mod tests {
         let r = response(&advert(), false, Some((0x1234, qs)));
         assert_eq!(&r[..2], &[0x12, 0x34]);
         assert_eq!(u16::from_be_bytes([r[4], r[5]]), 1, "the question echoed");
-        assert_eq!(&r[12..12 + qs.len()], qs);
+        assert_eq!(&r[12..12 + qs.1.len()], qs.1);
     }
 
     #[test]
