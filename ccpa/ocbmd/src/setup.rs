@@ -39,6 +39,27 @@ const AP_MARK: &str = "/tmp/ocbmd_selftest_radio_setup_ap";
 const HAL: &str = "/script/radio_hal.sh";
 #[cfg(test)]
 const HAL: &str = "/tmp/ocbmd_selftest_no_such_radio_hal.sh";
+/// The set-up AP's hostapd configuration, there from its start's first step to its teardown's last.
+#[cfg(not(test))]
+const AP_CONF: &str = "/tmp/hostapd_setup.conf";
+#[cfg(test)]
+const AP_CONF: &str = "/tmp/ocbmd_selftest_hostapd_setup.conf";
+
+/// A set-up network is up, or on its way up, by radio_hal.sh's files.
+fn ap_up() -> bool {
+    std::path::Path::new(AP_MARK).exists() || std::path::Path::new(AP_CONF).exists()
+}
+
+/// A set-up network this process did not raise must not stay up on its own (the review of 24 Nov, H): an earlier
+/// ocbmd's, which exited or respawned with its window open, at this one's start; and any, once a host's HELLO is taken
+/// ([`host_seen`]), whatever its session (a wired one, or one with wireless off, raises no CarPlay AP, whose start is
+/// what takes a set-up network down otherwise).
+pub fn orphan_down(why: &str) {
+    if ap_up() {
+        eprintln!("[ocbmd] setup: a set-up network is up {why}: taking it down");
+        hal("setup_ap_off");
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Phase {
@@ -276,6 +297,7 @@ pub fn host_seen() {
     static NOTED: AtomicBool = AtomicBool::new(false);
     if !NOTED.swap(true, Ordering::Relaxed) {
         note_host_at(ROOT);
+        orphan_down("with a host here");
     }
 }
 
@@ -345,6 +367,15 @@ mod tests {
         assert_eq!(used_because(&root), Some("a host has used this adapter"), "the leave is gone with the first HELLO");
         assert!(!std::path::Path::new(&format!("{root}{SETUP_ONCE}")).exists());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_set_up_network_on_its_way_up_or_up_is_seen_by_its_files() {
+        let _ = std::fs::remove_file(AP_CONF);
+        assert!(!ap_up() || std::path::Path::new(AP_MARK).exists());
+        std::fs::write(AP_CONF, b"interface=wlan0\n").unwrap();
+        assert!(ap_up(), "its configuration written: on its way up, or left by an ocbmd that is gone");
+        let _ = std::fs::remove_file(AP_CONF);
     }
 
     fn listening() -> (Setup, SocketAddr) {

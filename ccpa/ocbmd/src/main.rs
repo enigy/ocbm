@@ -5243,6 +5243,8 @@ fn main() {
     // Same for a stale CT_RADIO inhibit from a crashed prior ocbmd (tmpfs, but a daemon respawn
     // without a reboot would otherwise inherit it).
     let _ = std::fs::remove_file(RADIO_OFF_FLAG);
+    // And for a set-up network a prior ocbmd left up: no window of this process's is open yet (setup.rs).
+    setup::orphan_down("from an earlier ocbmd");
     // Create the liveness stamp (see [`ALIVE_FILE`]) — and note File::create also freshens the mtime
     // of one left behind by a predecessor, so a new instance never inherits a stale "wedged" reading.
     if let Err(e) = File::create(ALIVE_FILE) {
