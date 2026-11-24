@@ -1,10 +1,12 @@
 #!/bin/sh
-# build_wpa_supplicant.sh — cross-build the Wi-Fi link's station supplicant for the adapter: wpa_supplicant and wpa_cli
-# 2.11, static, armv7 musl (zig cc), with libnl 3.12.0 for nl80211 (WEXT kept as the fallback driver), WPA2-PSK only:
-# no SAE, so a WPA3-only hotspot is not supported in this version (WPA2 and WPA2/WPA3 mixed are). The installer image
-# places the two as /usr/sbin/ocbm-wpa_supplicant and /usr/sbin/ocbm-wpa_cli (tools/make_ocbm_installer.sh, from
-# $WPA_DIR/install), NEVER as /usr/sbin/wpa_supplicant: the vendor's dispatcher reads that path's existence as "STA
-# mode" and loads the IW416's driver in another mode (drv_mode=5, no AP interface) on every unit, set up or not.
+# build_wpa_supplicant.sh — cross-build the Wi-Fi link's station supplicant for the adapter: wpa_supplicant 2.11,
+# static, armv7 musl (zig cc), with libnl 3.12.0 for nl80211 (WEXT kept as the fallback driver), WPA2-PSK only: no SAE,
+# so a WPA3-only hotspot is not supported in this version (WPA2 and WPA2/WPA3 mixed are). The installer image places it
+# as /usr/sbin/ocbm-wpa_supplicant (tools/make_ocbm_installer.sh, from $WPA_DIR/install), NEVER as
+# /usr/sbin/wpa_supplicant: the vendor's dispatcher reads that path's existence as "STA mode" and loads the IW416's
+# driver in another mode (drv_mode=5, no AP interface) on every unit, set up or not. No wpa_cli (24 Nov 2026): the
+# station keeper and the bench speak to the supplicant's control socket with `ocbmd wpa` (ccpa/ocbmd/src/wpa.rs), and
+# wpa_cli's 96 KB (about 68 KB on flash) was more than an update to a final adapter could spare.
 #
 #   tools/build_wpa_supplicant.sh        # WPA_DIR defaults to <repo>/scratchpad/wpa (ignored by git)
 #
@@ -62,8 +64,8 @@ command -v "${PKG_CONFIG:-pkg-config}" >/dev/null 2>&1 || export PKG_CONFIG=true
 
 # No debug output (CONFIG_NO_STDOUT_DEBUG): 184 KB less, which the update needs to fit a final adapter (measured 24 Nov:
 # 729,248 B with it, 545,712 B without); a bench that wants the supplicant's log puts a debug build in /tmp/bin.
-# wpa_supplicant: nl80211 + WEXT, the control interface (wpa_cli), internal crypto, and nothing else: no EAP, no WPS,
-# no P2P, no SAE (WPA2-PSK only), no D-Bus.
+# wpa_supplicant: nl80211 + WEXT, the control interface (its UNIX socket, which `ocbmd wpa` speaks to), internal
+# crypto, and nothing else: no EAP, no WPS, no P2P, no SAE (WPA2-PSK only), no D-Bus.
 cat > "$WPA_SRC/wpa_supplicant/.config" <<EOF
 CONFIG_DRIVER_NL80211=y
 CONFIG_LIBNL32=y
@@ -80,11 +82,10 @@ EOF
 ( cd "$WPA_SRC/wpa_supplicant"
   CC="$CC_ARM" CFLAGS="-Os -MMD -ffunction-sections -fdata-sections" \
     LDFLAGS="-static -Wl,--gc-sections -s -L$NL_SRC/lib/.libs" \
-    make -j8 wpa_supplicant wpa_cli >/dev/null )
+    make -j8 wpa_supplicant >/dev/null )
 
 install -m 755 "$WPA_SRC/wpa_supplicant/wpa_supplicant" "$W/install/ocbm-wpa_supplicant"
-install -m 755 "$WPA_SRC/wpa_supplicant/wpa_cli" "$W/install/ocbm-wpa_cli"
-# The licences travel with the binaries (libnl is linked statically from the release named above, unmodified).
+# The licences travel with the binary (libnl is linked statically from the release named above, unmodified).
 install -m 644 "$WPA_SRC/COPYING" "$W/install/NOTICE.wpa_supplicant"
 install -m 644 "$NL_SRC/COPYING" "$W/install/NOTICE.libnl"
-echo "built  $W/install/ocbm-wpa_supplicant ($(wc -c < "$W/install/ocbm-wpa_supplicant") bytes), ocbm-wpa_cli ($(wc -c < "$W/install/ocbm-wpa_cli") bytes)"
+echo "built  $W/install/ocbm-wpa_supplicant ($(wc -c < "$W/install/ocbm-wpa_supplicant") bytes)"

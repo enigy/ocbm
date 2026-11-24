@@ -6,3 +6,5 @@
 #   - once.sh deletes them when it installs over an earlier OCBM.
 # Lines are only ever added. A path that comes back in a later version must leave this list first.
 usr/sbin/aa-bridge
+# The Wi-Fi link's wpa_cli, placed by the branch's bench packages until 24 Nov 2026; `ocbmd wpa` replaces it.
+usr/sbin/ocbm-wpa_cli

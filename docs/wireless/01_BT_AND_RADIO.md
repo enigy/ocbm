@@ -518,8 +518,12 @@ also joins the phone's Personal Hotspot as a station, so a head unit on that hot
 - **Never `/usr/sbin/wpa_supplicant`.** The vendor dispatcher's gate (`test -e /usr/sbin/wpa_supplicant &&
   supportStaMode=1`) switches moal to `wifi_mod_para_p2psta.conf` (`drv_mode=5`, `wfd_name=wlan`: no uAP BSS at all), and
   `radio_detect.sh` follows that gate on every unit, set up or not. The stock image ships no supplicant (the factory
-  survey of 27 Oct), so the keeper takes OCBM's own `/usr/sbin/ocbm-wpa_supplicant` and `ocbm-wpa_cli`, a unit's own
-  stock copy, or a bench copy in `/tmp/bin`, and waits without one. OCBM's own is built by
+  survey of 27 Oct), so the keeper takes OCBM's own `/usr/sbin/ocbm-wpa_supplicant`, a unit's own stock copy, or a bench
+  copy in `/tmp/bin`, and waits without one. It speaks to the supplicant's control socket
+  (`/var/run/wpa_supplicant/<if>`) with `ocbmd wpa`, not wpa_cli, which the adapter no longer carries (24 Nov 2026:
+  about 68 KB of flash); by hand over the console the same: `ocbmd wpa sta0 status` (or `scan`, `scan_results`,
+  `list_networks`, `enable_network 0`: wpa_cli's commands, the reply printed as wpa_cli prints it; `-p DIR` before the
+  interface for another control directory). OCBM's own is built by
   `tools/build_wpa_supplicant.sh` (wpa_supplicant 2.11 and libnl 3.12.0, static, nl80211 with WEXT as the fallback,
   WPA2-PSK only) from release archives a checkout fetches once into `scratchpad/wpa/dl`, each checked against a SHA-256
   pinned in the script, and the image places it when built (its licences as NOTICE files beside the payload).

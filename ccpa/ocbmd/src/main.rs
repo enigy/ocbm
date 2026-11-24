@@ -17,6 +17,7 @@ mod jffs2;
 mod mdns;
 mod setup;
 mod wifi;
+mod wpa;
 
 use wifi::Via;
 
@@ -5157,8 +5158,14 @@ fn set_nonblocking(f: &File) {
 }
 
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
     // `ocbmd jffs2-extract MTD2 OUT`: a tool run, not the daemon (ocbm_restore.sh's decoder; see jffs2.rs).
-    if let Some(code) = jffs2::cli(&std::env::args().collect::<Vec<_>>()) {
+    if let Some(code) = jffs2::cli(&args) {
+        std::process::exit(code);
+    }
+    // `ocbmd wpa [-p DIR] IFACE COMMAND...`: one request to the station's supplicant, for the keeper and the bench
+    // (wpa.rs). Also a tool run, before the lock.
+    if let Some(code) = wpa::cli(&args) {
         std::process::exit(code);
     }
     // Singleton guard BEFORE anything with a side effect — see [`PID_LOCK_FILE`]. The fd is held

@@ -806,12 +806,13 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
 ### Wireless transport — the RCS DataStream and the BT→WiFi path
 
 - **The Wi-Fi link (branch `wifi-link`, 24 Nov 2026): built and unit-tested, NOT benched.** Open: (1) no WPA supplicant
-  on the stock image: one must be bundled as `/usr/sbin/ocbm-wpa_supplicant` + `ocbm-wpa_cli` (never
-  `/usr/sbin/wpa_supplicant`, which flips the IW416 driver mode on every unit) or pushed to `/tmp/bin` for the bench; a
-  build needs downloaded sources (wpa_supplicant 2.11, libnl 3.12.0; `tools/build_wpa_supplicant.sh` checks them against
-  the SHA-256 pinned 24 Nov). Built and bundled 24 Nov (545,712 B and 96,340 B, no debug output): the update package
-  then fits a final adapter's `final_kb` 3,900 with a few KB to spare (the figure in the last hand-off notes), so
-  every further byte on flash counts; (2) the AP on `wlan0` (uAP BSS)
+  on the stock image: one must be bundled as `/usr/sbin/ocbm-wpa_supplicant` (never `/usr/sbin/wpa_supplicant`, which
+  flips the IW416 driver mode on every unit) or pushed to `/tmp/bin` for the bench; a build needs downloaded sources
+  (wpa_supplicant 2.11, libnl 3.12.0; `tools/build_wpa_supplicant.sh` checks them against the SHA-256 pinned 24 Nov).
+  Built and bundled 24 Nov (545,712 B, no debug output). Its wpa_cli (96,340 B) was dropped the same day, when the
+  update package stood at need_kb 3,895 of a final adapter's `final_kb` 3,900: `ocbmd wpa` speaks to the control
+  socket instead (ccpa/ocbmd/src/wpa.rs), and `retired.list` takes the copy a bench package placed. Every byte on flash
+  still counts; (2) the AP on `wlan0` (uAP BSS)
   beside the station on `sta0` is inferred from the stock driver configuration, not measured; (3) the AP on the
   hotspot's channel (ADDENDUM 6, 24 Nov: at its start in STA mode the AP follows the station, never to a radar channel,
   from `/tmp/hostapd_session.conf`; docs/wireless/01_BT_AND_RADIO.md, "Channels") is built, not benched: whether the

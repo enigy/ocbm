@@ -377,8 +377,12 @@ the host's arrival and the first frame, the PSK count is a lower bound: `PSK mis
 `/tmp/bench_wifi_selfstart_off` or `/etc/ocbm/bench_wifi_selfstart_off` (set unless "off"; the owner's
 `/etc/ocbm/wifi_selfstart_off` too): no CarPlay session without a host (M2 off) on an adapter with the link set up.
 `/tmp/bench_wifi_link_if` holding an interface name: ocbmd's listener binds that interface's address instead of the
-station's (never the AP's subnet), e.g. a wired bench over NCM. A bench supplicant goes in `/tmp/bin` (`wpa_supplicant`,
-`wpa_cli`). What to look for: `[wifi_sta]` and `[ocbmd] wifi:` lines in the box log, MGMT_INFO's `wifi_link`.
+station's (never the AP's subnet), e.g. a wired bench over NCM. A bench supplicant goes in `/tmp/bin` (`wpa_supplicant`;
+no wpa_cli is needed or shipped). The supplicant by hand, over the console: `ocbmd wpa sta0 status`, `ocbmd wpa sta0
+scan`, `ocbmd wpa sta0 scan_results`, `ocbmd wpa sta0 list_networks`, `ocbmd wpa sta0 enable_network 0` (in place of
+`ocbm-wpa_cli -p /var/run/wpa_supplicant -i sta0 <cmd>`; the first word goes in capitals, the rest as typed, so any
+wpa_cli command spelled as its control command works, e.g. `status-verbose`; exit 1 and a line on stderr when no
+supplicant answers). What to look for: `[wifi_sta]` and `[ocbmd] wifi:` lines in the box log, MGMT_INFO's `wifi_link`.
 The set-up network (M3): off with `/tmp/bench_wifi_setup_off` or `/etc/ocbm/bench_wifi_setup_off` (the owner's
 `/etc/ocbm/wifi_setup_off` too); offered only on an adapter never used, so a bench adapter needs `OCBM_WIFI_RESET` on a
 stick first (it removes the link and `/etc/ocbm/host_seen` and leaves `/etc/ocbm/wifi_setup_once`, in any mode, an

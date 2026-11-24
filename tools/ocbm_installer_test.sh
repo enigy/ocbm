@@ -70,9 +70,11 @@ usr/sbin/ocbmd"
 mkdir -p "$T/nowpa" "$T/wpa"
 have="$(WPA_INSTALL_DIR="$T/nowpa" bash "$HERE/make_ocbm_installer.sh" --list | grep -vE '^script/(ocbm_(dispatch|selftest|revert|finish|update|restore)|stock_restore_box)\.sh$' | LC_ALL=C sort -u)"
 check '[ "$want" = "$have" ]' "the payload is the pinned file set"
+# A wpa_cli beside it (an older build of the script made one): not shipped, `ocbmd wpa` speaks to the supplicant.
 printf 'x' > "$T/wpa/ocbm-wpa_supplicant"; printf 'x' > "$T/wpa/ocbm-wpa_cli"; chmod +x "$T/wpa/ocbm-wpa_supplicant" "$T/wpa/ocbm-wpa_cli"
 have_wpa="$(WPA_INSTALL_DIR="$T/wpa" bash "$HERE/make_ocbm_installer.sh" --list | grep -E 'wpa' | LC_ALL=C sort -u | tr '\n' ' ')"
-check '[ "$have_wpa" = "usr/sbin/ocbm-wpa_cli usr/sbin/ocbm-wpa_supplicant " ]' "a built supplicant joins the payload under OCBM's own names"
+check '[ "$have_wpa" = "usr/sbin/ocbm-wpa_supplicant " ]' "a built supplicant joins the payload under OCBM's own name, and no wpa_cli does"
+check 'grep -qx "usr/sbin/ocbm-wpa_cli" "$REPO/ccpa/installer/retired.list"' "  one a bench package placed is retired"
 check '! bash "$HERE/make_ocbm_installer.sh" --list | grep -qx "usr/sbin/wpa_supplicant"' \
   "never usr/sbin/wpa_supplicant: the vendor's dispatcher reads it as STA mode on every unit"
 mkdir -p "$T/noinst"; cp "$REPO/ccpa/installer/"* "$T/noinst/"; rm -f "$T/noinst/ocbm_dispatch.sh"

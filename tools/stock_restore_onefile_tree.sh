@@ -15,9 +15,10 @@
 # OCBM, like a trial archive, and is treated like one. A trial archive never has the extras.
 #
 # From a trial's rootfs (an archive, or a dump whose start script is OCBM's dispatcher):
-#   - drop OCBM's own files: the image's payload (tools/make_ocbm_installer.sh --list), /etc/ocbm/,
-#     /etc/carplay/ (OCBM's Bluetooth bond store), /script/ocbm_mode, and what OCBM writes at runtime
-#     (RUNTIME below)
+#   - drop OCBM's own files: the image's payload (tools/make_ocbm_installer.sh --list), the programs earlier
+#     versions placed that this one no longer ships (ccpa/installer/retired.list: a trial installed from an older
+#     image, or updated since, still has them), /etc/ocbm/, /etc/carplay/ (OCBM's Bluetooth bond store),
+#     /script/ocbm_mode, and what OCBM writes at runtime (RUNTIME below)
 #   - put /etc/hostapd.conf and /etc/bluetooth_name back from /etc/ocbm/identity.tgz, as
 #     ocbm_revert.sh does: OCBM rewrites the access point's name, passphrase and interface, and the
 #     Bluetooth name. The seam's Bluetooth name flag /etc/.custom_bluetooth_name (CarLink-<4 hex>, ccpa- before 2.0; while
@@ -138,8 +139,13 @@ if [ "$TRIAL" = 1 ]; then
     payload=$(bash "$HERE/make_ocbm_installer.sh" --list) || die "tools/make_ocbm_installer.sh --list failed"
   fi
   [ -n "$payload" ] || die "the payload list is empty"
+  # Read as the adapter's update commit and once.sh read it (ocbm_dispatch.sh retire): usr/sbin, usr/bin, script only.
+  retired=""
+  for t in $(sed 's/#.*//' "$HERE/../ccpa/installer/retired.list" 2>/dev/null); do
+    case "$t" in *..*) ;; usr/sbin/?*|usr/bin/?*|script/?*) retired="$retired $t" ;; esac
+  done
   n=0
-  for p in $payload $RUNTIME; do
+  for p in $payload $retired $RUNTIME; do
     case "$p" in ''|/*|..|../*|*/..|*/../*) die "refusing an unsafe path: '$p'" ;; esac
     if [ -e "$OUT/$p" ] || [ -L "$OUT/$p" ]; then rm -f "$OUT/$p" && n=$((n + 1)); fi
   done

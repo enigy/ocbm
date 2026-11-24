@@ -19,8 +19,8 @@
 # background scan). Not joined:
 #   - no session (no AP up, no host present): wpa_supplicant's own scans of every channel;
 #   - a session starting (the AP up, or a host present: M2's Bluetooth paging comes before any AP) and not yet
-#     established (/tmp/session_healthy not 1), for up to START_QUIET seconds: NO scan (wpa_cli disconnect), so the
-#     phone's page, its join of the AP and the session's set-up never meet one;
+#     established (/tmp/session_healthy not 1), for up to START_QUIET seconds: NO scan (the supplicant's DISCONNECT),
+#     so the phone's page, its join of the AP and the session's set-up never meet one;
 #   - then, with the AP up: its channel only (scan_freq), and one scan of every channel each FULL_SCAN_EVERY seconds;
 #     with no AP (a wired session): every channel.
 # CHANNELS (ADDENDUM 6, 24 Nov 2026). The AP starts on the station's channel where an AP may (radio_ap_up.sh), so the
@@ -32,10 +32,14 @@
 # The hotspot's last channel is kept in /etc/ocbm/wifi_link_channel (written when it changes) for the AP's channel at
 # a later boot (M2's design note); the state for ocbmd in /tmp/wifi_link_state.
 #
-# The supplicant: OCBM's own drop-in, /usr/sbin/ocbm-wpa_supplicant and /usr/sbin/ocbm-wpa_cli, never at
-# /usr/sbin/wpa_supplicant (the vendor's dispatcher reads THAT path's existence as "STA mode" and loads another driver
-# mode, on every unit, set up or not); else a unit's own stock copy at /usr/sbin; else a bench copy in /tmp/bin. The
-# stock 2025.10.15.1127 image ships none (the factory survey, 27 Oct). Without one the keeper waits, one line a minute.
+# The supplicant: OCBM's own drop-in, /usr/sbin/ocbm-wpa_supplicant, never at /usr/sbin/wpa_supplicant (the vendor's
+# dispatcher reads THAT path's existence as "STA mode" and loads another driver mode, on every unit, set up or not);
+# else a unit's own stock copy at /usr/sbin; else a bench copy in /tmp/bin. The stock 2025.10.15.1127 image ships none
+# (the factory survey, 27 Oct). Without one the keeper waits, one line a minute. Its control socket (ctrl_interface
+# below) is spoken to by `ocbmd wpa` (ccpa/ocbmd/src/wpa.rs), not wpa_cli, which the adapter no longer carries (24 Nov
+# 2026: its 68 KB of flash). Called by its bare name: the respawn wrapper's `pgrep -f /usr/sbin/ocbmd` (run_ocbmd.sh)
+# never takes one of these short runs for the daemon; `pidof ocbmd` does see one while it lasts (a few ms, at most the
+# 10 s reply wait).
 #
 # Test hooks (tools/wifi_sta_test.sh): WIFI_STA_ROOT (a scratch root for every path below), WIFI_STA_TICK,
 # WIFI_STA_ONCE (one pass, then exit), RADIO_STA_IF.
@@ -101,8 +105,8 @@ ssid_hex=$(sed -n 's/^ssid_hex=//p' "$CONF" 2>/dev/null | head -1)
 psk=$(sed -n 's/^psk=//p' "$CONF" 2>/dev/null | head -1)
 case "$ssid_hex" in ''|*[!0-9a-fA-F]*) log "no hotspot in $CONF - nothing to keep"; exit 0 ;; esac
 
-tool() {  # $1 = supplicant | cli: the path to use
-  for _tc in "/usr/sbin/ocbm-wpa_$1" "/usr/sbin/wpa_$1" "/tmp/bin/wpa_$1"; do
+supplicant() {  # the path to use
+  for _tc in /usr/sbin/ocbm-wpa_supplicant /usr/sbin/wpa_supplicant /tmp/bin/wpa_supplicant; do
     [ -x "$R$_tc" ] && { echo "$R$_tc"; return 0; }
   done
   return 1
@@ -166,20 +170,21 @@ publish() {  # $1 joined|joining|unsupported, $2 channel; the lines in the order
   { echo "iface=$IF"; echo "state=$1"; echo "channel=$2"; } > "$STATE.new" 2>/dev/null && mv -f "$STATE.new" "$STATE"
 }
 
-cli() { "$CLI" -p "$CTRL" -i "$IF" "$@" 2>/dev/null; }
+# One request to the supplicant's control socket, its reply on stdout (nothing when none came).
+cli() { ocbmd wpa -p "$CTRL" "$IF" "$@" 2>/dev/null; }
 
 log "keeping the station on the hotspot set up in $CONF"
 mkdir -p "$CTRL" "$R/var/run" 2>/dev/null
-WPA=""; CLI=""; said_tools=0; said_ap_on_sta=0; none=0; wpa_down=0; wpa_next=0
+WPA=""; said_tools=0; said_ap_on_sta=0; none=0; wpa_down=0; wpa_next=0
 last_ch=""; last_mismatch=""; joined_at=""; down_since=$(up_s)
 paused=0; ap_since=""; last_full=0; conf_freq="x"
 while :; do
   # No station on this unit (below): nothing changes before the next boot.
   [ "$none" = 1 ] && { [ -n "${WIFI_STA_ONCE:-}" ] && exit 0; sleep "$TICK"; continue; }
   now=$(up_s)
-  # The tools: a drop-in or a bench copy can come at any time.
+  # The supplicant: a drop-in or a bench copy can come at any time.
   if [ -z "$WPA" ]; then
-    WPA=$(tool supplicant) && CLI=$(tool cli) || { WPA=""; CLI=""; }
+    WPA=$(supplicant) || WPA=""
     if [ -z "$WPA" ]; then
       [ $((said_tools % 30)) = 0 ] && log "no wpa_supplicant (OCBM's drop-in /usr/sbin/ocbm-wpa_supplicant, the unit's own, or a bench copy in /tmp/bin): no station link yet"
       said_tools=$((said_tools + 1)); [ -n "${WIFI_STA_ONCE:-}" ] && exit 0; sleep "$TICK"; continue

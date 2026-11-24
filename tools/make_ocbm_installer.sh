@@ -31,12 +31,13 @@ payload() {  # SOURCE|PATH-ON-BOX: the programs and boot scripts, then Stage B/C
   echo "$REPO/tools/run_ocbmd.sh|script/run_ocbmd.sh"
   for s in radio_detect radio_hal radio_ap_up; do echo "$REPO/ccpa/rootfs/script/$s.sh|script/$s.sh"; done
   # The Wi-Fi link's station keeper and its DHCP hook: inert until /etc/ocbm/wifi_link names a hotspot. Its supplicant
-  # when tools/build_wpa_supplicant.sh has built it, as usr/sbin/ocbm-wpa_supplicant and ocbm-wpa_cli: never
-  # usr/sbin/wpa_supplicant, which the vendor's dispatcher reads as "STA mode" and then loads the IW416's driver in
-  # another mode on every unit.
+  # when tools/build_wpa_supplicant.sh has built it, as usr/sbin/ocbm-wpa_supplicant: never usr/sbin/wpa_supplicant,
+  # which the vendor's dispatcher reads as "STA mode" and then loads the IW416's driver in another mode on every unit.
+  # No wpa_cli: the keeper speaks to the supplicant with `ocbmd wpa` (24 Nov 2026; one an older build left in
+  # $WPA_INSTALL_DIR is not shipped, and retired.list takes one a bench package placed).
   for s in wifi_sta wifi_sta_dhcp; do echo "$REPO/ccpa/rootfs/script/$s.sh|script/$s.sh"; done
-  if [ -x "$WPA_INSTALL_DIR/ocbm-wpa_supplicant" ] && [ -x "$WPA_INSTALL_DIR/ocbm-wpa_cli" ]; then
-    for b in ocbm-wpa_supplicant ocbm-wpa_cli; do echo "$WPA_INSTALL_DIR/$b|usr/sbin/$b"; done
+  if [ -x "$WPA_INSTALL_DIR/ocbm-wpa_supplicant" ]; then
+    echo "$WPA_INSTALL_DIR/ocbm-wpa_supplicant|usr/sbin/ocbm-wpa_supplicant"
   fi
   for s in session_supervisor projection_up phone_reset run_supervisor; do echo "$REPO/tools/$s.sh|script/$s.sh"; done
   for s in ocbm_dispatch ocbm_selftest ocbm_revert ocbm_finish ocbm_update ocbm_restore; do echo "$INSTALLER_DIR/$s.sh|script/$s.sh"; done

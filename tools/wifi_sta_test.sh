@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # wifi_sta_test.sh — the Wi-Fi link's station keeper (ccpa/rootfs/script/wifi_sta.sh) and its DHCP hook, on the host,
-# against a scratch root (WIFI_STA_ROOT) with the supplicant, wpa_cli, udhcpc, ifconfig and pidof stood in for: what it
+# against a scratch root (WIFI_STA_ROOT) with the supplicant, `ocbmd wpa` (its control socket's client, in place of
+# wpa_cli since 24 Nov 2026), udhcpc, ifconfig and pidof stood in for: what it
 # starts and on which interface, the configuration it writes (0600, the name in hex, the key as given), the state it
 # publishes, the channel it keeps, the mismatch line, the scans around a CarPlay start (none while the phone joins the
 # AP, the AP's channel and a full scan a minute once the session runs), its waits (no supplicant, one interface, an AP
@@ -31,15 +32,21 @@ pf=""; while [ $# -gt 0 ]; do [ "$1" = -P ] && pf=$2; shift; done
 ( trap 'exit 0' TERM; while :; do sleep 0.1; done ) </dev/null >/dev/null 2>&1 &
 echo $! > "$pf"
 EOF
-# wpa_cli: `status` prints the scratch state file; every other command is noted.
-cat > "$S/wpa_cli" <<'EOF'
+# ocbmd's wpa subcommand (ccpa/ocbmd/src/wpa.rs), `ocbmd wpa -p DIR IFACE COMMAND...`: only with the keeper's own control
+# directory (else no answer, and said); `status` prints the scratch state file; every other request is noted.
+cat > "$S/ocbmd" <<'EOF'
 #!/bin/sh
-while [ $# -gt 0 ]; do case "$1" in -p|-i) shift 2 ;; *) break ;; esac; done
+[ "$1" = wpa ] || exit 2
+shift; dir=""; [ "$1" = -p ] && { dir=$2; shift 2; }
+iface=$1; shift
+[ "$dir" = "$STUB_R/var/run/wpa_supplicant" ] || { echo "wpa: another control directory: $dir" >> "$STUB_R/calls"; exit 1; }
 case "$1" in
   status) cat "$STUB_R/wpa_status" 2>/dev/null ;;
-  *) echo "wpa_cli $*" >> "$STUB_R/calls"; echo OK ;;
+  *) echo "wpa $iface $*" >> "$STUB_R/calls"; echo OK ;;
 esac
 EOF
+# A wpa_cli an adapter may still hold from a bench package (ocbm-wpa_cli): the keeper must never call it.
+printf '#!/bin/sh\necho "wpa_cli $*" >> "$STUB_R/calls"\necho OK\n' > "$S/wpa_cli"
 cat > "$S/udhcpc" <<'EOF'
 #!/bin/sh
 echo "udhcpc $*" >> "$STUB_R/calls"
@@ -73,7 +80,7 @@ unit() {  # $1 dir, $2 interfaces ("sta0 wlan0"), $3 psk: a scratch adapter with
   printf 'interface=wlan0\nchannel=36\nhw_mode=a\n' > "$R/etc/hostapd.conf"
   echo "100.00 50.00" > "$R/proc/uptime"
   ln -s "$S/wpa_supplicant" "$R/usr/sbin/ocbm-wpa_supplicant"
-  ln -s "$S/wpa_cli" "$R/usr/sbin/ocbm-wpa_cli"
+  ln -s "$S/wpa_cli" "$R/usr/sbin/ocbm-wpa_cli"   # left by a bench package: never called (checked below)
 }
 keep() {  # $1 dir, $2 shell, then env: one pass of the keeper
   local R="$1" sh="$2"; shift 2
@@ -127,21 +134,21 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   check '[ "$(grep -c "one radio serves both" "$R/tmp/box.log")" = 1 ]' "  the AP on 149, where it followed: nothing more said"
   # It leaves the hotspot; the AP up, the session not running yet: no scan at all.
   printf 'wpa_state=SCANNING\n' > "$R/wpa_status"
-  n=0; while [ "$n" -lt 30 ] && ! grep -q "wpa_cli disconnect" "$R/calls"; do n=$((n + 1)); sleep 0.1; done
-  check 'grep -q "wpa_cli disconnect" "$R/calls"' "a CarPlay start on the AP: the supplicant told to stop scanning"
+  n=0; while [ "$n" -lt 30 ] && ! grep -q "wpa sta0 disconnect" "$R/calls"; do n=$((n + 1)); sleep 0.1; done
+  check 'grep -q "wpa sta0 disconnect" "$R/calls"' "a CarPlay start on the AP: the supplicant told to stop scanning"
   # The session runs: the AP's channel only, and the supplicant back on. The AP followed to 149: 5745, where the
   # hotspot comes back (it follows the phone's own link to the AP); an AP on hostapd.conf's 36: 5180.
   echo 1 > "$R/tmp/session_healthy"
-  n=0; while [ "$n" -lt 30 ] && ! grep -q "wpa_cli reconnect" "$R/calls"; do n=$((n + 1)); sleep 0.1; done
-  check 'grep -qx "	scan_freq=5745" "$R/tmp/wpa_sta.conf" && grep -q "wpa_cli reconfigure" "$R/calls" && grep -q "wpa_cli reconnect" "$R/calls"' \
+  n=0; while [ "$n" -lt 30 ] && ! grep -q "wpa sta0 reconnect" "$R/calls"; do n=$((n + 1)); sleep 0.1; done
+  check 'grep -qx "	scan_freq=5745" "$R/tmp/wpa_sta.conf" && grep -q "wpa sta0 reconfigure" "$R/calls" && grep -q "wpa sta0 reconnect" "$R/calls"' \
     "the session running: scans of the AP's channel only, 149 where it followed (5745), the supplicant on again"
   rm -f "$R/tmp/hostapd_session.conf"
   n=0; while [ "$n" -lt 30 ] && ! grep -qx "	scan_freq=5180" "$R/tmp/wpa_sta.conf"; do n=$((n + 1)); sleep 0.1; done
   check 'grep -qx "	scan_freq=5180" "$R/tmp/wpa_sta.conf"' "  an AP on hostapd.conf's own channel, 36: its 5180"
   # A minute later: one full scan.
   uptime_at "$R" 170
-  n=0; while [ "$n" -lt 30 ] && ! grep -q "^wpa_cli scan" "$R/calls"; do n=$((n + 1)); sleep 0.1; done
-  check 'grep -q "^wpa_cli scan" "$R/calls"' "  and a scan of every channel once FULL_SCAN_EVERY has passed"
+  n=0; while [ "$n" -lt 30 ] && ! grep -q "^wpa sta0 scan" "$R/calls"; do n=$((n + 1)); sleep 0.1; done
+  check 'grep -q "^wpa sta0 scan" "$R/calls"' "  and a scan of every channel once FULL_SCAN_EVERY has passed"
   # The AP gone: every channel again.
   rm -f "$R/hostapd.running"
   n=0; while [ "$n" -lt 30 ] && grep -q "scan_freq" "$R/tmp/wpa_sta.conf"; do n=$((n + 1)); sleep 0.1; done
@@ -150,6 +157,8 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   kill "$BG"; wait "$BG" 2>/dev/null; BG=""
   check '[ ! -e "$R/var/run/wpa_sta.pid" ] && [ ! -e "$R/var/run/udhcpc_sta.pid" ] && [ ! -e "$R/tmp/wifi_link_state" ] && [ ! -d "$R/tmp/.wifi_sta_lock" ]' \
     "SIGTERM: the supplicant, the DHCP client, the state and the lock gone"
+  check '! grep -q "another control directory" "$R/calls" && ! grep -q "^wpa_cli" "$R/calls"' \
+    "  every request through ocbmd wpa to the keeper's control directory; the wpa_cli left beside it never called"
 
   # A session starting with no AP yet (a host present: M2's Bluetooth paging comes first): no scans until it runs, then
   # every channel (no AP to stay on).
@@ -159,11 +168,11 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   BG=$!
   n=0; while [ "$n" -lt 30 ] && [ ! -s "$R/tmp/wifi_link_state" ]; do n=$((n + 1)); sleep 0.1; done
   echo 1 > "$R/tmp/host_present"
-  n=0; while [ "$n" -lt 30 ] && ! grep -q "wpa_cli disconnect" "$R/calls"; do n=$((n + 1)); sleep 0.1; done
-  check 'grep -q "wpa_cli disconnect" "$R/calls"' "a host present and no AP yet (M2's paging): the supplicant told to stop scanning"
+  n=0; while [ "$n" -lt 30 ] && ! grep -q "wpa sta0 disconnect" "$R/calls"; do n=$((n + 1)); sleep 0.1; done
+  check 'grep -q "wpa sta0 disconnect" "$R/calls"' "a host present and no AP yet (M2's paging): the supplicant told to stop scanning"
   echo 1 > "$R/tmp/session_healthy"
-  n=0; while [ "$n" -lt 30 ] && ! grep -q "wpa_cli reconnect" "$R/calls"; do n=$((n + 1)); sleep 0.1; done
-  check 'grep -q "wpa_cli reconnect" "$R/calls" && ! grep -q "scan_freq" "$R/tmp/wpa_sta.conf"' "  the session running with no AP: every channel again"
+  n=0; while [ "$n" -lt 30 ] && ! grep -q "wpa sta0 reconnect" "$R/calls"; do n=$((n + 1)); sleep 0.1; done
+  check 'grep -q "wpa sta0 reconnect" "$R/calls" && ! grep -q "scan_freq" "$R/tmp/wpa_sta.conf"' "  the session running with no AP: every channel again"
   kill "$BG"; wait "$BG" 2>/dev/null; BG=""
 
   # The hotspot on a radar channel (100, 5500 MHz): no AP may start there, so the AP runs on its own 36 (radio_ap_up.sh).
@@ -176,7 +185,7 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   sleep 0.6
   check 'grep -qx "state=joined" "$R/tmp/wifi_link_state" && grep -qx "channel=100" "$R/tmp/wifi_link_state" && [ "$(grep -c "on channel 100 and the adapter.s AP on 36" "$R/tmp/box.log")" = 1 ]' \
     "the hotspot on radar channel 100, the AP on its own 36: joined on 100 (beside the AP's 36 for MGMT_INFO), said once"
-  check '! grep -q "wpa_cli disconnect" "$R/calls"' "  joined: no scan held or made"
+  check '! grep -q "wpa sta0 disconnect" "$R/calls"' "  joined: no scan held or made"
   kill "$BG"; wait "$BG" 2>/dev/null; BG=""
 
   # Back-offs: what cannot change before the next boot, or for a while, is asked for and said once.
@@ -204,8 +213,8 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   R="$T/d"; unit "$R" "sta0 wlan0" "$HASH"; rm -f "$R/usr/sbin/ocbm-wpa_supplicant"; keep "$R" "$sh"
   check 'grep -q "no wpa_supplicant" "$R/tmp/box.log" && [ ! -e "$R/calls" ]' "no supplicant anywhere: it waits, starting nothing"
   R="$T/e"; unit "$R" "sta0 wlan0" "$HASH"; rm -f "$R/usr/sbin/ocbm-wpa_supplicant" "$R/usr/sbin/ocbm-wpa_cli"
-  mkdir -p "$R/tmp/bin"; ln -s "$S/wpa_supplicant" "$R/tmp/bin/wpa_supplicant"; ln -s "$S/wpa_cli" "$R/tmp/bin/wpa_cli"; keep "$R" "$sh"
-  check 'grep -q "supplicant: $R/tmp/bin/wpa_supplicant" "$R/tmp/box.log"' "a bench copy in /tmp/bin is taken"
+  mkdir -p "$R/tmp/bin"; ln -s "$S/wpa_supplicant" "$R/tmp/bin/wpa_supplicant"; keep "$R" "$sh"
+  check 'grep -q "supplicant: $R/tmp/bin/wpa_supplicant" "$R/tmp/box.log"' "a bench copy in /tmp/bin is taken, no wpa_cli beside it"
   R="$T/f"; unit "$R" "sta0 wlan0" "$HASH"; printf 'interface=sta0\nchannel=36\n' > "$R/etc/hostapd.conf"; : > "$R/hostapd.running"
   keep "$R" "$sh"
   check 'grep -q "the AP runs on sta0" "$R/tmp/box.log" && ! grep -q "^wpa_supplicant" "$R/calls" 2>/dev/null' \
