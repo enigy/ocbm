@@ -2,14 +2,24 @@
 //! ocbmd's start and for 10 minutes, a set-up network from its own AP (`CarLink-Setup-xxxx`, a public WPA2 passphrase,
 //! client isolation: `radio_hal.sh setup_ap_on`), and listens on 192.168.43.1:7021 for the OCBS v1 exchange
 //! (`ocbm_link::setup_box_handshake`: P-256 ECDH, then OCBW records). One client at a time: the handshake within 5 s in
-//! all, then 60 s in all to MGMT_WIFI_LINK (Carlink shows the driver the network's name and waits for a tap first). Over
-//! that session the box takes CT_HELLO and MGMT_WIFI_LINK and nothing else, answered on the set-up link itself
-//! (main.rs `Daemon::setup_frame`): no info, no clock, no console, no file push, since trust is first-come. A set-up
-//! link never holds the box and never counts as a host. The window ends after one set-up, at its 10 minutes, or at a
-//! USB host's first frame; the set-up network goes, and the CarPlay AP's start stops it first in any case.
+//! all, its first record within 3 s, then 180 s in all to MGMT_WIFI_LINK (the driver compares the set-up code first,
+//! below). Over that session the box takes CT_HELLO and MGMT_WIFI_LINK and nothing else, answered on the set-up link
+//! itself (main.rs `Daemon::setup_frame`): no info, no clock, no console, no file push, since trust is first-come. A
+//! set-up link never holds the box and never counts as a host. The window ends after one set-up, at its 10 minutes (a
+//! session in progress then may finish within its own 180 s: no new client, the set-up network up until it ends), at a
+//! USB host's first frame, or after [`FAILED_LIMIT`] sessions that showed a code and set nothing up (then for this
+//! power-up); the set-up network goes, and the CarPlay AP's start stops it first in any case.
 //!
-//! Each exchange's two public points are kept ([`Setup::transcript`]) for a short confirmation code the owner has not
-//! decided on yet (notes/ocbm.md, "M3 additions").
+//! THE SET-UP CODE (ADDENDUM 5). It lets the driver see that Carlink is talking to THEIR adapter (not a neighbour's
+//! adapter in its own set-up window, not a stale network); it is no proof against an attacker in radio range who also
+//! fakes a Bluetooth name, and first-come trust stays the security model. When a set-up link's first record opens (the
+//! head unit holds the exchange's keys), the code from the exchange's transcript ([`ocbm_link::setup_code`]) goes on the
+//! adapter's Bluetooth: its four digits in `box_common::flags::SETUP_CODE` and SIGUSR1 to the armed btd, which names the
+//! controller "CarLink code NNNN" (local name and EIR) and makes it discoverable, inquiry scan only (btd `armed.rs`: the
+//! armed state's own wake, the supervisor's go's). When that session ends, for any reason, the file goes and the same
+//! signal puts the normal name and invisibility back. Controller and tmpfs only: never /etc/carplay_ident or any file on
+//! flash, nothing left by a power cut. A btd armed later (Bluetooth not up yet) reads the file when it arms; with no
+//! armed btd at all the code is not shown, and the log says so.
 
 use ocbm_link::{Transcript, SETUP_PORT};
 use std::fs::File;
@@ -26,8 +36,16 @@ pub const OFFER_AFTER: Duration = Duration::from_secs(20);
 pub const WINDOW: Duration = Duration::from_secs(600);
 /// The exchange itself.
 pub const HANDSHAKE_LIMIT: Duration = Duration::from_secs(5);
-/// From the end of the exchange to MGMT_WIFI_LINK (Carlink's confirm tap comes first, 20 s at most).
-pub const TO_LINK: Duration = Duration::from_secs(60);
+/// From the end of the exchange to MGMT_WIFI_LINK, in all (ADDENDUM 5, was 60 s): the driver compares the code Carlink
+/// shows with the adapter's name in a phone's or the car's Bluetooth list first (Carlink waits 150 s at most).
+pub const TO_LINK: Duration = Duration::from_secs(180);
+/// A set-up link whose first record has not opened this long after the exchange is closed (DECIDED here, notes/ocbm.md
+/// 24 Nov: not in the plan). Carlink's first keepalive comes after 1 s, and the dead rule counts bytes, not records: a
+/// peer dripping a record that never ends would otherwise hold the one place, no code shown, for TO_LINK.
+pub const FIRST_RECORD_WITHIN: Duration = ocbm_link::DEAD_AFTER;
+/// Set-up sessions in one window that showed a code and ended with no MGMT_WIFI_LINK stored: at this many the set-up
+/// network closes for this power-up (ADDENDUM 5's abuse limit).
+pub const FAILED_LIMIT: u32 = 5;
 /// The set-up AP's bring-up gets this long to say it is up.
 const RAISE_LIMIT: Duration = Duration::from_secs(30);
 /// radio_hal.sh's word that the set-up AP is up ("ok <iface>"), and removed when it goes.
@@ -44,6 +62,20 @@ const HAL: &str = "/tmp/ocbmd_selftest_no_such_radio_hal.sh";
 const AP_CONF: &str = "/tmp/hostapd_setup.conf";
 #[cfg(test)]
 const AP_CONF: &str = "/tmp/ocbmd_selftest_hostapd_setup.conf";
+/// The set-up code for the armed btd (the module docs), and that btd's pid file. The tests' paths name no real btd.
+#[cfg(not(test))]
+pub(crate) const CODE_FILE: &str = box_common::flags::SETUP_CODE;
+#[cfg(test)]
+pub(crate) const CODE_FILE: &str = "/tmp/ocbmd_selftest_bt_setup_code";
+#[cfg(not(test))]
+const BTD_ARMED: &str = box_common::flags::BTD_ARMED;
+#[cfg(test)]
+const BTD_ARMED: &str = "/tmp/ocbmd_selftest_no_such_btd_armed";
+/// [`FAILED_LIMIT`] reached: no set-up network again before the next power-up (tmpfs), whatever ocbmd's restarts.
+#[cfg(not(test))]
+pub(crate) const CLOSED_FOR_BOOT: &str = "/tmp/ocbmd_setup_closed";
+#[cfg(test)]
+pub(crate) const CLOSED_FOR_BOOT: &str = "/tmp/ocbmd_selftest_setup_closed";
 
 /// A set-up network is up, or on its way up, by radio_hal.sh's files.
 fn ap_up() -> bool {
@@ -69,7 +101,10 @@ pub enum Phase {
     Raising(Instant),
     /// Up, the listener running, until then.
     Offered(Instant),
-    /// Done for this start (a set-up, a host, the window, or never wanted).
+    /// The 10 minutes are over with a set-up session in progress: no new client, the set-up network up until that
+    /// session ends (within its own [`TO_LINK`]).
+    Finishing,
+    /// Done for this start (a set-up, a host, the window, the abuse limit, or never wanted).
     Over,
 }
 
@@ -80,24 +115,43 @@ pub struct Setup {
     /// The listener takes the next client only while this is false (one at a time).
     busy: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
-    /// Each authenticated exchange's points, by link id (for the later code; nothing reads them yet).
+    /// Each authenticated exchange's points, by link id: its set-up code's input.
     pub transcripts: Arc<Mutex<Vec<(u64, Transcript)>>>,
     /// A set-up link's MGMT_WIFI_LINK was stored: the window ends once it is applied.
     pub linked: bool,
+    /// The set-up link whose code is on the adapter's Bluetooth now; None: the normal name.
+    pub code_for: Option<u64>,
+    /// This window's set-up sessions that showed a code and ended with nothing set up ([`FAILED_LIMIT`]).
+    pub failed: u32,
 }
 
 impl Setup {
     /// Never offered (the link is set up, or the start is not one that may offer it).
     pub fn never() -> Setup {
-        Setup { phase: Phase::Over, listener: None, busy: Arc::default(), stop: Arc::default(), transcripts: Arc::default(), linked: false }
+        Setup {
+            phase: Phase::Over,
+            listener: None,
+            busy: Arc::default(),
+            stop: Arc::default(),
+            transcripts: Arc::default(),
+            linked: false,
+            code_for: None,
+            failed: 0,
+        }
     }
 
     pub fn waiting(now: Instant) -> Setup {
         Setup { phase: Phase::Waiting(now), ..Setup::never() }
     }
 
+    /// Taking clients: the set-up network coming up or up, within its 10 minutes.
     pub fn active(&self) -> bool {
         matches!(self.phase, Phase::Raising(_) | Phase::Offered(_))
+    }
+
+    /// The set-up network is up or on its way (taking clients, or a last session finishing).
+    pub fn up(&self) -> bool {
+        self.active() || self.phase == Phase::Finishing
     }
 
     /// A set-up link has ended: the listener may take the next client.
@@ -105,15 +159,31 @@ impl Setup {
         self.busy.store(false, Ordering::Release);
     }
 
-    /// The kept transcript of link `id`, if any (for the later short code; the tests read it).
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// The kept transcript of link `id`, if any.
     pub fn transcript(&self, id: u64) -> Option<Transcript> {
         self.transcripts.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(i, _)| *i == id).map(|(_, t)| t.clone())
     }
 
+    /// Set-up link `id`'s first record opened (it holds the exchange's keys): its code on the adapter's Bluetooth,
+    /// replacing any other ([`bt_code`] logs it, never the code's inputs). False with no transcript kept for it.
+    pub fn code_on(&mut self, id: u64) -> bool {
+        let Some(t) = self.transcript(id) else { return false };
+        self.code_for = Some(id);
+        bt_code(Some(&ocbm_link::setup_code(&t)));
+        true
+    }
+
+    /// The code off the adapter's Bluetooth, if it is on: the normal name and policy back.
+    pub fn code_off(&mut self) {
+        if self.code_for.take().is_some() {
+            bt_code(None);
+        }
+    }
+
     /// One step of the window: offer it when due, start the listener once the AP is up, end it at its time.
-    /// `quiet`: no host has spoken and no session holds the box. Returns a line for the log when the phase changed.
-    pub fn tick(&mut self, now: Instant, quiet: bool) -> Option<String> {
+    /// `quiet`: no host has spoken and no session holds the box. `in_session`: a set-up link is open, which may finish
+    /// after the 10 minutes. Returns a line for the log when the phase changed.
+    pub fn tick(&mut self, now: Instant, quiet: bool, in_session: bool) -> Option<String> {
         match self.phase {
             Phase::Waiting(since) if now.duration_since(since) >= OFFER_AFTER => {
                 if !quiet {
@@ -147,6 +217,12 @@ impl Setup {
                     return Some("the set-up network did not come up (hostapd refused its configuration?); not offered".into());
                 }
                 None
+            }
+            Phase::Offered(until) if now >= until && in_session => {
+                self.stop.store(true, Ordering::Release);
+                self.listener = None;
+                self.phase = Phase::Finishing;
+                Some("the window is over: no new client; up for the session in progress".into())
             }
             Phase::Offered(until) if now >= until => {
                 self.close();
@@ -202,6 +278,44 @@ fn hal(verb: &str) {
     let _ = std::process::Command::new("setsid").args(["sh", HAL, verb]).stdin(std::process::Stdio::null()).stdout(out).stderr(err).spawn();
 }
 
+/// The set-up code on the adapter's Bluetooth (`Some`: its four digits), or the normal name and policy back (`None`):
+/// the file the armed btd reads, then its wake (the module docs). Logged here, never the digits or their inputs.
+pub fn bt_code(code: Option<&str>) {
+    let on = if code.is_some() { "on" } else { "off" };
+    if let Err(e) = box_common::flags::put_setup_code(CODE_FILE, code) {
+        eprintln!("[ocbmd] setup: set-up code {on}: {e}");
+        return;
+    }
+    match armed_btd(BTD_ARMED, "/proc") {
+        Some(pid) => {
+            // SAFETY: a signal to the armed btd just identified, whose wake pipe takes SIGUSR1 (armed.rs).
+            unsafe { libc::kill(pid, libc::SIGUSR1) };
+            eprintln!("[ocbmd] setup: set-up code {on} Bluetooth (armed btd {pid})");
+        }
+        None => eprintln!("[ocbmd] setup: set-up code {on}: no armed btd yet"),
+    }
+}
+
+/// The armed btd's pid, from its pid file `armed`, when `proc_root`/<pid>/comm names btd. Only an armed btd writes the
+/// file, and only it takes SIGUSR1 (a btd started at a host's arrival has no handler, and the signal's default would end
+/// it); a pid reused by another program is not woken. A zombie's signal goes nowhere.
+fn armed_btd(armed: &str, proc_root: &str) -> Option<libc::pid_t> {
+    let pid = std::fs::read_to_string(armed).ok()?.trim().parse::<libc::pid_t>().ok().filter(|p| *p > 1)?;
+    (std::fs::read_to_string(format!("{proc_root}/{pid}/comm")).ok()?.trim() == "btd").then_some(pid)
+}
+
+/// A set-up code an earlier ocbmd left up (it exited or crashed with its session open) comes off at this one's start.
+pub fn code_orphan_off() {
+    if std::path::Path::new(CODE_FILE).exists() {
+        bt_code(None);
+    }
+}
+
+/// [`FAILED_LIMIT`] reached: no set-up network before the next power-up ([`wanted`]).
+pub fn closed_for_boot() {
+    let _ = std::fs::write(CLOSED_FOR_BOOT, b"1\n");
+}
+
 /// The listener's thread: accepts, and while a client is in the exchange or holds a set-up link (`busy`) closes every
 /// other at once. The exchange runs on a thread of its own, within [`HANDSHAKE_LIMIT`] in all, so a slow client never
 /// keeps this thread from the stop flag or from closing the others.
@@ -255,6 +369,10 @@ pub fn wanted() -> bool {
     }
     if let Some((_, f)) = box_common::bench_switch("wifi_setup_off") {
         eprintln!("[ocbmd] [bench] setup: no set-up network ({f})");
+        return false;
+    }
+    if std::path::Path::new(CLOSED_FOR_BOOT).exists() {
+        eprintln!("[ocbmd] setup: no set-up network until the next power-up (the abuse limit)");
         return false;
     }
     if let Some(why) = used_because(ROOT) {
@@ -318,22 +436,84 @@ fn note_host_at(root: &str) {
     }
 }
 
+/// Serializes the tests that write the set-up code's file and the abuse limit's (one path each for the process).
+#[cfg(test)]
+pub(crate) fn code_file_lock() -> std::sync::MutexGuard<'static, ()> {
+    static L: Mutex<()> = Mutex::new(());
+    L.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The code's file as the armed btd reads it (box_common::flags::setup_code): four digits while it is on, no file
+    /// when it is off. No armed btd here (the tests' pid file names none), so nothing is signalled.
+    #[test]
+    fn the_set_up_code_is_put_in_its_file_and_taken_out() {
+        let _c = code_file_lock();
+        assert_eq!(armed_btd(BTD_ARMED, "/proc"), None, "the tests wake no process");
+        bt_code(Some("2092"));
+        let text = std::fs::read_to_string(CODE_FILE).unwrap();
+        assert_eq!(box_common::flags::setup_code(&text), Some("2092"));
+        bt_code(None);
+        assert!(!std::path::Path::new(CODE_FILE).exists());
+        let mut s = Setup::waiting(Instant::now());
+        assert!(!s.code_on(7) && s.code_for.is_none(), "no transcript kept: no code");
+        let (_, host_pub) = ocbm_link::setup_keypair_from(&[0x11; 32]).unwrap();
+        let (_, box_pub) = ocbm_link::setup_keypair_from(&[0x22; 32]).unwrap();
+        s.transcripts.lock().unwrap().push((7, Transcript { host_pub, box_pub }));
+        assert!(s.code_on(7) && s.code_for == Some(7));
+        assert_eq!(std::fs::read_to_string(CODE_FILE).unwrap().trim(), "2092", "the note's vector");
+        s.code_off();
+        assert!(s.code_for.is_none() && !std::path::Path::new(CODE_FILE).exists());
+        std::fs::write(CODE_FILE, b"1234\n").unwrap();
+        s.code_off();
+        assert!(std::path::Path::new(CODE_FILE).exists(), "off only what this window put on");
+        code_orphan_off();
+        assert!(!std::path::Path::new(CODE_FILE).exists(), "an earlier ocbmd's code comes off at the start");
+    }
+
+    /// Only a btd named by the pid file is woken: not another program in a reused pid, init, or no file.
+    #[test]
+    fn only_the_armed_btd_is_woken() {
+        let root = format!("/tmp/ocbmd_selftest_proc_{}", std::process::id());
+        let _ = std::fs::remove_dir_all(&root);
+        let comm = |pid: u32, text: &str| {
+            std::fs::create_dir_all(format!("{root}/{pid}")).unwrap();
+            std::fs::write(format!("{root}/{pid}/comm"), text).unwrap();
+        };
+        comm(300, "btd\n");
+        comm(302, "sh\n");
+        comm(303, "btdx\n");
+        let armed = format!("{root}/armed");
+        let pid_in = |p: &str| {
+            std::fs::write(&armed, p).unwrap();
+            armed_btd(&armed, &root)
+        };
+        assert_eq!(pid_in("300\n"), Some(300));
+        assert_eq!(pid_in("302\n"), None, "another program");
+        assert_eq!(pid_in("303\n"), None, "another name");
+        assert_eq!(pid_in("304\n"), None, "no such process");
+        assert_eq!(pid_in("1\n"), None);
+        assert_eq!(pid_in("x\n"), None);
+        let _ = std::fs::remove_file(&armed);
+        assert_eq!(armed_btd(&armed, &root), None, "no pid file: no armed btd");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn the_window_waits_then_gives_up_when_a_host_spoke_or_the_ap_never_came() {
         let t0 = Instant::now();
         let mut s = Setup::waiting(t0);
-        assert_eq!(s.tick(t0 + OFFER_AFTER - Duration::from_secs(1), true), None);
-        assert!(s.tick(t0 + OFFER_AFTER, false).is_some());
+        assert_eq!(s.tick(t0 + OFFER_AFTER - Duration::from_secs(1), true, false), None);
+        assert!(s.tick(t0 + OFFER_AFTER, false, false).is_some());
         assert_eq!(s.phase, Phase::Over, "a host spoke: never offered");
         let mut s = Setup::waiting(t0);
         let _ = std::fs::remove_file(AP_MARK);
-        assert!(s.tick(t0 + OFFER_AFTER, true).is_some());
+        assert!(s.tick(t0 + OFFER_AFTER, true, false).is_some());
         assert!(matches!(s.phase, Phase::Raising(_)));
-        assert!(s.tick(t0 + OFFER_AFTER + RAISE_LIMIT, true).unwrap().contains("did not come up"));
+        assert!(s.tick(t0 + OFFER_AFTER + RAISE_LIMIT, true, false).unwrap().contains("did not come up"));
         assert_eq!(s.phase, Phase::Over);
     }
 

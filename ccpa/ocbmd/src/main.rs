@@ -4287,7 +4287,27 @@ impl Daemon {
             self.release_box("its link ended");
         }
         if l.setup {
-            self.setup.link_ended();
+            self.setup_session_over(l.id);
+        }
+    }
+
+    /// Set-up link `id` has ended, for whatever reason: the listener may take the next client, its code comes off the
+    /// adapter's Bluetooth, a session that showed one and set nothing up counts toward the abuse limit, and the set-up
+    /// network goes with the last session after the 10 minutes.
+    fn setup_session_over(&mut self, id: u64) {
+        self.setup.link_ended();
+        let showed = self.setup.code_for == Some(id);
+        self.setup.code_off();
+        if showed && !self.setup.linked && self.setup.up() {
+            self.setup.failed += 1;
+            if self.setup.failed >= setup::FAILED_LIMIT {
+                setup::closed_for_boot();
+                self.setup_end("the abuse limit; closed until the next power-up");
+                return;
+            }
+        }
+        if self.setup.phase == setup::Phase::Finishing {
+            self.setup_end("its last session is over");
         }
     }
 
@@ -4363,21 +4383,24 @@ impl Daemon {
     /// End the set-up window now (a USB host spoke, a host took the box, the set-up is done): the set-up network goes
     /// and every set-up link closes, whatever the window's phase.
     fn setup_end(&mut self, why: &str) {
-        if self.setup.active() {
+        if self.setup.up() {
             eprintln!("[ocbmd] setup: {why}; the set-up network goes");
         }
+        self.setup.code_off();
         self.setup.close();
         for l in self.wifi.links.iter().filter(|l| l.setup) {
             l.close();
         }
     }
 
-    /// Each pass while the window waits or is open: its phase, and its links closed when it ends.
+    /// Each pass while the window waits or is open: its phase, and its links closed when it ends (a session in
+    /// progress at its 10 minutes finishes first: Phase::Finishing).
     fn setup_tick(&mut self, now: Instant) {
         let quiet = !self.heard && self.wifi.via.is_none() && !self.present;
-        if let Some(line) = self.setup.tick(now, quiet) {
+        let in_session = self.wifi.links.iter().any(|l| l.setup && !l.is_closed());
+        if let Some(line) = self.setup.tick(now, quiet, in_session) {
             eprintln!("[ocbmd] setup: {line}");
-            if !self.setup.active() {
+            if self.setup.phase == setup::Phase::Over {
                 self.setup_end("the window is over");
             }
         }
@@ -4390,11 +4413,30 @@ impl Daemon {
             let (_, came, before) = self.wifi.pending.take().expect("checked just above");
             self.wifi_apply(came, before, now, direct_io);
         }
-        // A set-up link has TO_LINK from its exchange's end, all told (the driver's confirm comes before its
-        // MGMT_WIFI_LINK), whatever the window's state or the set-up network's.
-        for l in self.wifi.links.iter().filter(|l| l.setup && now.duration_since(l.since) >= setup::TO_LINK) {
-            eprintln!("[ocbmd] setup: link {} past its {} s; closed", l.id, setup::TO_LINK.as_secs());
+        // A set-up link has TO_LINK from its exchange's end, all told (the driver compares the set-up code before its
+        // MGMT_WIFI_LINK), whatever the window's state or the set-up network's; its first record within
+        // FIRST_RECORD_WITHIN, and once that record opened its code goes on the adapter's Bluetooth.
+        const _: () = assert!(setup::TO_LINK.as_secs() == 180 && setup::FIRST_RECORD_WITHIN.as_secs() == 3, "the lines below");
+        let mut opened = None;
+        for l in self.wifi.links.iter().filter(|l| l.setup && !l.is_closed()) {
+            let age = now.saturating_duration_since(l.since);
+            let why = if age >= setup::TO_LINK {
+                "past its 180 s"
+            } else if l.opened() {
+                if self.setup.code_for != Some(l.id) && self.setup.up() {
+                    opened = Some(l.id);
+                }
+                continue;
+            } else if age >= setup::FIRST_RECORD_WITHIN {
+                "no record in 3 s"
+            } else {
+                continue;
+            };
+            eprintln!("[ocbmd] setup: link {}: {why}; closed", l.id);
             l.close();
+        }
+        if let Some(id) = opened {
+            self.setup.code_on(id);
         }
         for l in self.wifi.links.iter().filter(|l| !l.setup && !l.admitted && now.duration_since(l.since) >= wifi::HELLO_WITHIN) {
             eprintln!("[ocbmd] wifi: link {} sent no HELLO in {} s; closed", l.id, wifi::HELLO_WITHIN.as_secs());
@@ -5251,8 +5293,10 @@ fn main() {
     // Same for a stale CT_RADIO inhibit from a crashed prior ocbmd (tmpfs, but a daemon respawn
     // without a reboot would otherwise inherit it).
     let _ = std::fs::remove_file(RADIO_OFF_FLAG);
-    // And for a set-up network a prior ocbmd left up: no window of this process's is open yet (setup.rs).
+    // And for a set-up network a prior ocbmd left up: no window of this process's is open yet (setup.rs); its set-up
+    // code on the adapter's Bluetooth too.
     setup::orphan_down("from an earlier ocbmd");
+    setup::code_orphan_off();
     // Create the liveness stamp (see [`ALIVE_FILE`]) — and note File::create also freshens the mtime
     // of one left behind by a predecessor, so a new instance never inherits a stale "wedged" reading.
     if let Err(e) = File::create(ALIVE_FILE) {
@@ -8028,6 +8072,8 @@ mod tests {
     fn a_set_up_link_has_its_limit_whatever_the_window_and_only_one_is_open() {
         let mut d = td();
         let (_out, mut host) = setup_link_on(&mut d, 1 << 35);
+        wifi::test_opened(&d.wifi.links[0]); // a head unit's: its first record opened
+        assert_eq!(setup::TO_LINK, Duration::from_secs(180), "ADDENDUM 5: the driver compares the code first");
         let since = d.wifi.links[0].since;
         d.setup.linked = true; // no exemption once its MGMT_WIFI_LINK was stored
         d.wifi_tick(since + setup::TO_LINK - Duration::from_secs(1), false);
@@ -8068,6 +8114,148 @@ mod tests {
         assert!(d.wifi.on && d.wifi.usb_out.is_none() && !d.wifi.restart_when_idle, "Wi-Fi hosts at once, nothing kept for USB");
         d.wifi.stop();
         let _ = std::fs::remove_file(wifi::LINK_FILE);
+    }
+
+    /// The set-up code's digits as the armed btd would read them, None with no file.
+    fn code_up() -> Option<String> {
+        std::fs::read_to_string(setup::CODE_FILE).ok().map(|t| t.trim().to_string())
+    }
+
+    /// The window open, and a set-up link `id` whose exchange gave the note's fixed points (its code: 2092).
+    fn setup_session(d: &mut Daemon, id: u64) -> (File, TcpStream) {
+        let (_, host_pub) = ocbm_link::setup_keypair_from(&[0x11; 32]).unwrap();
+        let (_, box_pub) = ocbm_link::setup_keypair_from(&[0x22; 32]).unwrap();
+        d.setup.transcripts.lock().unwrap().push((id, ocbm_link::Transcript { host_pub, box_pub }));
+        setup_link_on(d, id)
+    }
+
+    /// ADDENDUM 5: the code goes on the adapter's Bluetooth only once the set-up link's first record has opened (the
+    /// head unit holds the exchange's keys), stays while the session runs, and comes off when it ends: here its link
+    /// dying; a USB host speaking, the ACK's apply and the abuse limit take it off too (below). Nothing on flash.
+    #[test]
+    fn a_set_up_code_goes_on_bluetooth_at_the_first_record_and_off_when_the_session_ends() {
+        let _c = setup::code_file_lock();
+        let _ = std::fs::remove_file(setup::CODE_FILE);
+        let mut d = td();
+        d.setup.phase = setup::Phase::Offered(Instant::now() + setup::WINDOW);
+        let (_out, _host) = setup_session(&mut d, 1 << 41);
+        let t = d.wifi.links[0].since;
+        d.wifi_tick(t + Duration::from_millis(500), false);
+        assert_eq!((d.setup.code_for, code_up()), (None, None), "no record yet: no code");
+        wifi::test_opened(&d.wifi.links[0]);
+        d.wifi_tick(t + Duration::from_secs(1), false);
+        assert_eq!(d.setup.code_for, Some(1 << 41));
+        assert_eq!(code_up().as_deref(), Some("2092"), "the transcript's code, for the armed btd");
+        d.wifi_tick(t + Duration::from_secs(170), false);
+        assert_eq!(code_up().as_deref(), Some("2092"), "up while the session runs, past the old 60 s");
+        d.link_lost(0);
+        assert_eq!((d.setup.code_for, code_up()), (None, None), "the session over: the normal name back");
+        assert_eq!(d.setup.failed, 1, "it showed a code and set nothing up");
+        assert!(d.setup.active(), "the window goes on for the next client");
+        // A USB host speaking ends the next session's code at once, and the window.
+        let (_out, _host) = setup_session(&mut d, 1 << 42);
+        wifi::test_opened(&d.wifi.links[0]);
+        d.wifi_tick(Instant::now(), false);
+        assert_eq!(code_up().as_deref(), Some("2092"));
+        d.usb_frame(p::CH_CTRL, p::F_SOM | p::F_EOM, &[p::CT_HEARTBEAT], Instant::now());
+        assert_eq!((d.setup.code_for, code_up(), &d.setup.phase), (None, None, &setup::Phase::Over));
+        d.link_lost(0);
+        assert_eq!(d.setup.failed, 1, "a session the window's end cut is no failed one");
+    }
+
+    /// The set-up session's MGMT_WIFI_LINK stored and applied: the code comes off with the window, and that session is
+    /// no failed one.
+    #[test]
+    fn a_set_up_that_is_done_takes_its_code_off_and_counts_no_failure() {
+        let _l = wifi_file_lock();
+        let _c = setup::code_file_lock();
+        let _ = std::fs::remove_file(wifi::LINK_FILE);
+        let mut d = td();
+        d.setup.phase = setup::Phase::Offered(Instant::now() + setup::WINDOW);
+        let (_out, _host) = setup_session(&mut d, 1 << 43);
+        wifi::test_opened(&d.wifi.links[0]);
+        d.wifi_tick(Instant::now(), false);
+        assert_eq!(code_up().as_deref(), Some("2092"));
+        assert!(d.link_frame(0, p::CH_MGMT, p::F_SOM | p::F_EOM, &provision(0x43, "Example Hotspot", &"ab".repeat(32)), Instant::now()));
+        let (at, _, _) = d.wifi.pending.clone().unwrap();
+        d.wifi_tick(at, false);
+        assert_eq!((d.setup.code_for, code_up(), &d.setup.phase), (None, None, &setup::Phase::Over), "done: off with the window");
+        d.link_lost(0);
+        assert_eq!(d.setup.failed, 0);
+        d.wifi.stop();
+        let _ = std::fs::remove_file(wifi::LINK_FILE);
+    }
+
+    /// A set-up link whose first record has not opened 3 s after its exchange is closed (bytes but no record: no
+    /// Carlink, which keeps alive after 1 s), no code shown and no failure counted; one that opened keeps its 180 s.
+    #[test]
+    fn a_set_up_link_with_no_record_in_three_seconds_is_closed_and_shows_nothing() {
+        let _c = setup::code_file_lock();
+        let mut d = td();
+        d.setup.phase = setup::Phase::Offered(Instant::now() + setup::WINDOW);
+        let (_out, mut host) = setup_session(&mut d, 1 << 44);
+        let t = d.wifi.links[0].since;
+        d.wifi_tick(t + setup::FIRST_RECORD_WITHIN - Duration::from_millis(100), false);
+        host.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+        let mut b = [0u8; 16];
+        assert!(matches!(host.read(&mut b), Err(_)), "still open within its 3 s");
+        d.wifi_tick(t + setup::FIRST_RECORD_WITHIN, false);
+        assert!(closed(&mut host), "no record in 3 s: closed");
+        assert_eq!(d.setup.code_for, None);
+        d.link_lost(0);
+        assert_eq!((d.setup.failed, code_up()), (0, None), "it never showed a code");
+    }
+
+    /// The abuse limit: the fifth session in one window that showed a code and set nothing up closes the set-up network,
+    /// and no ocbmd offers it again before the next power-up.
+    #[test]
+    fn five_sessions_that_showed_a_code_and_set_nothing_up_close_the_set_up_network_until_the_next_power_up() {
+        let _c = setup::code_file_lock();
+        let _ = std::fs::remove_file(setup::CLOSED_FOR_BOOT);
+        let mut d = td();
+        d.setup.phase = setup::Phase::Offered(Instant::now() + setup::WINDOW);
+        for n in 1..=setup::FAILED_LIMIT {
+            let (_out, _host) = setup_session(&mut d, (1 << 45) + u64::from(n));
+            wifi::test_opened(&d.wifi.links[0]);
+            d.wifi_tick(Instant::now(), false);
+            assert!(code_up().is_some(), "session {n}: its code (a second handshake replaces the first's)");
+            d.link_lost(0);
+            assert_eq!(d.setup.failed, n);
+            assert_eq!(d.setup.active(), n < setup::FAILED_LIMIT, "after session {n}");
+        }
+        assert_eq!((&d.setup.phase, code_up()), (&setup::Phase::Over, None));
+        assert!(std::path::Path::new(setup::CLOSED_FOR_BOOT).exists(), "kept for this power-up (tmpfs)");
+        assert!(!setup::wanted(), "no window again before the next power-up");
+        let _ = std::fs::remove_file(setup::CLOSED_FOR_BOOT);
+    }
+
+    /// The 10 minutes over with a session in progress: no new client, but the set-up network stays until that session
+    /// ends (within its own 180 s), then goes. With none in progress it goes at once.
+    #[test]
+    fn a_session_in_progress_at_the_window_s_end_may_finish_then_the_network_goes() {
+        let _c = setup::code_file_lock();
+        let mut d = td();
+        let due = Instant::now();
+        d.setup.phase = setup::Phase::Offered(due);
+        let (_out, mut host) = setup_session(&mut d, 1 << 46);
+        wifi::test_opened(&d.wifi.links[0]);
+        d.wifi_tick(due, false);
+        d.setup_tick(due);
+        assert_eq!(d.setup.phase, setup::Phase::Finishing);
+        assert!(d.setup.up() && !d.setup.active(), "up for the session, taking no one new");
+        host.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+        let mut b = [0u8; 16];
+        assert!(matches!(host.read(&mut b), Err(_)), "the session goes on");
+        assert_eq!(code_up().as_deref(), Some("2092"), "its code stays up");
+        let (authed, mut late) = test_authed(1 << 47);
+        d.setup_link(authed);
+        assert!(closed(&mut late), "no new set-up link after the 10 minutes");
+        d.link_lost(0);
+        assert_eq!((&d.setup.phase, code_up()), (&setup::Phase::Over, None), "its end takes the network down");
+        let mut d = td();
+        d.setup.phase = setup::Phase::Offered(due);
+        d.setup_tick(due);
+        assert_eq!(d.setup.phase, setup::Phase::Over, "nothing in progress: down at once");
     }
 
     /// A finished exchange as the listener hands it over, and the host's end of its socket.

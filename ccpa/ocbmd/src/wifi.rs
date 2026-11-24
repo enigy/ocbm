@@ -664,18 +664,33 @@ pub struct Link {
     pub reasm: ocbm_proto::Reassembler,
     /// Its HELLO was taken: it holds (or held) the box.
     pub admitted: bool,
-    /// A set-up network session (setup.rs, M3): its own rules (two messages, 60 s in all), answered on the link itself.
+    /// A set-up network session (setup.rs, M3): its own rules (two messages, 180 s in all), answered on the link itself.
     pub setup: bool,
     /// A set-up link's own frame sequence (it never takes the box's).
     pub seq: u32,
     pub since: Instant,
+    /// Its first record has opened (its reader's word): the peer holds the keys its handshake made. A set-up link's
+    /// code goes on the adapter's Bluetooth then (setup.rs).
+    opened: Arc<AtomicBool>,
+    /// [`Link::close`] has been called: its end is on the way (the loop sees its input's EOF a pass or so later).
+    closed: std::cell::Cell<bool>,
     sock: TcpStream,
 }
 
 impl Link {
     /// End the link now: both threads see the socket shut and end, closing their pipe ends.
     pub fn close(&self) {
+        self.closed.set(true);
         let _ = self.sock.shutdown(std::net::Shutdown::Both);
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.closed.get()
+    }
+
+    /// A record from the peer has opened.
+    pub fn opened(&self) -> bool {
+        self.opened.load(Ordering::Acquire)
     }
 }
 
@@ -700,18 +715,33 @@ pub fn start_link(a: Authed) -> std::io::Result<Link> {
     let Session { tx, rx } = session;
     let rs = stream.try_clone()?;
     let ws = stream.try_clone()?;
+    let opened = Arc::new(AtomicBool::new(false));
+    let first = opened.clone();
     std::thread::Builder::new()
         .name("wifi-read".into())
         .stack_size(crate::RELAY_STACK)
-        .spawn(move || link_reader(id, rs, rx, host_bytes))?;
+        .spawn(move || link_reader(id, rs, rx, host_bytes, first))?;
     std::thread::Builder::new()
         .name("wifi-write".into())
         .stack_size(crate::RELAY_STACK)
         .spawn(move || link_writer(id, ws, tx, frames))?;
-    Ok(Link { id, peer, from_host, to_host: Some(to_host), reasm: ocbm_proto::Reassembler::new(), admitted: false, setup: false, seq: 0, since: Instant::now(), sock: stream })
+    Ok(Link {
+        id,
+        peer,
+        from_host,
+        to_host: Some(to_host),
+        reasm: ocbm_proto::Reassembler::new(),
+        admitted: false,
+        setup: false,
+        seq: 0,
+        since: Instant::now(),
+        opened,
+        closed: std::cell::Cell::new(false),
+        sock: stream,
+    })
 }
 
-fn link_reader(id: u64, mut s: TcpStream, mut rx: ocbm_link::Opener, mut host_bytes: File) {
+fn link_reader(id: u64, mut s: TcpStream, mut rx: ocbm_link::Opener, mut host_bytes: File, opened: Arc<AtomicBool>) {
     let mut buf = vec![0u8; 32 * 1024];
     let (mut records, mut bytes) = (0u64, 0u64);
     let why = 'outer: loop {
@@ -729,6 +759,9 @@ fn link_reader(id: u64, mut s: TcpStream, mut rx: ocbm_link::Opener, mut host_by
             match rx.next() {
                 Ok(Some(plain)) => {
                     records += 1;
+                    if records == 1 {
+                        opened.store(true, Ordering::Release);
+                    }
                     if plain.is_empty() {
                         continue; // a keepalive
                     }
@@ -962,9 +995,17 @@ pub fn test_link(id: u64) -> (Link, File, TcpStream) {
         setup: false,
         seq: 0,
         since: Instant::now(),
+        opened: Arc::default(),
+        closed: std::cell::Cell::new(false),
         sock,
     };
     (link, out_read, host)
+}
+
+/// The tests' stand-in for a link's reader opening its first record.
+#[cfg(test)]
+pub fn test_opened(l: &Link) {
+    l.opened.store(true, Ordering::Release);
 }
 
 /// An address for the tests' listener.
