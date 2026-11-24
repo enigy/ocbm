@@ -634,9 +634,15 @@ once, from a Wi-Fi holder too, and no USB frame is ever dropped; where the acces
 USB is read on a thread whose read is issued afresh every 10 s and after any failed read, ADDENDUM 7), and with no
 link set up behaves as 2.7.1. With a link set
 up the adapter also starts its CarPlay session at power-up with no host, video parked, and a host attaches to it at
-SUBSCRIBE (M2). One radio serves the hotspot and the adapter's own AP, so with a link set up the AP starts on the
-channel the station holds the hotspot on, never a radar channel (ADDENDUM 6), and MGMT_INFO's `wifi_link` gives the
-hotspot's `channel` beside the `ap_channel` the AP runs on. ocbmd `src/wifi.rs` and `src/mdns.rs`,
+SUBSCRIBE (M2). At that attach, and when the same host comes back over a running session (its link lost within the
+heartbeat grace), the box sends one live `CT_PROJ_MODE` (no `F_REPLAY`) right after its replayed one, and replays on
+CH_METADATA what the phone said on the metadata seam meanwhile, kept in Wi-Fi mode only (`src/meta.rs`: the latest
+now-playing, route guidance, maneuver, lane, call, location and vehicle-status records, the corner mask and the
+artwork; not the command plists or route A's `dataStream` requests), as the seam's own records and at a record
+boundary of the channel's stream; a host takes them as the phone's, and one it already had changes nothing. One radio
+serves the hotspot and the adapter's own AP, so with a link set up the AP starts on the channel the station holds the
+hotspot on, never a radar channel (ADDENDUM 6), and MGMT_INFO's `wifi_link` gives the hotspot's `channel` beside the
+`ap_channel` the AP runs on. ocbmd `src/wifi.rs` and `src/mdns.rs`,
 `/script/wifi_sta.sh`, and the Wi-Fi link section of docs/wireless/01_BT_AND_RADIO.md have the rest; the hand-off notes
 of 24 Nov hold the contract with Carlink.
 

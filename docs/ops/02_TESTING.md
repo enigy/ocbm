@@ -383,6 +383,14 @@ scan`, `ocbmd wpa sta0 scan_results`, `ocbmd wpa sta0 list_networks`, `ocbmd wpa
 `ocbm-wpa_cli -p /var/run/wpa_supplicant -i sta0 <cmd>`; the first word goes in capitals, the rest as typed, so any
 wpa_cli command spelled as its control command works, e.g. `status-verbose`; exit 1 and a line on stderr when no
 supplicant answers). What to look for: `[wifi_sta]` and `[ocbmd] wifi:` lines in the box log, MGMT_INFO's `wifi_link`.
+A link's end lines (`wifi: link N reader ended: ...`, `... writer ended: ...`) say who closed it (`the host closed the
+link` after the host's FIN, `the box closed the link (...)` after the box's own shutdown), the uptime, both ways'
+records, bytes and how long ago the last went, and the socket's own view: `tcp state 8` (close-wait: the host's FIN came
+first), `4`/`5` (fin-wait: the box shut first), `7` (a reset), then `unacked`, `retrans`, `rtt`, `data in`/`out` and
+`acked ... ms ago`, `queued` B; while a Wi-Fi host holds the box the same counters come every 30 s beside the health
+line (`wifi: link N at uptime ...`). At an attach, and at the same host's return: `session: <why>: the session's
+metadata replayed (N B: nowPlaying x2, location, ...)` (or `... goes at the end of the record under way`, or `no
+metadata of the session's kept to replay`) and `projection mode -> host: 2 (live: ...)`.
 The set-up network (M3): off with `/tmp/bench_wifi_setup_off` or `/etc/ocbm/bench_wifi_setup_off` (the owner's
 `/etc/ocbm/wifi_setup_off` too); offered only on an adapter never used, so a bench adapter needs `OCBM_WIFI_RESET` on a
 stick first (it removes the link and `/etc/ocbm/host_seen` and leaves `/etc/ocbm/wifi_setup_once`, in any mode, an
