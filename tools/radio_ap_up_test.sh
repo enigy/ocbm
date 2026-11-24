@@ -118,7 +118,10 @@ exit 1
 EOF
 cat > "$S/hostapd" <<EOF
 #!/bin/sh
-# A stand-in hostapd: its pid for pidof, its AP-ENABLED half a second in (its stdout is the box log), then running.
+# A stand-in hostapd: its pid for pidof, its AP-ENABLED half a second in (its stdout is the box log), then running. It
+# notes the configuration it was given, and refuses at once one on the channel $S/refuse names (ADDENDUM 6).
+echo "\$1" >> "$S/hostapd.confs"
+grep -qx "channel=\$(cat "$S/refuse" 2>/dev/null)" "\$1" 2>/dev/null && { echo "Could not set channel for kernel driver"; exit 1; }
 echo \$\$ > "$S/hostapd.pid"
 sleep 0.5; echo "sta0: AP-ENABLED "
 while :; do sleep 0.1; done
@@ -139,10 +142,12 @@ cat > "$S/ps" <<EOF
 "$PSPATH/ps" "\$@"; cat "$S/ps.extra" 2>/dev/null; exit 0
 EOF
 chmod 755 "$S"/*
-# radio_ap_up.sh (PREP when $2 says so) under shell $1 on adapter $R, OLD_DHCP passed on; its output in $R.out and its
-# status in $R.rc. The servers and hostapd it leaves running are this run's to end (ended).
+# radio_ap_up.sh (PREP when $2 says so) under shell $1 on adapter $R, OLD_DHCP passed on, and FOLLOW as the seam's
+# RADIO_AP_CHANNEL when set (STA mode); its output in $R.out and its status in $R.rc. The servers and hostapd it leaves
+# running are this run's to end (ended).
 start_ap() {
-  env OCBM_TEST_PATH="$S:$PSPATH${SED_SHIM:+:$SED_SHIM}" AP_ROOT="$R" AP_PROC="$R/proc" AP_BOXLOG="$R/tmp/box.log" \
+  env ${FOLLOW+"RADIO_AP_CHANNEL=$FOLLOW"} \
+    OCBM_TEST_PATH="$S:$PSPATH${SED_SHIM:+:$SED_SHIM}" AP_ROOT="$R" AP_PROC="$R/proc" AP_BOXLOG="$R/tmp/box.log" \
     AP_DHCP_MATCH="$MATCH" RADIO_WLAN_IF=sta0 OLD_DHCP="${OLD_DHCP:-}" "$1" "$AP" ${2:-} > "$R.out" 2>&1
   echo $? > "$R.rc"
 }
@@ -337,6 +342,97 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   check '[ "$(cat "$R.rc")" = 0 ] && grep -q "still there 1 s after SIGTERM" "$R.out" && gone "$old" && [ "$(cat "$S/udhcpd.start" 2>/dev/null)" = "old gone" ]' \
     "one deaf to SIGTERM: SIGKILLed after the start's own 1 s, then this AP's server, and the AP up"
   ended
+
+  # ---- STA mode: the AP on the station's channel (ADDENDUM 6, 24 Nov 2026) ----------------------------------------
+  echo "== $sh: STA mode: the AP follows the station's channel, never to a radar channel, hostapd.conf untouched"
+  used=$(RADIO_AP_UP_FUNCS=1 "$sh" -c '. "$1"; c=0; while [ $c -le 200 ]; do ap_may_use $c && printf "%s " $c; c=$((c + 1)); done' sh "$AP")
+  check '[ "$used" = "1 2 3 4 5 6 7 8 9 10 11 36 40 44 48 149 153 157 161 165 " ]' \
+    "the channels an AP may start on (0-200): 1-11, 36-48, 149-165; no radar (DFS) channel, nothing else"
+  sides=$(RADIO_AP_UP_FUNCS=1 "$sh" -c '. "$1"; for c in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 36 40 44 48 149 153 157 161 165; do
+    ht40_side $c; printf "%s%s " $c "$_hs"; done' sh "$AP")
+  check '[ "$sides" = "1+ 2+ 3+ 4+ 5+ 6+ 7+ 8- 9- 10- 11- 12- 13- 14 36+ 40- 44+ 48- 149+ 153- 157+ 161- 165 " ]' \
+    "HT40's side, its pair's: 36/40, 44/48, 149/153, 157/161, 1-7 up, 8-13 down; none on 14 and 165"
+  # ap_follow on the factory file's shape (country_code=US, 802.11n, HT40+ on 36), the AP's own channel 36: "ch _hrun".
+  F="$T/follow"
+  mkf() {
+    rm -rf "$F" "$F.out"; mkdir -p "$F/etc" "$F/tmp"
+    printf 'interface=wlan0\nssid=CarLink-0a1b\nwpa=3\nwpa_passphrase=%s\ndriver=nl80211\nieee80211n=1\n#ieee80211ac=1\ncountry_code=US\n#hw_mode=g\n#channel=11\nhw_mode=a\nchannel=36\n#ht_capab=[SHORT-GI-20][SHORT-GI-40][HT40-]\nht_capab=[SHORT-GI-20][SHORT-GI-40][HT40+]\n' \
+      "$PW" > "$F/etc/hostapd.conf"
+    cp "$F/etc/hostapd.conf" "$F.ref"; touch -t 202001010000 "$F/etc/hostapd.conf"; touch -t 202101010000 "$F.mark"
+  }
+  fol() {  # $1: the seam's RADIO_AP_CHANNEL (none given: unset, as with no link)
+    env ${1+"RADIO_AP_CHANNEL=$1"} RADIO_AP_UP_FUNCS=1 AP_BOXLOG="$F/tmp/box.log" OCBM_TEST_PATH="${OCBM_TEST_PATH:-}" \
+      "$sh" -c '. "$1"; ch=36; ap_follow "$2" > "$2.out" 2>&1; echo "$ch $_hrun"' sh "$AP" "$F"
+  }
+  SC="$F/tmp/hostapd_session.conf"
+  others() { grep -v -e '^channel=' -e '^hw_mode=' -e '^ht_capab=' "$1"; }
+  while read -r fc hm hs; do
+    mkf; r=$(fol "$fc"); d="HT40$hs"; [ -n "$hs" ] || d="no HT40 (20 MHz)"
+    check '[ "$r" = "$fc $SC" ] && grep -qx "channel=$fc" "$SC" && grep -qx "hw_mode=$hm" "$SC" && grep -qxF "ht_capab=[SHORT-GI-20][SHORT-GI-40]${hs:+[HT40$hs]}" "$SC"' \
+      "the station on $fc: the AP follows, hw_mode=$hm, $d"
+    check 'cmp -s "$F/etc/hostapd.conf" "$F.ref" && [ -z "$(find "$F/etc" -type f -newer "$F.mark")" ] && [ "$(others "$SC")" = "$(others "$F.ref")" ]' \
+      "  hostapd.conf on flash untouched; the session's every other line as it has it, the passphrase too"
+  done <<'EOF'
+149 a +
+153 a -
+157 a +
+161 a -
+165 a
+40 a -
+44 a +
+48 a -
+6 g +
+11 g -
+EOF
+  mkf; r=$(fol 149)
+  check '[ "$(ls -l "$SC" | cut -c1-10)" = "-rw-------" ] && [ ! -e "$SC.new" ]' "the session's configuration is 0600 (the AP's passphrase is in it)"
+  check 'grep -q "the AP follows the station to channel 149 (hw_mode=a, HT40+)" "$F/tmp/box.log" && grep -q "follows the station to channel 149" "$F.out"' \
+    "  and said, in the box log too"
+  mkf; r=$(fol 36)
+  check '[ "$r" = "36 $F/etc/hostapd.conf" ] && [ ! -e "$SC" ] && [ ! -s "$F.out" ]' \
+    "the station on the AP's own channel (36): hostapd.conf as before, nothing written, nothing said"
+  mkf; : > "$SC"; r=$(fol)
+  check '[ "$r" = "36 $F/etc/hostapd.conf" ] && [ ! -e "$SC" ] && [ ! -s "$F.out" ] && [ ! -e "$F/tmp/box.log" ]' \
+    "no Wi-Fi link (no channel given): as before, nothing said; a session's configuration left by an earlier start goes"
+  mkf; r=$(fol 0)
+  check '[ "$r" = "36 $F/etc/hostapd.conf" ] && [ ! -e "$SC" ] && grep -q "the station is not on the hotspot - the AP keeps its own channel 36" "$F/tmp/box.log"' \
+    "the station not on the hotspot (0): the AP's own channel, said"
+  for fc in 52 64 100 120 144; do
+    mkf; r=$(fol "$fc")
+    check '[ "$r" = "36 $F/etc/hostapd.conf" ] && [ ! -e "$SC" ] && grep -q "the station is on channel $fc, a radar (DFS) channel - the AP keeps its own channel 36" "$F/tmp/box.log" && cmp -s "$F/etc/hostapd.conf" "$F.ref"' \
+      "the station on radar channel $fc: no AP there, the AP's own channel (36), and why, said"
+  done
+  mkf; r=$(fol 169)
+  check '[ "$r" = "36 $F/etc/hostapd.conf" ] && [ ! -e "$SC" ] && grep -q "on channel 169, not one an AP may use - the AP keeps its own channel 36" "$F/tmp/box.log"' \
+    "a channel outside the table (169): the AP's own, said"
+  mkf; printf 'ieee80211ac=1\nvht_oper_chwidth=1\nvht_oper_centr_freq_seg0_idx=42\n' >> "$F/etc/hostapd.conf"; r=$(fol 157)
+  check 'grep -qx "ieee80211ac=1" "$SC" && ! grep -q "^vht_oper_c" "$SC" && grep -q "^vht_oper_c" "$F/etc/hostapd.conf"' \
+    "a VHT centre for 36's block is not carried to 157 (the flash file keeps it)"
+
+  # The whole start, its commands stood in for: hostapd from the session's configuration, or, refused there, its own.
+  R="$T/ap/$TAG"; adapter "$R"; mkdir -p "$R/sys/class/net/sta0/wireless" "$R/proc"
+  standins_ended; ended; rm -f "$S"/if.* "$S/udhcpd.exit" "$S/ps.extra" "$S/hostapd.confs" "$S/refuse"
+  start_ap "$sh" PREP; cp "$R/etc/hostapd.conf" "$R.flash"; : > "$S/hostapd.confs"
+  start_ap "$sh"
+  check '[ "$(cat "$R.rc")" = 0 ] && [ "$(cat "$S/hostapd.confs")" = "$R/etc/hostapd.conf" ] && [ ! -e "$R/tmp/hostapd_session.conf" ] && ! grep -q "STA mode" "$R.out" "$R/tmp/box.log"' \
+    "no Wi-Fi link: hostapd from hostapd.conf, as before, and not a word of STA mode"
+  ended; : > "$S/hostapd.confs"
+  FOLLOW=149; start_ap "$sh"; unset FOLLOW
+  check '[ "$(cat "$R.rc")" = 0 ] && grep -q "AP up: ssid=[^ ]* ip=192.168.43.1 ch=149 if=sta0 dhcp=yes" "$R.out" && [ "$(cat "$S/hostapd.confs")" = "$R/tmp/hostapd_session.conf" ]' \
+    "the station on 149: hostapd from the session's configuration, the AP up on 149"
+  check 'cmp -s "$R/etc/hostapd.conf" "$R.flash" && grep -qx "channel=36" "$R/etc/hostapd.conf" && grep -qx "ht_capab=\[HT40+\]" "$R/tmp/hostapd_session.conf"' \
+    "  hostapd.conf on flash as it was (36); HT40+ for 149 in the session's"
+  : > "$S/hostapd.confs"; FOLLOW=44; start_ap "$sh"; unset FOLLOW
+  check '[ "$(cat "$R.rc")" = 0 ] && [ ! -s "$S/hostapd.confs" ] && grep -qx "channel=149" "$R/tmp/hostapd_session.conf" && grep -q "AP up: .* ch=149 " "$R.out"' \
+    "a start while that AP runs: nothing moves (no hostapd started, its configuration kept), and it says ch=149"
+  ended; : > "$S/hostapd.confs"; echo 149 > "$S/refuse"
+  t0=$(date +%s); FOLLOW=149; start_ap "$sh"; unset FOLLOW; t1=$(date +%s)
+  check '[ "$(cat "$R.rc")" = 0 ] && grep -q "hostapd did not start on channel 149 - the AP takes its own channel 36" "$R.out" && grep -q "AP up: ssid=[^ ]* ip=192.168.43.1 ch=36 if=sta0 dhcp=yes" "$R.out"' \
+    "hostapd refuses 149 (a domain with no AP there): the AP comes up on its own channel, 36, and says so"
+  check '[ "$(sed -n 1p "$S/hostapd.confs")" = "$R/tmp/hostapd_session.conf" ] && [ "$(sed -n 2p "$S/hostapd.confs")" = "$R/etc/hostapd.conf" ] && [ ! -e "$R/tmp/hostapd_session.conf" ] && grep -q "hostapd did not start on channel 149" "$R/tmp/box.log"' \
+    "  the session's configuration first, then hostapd.conf; the session's gone; in the box log too"
+  check '[ $((t1 - t0)) -le 5 ]' "  within a few seconds, not the converge step's 12 s bound"
+  ended; rm -f "$S/refuse" "$S/hostapd.confs"
 
   # do_wifi_ap_off itself, its commands stood in for (the second review, item 5): the AP's server seen gone before it
   # returns, so that a teardown which killed and went on (2.6.1's) fails here.

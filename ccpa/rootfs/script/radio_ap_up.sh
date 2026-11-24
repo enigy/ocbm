@@ -31,6 +31,7 @@
 # USAGE  RADIO_WLAN_IF=<iface> sh radio_ap_up.sh [AP|PREP]
 #        AP (the default) brings the AP up. PREP writes its configuration only, raising nothing, and the stamp a
 #        later AP start trusts (radio_hal.sh wifi_ap_prep, the armed state between host sessions).
+#        RADIO_AP_CHANNEL: STA mode's station channel, for the AP to follow (ap_follow).
 # EXIT   0 AP converged (PREP: configured)   1 failed to converge
 ########################
 set -u
@@ -341,6 +342,38 @@ ap_enabled_seen() {
   case "$_ae_out" in *AP-ENABLED*) return 0 ;; esac
   return 1
 }
+# ---- STA mode: the AP on the station's channel (ADDENDUM 6, 24 Nov 2026) --------------------------------------------
+# One radio. The bench's AP on 36 beside the station on the hotspot's 149 was never joined. RADIO_AP_CHANNEL is the
+# seam's ("" no link, 0 not joined: the own channel, as before). ap_may_use: the US domain hostapd.conf asks for
+# (country_code=US), no DFS: 1-11, 36-48, 149-165. ht40_side: its pair's side (_hs); none on 165 and 14.
+ap_may_use() { case "$1" in [1-9]|1[01]|36|40|44|48|149|153|157|161|165) return 0 ;; esac; return 1; }
+ht40_side() { _hs=""; case "$1" in [1-7]|36|44|149|157) _hs=+ ;; [89]|1[0-3]|40|48|153|161) _hs=- ;; esac; }
+say() { echo "$L $*"; echo "$L $*" 2>/dev/null >>"$AP_BOXLOG"; }   # the box log too
+# hostapd's configuration (_hrun) under root $1: AP_SESSION (tmpfs, 0600: hostapd.conf with the station's channel, band
+# and HT40 side) when it follows, else hostapd.conf, never written for it. Sets ch; _own: the AP's own.
+AP_SESSION=/tmp/hostapd_session.conf
+ap_follow() {
+  _hrun="$1/etc/hostapd.conf"; _own=$ch; _fc=${RADIO_AP_CHANNEL:-}
+  rm -f "$1$AP_SESSION"
+  case "$_fc" in
+    ''|"$ch") return 0 ;;
+    0) say "STA mode: the station is not on the hotspot - the AP keeps its own channel $ch"; return 0 ;;
+  esac
+  if ! ap_may_use "$_fc"; then
+    _w="not one an AP may use"
+    case "$_fc" in 5[2-9]|6[0-4]|1[0-3][0-9]|14[0-4]) _w="a radar (DFS) channel" ;; esac
+    say "STA mode: the station is on channel $_fc, $_w - the AP keeps its own channel $ch"; return 0
+  fi
+  _hm=a; [ "$_fc" -le 14 ] && _hm=g; ht40_side "$_fc"
+  if ( umask 077; sed -e "s/^channel=.*/channel=$_fc/; s/^hw_mode=.*/hw_mode=$_hm/; /^vht_oper_c/d" \
+         -e "/^ht_capab=/s/\[HT40[-+]\]/${_hs:+[HT40$_hs]}/" "$_hrun" > "$1$AP_SESSION.new" ) \
+     && mv -f "$1$AP_SESSION.new" "$1$AP_SESSION"; then
+    say "STA mode: the AP follows the station to channel $_fc (hw_mode=$_hm${_hs:+, HT40$_hs})"
+    ch=$_fc; _hrun="$1$AP_SESSION"
+  else
+    rm -f "$1$AP_SESSION.new"; say "STA mode: channel $_fc not written - the AP keeps its own channel $ch"
+  fi
+}
 [ "${RADIO_AP_UP_FUNCS:-}" = 1 ] && return 0
 
 # The root the start works under, "" on the adapter, beside AP_PROC (above): a test hook. tools/radio_ap_up_test.sh runs
@@ -429,12 +462,15 @@ test -e "$AP_ROOT/tmp/bin/hostapd" || cp "$AP_ROOT/usr/sbin/hostapd" "$AP_ROOT/t
 # This start's own line, before the launch: the converge step waits for an AP-ENABLED after it (ap_enabled_seen).
 _ae_mark="[radio] hostapd starting on $IF"
 echo "$_ae_mark" 2>/dev/null >> "$AP_BOXLOG" || _ae_mark=""
-_launched=0; _hapd=""; _dhcpd=""
+_launched=0; _hapd=""; _dhcpd=""; _hrun="$AP_ROOT/etc/hostapd.conf"
 if ! pidof hostapd >/dev/null 2>&1; then
-  setsid hostapd "$AP_ROOT/etc/hostapd.conf" </dev/null >>"$AP_BOXLOG" 2>&1 &
+  ap_follow "$AP_ROOT"
+  setsid hostapd "$_hrun" </dev/null >>"$AP_BOXLOG" 2>&1 &
   _hapd=$!
   tl_stamp ap_start
   _launched=1
+elif [ -f "$AP_ROOT$AP_SESSION" ]; then
+  ch=$(sed -n 's/^channel=//p' "$AP_ROOT$AP_SESSION")   # up already, where it followed
 fi
 
 # The AP's DHCP server, explicitly scoped. The stock script masked this behind a global udhcpd
@@ -491,26 +527,41 @@ hapd_exited() {
   read -r _hx_pid _hx_name _hx_state _hx_rest 2>/dev/null <"$AP_PROC/$_hapd/stat"
   [ "$_hx_name" = "(hostapd)" ] && [ "$_hx_state" = Z ]
 }
-n=0
-# The first pass is the timeline's ap_up: the AP serving, before the confirmation below.
-while [ "$n" -lt 50 ]; do ap_serving && { tl_stamp ap_up; break; }; n=$((n+1)); sleep 0.2; done
-# CONFIRMED ON HOSTAPD'S OWN WORD (16 Nov 2026), not on a second. In the foreground hostapd is in the process list
-# before its start-up is through, so the loop above passes a hostapd that then refuses its configuration; this used
-# to sleep a fixed second and look again. Its AP-ENABLED, in the box log after this start's own line, says it took
-# the configuration and the driver started the AP: a stronger answer, and sooner (about 0.65 s after ap_up on the
-# bench, where the second ended 1 s after it). The seam's wlan lock is held until this returns, and btd's 0x5703 reply
-# to the phone waits on that lock (wifi_handoff::wait_for_ap), so a fixed second was a second the reply could wait for
-# nothing. Up to 2 s; with no AP-ENABLED by then a hostapd still running counts, as it did after the second. One not
-# launched here (running already) is confirmed as before.
-_ae_ms=""
-if [ "$_launched" = 1 ]; then
+# ap_follow's AP refused: its hostapd gone in its start-up (a zombie, or reaped). Never so for another AP.
+hapd_refused() { [ "$_hrun" = "$AP_ROOT$AP_SESSION" ] && { hapd_exited || ! kill -0 "$_hapd" 2>/dev/null; }; }
+ap_converge() {
   n=0
-  while [ "$n" -lt 20 ] && ! hapd_exited; do
-    ap_enabled_seen && { _ae_ms=$((n * 100)); break; }
-    n=$((n+1)); sleep 0.1
-  done
-else
-  sleep 1
+  # The first pass is the timeline's ap_up: the AP serving, before the confirmation below.
+  while [ "$n" -lt 50 ]; do ap_serving && { tl_stamp ap_up; break; }; hapd_refused && break; n=$((n+1)); sleep 0.2; done
+  # CONFIRMED ON HOSTAPD'S OWN WORD (16 Nov 2026), not on a second. In the foreground hostapd is in the process list
+  # before its start-up is through, so the loop above passes a hostapd that then refuses its configuration; this used
+  # to sleep a fixed second and look again. Its AP-ENABLED, in the box log after this start's own line, says it took
+  # the configuration and the driver started the AP: a stronger answer, and sooner (about 0.65 s after ap_up on the
+  # bench, where the second ended 1 s after it). The seam's wlan lock is held until this returns, and btd's 0x5703
+  # reply to the phone waits on that lock (wifi_handoff::wait_for_ap), so a fixed second was a second the reply could
+  # wait for nothing. Up to 2 s; with no AP-ENABLED by then a hostapd still running counts, as it did after the second.
+  # One not launched here (running already) is confirmed as before.
+  _ae_ms=""
+  if [ "$_launched" = 1 ]; then
+    n=0
+    while [ "$n" -lt 20 ] && ! hapd_exited; do
+      ap_enabled_seen && { _ae_ms=$((n * 100)); break; }
+      hapd_refused && break
+      n=$((n+1)); sleep 0.1
+    done
+  else
+    sleep 1
+  fi
+}
+ap_converge
+# Refused there (a domain with no AP on it, say): the AP's own channel, as before.
+if hapd_refused; then
+  say "STA mode: hostapd did not start on channel $ch - the AP takes its own channel $_own"
+  rm -f "$_hrun"; ch=$_own; _hrun="$AP_ROOT/etc/hostapd.conf"
+  [ -n "$_ae_mark" ] && echo "$_ae_mark" 2>/dev/null >> "$AP_BOXLOG"
+  setsid hostapd "$_hrun" </dev/null >>"$AP_BOXLOG" 2>&1 &
+  _hapd=$!
+  ap_converge
 fi
 # Re-test the FULL predicate after the loop: falling out of it on the bound is not success, and
 # re-checking only hostapd here would let a missing address or a dead DHCP server report as up.
