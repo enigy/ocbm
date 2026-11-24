@@ -66,8 +66,14 @@ const KEEPER: &str = "/tmp/ocbmd_selftest_no_such_wifi_sta.sh";
 const KEEPER_LOCK_PID: &str = "/tmp/.wifi_sta_lock/pid";
 #[cfg(test)]
 const KEEPER_LOCK_PID: &str = "/tmp/ocbmd_selftest_no_such_wifi_sta_lock/pid";
-/// The AP's configuration, for its channel.
+/// The AP's configuration, for its channel: [`AP_SESSION_CONF`] while the AP runs from it, else this flash file.
 pub const HOSTAPD_CONF: &str = "/etc/hostapd.conf";
+/// The configuration the AP runs from where it followed the station's channel (radio_ap_up.sh, ADDENDUM 6 of the Wi-Fi
+/// link plan): hostapd.conf with that channel, band and HT40 side, in tmpfs, there only while that AP is.
+#[cfg(not(test))]
+pub const AP_SESSION_CONF: &str = "/tmp/hostapd_session.conf";
+#[cfg(test)]
+pub const AP_SESSION_CONF: &str = "/tmp/ocbmd_selftest_no_such_hostapd_session.conf";
 
 /// Handshakes under way at once, all peers together.
 pub const MAX_HANDSHAKES: usize = 4;
@@ -340,6 +346,11 @@ fn v4_where(pick: impl Fn(&str, Ipv4Addr) -> bool) -> Option<(Ipv4Addr, Ipv4Addr
 /// The channel the AP is configured for (hostapd.conf `channel=`), 0 when unreadable.
 pub fn ap_channel(conf: &str) -> u32 {
     conf.lines().find_map(|l| l.strip_prefix("channel=")).and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+}
+
+/// The text of the configuration the AP runs from: `session`'s while it is there, else `flash`'s; "" when neither reads.
+pub fn ap_conf_text(session: &str, flash: &str) -> String {
+    std::fs::read_to_string(session).or_else(|_| std::fs::read_to_string(flash)).unwrap_or_default()
 }
 
 /// What the bench's interface lever names, if anything.
@@ -968,7 +979,7 @@ impl Side {
     /// MGMT_INFO's `"wifi_link"` object.
     pub fn info(&self) -> String {
         let sta = read_sta(STA_STATE);
-        let ap = ap_channel(&std::fs::read_to_string(HOSTAPD_CONF).unwrap_or_default());
+        let ap = ap_channel(&ap_conf_text(AP_SESSION_CONF, HOSTAPD_CONF));
         let listening = self.shared.as_ref().is_some_and(|s| s.bound().is_some());
         info_json(self.conf.is_some(), matches!(self.via, Some(Via::Wifi(_))), sta.as_ref(), listening, ap)
     }
@@ -1079,6 +1090,26 @@ mod tests {
         assert_eq!(ap_channel("ssid=x\n"), 0);
         assert!(reserved_subnet(Ipv4Addr::new(192, 168, 43, 10)) && reserved_subnet(Ipv4Addr::new(192, 168, 50, 2)));
         assert!(!reserved_subnet(Ipv4Addr::new(172, 20, 10, 2)));
+    }
+
+    /// ADDENDUM 6: `ap_channel` is the running AP's, its per-session configuration's where it followed the station.
+    #[test]
+    fn ap_channel_is_the_running_configurations() {
+        let dir = format!("/tmp/ocbmd_selftest_ap_conf_{}", std::process::id());
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (session, flash) = (format!("{dir}/hostapd_session.conf"), format!("{dir}/hostapd.conf"));
+        std::fs::write(&flash, "interface=wlan0\nhw_mode=a\nchannel=36\n").unwrap();
+        assert_eq!(ap_channel(&ap_conf_text(&session, &flash)), 36, "no session configuration: the flash file's");
+        std::fs::write(&session, "interface=wlan0\nhw_mode=a\nchannel=149\n").unwrap();
+        assert_eq!(ap_channel(&ap_conf_text(&session, &flash)), 149, "the AP followed the station: its session's");
+        std::fs::remove_file(&session).unwrap();
+        std::fs::remove_file(&flash).unwrap();
+        assert_eq!(ap_channel(&ap_conf_text(&session, &flash)), 0, "neither: unknown");
+        let _ = std::fs::remove_dir_all(&dir);
+        // The hotspot on a radar channel and the AP on its own: joined, the two channels differ (Carlink's line).
+        let dfs = Sta { iface: "sta0".into(), joined: true, channel: 100, none: false };
+        assert_eq!(info_json(true, false, Some(&dfs), true, 36), "{\"state\":\"joined\",\"channel\":100,\"ap_channel\":36}");
     }
 
     #[test]
