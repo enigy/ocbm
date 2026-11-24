@@ -145,7 +145,7 @@ fn do_hello(link: &mut Link) -> bool {
     hi[0] = p::CT_HELLO;
     hi[1] = p::VERSION;
     hi[2..6].copy_from_slice(&host_instance_nonce().to_le_bytes());
-    link.send(p::CH_CTRL, p::F_SOM | p::F_EOM, &hi);
+    let mut taken = u8::from(link.send(p::CH_CTRL, p::F_SOM | p::F_EOM, &hi));
     // REATTACH RESYNC: a prior session may have left kernel-buffered A/V/bulk frames ahead of our
     // HELLO_ACK that the box cannot retract. Drain frames until the ACK (or timeout) rather than
     // giving up on the first — the box also clears its software queues on HELLO. `out` is full-size
@@ -180,11 +180,13 @@ fn do_hello(link: &mut Link) -> bool {
             stale += 1; // leftover frame from a prior session — keep draining toward the ACK
         }
         if !resent && Instant::now() >= resend_at {
-            link.send(p::CH_CTRL, p::F_SOM | p::F_EOM, &hi);
+            taken += u8::from(link.send(p::CH_CTRL, p::F_SOM | p::F_EOM, &hi));
             resent = true;
         }
     }
-    eprintln!("no HELLO_ACK");
+    // A USB write completes only when the adapter's gadget has a read queued: none taken = nothing on the adapter was
+    // reading; taken = the adapter read them and did not answer (two cases one line hid, ADDENDUM 7 of 24 Nov).
+    eprintln!("no HELLO_ACK ({taken} of {} HELLO taken by the adapter's USB)", 1 + u8::from(resent));
     false
 }
 
