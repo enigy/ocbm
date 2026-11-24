@@ -111,20 +111,33 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
     "joined on channel 36: published, and the channel kept on flash"
   check 'grep -q "^udhcpc -i sta0 -b -R -p" "$R/calls"' "  the DHCP client on sta0"
   check '! grep -q "one radio serves both" "$R/tmp/box.log"' "  the same channel as the AP: no mismatch line"
-  # The hotspot moves to 149: said plainly, once.
+  # The hotspot moves to 149 while no AP runs: published, nothing said (the next AP starts there, ADDENDUM 6).
   printf 'wpa_state=COMPLETED\nfreq=5745\n' > "$R/wpa_status"
   n=0; while [ "$n" -lt 30 ] && ! grep -qx "channel=149" "$R/tmp/wifi_link_state"; do n=$((n + 1)); sleep 0.1; done
   sleep 0.5
-  check '[ "$(grep -c "on channel 149 and the adapter.s AP on 36" "$R/tmp/box.log")" = 1 ]' "another channel than the AP's: one plain line"
-  # It leaves the hotspot; the AP comes up, the session is not running yet: no scan at all.
-  printf 'wpa_state=SCANNING\n' > "$R/wpa_status"; : > "$R/hostapd.running"
+  check 'grep -qx "state=joined" "$R/tmp/wifi_link_state" && ! grep -q "one radio serves both" "$R/tmp/box.log"' \
+    "the hotspot on 149 and no AP up: published, nothing said (the next AP starts on 149)"
+  # An AP up on its own 36 meanwhile (it came up before the station joined): said plainly, once; the AP not moved.
+  : > "$R/hostapd.running"; sleep 0.8
+  check '[ "$(grep -c "on channel 149 and the adapter.s AP on 36: one radio serves both; the AP stays for this session" "$R/tmp/box.log")" = 1 ]' \
+    "an AP running on its own 36 beside it: one plain line, the AP left for its session"
+  check '! grep -q "M1 does not move" "$R/tmp/box.log"' "  (not the old line: the AP does move, at its next start)"
+  # The AP on the station's channel, from its configuration where it followed (radio_ap_up.sh): nothing more said.
+  printf 'interface=wlan0\nchannel=149\nhw_mode=a\n' > "$R/tmp/hostapd_session.conf"; sleep 0.8
+  check '[ "$(grep -c "one radio serves both" "$R/tmp/box.log")" = 1 ]' "  the AP on 149, where it followed: nothing more said"
+  # It leaves the hotspot; the AP up, the session not running yet: no scan at all.
+  printf 'wpa_state=SCANNING\n' > "$R/wpa_status"
   n=0; while [ "$n" -lt 30 ] && ! grep -q "wpa_cli disconnect" "$R/calls"; do n=$((n + 1)); sleep 0.1; done
   check 'grep -q "wpa_cli disconnect" "$R/calls"' "a CarPlay start on the AP: the supplicant told to stop scanning"
-  # The session runs: the AP's channel only, and the supplicant back on.
+  # The session runs: the AP's channel only, and the supplicant back on. The AP followed to 149: 5745, where the
+  # hotspot comes back (it follows the phone's own link to the AP); an AP on hostapd.conf's 36: 5180.
   echo 1 > "$R/tmp/session_healthy"
   n=0; while [ "$n" -lt 30 ] && ! grep -q "wpa_cli reconnect" "$R/calls"; do n=$((n + 1)); sleep 0.1; done
-  check 'grep -qx "	scan_freq=5180" "$R/tmp/wpa_sta.conf" && grep -q "wpa_cli reconfigure" "$R/calls" && grep -q "wpa_cli reconnect" "$R/calls"' \
-    "the session running: scans of the AP's channel only (5180), the supplicant on again"
+  check 'grep -qx "	scan_freq=5745" "$R/tmp/wpa_sta.conf" && grep -q "wpa_cli reconfigure" "$R/calls" && grep -q "wpa_cli reconnect" "$R/calls"' \
+    "the session running: scans of the AP's channel only, 149 where it followed (5745), the supplicant on again"
+  rm -f "$R/tmp/hostapd_session.conf"
+  n=0; while [ "$n" -lt 30 ] && ! grep -qx "	scan_freq=5180" "$R/tmp/wpa_sta.conf"; do n=$((n + 1)); sleep 0.1; done
+  check 'grep -qx "	scan_freq=5180" "$R/tmp/wpa_sta.conf"' "  an AP on hostapd.conf's own channel, 36: its 5180"
   # A minute later: one full scan.
   uptime_at "$R" 170
   n=0; while [ "$n" -lt 30 ] && ! grep -q "^wpa_cli scan" "$R/calls"; do n=$((n + 1)); sleep 0.1; done
@@ -151,6 +164,19 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   echo 1 > "$R/tmp/session_healthy"
   n=0; while [ "$n" -lt 30 ] && ! grep -q "wpa_cli reconnect" "$R/calls"; do n=$((n + 1)); sleep 0.1; done
   check 'grep -q "wpa_cli reconnect" "$R/calls" && ! grep -q "scan_freq" "$R/tmp/wpa_sta.conf"' "  the session running with no AP: every channel again"
+  kill "$BG"; wait "$BG" 2>/dev/null; BG=""
+
+  # The hotspot on a radar channel (100, 5500 MHz): no AP may start there, so the AP runs on its own 36 (radio_ap_up.sh).
+  # The station stays joined; the state says so with both channels for MGMT_INFO, and the line says so once.
+  R="$T/q"; unit "$R" "sta0 wlan0" "$HASH"; printf 'wpa_state=COMPLETED\nfreq=5500\n' > "$R/wpa_status"; : > "$R/hostapd.running"
+  env STUB_R="$R" WIFI_STA_ROOT="$R" WIFI_STA_TICK=0.2 WIFI_STA_HAL="$S/hal.sh" OCBM_TEST_PATH="$S${OCBM_TEST_PATH:+:$OCBM_TEST_PATH}" \
+    "$sh" "$KEEPER" >/dev/null 2>&1 &
+  BG=$!
+  n=0; while [ "$n" -lt 50 ] && ! grep -qx "state=joined" "$R/tmp/wifi_link_state" 2>/dev/null; do n=$((n + 1)); sleep 0.1; done
+  sleep 0.6
+  check 'grep -qx "state=joined" "$R/tmp/wifi_link_state" && grep -qx "channel=100" "$R/tmp/wifi_link_state" && [ "$(grep -c "on channel 100 and the adapter.s AP on 36" "$R/tmp/box.log")" = 1 ]' \
+    "the hotspot on radar channel 100, the AP on its own 36: joined on 100 (beside the AP's 36 for MGMT_INFO), said once"
+  check '! grep -q "wpa_cli disconnect" "$R/calls"' "  joined: no scan held or made"
   kill "$BG"; wait "$BG" 2>/dev/null; BG=""
 
   # Back-offs: what cannot change before the next boot, or for a while, is asked for and said once.
@@ -284,5 +310,17 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   check 'grep -qx "start	192.168.43.100" "$R/tmp/udhcpd_setup.conf" && grep -qx "end	192.168.43.200" "$R/tmp/udhcpd_setup.conf" && ! grep -q "10\.0\.0" "$R/tmp/udhcpd_setup.conf"' \
     "  its pool on the set-up address's subnet, whatever /etc/udhcpd.conf holds (a custom /etc/wifi_ip)"
   check 'grep -q "^ok sta0" "$R/tmp/.radio_setup_ap"' "  the marker ocbmd waits for"
+  # ADDENDUM 6: the station's channel the seam hands the AP layer (sta_channel), from the keeper's state, no fork.
+  fch() { hal "$R" "$sh" 'sta_channel; echo "[$_fch]"'; }
+  printf 'iface=sta0\nstate=joined\nchannel=149\n' > "$R/tmp/wifi_link_state"
+  check '[ "$(fch)" = "[]" ]' "sta_channel: no link, a keeper's state left over: nothing to follow"
+  printf 'key=%s\nssid_hex=6e6574\npsk=\n' "$(printf '11%.0s' $(seq 32))" > "$R/etc/ocbm/wifi_link"
+  check '[ "$(fch)" = "[149]" ]' "  a link, the station joined on 149: 149"
+  printf 'iface=sta0\nstate=joining\nchannel=0\n' > "$R/tmp/wifi_link_state"
+  check '[ "$(fch)" = "[0]" ]' "  not on the hotspot: 0"
+  printf 'iface=\nstate=unsupported\nchannel=0\n' > "$R/tmp/wifi_link_state"
+  check '[ "$(fch)" = "[]" ]' "  no station on this unit: nothing"
+  rm -f "$R/tmp/wifi_link_state"
+  check '[ "$(fch)" = "[]" ]' "  no keeper state yet: nothing"
 done
 [ "$fails" -eq 0 ] && echo "wifi_sta_test: all passed" || { echo "wifi_sta_test: $fails FAILED"; exit 1; }

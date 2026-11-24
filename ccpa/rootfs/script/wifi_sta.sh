@@ -23,7 +23,9 @@
 #     phone's page, its join of the AP and the session's set-up never meet one;
 #   - then, with the AP up: its channel only (scan_freq), and one scan of every channel each FULL_SCAN_EVERY seconds;
 #     with no AP (a wired session): every channel.
-# The hotspot on another channel than the AP's is said plainly, once a change; M1 never moves the AP's channel.
+# CHANNELS (ADDENDUM 6, 24 Nov 2026). The AP starts on the station's channel where an AP may (radio_ap_up.sh), so the
+# two differ only when the station joined after the AP came up, or on a channel no AP may use (a radar one): said
+# plainly while the AP runs, once a change. Nothing moves the AP during a session; its next start follows.
 #
 # /etc/ocbm/wifi_link (ocbmd writes it, 0600): key= (ocbmd's), ssid_hex= (the hotspot's name in hex), psk= (64 hex
 # digits: the PBKDF2 hash, worked out on the head unit; or the passphrase; or empty: an open network).
@@ -120,7 +122,13 @@ sta_if() {
 }
 
 ap_up() { pidof hostapd >/dev/null 2>&1; }
-ap_channel() { _apc=$(sed -n 's/^channel=//p' "$HOSTAPD_CONF" 2>/dev/null | head -1); case "$_apc" in ''|*[!0-9]*) echo 0 ;; *) echo "$_apc" ;; esac; }
+# The AP's channel: the configuration it runs from, the session's where it followed the station (radio_ap_up.sh).
+AP_SESSION=$R/tmp/hostapd_session.conf
+ap_channel() {
+  _apf=$HOSTAPD_CONF; [ -f "$AP_SESSION" ] && _apf=$AP_SESSION
+  _apc=$(sed -n 's/^channel=//p' "$_apf" 2>/dev/null | head -1)
+  case "$_apc" in ''|*[!0-9]*) echo 0 ;; *) echo "$_apc" ;; esac
+}
 ap_iface_conf() { sed -n 's/^interface=//p' "$HOSTAPD_CONF" 2>/dev/null | head -1; }
 freq_of() {  # $1 channel -> MHz
   if [ "$1" -ge 1 ] && [ "$1" -le 13 ]; then echo $((2407 + 5 * $1)); elif [ "$1" = 14 ]; then echo 2484
@@ -154,7 +162,7 @@ write_conf() {  # $1 = "" (every channel) or the one frequency to scan
   conf_freq=$1
 }
 
-publish() {  # $1 joined|joining|unsupported, $2 channel
+publish() {  # $1 joined|joining|unsupported, $2 channel; the lines in the order radio_hal.sh's sta_channel reads them
   { echo "iface=$IF"; echo "state=$1"; echo "channel=$2"; } > "$STATE.new" 2>/dev/null && mv -f "$STATE.new" "$STATE"
 }
 
@@ -233,12 +241,14 @@ while :; do
       _kept=""; read -r _kept 2>/dev/null <"$CHANNEL_MEMO"
       [ "$_kept" = "$ch" ] || { echo "$ch" > "$CHANNEL_MEMO.new" 2>/dev/null && mv -f "$CHANNEL_MEMO.new" "$CHANNEL_MEMO"; }
     fi
-    apc=$(ap_channel)
-    mm="$ch/$apc"
+    # An AP running on another channel (it came up before the station joined, or the hotspot's is no AP's): said once a
+    # change. It stays for its session; its next start follows where an AP may (ADDENDUM 6).
+    mm=""; ap_up && mm="$ch/$(ap_channel)"
     if [ "$mm" != "$last_mismatch" ]; then
-      last_mismatch=$mm
-      [ "$apc" != 0 ] && [ "$ch" != "$apc" ] && \
-        log "the hotspot is on channel $ch and the adapter's AP on $apc: one radio serves both (M1 does not move the AP)"
+      last_mismatch=$mm; apc=${mm#*/}
+      [ -n "$mm" ] && [ "$apc" != 0 ] && [ "$ch" != "$apc" ] && \
+        log "the hotspot is on channel $ch and the adapter's AP on $apc: one radio serves both; the AP stays for this" \
+            "session, its next start follows the hotspot where an AP may (no radar channel)"
     fi
     down_since=""
   else
