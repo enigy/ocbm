@@ -24,9 +24,11 @@ set -eu
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 W=${WPA_DIR:-$REPO/scratchpad/wpa}
 WPA_TGZ=wpa_supplicant-2.11.tar.gz
-WPA_SHA256=""   # pinned at the first download
+# Pinned 24 Nov 2026 from the archives fetched that day (3,841,433 B and 1,191,546 B). wpa_supplicant's SHA-512 begins
+# 9a0a3a9d and ends e277b2, as Alpine's aports record it; libnl's SHA-256 is the one its release lists.
+WPA_SHA256=912ea06f74e30a8e36fbb68064d6cdff218d8d591db0fc5d75dee6c81ac7fc0a
 NL_TGZ=libnl-3.12.0.tar.gz
-NL_SHA256=""    # pinned at the first download
+NL_SHA256=fc51ca7196f1a3f5fdf6ffd3864b50f4f9c02333be28be4eeca057e103c0dd18
 
 die() { echo "build_wpa_supplicant: $*" >&2; exit 1; }
 sha256() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi; }
