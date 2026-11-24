@@ -588,12 +588,44 @@ fn listen_loop(shared: Arc<Shared>, fixed: Option<TcpListener>, tx: mpsc::Sender
 }
 
 /// The box's side of one handshake, within the handshake limit.
-fn handshake(mut s: TcpStream, key: &LinkKey) -> Result<(TcpStream, Session), ocbm_link::LinkError> {
-    s.set_read_timeout(Some(ocbm_link::HANDSHAKE_TIMEOUT))?;
-    s.set_write_timeout(Some(ocbm_link::HANDSHAKE_TIMEOUT))?;
+fn handshake(s: TcpStream, key: &LinkKey) -> Result<(TcpStream, Session), ocbm_link::LinkError> {
     let nonce = ocbm_link::random32()?;
-    let session = ocbm_link::box_handshake(&mut s, key, nonce)?;
+    let session = ocbm_link::box_handshake(&mut Deadline::new(&s, ocbm_link::HANDSHAKE_TIMEOUT), key, nonce)?;
     Ok((s, session))
+}
+
+/// One deadline for a whole exchange, never one per read: each read and write gets what is left of it, so a peer that
+/// sends a byte every 4.9 s is cut at the limit, not minutes later (the review of 24 Nov, D). Both listeners' handshakes.
+pub struct Deadline<'a>(&'a TcpStream, Instant);
+
+impl<'a> Deadline<'a> {
+    pub fn new(s: &'a TcpStream, within: Duration) -> Self {
+        Deadline(s, Instant::now() + within)
+    }
+    fn left(&self) -> std::io::Result<Duration> {
+        let left = self.1.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        Ok(left)
+    }
+}
+
+impl Read for Deadline<'_> {
+    fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+        self.0.set_read_timeout(Some(self.left()?))?;
+        (&*self.0).read(b)
+    }
+}
+
+impl Write for Deadline<'_> {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.set_write_timeout(Some(self.left()?))?;
+        (&*self.0).write(b)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 // ---- a link ----------------------------------------------------------------------------------------------------
@@ -1120,39 +1152,49 @@ mod tests {
         shared.stop.store(true, Ordering::Release);
     }
 
-    /// A stranger holding a connection open costs one slot, and only its own address's: the paired host still
-    /// gets in at once.
+    /// A peer that drips one byte of its reply every 300 ms: in time for every read, so a per-read limit would hold its
+    /// slot for 20 s. It is cut 5 s after it connected, all reads together.
+    fn slow_drip(addr: SocketAddr) -> (TcpStream, Instant) {
+        let s = TcpStream::connect(addr).unwrap();
+        let t0 = Instant::now();
+        let w = s.try_clone().unwrap();
+        std::thread::spawn(move || {
+            for _ in 0..ocbm_link::REPLY_LEN {
+                if (&w).write_all(b"O").is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(300));
+            }
+        });
+        (s, t0)
+    }
+
+    /// When the box ended a connection, counted from `t0`: its EOF, read past whatever it sent first.
+    fn cut_after(mut s: TcpStream, t0: Instant) -> Duration {
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut b = [0u8; 256];
+        while matches!(s.read(&mut b), Ok(n) if n > 0) {}
+        t0.elapsed()
+    }
+
+    /// A stranger dripping bytes from one address costs one slot, its own address's, and only for the handshake's 5 s
+    /// in all: the paired host from another address gets in at once meanwhile. Two addresses on a dual-stack loopback
+    /// listener (::1 and 127.0.0.1, which macOS has where it has no 127.0.0.2).
     #[test]
-    fn a_silent_stranger_does_not_hold_the_paired_hosts_way_in() {
+    fn a_slow_drip_stranger_is_cut_at_five_seconds_and_the_paired_host_gets_in_meanwhile() {
         let key = LinkKey([7u8; 32]);
         let shared = Shared::new(Some(key.clone()));
-        let l = start_listener(shared.clone(), Bind::Fixed(loopback0())).unwrap();
-        let addr = l.fixed.unwrap();
-        // Three strangers from other loopback addresses (macOS answers only on 127.0.0.1; then they share it, and
-        // the per-address rule refuses all but the first, which is the point too).
-        let mut strangers = Vec::new();
-        for _ in 0..3 {
-            if let Ok(s) = TcpStream::connect(addr) {
-                strangers.push(s);
-            }
-        }
-        std::thread::sleep(Duration::from_millis(100));
-        // The paired host, from the same address as the strangers here: it is refused while one of them holds the
-        // address's slot, so it retries, as Carlink does, and gets in once the slot is free (5 s at most).
-        let t0 = Instant::now();
-        let mut linked = false;
-        while t0.elapsed() < Duration::from_secs(8) {
-            let mut h = TcpStream::connect(addr).unwrap();
-            h.set_read_timeout(Some(Duration::from_secs(6))).unwrap();
-            if host_handshake(&mut h, &key, [2u8; 32]).is_ok() {
-                linked = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(200));
-        }
-        assert!(linked, "the paired host should get in within the handshake limit");
-        assert!(t0.elapsed() <= Duration::from_secs(7));
-        drop(strangers);
+        let l = start_listener(shared.clone(), Bind::Fixed("[::]:0".parse().unwrap())).unwrap();
+        let port = l.fixed.unwrap().port();
+        let (stranger, t0) = slow_drip(SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), port));
+        std::thread::sleep(Duration::from_millis(200));
+        let mut h = TcpStream::connect(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)).unwrap();
+        h.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let hs = Instant::now();
+        assert!(host_handshake(&mut h, &key, [2u8; 32]).is_ok(), "the paired host, from another address");
+        assert!(hs.elapsed() < Duration::from_secs(2), "at once, not after the stranger's slot");
+        let took = cut_after(stranger, t0);
+        assert!(took >= Duration::from_millis(4500) && took <= Duration::from_millis(6500), "the stranger cut after {took:?}");
         shared.stop.store(true, Ordering::Release);
     }
 }

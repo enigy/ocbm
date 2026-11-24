@@ -173,7 +173,10 @@ fn hal(verb: &str) {
     let _ = std::process::Command::new("setsid").args(["sh", HAL, verb]).stdin(std::process::Stdio::null()).stdout(out).stderr(err).spawn();
 }
 
-fn listen(l: TcpListener, busy: Arc<AtomicBool>, stop: Arc<AtomicBool>, ts: Arc<Mutex<Vec<(u64, Transcript)>>>, tx: mpsc::Sender<crate::wifi::Authed>, mut wake: File) {
+/// The listener's thread: accepts, and while a client is in the exchange or holds a set-up link (`busy`) closes every
+/// other at once. The exchange runs on a thread of its own, within [`HANDSHAKE_LIMIT`] in all, so a slow client never
+/// keeps this thread from the stop flag or from closing the others.
+fn listen(l: TcpListener, busy: Arc<AtomicBool>, stop: Arc<AtomicBool>, ts: Arc<Mutex<Vec<(u64, Transcript)>>>, tx: mpsc::Sender<crate::wifi::Authed>, wake: File) {
     let mut id = 1u64 << 32; // set-up links' ids, apart from the Wi-Fi listener's
     while !stop.load(Ordering::Acquire) {
         let mut pfd = libc::pollfd { fd: l.as_raw_fd(), events: libc::POLLIN, revents: 0 };
@@ -181,25 +184,35 @@ fn listen(l: TcpListener, busy: Arc<AtomicBool>, stop: Arc<AtomicBool>, ts: Arc<
         if unsafe { libc::poll(&mut pfd, 1, 500) } <= 0 {
             continue;
         }
-        let Ok((mut s, peer)) = l.accept() else { continue };
-        if busy.load(Ordering::Acquire) {
+        let Ok((s, peer)) = l.accept() else { continue };
+        if busy.swap(true, Ordering::AcqRel) {
             eprintln!("[ocbmd] setup: refused {}: one client at a time", crate::wifi::peer_short(&peer));
             continue; // dropped: closed
         }
-        let _ = s.set_read_timeout(Some(HANDSHAKE_LIMIT));
-        let _ = s.set_write_timeout(Some(HANDSHAKE_LIMIT));
-        let r = ocbm_link::setup_keypair().map_err(ocbm_link::LinkError::Io).and_then(|(sk, pk)| ocbm_link::setup_box_handshake(&mut s, &sk, &pk));
-        match r {
-            Ok((session, t)) => {
-                id += 1;
-                ts.lock().unwrap_or_else(|e| e.into_inner()).push((id, t));
-                busy.store(true, Ordering::Release);
-                eprintln!("[ocbmd] setup: {} completed the set-up exchange (link {id}); waiting for its MGMT_WIFI_LINK", crate::wifi::peer_short(&peer));
-                if tx.send(crate::wifi::Authed { id, peer, stream: s, session }).is_ok() {
-                    let _ = wake.write(&[1]);
+        id += 1;
+        let (hb, hts, htx, hw) = (busy.clone(), ts.clone(), tx.clone(), wake.try_clone());
+        let hs = move || {
+            let r = ocbm_link::setup_keypair()
+                .map_err(ocbm_link::LinkError::Io)
+                .and_then(|(sk, pk)| ocbm_link::setup_box_handshake(&mut crate::wifi::Deadline::new(&s, HANDSHAKE_LIMIT), &sk, &pk));
+            match r {
+                Ok((session, t)) => {
+                    hts.lock().unwrap_or_else(|e| e.into_inner()).push((id, t));
+                    eprintln!("[ocbmd] setup: {} completed the set-up exchange (link {id})", crate::wifi::peer_short(&peer));
+                    if htx.send(crate::wifi::Authed { id, peer, stream: s, session }).is_ok() {
+                        if let Ok(mut w) = hw {
+                            let _ = w.write(&[1]);
+                        }
+                        return;
+                    }
                 }
+                Err(e) => eprintln!("[ocbmd] setup: refused {}: {e}", crate::wifi::peer_short(&peer)),
             }
-            Err(e) => eprintln!("[ocbmd] setup: refused {}: {e}", crate::wifi::peer_short(&peer)),
+            hb.store(false, Ordering::Release);
+        };
+        if std::thread::Builder::new().name("setup-hs".into()).stack_size(96 * 1024).spawn(hs).is_err() {
+            eprintln!("[ocbmd] setup: no thread for the exchange; {} dropped", crate::wifi::peer_short(&peer));
+            busy.store(false, Ordering::Release);
         }
     }
 }
@@ -257,26 +270,91 @@ mod tests {
         assert_eq!(s.phase, Phase::Over);
     }
 
-    /// One client at a time: a second is closed while the first's set-up link lives; an off-curve point is refused.
-    #[test]
-    fn the_listener_takes_one_client_at_a_time() {
-        use std::io::Read;
+    fn listening() -> (Setup, SocketAddr) {
         let mut s = Setup::waiting(Instant::now());
         s.start_listener("127.0.0.1:0".parse().unwrap()).unwrap();
         s.phase = Phase::Offered(Instant::now() + WINDOW);
         let addr = s.listener.as_ref().unwrap().fixed.unwrap();
+        (s, addr)
+    }
+
+    /// What the box sends before it closes, and when it closed (counted from `t0`).
+    fn box_says(c: &mut std::net::TcpStream, t0: Instant) -> (Vec<u8>, Duration) {
+        use std::io::Read;
+        c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let (mut got, mut b) = (Vec::new(), [0u8; 128]);
+        while let Ok(n @ 1..) = c.read(&mut b) {
+            got.extend_from_slice(&b[..n]);
+        }
+        (got, t0.elapsed())
+    }
+
+    /// One client at a time, and the exchange within 5 s IN ALL: a client dripping its opening a byte every 300 ms
+    /// (in time for every read) holds the one place for 5 s; another meanwhile is closed at once, not left waiting
+    /// behind it; then a whole exchange goes through, its transcript kept, and the stop flag ends the listener.
+    #[test]
+    fn the_listener_takes_one_client_at_a_time_and_cuts_a_slow_one_at_five_seconds() {
+        let (s, addr) = listening();
+        let mut drip = std::net::TcpStream::connect(addr).unwrap();
+        let t0 = Instant::now();
+        let w = drip.try_clone().unwrap();
+        std::thread::spawn(move || {
+            for _ in 0..ocbm_link::SETUP_HELLO_LEN {
+                if (&w).write_all(b"O").is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(300));
+            }
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        let mut other = std::net::TcpStream::connect(addr).unwrap();
+        let t1 = Instant::now();
+        let (said, closed) = box_says(&mut other, t1);
+        assert!(said.is_empty() && closed < Duration::from_secs(1), "a second client closed at once ({closed:?})");
+        let (said, cut) = box_says(&mut drip, t0);
+        assert!(said.is_empty(), "nothing for an opening that never came");
+        assert!(cut >= Duration::from_millis(4500) && cut <= Duration::from_millis(6500), "cut after {cut:?}");
         let (hs, hp) = ocbm_link::setup_keypair_from(&[0x11; 32]).unwrap();
-        let mut c1 = std::net::TcpStream::connect(addr).unwrap();
-        c1.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-        let (_sess, t) = ocbm_link::setup_host_handshake(&mut c1, &hs, &hp).unwrap();
+        let mut c = std::net::TcpStream::connect(addr).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let (_sess, t) = ocbm_link::setup_host_handshake(&mut c, &hs, &hp).expect("the place is free again");
         let a = s.listener.as_ref().unwrap().rx.recv_timeout(Duration::from_secs(3)).unwrap();
         assert_eq!(s.transcript(a.id), Some(t), "the transcript kept for a later code");
-        let mut c2 = std::net::TcpStream::connect(addr).unwrap();
-        c2.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-        c2.write_all(&[0u8; ocbm_link::SETUP_HELLO_LEN]).unwrap();
-        let mut b = [0u8; 8];
-        assert!(matches!(c2.read(&mut b), Ok(0) | Err(_)), "a second client is closed");
-        s.link_ended();
+        s.stop.store(true, Ordering::Release);
+        std::thread::sleep(Duration::from_millis(700));
+        assert!(std::net::TcpStream::connect(addr).is_err(), "the listener ended with the stop flag");
+    }
+
+    /// A point is read and checked before the box says anything: off the curve, compressed, or the magic wrong, the
+    /// box closes with nothing sent; a point on the curve gets the box's 70 bytes.
+    #[test]
+    fn an_opening_with_a_bad_point_is_refused_after_it_is_parsed() {
+        let (s, addr) = listening();
+        let (_, good) = ocbm_link::setup_keypair_from(&[0x22; 32]).unwrap();
+        let mut off_curve = good;
+        off_curve[64] ^= 1; // y + 1: not on P-256
+        let mut compressed = good;
+        compressed[0] = 0x02;
+        for (point, magic, want) in [(off_curve, *b"OCBS", 0), (compressed, *b"OCBS", 0), (good, *b"OCBW", 0), (good, *b"OCBS", ocbm_link::SETUP_HELLO_LEN)] {
+            let mut c = std::net::TcpStream::connect(addr).unwrap();
+            let mut opening = magic.to_vec();
+            opening.push(1);
+            opening.extend_from_slice(&point);
+            c.write_all(&opening).unwrap();
+            if want > 0 {
+                use std::io::Read;
+                let mut theirs = [0u8; ocbm_link::SETUP_HELLO_LEN];
+                c.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                c.read_exact(&mut theirs).expect("the box's opening");
+                assert_eq!(&theirs[..4], b"OCBS");
+                let _ = s.listener.as_ref().unwrap().rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            } else {
+                let (said, _) = box_says(&mut c, Instant::now());
+                assert!(said.is_empty(), "closed with nothing sent: {:02x?}", &opening[..6]);
+            }
+            s.link_ended(); // the next client's turn (the daemon does this when a set-up link ends)
+            std::thread::sleep(Duration::from_millis(100));
+        }
         s.stop.store(true, Ordering::Release);
     }
 }
