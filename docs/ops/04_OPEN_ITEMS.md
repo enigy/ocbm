@@ -812,11 +812,16 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
   the SHA-256 pinned 24 Nov). Built and bundled 24 Nov (545,712 B and 96,340 B, no debug output): the update package
   then fits a final adapter's `final_kb` 3,900 with a few KB to spare (the figure in the last hand-off notes), so
   every further byte on flash counts; (2) the AP on `wlan0` (uAP BSS)
-  beside the station on `sta0` is inferred from the stock driver configuration, not measured; (3) what the driver does
-  when the hotspot and the
-  AP sit on different channels; (4) WPA3-only hotspots are not supported in this version (WPA2 and mixed are; the box
+  beside the station on `sta0` is inferred from the stock driver configuration, not measured; (3) the AP on the
+  hotspot's channel (ADDENDUM 6, 24 Nov: at its start in STA mode the AP follows the station, never to a radar channel,
+  from `/tmp/hostapd_session.conf`; docs/wireless/01_BT_AND_RADIO.md, "Channels") is built, not benched: whether the
+  phone joins the AP on 149 while the station holds the hotspot there, whether hostapd and the vendor driver take an AP
+  on 149-165 at all (the US domain applied, or 149-165 no-IR: then the AP falls back to its own channel, and the first
+  bench's failure stays) and HT40+ there, and what the radio does when the station joins another channel during a
+  session; (4) WPA3-only hotspots are not supported in this version (WPA2 and mixed are; the box
   gets the PBKDF2 hash, the supplicant has no SAE); (5) M2's self-started session: the phone's audio goes nowhere while no host is attached (60 s / 180 s holds);
-  the AP's channel pinned from the hotspot's last one is a design note only; (6) M3 (the set-up network) is built, not
+  an AP started before the station has joined (at a boot, say) takes `hostapd.conf`'s channel: the hotspot's last one
+  is kept, not used; (6) M3 (the set-up network) is built, not
   benched: whether the stock hostapd takes `ap_isolate=1` (it refuses an unknown key, and then no set-up network is
   offered), and what the set-up AP raised 20 s into a boot with no host yet costs a head unit that connects later; its
   set-up code (24 Nov, ADDENDUM 5) is built, not benched: UNMEASURED whether a phone's Bluetooth list (and the car's)

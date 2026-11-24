@@ -632,8 +632,11 @@ advertises `_ocbm._tcp` there (TXT `id` = an HMAC of the key), takes one host at
 it takes holds the box against Wi-Fi hosts until it leaves or is silent for 10 s; a USB host's frame always takes it at
 once, from a Wi-Fi holder too, and no USB frame is ever dropped), and with no link set up behaves as 2.7.1. With a link set
 up the adapter also starts its CarPlay session at power-up with no host, video parked, and a host attaches to it at
-SUBSCRIBE (M2). ocbmd `src/wifi.rs` and `src/mdns.rs`, `/script/wifi_sta.sh`, and the Wi-Fi link section of
-docs/wireless/01_BT_AND_RADIO.md have the rest; the hand-off notes of 24 Nov hold the contract with Carlink.
+SUBSCRIBE (M2). One radio serves the hotspot and the adapter's own AP, so with a link set up the AP starts on the
+channel the station holds the hotspot on, never a radar channel (ADDENDUM 6), and MGMT_INFO's `wifi_link` gives the
+hotspot's `channel` beside the `ap_channel` the AP runs on. ocbmd `src/wifi.rs` and `src/mdns.rs`,
+`/script/wifi_sta.sh`, and the Wi-Fi link section of docs/wireless/01_BT_AND_RADIO.md have the rest; the hand-off notes
+of 24 Nov hold the contract with Carlink.
 
 First set-up with no USB (M3, `src/setup.rs`, not benched): an adapter NEVER USED (no link, no host's HELLO ever taken
 on it, no bonded phone, no kept host config, no update record) offers, 20 s after ocbmd's start if no host has spoken

@@ -534,14 +534,36 @@ also joins the phone's Personal Hotspot as a station, so a head unit on that hot
   supplicant's own scans of every channel; with a session starting (the AP up, or `/tmp/host_present` 1: M2's own session
   pages the bonded phones over Bluetooth before any AP) and not established (`/tmp/session_healthy` not 1, 40 s at most)
   none at all, so the page, the phone's join of the AP and the session's set-up never meet a scan; then the AP's channel
-  only and one scan of every channel a minute, or every channel with no AP (a wired session).
+  only (the one it runs on: the hotspot's last where it followed it, below) and one scan of every channel a minute, or
+  every channel with no AP (a wired session).
 - **The listener and the advert stay on the station's side.** The listener takes connections from the station's
   interface only (SO_BINDTODEVICE: under Linux's weak-host model the station's address alone would also answer on the
   AP's or USB's network). The mDNS socket is bound to the group, 224.0.0.251:5353, so no unicast datagram for carplayd's
   mdns-sd (its sockets: 0.0.0.0:5353, SO_REUSEPORT) can land in it.
-- **Channels.** The AP keeps the channel `hostapd.conf` pins. A hotspot on another channel is logged in one line and shown
-  in MGMT_INFO (`wifi_link.channel` against `ap_channel`). What the driver does then (refuse, move the uAP, or time-share
-  the channels) is for the bench.
+- **Channels: the AP follows the hotspot** (ADDENDUM 6 of the hand-off plan, 24 Nov 2026; not benched). One radio, so
+  one channel for the adapter's AP, its station and the head unit: the hotspot's. On the first bench (24 Nov, dev
+  adapter) the station held the hotspot on 149 and the AP came up on `hostapd.conf`'s 36: the phone never joined the AP
+  (4 CarPlay starts of 4, cut by btd's 90 s watchdog). With a session running on 36 the phone's hotspot was on 36 too
+  (it follows the phone's own link) and the station joined beside the AP there. So at each AP start in STA mode the seam
+  (`radio_hal.sh` `sta_channel`) hands the AP layer the channel the station is associated on, from the keeper's
+  `/tmp/wifi_link_state` (no fork), and `radio_ap_up.sh` (`ap_follow`) starts hostapd there from a per-session
+  configuration, `/tmp/hostapd_session.conf` (tmpfs, 0600): `hostapd.conf` with that `channel=`, its band's `hw_mode`
+  and the HT40 side of its 40 MHz pair, any VHT centre left out. `hostapd.conf` on flash is never written for it; the
+  per-session file goes at the AP's teardown and at the next start. btd's 0x5703 (the channel the phone is told) and
+  MGMT_INFO's `ap_channel` read it while it is there, `hostapd.conf` otherwise. With no link nothing of this runs.
+  - **Where an AP may start:** the US domain the unit's `hostapd.conf` asks for (`country_code=US` in the factory file
+    of 28 Oct and the dev adapter's of 21 Oct: 802.11n, HT40+ on 36, VHT off) without radar detection: 1-11, 36-48
+    (U-NII-1), 149-165 (U-NII-3). Never 52-144 (DFS), nor any other. HT40 on its pair's side: 36/40, 44/48, 149/153,
+    157/161 (HT40+ on the lower channel, HT40- on the upper), 1-7 HT40+ and 8-11 HT40- at 2.4 GHz; 165 and 14 have
+    no pair, 20 MHz there. In STA mode `/etc/wifi_use_24G` gives way: the AP goes to the station's band.
+  - **Not associated, or on a channel no AP may use** (a radar one): the AP keeps its own channel, as before, and the
+    box log says why; the station stays joined, so MGMT_INFO shows `joined` with the two channels and Carlink its
+    line. A followed channel hostapd refuses (it exits in its start-up: a domain with no AP there, say) costs one try:
+    the AP then starts on its own channel, also said.
+  - **During a session nothing moves.** The station joining after the AP is up finds the hotspot on the AP's channel
+    (the phone's hotspot follows the phone's link, as benched). A station on another channel while the AP runs (it came
+    up before the station joined) is said once by the keeper and reported in MGMT_INFO; the next AP start follows.
+    What the radio does meanwhile (refuse the association, move the uAP, time-share the two channels) is for the bench.
 
 ## Between host sessions: armed (Bluetooth powered, invisible)
 
