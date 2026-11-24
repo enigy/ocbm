@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 mod jffs2;
 mod mdns;
+mod meta;
 mod setup;
 mod wifi;
 mod wpa;
@@ -317,6 +318,8 @@ struct Daemon {
     attach_live: bool,
     /// M3: the set-up network's window (setup.rs). Over (inert) on an adapter with the link set up.
     setup: setup::Setup,
+    /// Wi-Fi mode: the session's latest metadata records, for a host that SUBSCRIBEs over a running session (meta.rs).
+    meta_keep: meta::MetaKeep,
 }
 
 /// M2 (the owner's word, 23 Nov 2026): a CarPlay session an adapter with the Wi-Fi link set up starts at power-up with
@@ -2213,6 +2216,8 @@ impl Daemon {
         // Stop streaming the log and drop what was buffered for a host that is no longer there.
         // The file itself keeps being capped — log_tick runs unsubscribed for exactly that reason.
         self.log_reset();
+        // The session is over: what its phone said is no next host's.
+        self.meta_keep.clear();
         // The one-file install: the session after the confirm is over, so stock goes now.
         finish_if_confirmed(INSTALL_MODE_FILE, start_install_finish);
     }
@@ -2323,6 +2328,12 @@ impl Daemon {
         }
         self.last_health_log = Some(now);
         eprintln!("{}", self.health_line(now));
+        // The Wi-Fi holder's link beside it (ADDENDUM 8 (b)): what each way last carried, and the socket's own view.
+        if let Some(Via::Wifi(id)) = self.wifi.via {
+            if let Some(i) = self.wifi.link_index(id) {
+                eprintln!("[ocbmd] wifi: link {id} at uptime {} s: {}", uptime_text(), self.wifi.links[i].stats_line());
+            }
+        }
     }
 
     /// Report the box's own readiness to the host as `CT_BOX_HEALTH`, on change.
@@ -3244,6 +3255,55 @@ impl Daemon {
         closed
     }
 
+    /// One chunk of the metadata seam for the host. Wi-Fi mode: kept as it passes (meta.rs), and a replay that waited
+    /// for the record under way goes in at the record's end, between the chunk's two parts.
+    fn metadata_chunk(&mut self, fl: u8, b: &[u8]) {
+        let (mut fl, mut b) = (fl, b);
+        if self.wifi.on {
+            if let Some((cut, why)) = self.meta_keep.feed(b) {
+                if cut > 0 {
+                    self.send(p::CH_METADATA, fl, &b[..cut]);
+                    fl = p::F_SOM | p::F_EOM;
+                }
+                self.meta_replay(why);
+                b = &b[cut..];
+                let _ = self.meta_keep.feed(b);
+            }
+        }
+        if !b.is_empty() {
+            self.send(p::CH_METADATA, fl, b);
+        }
+    }
+
+    /// A host SUBSCRIBEd over a session already running, in Wi-Fi mode: hand it what the phone said on the metadata
+    /// seam before it came, after the SUBSCRIBE that armed its lanes. Now if the seam is between records; else at the
+    /// end of the one under way ([`Daemon::metadata_chunk`]), since the host reads the channel as one stream.
+    fn meta_attach(&mut self, why: &'static str) {
+        if !self.wifi.on {
+            return;
+        }
+        if self.meta_keep.at_boundary() {
+            self.meta_replay(why);
+        } else {
+            self.meta_keep.defer(why);
+            eprintln!("[ocbmd] session: {why}: the session's metadata goes at the end of the record under way");
+        }
+    }
+
+    /// The kept records on CH_METADATA, as the seam's own bytes.
+    fn meta_replay(&mut self, why: &str) {
+        let bytes = self.meta_keep.replay();
+        if bytes.is_empty() {
+            eprintln!("[ocbmd] session: {why}: no metadata of the session's kept to replay");
+            return;
+        }
+        for chunk in bytes.chunks(p::MAX_PAYLOAD) {
+            self.send(p::CH_METADATA, p::F_SOM | p::F_EOM, chunk);
+        }
+        let (n, kinds) = (bytes.len(), self.meta_keep.kinds());
+        eprintln!("[ocbmd] session: {why}: the session's metadata replayed ({n} B: {kinds})");
+    }
+
     /// Forget the mic seam socket (`ensure_mic_seam` reconnects on the next tick) and, if the host was
     /// gated ON through this seam, gate it OFF now. The seam's owner (carplayd, per session)
     /// sends `uplink off` and closes; if our next PCM
@@ -3787,6 +3847,8 @@ impl Daemon {
                     self.lo_capped = false;
                     self.av_backpressured = false;
                     self.seq = 0;
+                    // A metadata replay still waiting was the last host's: this host's SUBSCRIBE asks for its own.
+                    self.meta_keep.cancel();
                     let mut caps =
                         p::CAP_CONSOLE | p::CAP_FILE | p::CAP_PHONE_POLICY | p::CAP_PAIR_WINDOW
                         | p::CAP_INSTALL | p::CAP_PHONE_SWITCH | p::CAP_WIFI_LINK;
@@ -3978,6 +4040,7 @@ impl Daemon {
                             eprintln!("[ocbmd] wifi: a host attaches to the running session (re-keying its A/V seams)");
                             self.rekey_av = true;
                             self.attach_live = true;
+                            self.meta_attach("a host attached to the running session");
                         }
                         self.send(
                             p::CH_CTRL,
@@ -4004,6 +4067,11 @@ impl Daemon {
                         // keys are gone: hand them again (`rekey_av`). A config re-push has no HELLO and
                         // keeps its keys, so it is left alone.
                         self.rekey_av |= reattached;
+                        // Wi-Fi mode: the same host back over the running session (its link lost within the heartbeat
+                        // grace) is handed what the phone said meanwhile, which went to the sink.
+                        if reattached && self.wifi.on {
+                            self.meta_attach("the same host re-attached");
+                        }
                         self.send(
                             p::CH_CTRL,
                             p::F_SOM | p::F_EOM,
@@ -4262,6 +4330,7 @@ impl Daemon {
             self.wifi.usb_out = Some(prev);
         }
         self.clear_output();
+        self.meta_keep.cancel();
         eprintln!("[ocbmd] wifi: the host over {} let the box go ({why})", via_name(Some(old)));
     }
 
@@ -5374,6 +5443,7 @@ fn main() {
         selfs: None,
         attach_live: false,
         setup: if setup_on { setup::Setup::waiting(Instant::now()) } else { setup::Setup::never() },
+        meta_keep: meta::MetaKeep::default(),
     };
     let direct_io = acc_io == AccIo::Direct;
     let mut reasm = p::Reassembler::new();
@@ -5721,7 +5791,11 @@ fn main() {
                                 fl |= p::F_NEW_SOURCE;
                                 d.av_conns[idx].2 = false;
                             }
-                            d.send(ch, fl, &avbuf[..n]);
+                            if ch == p::CH_METADATA {
+                                d.metadata_chunk(fl, &avbuf[..n]);
+                            } else {
+                                d.send(ch, fl, &avbuf[..n]);
+                            }
                         }
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                         Err(_) => av_close.push(idx),
@@ -5824,6 +5898,10 @@ fn main() {
         av_close.dedup();
         for &idx in av_close.iter().rev() {
             if idx < d.av_conns.len() {
+                // The metadata seam's producer gone (its carplayd's session over): what it said goes with it.
+                if d.av_conns[idx].1 == p::CH_METADATA {
+                    d.meta_keep.clear();
+                }
                 d.av_conns.remove(idx);
             }
         }
@@ -5837,6 +5915,10 @@ fn main() {
         // with orphaned local sockets.
         // `true` = fresh: its first forwarded frame gets F_NEW_SOURCE (see the `av_conns` field comment).
         for (s, ch) in av_new {
+            // A new metadata producer is a new session's (or a new stream): nothing kept from the last is replayed.
+            if ch == p::CH_METADATA {
+                d.meta_keep.clear();
+            }
             d.av_conns.retain(|(_, c, _)| *c != ch);
             d.av_conns.push((s, ch, true));
         }
@@ -6040,6 +6122,7 @@ mod tests {
             selfs: None,
             attach_live: false,
             setup: setup::Setup::never(),
+            meta_keep: meta::MetaKeep::default(),
         }
     }
 
@@ -8065,6 +8148,71 @@ mod tests {
         assert!(std::path::Path::new(SELF_OVER_FILE).exists() && !self_start_wanted());
         let _ = std::fs::remove_file(SELF_OVER_FILE);
         let _ = std::fs::remove_file(SESSION_CFG_FILE);
+    }
+
+    /// One metadata seam record of JSON: `[u32 BE "META"][u32 BE len][0x02][json]`.
+    fn meta_rec(json: &str) -> Vec<u8> {
+        let mut r = b"META".to_vec();
+        r.extend_from_slice(&((1 + json.len()) as u32).to_be_bytes());
+        r.push(0x02);
+        r.extend_from_slice(json.as_bytes());
+        r
+    }
+
+    /// The CH_METADATA bytes queued for the host, as one stream.
+    fn meta_out(d: &mut Daemon) -> Vec<u8> {
+        sent_lo(d).into_iter().filter(|(ch, _, _)| *ch == p::CH_METADATA).flat_map(|(_, _, pl)| pl).collect()
+    }
+
+    /// ADDENDUM 8 (a): in Wi-Fi mode what the phone said on the metadata seam while no host held the box goes to a host
+    /// that attaches, after its SUBSCRIBE; to the same host back after a lost link; and, asked for inside a record, at
+    /// that record's end. The session's end empties it.
+    #[test]
+    fn the_sessions_metadata_goes_to_a_host_that_attaches_and_to_the_same_host_back() {
+        let _flag = presence_flag_lock();
+        std::fs::write(SESSION_CFG_FILE, b"cfg: kept\n").unwrap();
+        let np = meta_rec(r#"{"kind":"nowPlaying","title":"t","playbackStatus":1}"#);
+        let loc = meta_rec(r#"{"kind":"location","state":"start"}"#);
+        let both = [&np[..], &loc[..]].concat();
+        let mut d = td_wifi();
+        d.self_session_start(Instant::now());
+        // As the loop forwards the :9004 seam while the session runs parked: as it came (to the sink: nobody holds it).
+        d.metadata_chunk(p::F_SOM | p::F_EOM, &both);
+        assert_eq!(meta_out(&mut d), both);
+        d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &hello(0x2200_0003, b""));
+        subscribe(&mut d, b"cfg: kept\n");
+        assert!(d.attach_live && d.rekey_av);
+        assert_eq!(meta_out(&mut d), both, "replayed after the SUBSCRIBE");
+        // Its link lost with no CT_STOP (ss.attached stays true); the same host back within the heartbeat grace, with a
+        // record of the seam half through.
+        d.attach_live = false;
+        let tick = meta_rec(r#"{"kind":"nowPlaying","elapsedMs":5}"#);
+        d.metadata_chunk(p::F_SOM | p::F_EOM, &tick[..7]);
+        d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &hello(0x2200_0003, b""));
+        assert!(d.host_reattached);
+        subscribe(&mut d, b"cfg: kept\n");
+        assert!(d.selfs.as_ref().is_some_and(|s| s.attached), "not the attach branch: the same host's own");
+        assert!(meta_out(&mut d).is_empty(), "the replay waits for the end of the record under way");
+        let veh = meta_rec(r#"{"kind":"vehicleStatus","state":"start","want":[3]}"#);
+        d.metadata_chunk(p::F_SOM | p::F_EOM, &[&tick[7..], &veh[..]].concat());
+        let want = [&tick[7..], &np[..], &loc[..], &tick[..], &veh[..]].concat();
+        assert_eq!(meta_out(&mut d), want, "the record's end, the replay (that record in it), then the rest");
+        d.go_idle(false);
+        assert!(d.meta_keep.replay().is_empty(), "the session is over");
+        let _ = std::fs::remove_file(SESSION_CFG_FILE);
+
+        // A box with no Wi-Fi link set up is 2.7.1's: the seam passes untouched, nothing is kept, a reattach gets no
+        // replay.
+        let mut usb = td();
+        usb.metadata_chunk(p::F_SOM | p::F_NEW_SOURCE, &both);
+        assert_eq!(sent_lo(&mut usb), vec![(p::CH_METADATA, p::F_SOM | p::F_NEW_SOURCE, both.clone())]);
+        assert!(usb.meta_keep.replay().is_empty());
+        for _ in 0..2 {
+            usb.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &hello(0x2200_0004, b""));
+            subscribe(&mut usb, b"cfg: x\n");
+        }
+        assert!(meta_out(&mut usb).is_empty() && usb.rekey_av);
+        usb.go_idle(false);
     }
 
     #[test]

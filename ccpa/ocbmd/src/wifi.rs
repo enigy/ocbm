@@ -29,7 +29,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
 use std::os::unix::io::AsRawFd;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -662,6 +662,115 @@ impl Write for Deadline<'_> {
 
 // ---- a link ----------------------------------------------------------------------------------------------------
 
+/// A link's counters, shared by its two threads and the loop: what each way carried and when, and whether the box shut
+/// the socket first. For its end lines and the loop's 30 s line: from the box's log alone the 24 Nov attach bench could
+/// not tell who ended a link, nor when either side had last heard the other (ADDENDUM 8 of the Wi-Fi link plan).
+#[derive(Default)]
+pub struct LinkStats {
+    /// `crate::mono_ms()` at the link's start.
+    since_ms: AtomicU64,
+    in_records: AtomicU64,
+    in_bytes: AtomicU64,
+    /// `crate::mono_ms()` of the last record opened; 0: none yet.
+    last_in_ms: AtomicU64,
+    out_records: AtomicU64,
+    out_keepalives: AtomicU64,
+    out_bytes: AtomicU64,
+    /// `crate::mono_ms()` of the last record written whole; 0: none yet.
+    last_out_ms: AtomicU64,
+    /// `crate::mono_ms()` when the write under way began; 0 between writes.
+    write_since_ms: AtomicU64,
+    /// The box shut the socket: [`SHUT_BY_LOOP`] or [`SHUT_BY_WRITER`], the first of them. 0: not the box, so an end of
+    /// stream the reader reads is the host's.
+    box_shut: AtomicU8,
+}
+
+/// [`Link::close`]: the loop ended the link.
+const SHUT_BY_LOOP: u8 = 1;
+/// The writer thread ended (its write failed or stuck, or the loop dropped the link's output) and shut the socket.
+const SHUT_BY_WRITER: u8 = 2;
+
+impl LinkStats {
+    fn new() -> Arc<Self> {
+        let s = LinkStats::default();
+        s.since_ms.store(crate::mono_ms(), Ordering::Relaxed);
+        Arc::new(s)
+    }
+
+    /// Note that the box shut the socket, unless it had already.
+    fn shut(&self, by: u8) {
+        let _ = self.box_shut.compare_exchange(0, by, Ordering::SeqCst, Ordering::SeqCst);
+    }
+
+    /// Both ways, the link's age and a write under way: "up 32210 ms; in 53 records, 58361 B, the last 120 ms ago; out
+    /// 1412 records (31 keepalives), 474591 B, the last 40 ms ago".
+    pub fn line(&self) -> String {
+        let now = crate::mono_ms();
+        let ago = |at: &AtomicU64| match at.load(Ordering::Relaxed) {
+            0 => "never".to_string(),
+            t => format!("{} ms ago", now.saturating_sub(t)),
+        };
+        let w = self.write_since_ms.load(Ordering::Relaxed);
+        format!(
+            "up {} ms; in {} records, {} B, the last {}; out {} records ({} keepalives), {} B, the last {}{}",
+            now.saturating_sub(self.since_ms.load(Ordering::Relaxed)),
+            self.in_records.load(Ordering::Relaxed),
+            self.in_bytes.load(Ordering::Relaxed),
+            ago(&self.last_in_ms),
+            self.out_records.load(Ordering::Relaxed),
+            self.out_keepalives.load(Ordering::Relaxed),
+            self.out_bytes.load(Ordering::Relaxed),
+            ago(&self.last_out_ms),
+            if w == 0 { String::new() } else { format!("; a write under way for {} ms", now.saturating_sub(w)) },
+        )
+    }
+}
+
+/// What a link's end of stream was: after the box's own shutdown, that shutdown; otherwise the host's FIN.
+fn eof_reason(box_shut: u8) -> &'static str {
+    match box_shut {
+        SHUT_BY_LOOP => "the box closed the link (the loop ended it)",
+        SHUT_BY_WRITER => "the box closed the link (its writer ended)",
+        _ => "the host closed the link",
+    }
+}
+
+/// The socket's own view (Linux; nothing elsewhere): its TCP state (1 established; 8 close-wait: the peer's FIN came
+/// first; 4/5 fin-wait: this side shut first; 7 closed: a reset), the segments not yet acknowledged, the
+/// retransmissions, the RTT, how long since data last came in and went out and since the peer last acknowledged, and
+/// the bytes the kernel still holds to send.
+pub fn tcp_view(s: &TcpStream) -> String {
+    #[cfg(target_os = "linux")]
+    {
+        let fd = s.as_raw_fd();
+        // SAFETY: getsockopt(TCP_INFO) into a zeroed tcp_info with its size; the kernel fills what it has (3.14's
+        // fields reach tcpi_total_retrans, the last read here).
+        let mut ti: libc::tcp_info = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::tcp_info>() as libc::socklen_t;
+        let info = (&mut ti as *mut libc::tcp_info).cast();
+        if unsafe { libc::getsockopt(fd, libc::IPPROTO_TCP, libc::TCP_INFO, info, &mut len) } == 0 {
+            let mut queued: libc::c_int = 0;
+            // SAFETY: TIOCOUTQ (SIOCOUTQ) on a TCP socket: the bytes in its send queue, unsent or unacknowledged.
+            let q = unsafe { libc::ioctl(fd, libc::TIOCOUTQ, &mut queued as *mut libc::c_int) } == 0;
+            return format!(
+                "; tcp state {}, unacked {}, retrans {}/{}, rtt {} us, data in {} ms ago, out {} ms ago, \
+                 acked {} ms ago, queued {}",
+                ti.tcpi_state,
+                ti.tcpi_unacked,
+                ti.tcpi_retransmits,
+                ti.tcpi_total_retrans,
+                ti.tcpi_rtt,
+                ti.tcpi_last_data_recv,
+                ti.tcpi_last_data_sent,
+                ti.tcpi_last_ack_recv,
+                if q { format!("{queued} B") } else { "?".to_string() },
+            );
+        }
+    }
+    let _ = s;
+    String::new()
+}
+
 /// An authenticated host connection, as the poll loop holds it.
 pub struct Link {
     pub id: u64,
@@ -686,13 +795,21 @@ pub struct Link {
     /// [`Link::close`] has been called: its end is on the way (the loop sees its input's EOF a pass or so later).
     closed: std::cell::Cell<bool>,
     sock: TcpStream,
+    /// What the link carried each way, and whether the box shut it ([`LinkStats`]).
+    stats: Arc<LinkStats>,
 }
 
 impl Link {
     /// End the link now: both threads see the socket shut and end, closing their pipe ends.
     pub fn close(&self) {
+        self.stats.shut(SHUT_BY_LOOP);
         self.closed.set(true);
         let _ = self.sock.shutdown(std::net::Shutdown::Both);
+    }
+
+    /// The link's counters and its socket's view, for the loop's 30 s line.
+    pub fn stats_line(&self) -> String {
+        format!("{}{}", self.stats.line(), tcp_view(&self.sock))
     }
 
     pub fn is_closed(&self) -> bool {
@@ -728,14 +845,16 @@ pub fn start_link(a: Authed) -> std::io::Result<Link> {
     let ws = stream.try_clone()?;
     let opened = Arc::new(AtomicBool::new(false));
     let first = opened.clone();
+    let stats = LinkStats::new();
+    let (rstats, wstats) = (stats.clone(), stats.clone());
     std::thread::Builder::new()
         .name("wifi-read".into())
         .stack_size(crate::RELAY_STACK)
-        .spawn(move || link_reader(id, rs, rx, host_bytes, first))?;
+        .spawn(move || link_reader(id, rs, rx, host_bytes, first, rstats))?;
     std::thread::Builder::new()
         .name("wifi-write".into())
         .stack_size(crate::RELAY_STACK)
-        .spawn(move || link_writer(id, ws, tx, frames))?;
+        .spawn(move || link_writer(id, ws, tx, frames, wstats))?;
     Ok(Link {
         id,
         peer,
@@ -749,15 +868,23 @@ pub fn start_link(a: Authed) -> std::io::Result<Link> {
         opened,
         closed: std::cell::Cell::new(false),
         sock: stream,
+        stats,
     })
 }
 
-fn link_reader(id: u64, mut s: TcpStream, mut rx: ocbm_link::Opener, mut host_bytes: File, opened: Arc<AtomicBool>) {
+fn link_reader(
+    id: u64,
+    mut s: TcpStream,
+    mut rx: ocbm_link::Opener,
+    mut host_bytes: File,
+    opened: Arc<AtomicBool>,
+    stats: Arc<LinkStats>,
+) {
     let mut buf = vec![0u8; 32 * 1024];
     let (mut records, mut bytes) = (0u64, 0u64);
     let why = 'outer: loop {
         let n = match s.read(&mut buf) {
-            Ok(0) => break "the host closed the link".to_string(),
+            Ok(0) => break eof_reason(stats.box_shut.load(Ordering::SeqCst)).to_string(),
             Ok(n) => n,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
@@ -770,6 +897,8 @@ fn link_reader(id: u64, mut s: TcpStream, mut rx: ocbm_link::Opener, mut host_by
             match rx.next() {
                 Ok(Some(plain)) => {
                     records += 1;
+                    stats.in_records.store(records, Ordering::Relaxed);
+                    stats.last_in_ms.store(crate::mono_ms(), Ordering::Relaxed);
                     if records == 1 {
                         opened.store(true, Ordering::Release);
                     }
@@ -777,6 +906,7 @@ fn link_reader(id: u64, mut s: TcpStream, mut rx: ocbm_link::Opener, mut host_by
                         continue; // a keepalive
                     }
                     bytes += plain.len() as u64;
+                    stats.in_bytes.store(bytes, Ordering::Relaxed);
                     if let Err(e) = host_bytes.write_all(&plain) {
                         break 'outer format!("the loop's pipe: {e}");
                     }
@@ -786,12 +916,18 @@ fn link_reader(id: u64, mut s: TcpStream, mut rx: ocbm_link::Opener, mut host_by
             }
         }
     };
-    eprintln!("[ocbmd] wifi: link {id} reader ended: {why} ({records} records, {bytes} B in)");
+    // The socket's view before this side's shutdown below: a FIN from the host reads tcp state 8 (close-wait).
+    eprintln!(
+        "[ocbmd] wifi: link {id} reader ended: {why} ({records} records, {bytes} B in) at uptime {} s; {}{}",
+        crate::uptime_text(),
+        stats.line(),
+        tcp_view(&s)
+    );
     let _ = s.shutdown(std::net::Shutdown::Both);
     // `host_bytes` drops here: the loop reads EOF.
 }
 
-fn link_writer(id: u64, mut s: TcpStream, mut tx: ocbm_link::Sealer, frames: File) {
+fn link_writer(id: u64, mut s: TcpStream, mut tx: ocbm_link::Sealer, frames: File, stats: Arc<LinkStats>) {
     let mut buf = vec![0u8; ocbm_link::MAX_RECORD];
     let mut out: Vec<u8> = Vec::with_capacity(4 + ocbm_link::MAX_RECORD + ocbm_link::TAG);
     let mut bytes = 0u64;
@@ -801,6 +937,7 @@ fn link_writer(id: u64, mut s: TcpStream, mut tx: ocbm_link::Sealer, frames: Fil
         // SAFETY: one valid pollfd for a descriptor this thread owns.
         let r = unsafe { libc::poll(&mut pfd, 1, keepalive_ms) };
         out.clear();
+        let keepalive = r == 0;
         if r == 0 {
             tx.seal_into(&mut out, &[]); // nothing to send for a second: the keepalive
         } else if r < 0 {
@@ -820,15 +957,31 @@ fn link_writer(id: u64, mut s: TcpStream, mut tx: ocbm_link::Sealer, frames: Fil
                 Err(e) => break format!("pipe read failed: {e}"),
             }
         }
-        if let Err(e) = s.write_all(&out) {
+        stats.write_since_ms.store(crate::mono_ms(), Ordering::Relaxed);
+        let wrote = s.write_all(&out);
+        stats.write_since_ms.store(0, Ordering::Relaxed);
+        if let Err(e) = wrote {
             break if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) {
                 format!("a write stuck for {} s (the host is gone from the hotspot?)", ocbm_link::DEAD_AFTER.as_secs())
             } else {
                 format!("send failed: {e}")
             };
         }
+        stats.out_records.fetch_add(1, Ordering::Relaxed);
+        if keepalive {
+            stats.out_keepalives.fetch_add(1, Ordering::Relaxed);
+        }
+        stats.out_bytes.store(bytes, Ordering::Relaxed);
+        stats.last_out_ms.store(crate::mono_ms(), Ordering::Relaxed);
     };
-    eprintln!("[ocbmd] wifi: link {id} writer ended: {why} ({bytes} B out)");
+    eprintln!(
+        "[ocbmd] wifi: link {id} writer ended: {why} ({bytes} B out) at uptime {} s; {}{}",
+        crate::uptime_text(),
+        stats.line(),
+        tcp_view(&s)
+    );
+    // Before the shutdown: the reader's end of stream after it is this box's, and its line says so.
+    stats.shut(SHUT_BY_WRITER);
     let _ = s.shutdown(std::net::Shutdown::Both);
     // `frames` drops here: the loop's writes fail (EPIPE / POLLERR).
 }
@@ -1009,6 +1162,7 @@ pub fn test_link(id: u64) -> (Link, File, TcpStream) {
         opened: Arc::default(),
         closed: std::cell::Cell::new(false),
         sock,
+        stats: LinkStats::new(),
     };
     (link, out_read, host)
 }
@@ -1202,6 +1356,12 @@ mod tests {
         }
         assert_eq!(got, b"HELLO_ACK");
         assert!(keepalives >= 2, "keepalives from an idle box: {keepalives}");
+        // Its counters, which its end lines and the loop's 30 s line read (ADDENDUM 8 (b)).
+        let st = &link.stats;
+        assert_eq!((st.in_records.load(Ordering::Relaxed), st.in_bytes.load(Ordering::Relaxed)), (1, 17));
+        assert!(st.out_records.load(Ordering::Relaxed) >= 3 && st.out_keepalives.load(Ordering::Relaxed) >= 2);
+        assert_eq!(st.out_bytes.load(Ordering::Relaxed), 9);
+        assert!(link.stats_line().contains("; in 1 records, 17 B, the last "), "{}", link.stats_line());
 
         // The host has been silent since its frame (no keepalive): the box drops it DEAD_AFTER after that, and the
         // loop's end reads EOF.
@@ -1222,6 +1382,32 @@ mod tests {
         let mut link = start_link(l.rx.recv_timeout(Duration::from_secs(3)).unwrap()).unwrap();
         drop(h);
         assert!(eof_within(&mut link.from_host, 2));
+        assert_eq!(link.stats.box_shut.load(Ordering::SeqCst), 0, "the host's close: the box shut nothing first");
+        assert_eq!(eof_reason(0), "the host closed the link");
+        shared.stop.store(true, Ordering::Release);
+    }
+
+    /// A link the box ends itself reads as the box's end, not as the host's (ADDENDUM 8 (b): its reader said "the host
+    /// closed the link" after the box's own shutdown too).
+    #[test]
+    fn a_link_the_box_closes_is_told_from_one_the_host_closed() {
+        let key = LinkKey([3u8; 32]);
+        let shared = Shared::new(Some(key.clone()));
+        let l = start_listener(shared.clone(), Bind::Fixed(loopback0())).unwrap();
+        let mut h = TcpStream::connect(l.fixed.unwrap()).unwrap();
+        h.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let _sess = host_handshake(&mut h, &key, [2u8; 32]).unwrap();
+        let mut link = start_link(l.rx.recv_timeout(Duration::from_secs(3)).unwrap()).unwrap();
+        link.close();
+        assert!(eof_within(&mut link.from_host, 2));
+        assert_eq!(link.stats.box_shut.load(Ordering::SeqCst), SHUT_BY_LOOP);
+        assert_eq!(eof_reason(SHUT_BY_LOOP), "the box closed the link (the loop ended it)");
+        // The writer's own end (a failed or stuck write, or the loop dropping the link's output) shuts it first too.
+        link.stats.box_shut.store(0, Ordering::SeqCst);
+        link.stats.shut(SHUT_BY_WRITER);
+        link.stats.shut(SHUT_BY_LOOP);
+        assert_eq!(link.stats.box_shut.load(Ordering::SeqCst), SHUT_BY_WRITER, "the first to shut it is the one named");
+        assert_eq!(eof_reason(SHUT_BY_WRITER), "the box closed the link (its writer ended)");
         shared.stop.store(true, Ordering::Release);
     }
 
