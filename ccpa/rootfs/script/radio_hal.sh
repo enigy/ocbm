@@ -818,12 +818,12 @@ ap_dhcp_stop() {
 }
 
 # ---- M3: the set-up network (ocbmd src/setup.rs) --------------------------------------------------------------------
-# An adapter with no Wi-Fi link and no host offers, for a while, a set-up network from its one AP: SSID CarLink-Setup-xxxx
+# An adapter never used (ocbmd decides) offers, for a while, a set-up network from its one AP: SSID CarLink-Setup-xxxx
 # (the box's own 4 hex), the public WPA2 passphrase "carlinksetup", 192.168.43.1/24 with DHCP, and CLIENT ISOLATION
 # (ap_isolate=1: a second client cannot reach the first, so it cannot stand between the head unit and the box). Its
-# hostapd and udhcpd configurations live in /tmp, made from the CarPlay AP's: the flash ones are never written. A
-# hostapd that refuses ap_isolate refuses the whole configuration, and then no set-up network is offered (the marker
-# below never says ok). The CarPlay AP's start (do_wifi_ap_on) stops a set-up AP first.
+# configurations live in /tmp, hostapd's made from the CarPlay AP's: the flash ones are never written. A hostapd that
+# refuses ap_isolate refuses the whole configuration, and then no set-up network is offered (the marker below never
+# says ok). The CarPlay AP's start (do_wifi_ap_on) stops a set-up AP first.
 SETUP_MARK=/tmp/.radio_setup_ap
 SETUP_HAPD=/tmp/hostapd_setup.conf
 SETUP_DHCP=/tmp/udhcpd_setup.conf
@@ -841,8 +841,9 @@ do_setup_ap_on() {
   sed -e '/^interface=/d; /^ssid=/d; /^wpa_passphrase=/d; /^ap_isolate=/d; /^ctrl_interface/d' /etc/hostapd.conf > "$SETUP_HAPD.new" || return 1
   printf 'interface=%s\nssid=CarLink-Setup-%s\nwpa_passphrase=carlinksetup\nap_isolate=1\n' "$_si" "$_ssfx" >> "$SETUP_HAPD.new"
   mv -f "$SETUP_HAPD.new" "$SETUP_HAPD"
-  sed -e '/^[[:space:]]*interface[[:space:]]/d; /^[[:space:]]*lease_file[[:space:]]/d; /^[[:space:]]*pidfile[[:space:]]/d' /etc/udhcpd.conf > "$SETUP_DHCP" 2>/dev/null
-  printf 'interface\t%s\nlease_file\t/tmp/udhcpd_setup.leases\npidfile\t/tmp/udhcpd_setup.pid\n' "$_si" >> "$SETUP_DHCP"
+  # Its own pool on its own subnet, never /etc/udhcpd.conf's: a custom /etc/wifi_ip moves that one (radio_ap_up.sh), and
+  # the set-up address stays 192.168.43.1, where Carlink looks for it.
+  printf 'start\t192.168.43.100\nend\t192.168.43.200\ninterface\t%s\nlease_file\t/tmp/udhcpd_setup.leases\npidfile\t/tmp/udhcpd_setup.pid\nopt\tsubnet\t255.255.255.0\n' "$_si" > "$SETUP_DHCP"
   ifconfig "$_si" 192.168.43.1 netmask 255.255.255.0 up || return 1
   setsid hostapd "$SETUP_HAPD" </dev/null >>"$BOXLOG" 2>&1 &
   setsid busybox udhcpd -f "$SETUP_DHCP" </dev/null >/dev/null 2>&1 &

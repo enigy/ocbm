@@ -15,19 +15,15 @@
 # another wireless interface exists beside it). It never touches the AP's interface, and waits while an AP raised
 # before the link was set up still runs on the station's.
 #
-# WHAT IT SCANS, AND WHEN (ADDENDUM 3 of the plan: no scan storms during the phone's join of the AP). Joined, nothing:
-# wpa_supplicant scans only to find a network, and no background scan is configured. Not joined:
-#   - no AP up (between sessions, or before the first): wpa_supplicant's own scans on every channel, its default
-#     cadence (a few seconds apart);
-#   - the AP up and the CarPlay session not established yet (/tmp/session_healthy not 1), for up to
-#     START_QUIET seconds from the AP's start: NO scan at all (wpa_cli disconnect), so the phone's join of the AP, its
-#     DHCP and the session's set-up never meet an off-channel scan;
-#   - the AP up and the session established (or the quiet time over): wpa_supplicant scans the AP's channel only
-#     (scan_freq, on-channel: the radio never leaves the AP's channel for them), and this keeper asks for one scan of
-#     every channel each FULL_SCAN_EVERY seconds, a short gap in the AP's air time that a running session bears.
-# A hotspot on the AP's channel is found within seconds in every phase; one on another channel between sessions at
-# once, during a session within FULL_SCAN_EVERY. When the hotspot and the AP are on different channels it says so
-# plainly (one line a change); M1 never moves the AP's channel.
+# WHAT IT SCANS, AND WHEN (no scan storms while a phone joins; docs/wireless/01_BT_AND_RADIO.md). Joined: nothing (no
+# background scan). Not joined:
+#   - no session (no AP up, no host present): wpa_supplicant's own scans of every channel;
+#   - a session starting (the AP up, or a host present: M2's Bluetooth paging comes before any AP) and not yet
+#     established (/tmp/session_healthy not 1), for up to START_QUIET seconds: NO scan (wpa_cli disconnect), so the
+#     phone's page, its join of the AP and the session's set-up never meet one;
+#   - then, with the AP up: its channel only (scan_freq), and one scan of every channel each FULL_SCAN_EVERY seconds;
+#     with no AP (a wired session): every channel.
+# The hotspot on another channel than the AP's is said plainly, once a change; M1 never moves the AP's channel.
 #
 # /etc/ocbm/wifi_link (ocbmd writes it, 0600): key= (ocbmd's), ssid_hex= (the hotspot's name in hex), psk= (64 hex
 # digits: the PBKDF2 hash, worked out on the head unit; or the passphrase; or empty: an open network).
@@ -57,6 +53,7 @@ WPALOG=$R/tmp/wifi_sta.log
 BOXLOG=$R/tmp/box.log
 HOSTAPD_CONF=$R/etc/hostapd.conf
 HEALTHY=$R/tmp/session_healthy
+PRESENT=$R/tmp/host_present
 ONE_IF=$R/tmp/.radio_one_iface
 SYS=$R/sys
 LOCK=$R/tmp/.wifi_sta_lock
@@ -165,7 +162,7 @@ cli() { "$CLI" -p "$CTRL" -i "$IF" "$@" 2>/dev/null; }
 
 log "keeping the station on the hotspot set up in $CONF"
 mkdir -p "$CTRL" "$R/var/run" 2>/dev/null
-WPA=""; CLI=""; said_tools=0; said_ap_on_sta=0; none=0
+WPA=""; CLI=""; said_tools=0; said_ap_on_sta=0; none=0; wpa_down=0; wpa_next=0
 last_ch=""; last_mismatch=""; joined_at=""; down_since=$(up_s)
 paused=0; ap_since=""; last_full=0; conf_freq="x"
 while :; do
@@ -208,15 +205,21 @@ while :; do
     said_ap_on_sta=1; [ -n "${WIFI_STA_ONCE:-}" ] && exit 0; sleep "$TICK"; continue
   fi
   said_ap_on_sta=0
-  # The supplicant.
-  if ! pid_of "$WPA_PID" >/dev/null; then
+  # The supplicant: started, and again no sooner than 30 s after its last start; one that does not start or does not
+  # stay is said once, until it runs.
+  if ! pid_of "$WPA_PID" >/dev/null && [ "$now" -ge "$wpa_next" ]; then
+    wpa_next=$((now + 30))
     [ "$conf_freq" = x ] && write_conf ""
     ifconfig "$IF" 0.0.0.0 up 2>/dev/null
-    log "starting the supplicant on $IF"
-    "$WPA" -B -P "$WPA_PID" -D nl80211,wext -i "$IF" -c "$WPACONF" >> "$WPALOG" 2>&1 || log "the supplicant did not start (rc $?)"
+    [ "$wpa_down" = 1 ] || log "starting the supplicant on $IF"
+    "$WPA" -B -P "$WPA_PID" -D nl80211,wext -i "$IF" -c "$WPACONF" >> "$WPALOG" 2>&1 && sleep 1
     paused=0
-    sleep 1
   fi
+  if ! pid_of "$WPA_PID" >/dev/null; then
+    [ "$wpa_down" = 1 ] || log "the supplicant did not start, or did not stay (/tmp/wifi_sta.log): again every 30 s"
+    wpa_down=1; [ -n "${WIFI_STA_ONCE:-}" ] && exit 0; sleep "$TICK"; continue
+  fi
+  wpa_down=0
   st=$(cli status)
   wstate=$(echo "$st" | sed -n 's/^wpa_state=//p')
   freq=$(echo "$st" | sed -n 's/^freq=//p')
@@ -245,20 +248,19 @@ while :; do
     fi
     [ -n "$down_since" ] || { down_since=$now; log "$IF looking for the hotspot"; }
     publish joining 0
-    # Scans around the session (the header).
-    if ap_up; then
-      [ -n "$ap_since" ] || ap_since=$now
-      healthy=""; read -r healthy 2>/dev/null <"$HEALTHY"
-      if [ "$healthy" != 1 ] && [ $((now - ap_since)) -lt "$START_QUIET" ]; then
-        [ "$paused" = 1 ] || { cli disconnect >/dev/null; paused=1; log "CarPlay is starting on the AP: no scans until it runs (${START_QUIET} s at most)"; }
-      else
-        f=$(freq_of "$(ap_channel)")
-        [ "$f" != 0 ] && [ "$conf_freq" != "$f" ] && { write_conf "$f"; cli reconfigure >/dev/null; }
-        if [ "$paused" = 1 ]; then cli reconnect >/dev/null; paused=0; last_full=$now; log "scanning the AP's channel, and every channel each ${FULL_SCAN_EVERY} s"; fi
-        [ $((now - last_full)) -ge "$FULL_SCAN_EVERY" ] && { cli scan >/dev/null; last_full=$now; }
-      fi
+    # Scans around a session (the header): one is starting with the AP up or a host present.
+    up=0; ap_up && up=1
+    hp=""; read -r hp 2>/dev/null <"$PRESENT"
+    healthy=""; read -r healthy 2>/dev/null <"$HEALTHY"
+    if [ "$up" = 1 ] || [ "$hp" = 1 ]; then [ -n "$ap_since" ] || ap_since=$now; else ap_since=""; fi
+    if [ -n "$ap_since" ] && [ "$healthy" != 1 ] && [ $((now - ap_since)) -lt "$START_QUIET" ]; then
+      [ "$paused" = 1 ] || { cli disconnect >/dev/null; paused=1; log "CarPlay is starting: no scans until it runs (${START_QUIET} s at most)"; }
+    elif [ "$up" = 1 ]; then
+      f=$(freq_of "$(ap_channel)")
+      [ "$f" != 0 ] && [ "$conf_freq" != "$f" ] && { write_conf "$f"; cli reconfigure >/dev/null; }
+      if [ "$paused" = 1 ]; then cli reconnect >/dev/null; paused=0; last_full=$now; log "scanning the AP's channel, and every channel each ${FULL_SCAN_EVERY} s"; fi
+      [ $((now - last_full)) -ge "$FULL_SCAN_EVERY" ] && { cli scan >/dev/null; last_full=$now; }
     else
-      ap_since=""
       [ "$conf_freq" != "" ] && { write_conf ""; cli reconfigure >/dev/null; }
       [ "$paused" = 1 ] && { cli reconnect >/dev/null; paused=0; }
     fi

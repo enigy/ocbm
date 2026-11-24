@@ -61,6 +61,8 @@ cat > "$S/hal.sh" <<'EOF'
 echo "radio_hal $*" >> "$STUB_R/calls"
 EOF
 printf 'echo "radio_hal $*" >> "$STUB_R/calls"\nexit 3\n' > "$S/hal3.sh"
+# A supplicant that does not start.
+printf '#!/bin/sh\necho "wpa_supplicant $*" >> "$STUB_R/calls"\nexit 1\n' > "$S/wpa_fail"; chmod 755 "$S/wpa_fail"
 
 unit() {  # $1 dir, $2 interfaces ("sta0 wlan0"), $3 psk: a scratch adapter with the link set up
   local R="$1" i
@@ -136,6 +138,21 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   check '[ ! -e "$R/var/run/wpa_sta.pid" ] && [ ! -e "$R/var/run/udhcpc_sta.pid" ] && [ ! -e "$R/tmp/wifi_link_state" ] && [ ! -d "$R/tmp/.wifi_sta_lock" ]' \
     "SIGTERM: the supplicant, the DHCP client, the state and the lock gone"
 
+  # A session starting with no AP yet (a host present: M2's Bluetooth paging comes first): no scans until it runs, then
+  # every channel (no AP to stay on).
+  R="$T/p"; unit "$R" "sta0 wlan0" "$HASH"; printf 'wpa_state=SCANNING\n' > "$R/wpa_status"
+  env STUB_R="$R" WIFI_STA_ROOT="$R" WIFI_STA_TICK=0.2 WIFI_STA_HAL="$S/hal.sh" OCBM_TEST_PATH="$S${OCBM_TEST_PATH:+:$OCBM_TEST_PATH}" \
+    "$sh" "$KEEPER" >/dev/null 2>&1 &
+  BG=$!
+  n=0; while [ "$n" -lt 30 ] && [ ! -s "$R/tmp/wifi_link_state" ]; do n=$((n + 1)); sleep 0.1; done
+  echo 1 > "$R/tmp/host_present"
+  n=0; while [ "$n" -lt 30 ] && ! grep -q "wpa_cli disconnect" "$R/calls"; do n=$((n + 1)); sleep 0.1; done
+  check 'grep -q "wpa_cli disconnect" "$R/calls"' "a host present and no AP yet (M2's paging): the supplicant told to stop scanning"
+  echo 1 > "$R/tmp/session_healthy"
+  n=0; while [ "$n" -lt 30 ] && ! grep -q "wpa_cli reconnect" "$R/calls"; do n=$((n + 1)); sleep 0.1; done
+  check 'grep -q "wpa_cli reconnect" "$R/calls" && ! grep -q "scan_freq" "$R/tmp/wpa_sta.conf"' "  the session running with no AP: every channel again"
+  kill "$BG"; wait "$BG" 2>/dev/null; BG=""
+
   # Back-offs: what cannot change before the next boot, or for a while, is asked for and said once.
   R="$T/c"; unit "$R" "sta0" "$HASH"
   env STUB_R="$R" WIFI_STA_ROOT="$R" WIFI_STA_TICK=0.1 WIFI_STA_HAL="$S/hal3.sh" OCBM_TEST_PATH="$S${OCBM_TEST_PATH:+:$OCBM_TEST_PATH}" \
@@ -150,6 +167,13 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   check 'grep -qx "state=unsupported" "$R/tmp/wifi_link_state" && [ ! -e "$R/calls" ]' \
     "  the seam's one-interface mark: not even asked, and state=unsupported for ocbmd"
   kill "$BG"; wait "$BG" 2>/dev/null; BG=""
+  R="$T/c2"; unit "$R" "sta0 wlan0" "$HASH"; ln -sf "$S/wpa_fail" "$R/usr/sbin/ocbm-wpa_supplicant"
+  env STUB_R="$R" WIFI_STA_ROOT="$R" WIFI_STA_TICK=0.1 WIFI_STA_HAL="$S/hal.sh" OCBM_TEST_PATH="$S${OCBM_TEST_PATH:+:$OCBM_TEST_PATH}" \
+    "$sh" "$KEEPER" >/dev/null 2>&1 &
+  BG=$!; sleep 1.2; kill "$BG"; wait "$BG" 2>/dev/null; BG=""
+  check '[ "$(grep -c "^wpa_supplicant" "$R/calls")" = 1 ] && [ "$(grep -c "did not start" "$R/tmp/box.log")" = 1 ]' \
+    "a supplicant that does not start: tried again only 30 s later, said once"
+
   # Waits.
   R="$T/d"; unit "$R" "sta0 wlan0" "$HASH"; rm -f "$R/usr/sbin/ocbm-wpa_supplicant"; keep "$R" "$sh"
   check 'grep -q "no wpa_supplicant" "$R/tmp/box.log" && [ ! -e "$R/calls" ]' "no supplicant anywhere: it waits, starting nothing"
@@ -243,7 +267,7 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   # M3's set-up network: its configuration in /tmp from the CarPlay AP's, client isolation on, the flash file untouched.
   mkdir -p "$R/tmp"
   printf 'interface=sta0\nssid=CarLink-0a1b\nwpa_passphrase=private\nchannel=36\nhw_mode=a\n' > "$R/etc/hostapd.conf"
-  printf 'start\t192.168.43.100\ninterface\tsta0\nlease_file\t/var/lib/udhcpd.leases\n' > "$R/etc/udhcpd.conf"
+  printf 'start\t10.0.0.100\nend\t10.0.0.200\ninterface\tsta0\nlease_file\t/var/lib/udhcpd.leases\n' > "$R/etc/udhcpd.conf"   # a custom /etc/wifi_ip's pool
   before=$(cat "$R/etc/hostapd.conf")
   on='caps() { RADIO_BACKEND=mapped; return 0; }; wlan_driver_up() { return 0; }; box_name() { echo CarLink-0a1b; }
       ifconfig() { echo "ifconfig $*" >> "'"$R"'/calls"; }; setsid() { echo "setsid $*" >> "'"$R"'/calls"; }
@@ -257,6 +281,8 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
     "  the CarPlay AP's passphrase not carried over, its flash configuration untouched"
   check 'grep -q "udhcpd -f $R/tmp/udhcpd_setup.conf" "$R/calls" && grep -q "lease_file	/tmp/udhcpd_setup.leases" "$R/tmp/udhcpd_setup.conf"' \
     "  its own DHCP server and lease file in /tmp"
+  check 'grep -qx "start	192.168.43.100" "$R/tmp/udhcpd_setup.conf" && grep -qx "end	192.168.43.200" "$R/tmp/udhcpd_setup.conf" && ! grep -q "10\.0\.0" "$R/tmp/udhcpd_setup.conf"' \
+    "  its pool on the set-up address's subnet, whatever /etc/udhcpd.conf holds (a custom /etc/wifi_ip)"
   check 'grep -q "^ok sta0" "$R/tmp/.radio_setup_ap"' "  the marker ocbmd waits for"
 done
 [ "$fails" -eq 0 ] && echo "wifi_sta_test: all passed" || { echo "wifi_sta_test: $fails FAILED"; exit 1; }
