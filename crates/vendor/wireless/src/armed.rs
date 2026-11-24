@@ -22,6 +22,15 @@
 //!   declare the controller well, reluctant to give it up: a miss is tried again [`CHECK_RETRY`] later, up to
 //!   [`CHECK_TRIES`] in a row, and only then does btd exit, so the next host takes today's path. A check never resets
 //!   anything: at worst btd exits, and the supervisor powers Bluetooth down through the seam (`bt_off`).
+//! - **The set-up code (M3, ADDENDUM 5, 24 Nov 2026).** ocbmd's set-up session (an adapter never used, its set-up network
+//!   up, a head unit through the set-up exchange) puts four digits in [`CODE_FILE`] once the head unit's first record
+//!   opens, removes them when that session ends for any reason, and sends SIGUSR1 after each change, as the supervisor
+//!   does for a go. Woken with no go, btd names the controller [`code_name`] (the local name and the EIR's) and turns
+//!   inquiry scan on, page scan still off: listed in a phone's or a car's Bluetooth search, connectable by nobody. With
+//!   no code: the armed name and no scan again. The file is read at the arm too (a code put up before this btd was
+//!   armed: Bluetooth not up yet), at every wake and at every check, and the checks hold the controller to the code's
+//!   scan while it is shown. A go while it is shown hands the session the code's name as the armed one, so the session's
+//!   bring-up rewrites its identity. Never on flash: a power cut leaves nothing behind.
 
 use std::io::{ErrorKind, Read as _};
 use std::os::unix::io::AsRawFd as _;
@@ -35,7 +44,9 @@ use crate::bt_bringup;
 /// The environment variable the supervisor starts an armed btd with (`1`).
 pub const ARM_ENV: &str = "OCBM_BTD_ARM";
 /// This btd's pid while it is armed and ready for a go; removed at the go and on a clean exit.
-pub const ARMED_FILE: &str = "/tmp/.btd_armed";
+pub const ARMED_FILE: &str = box_common::flags::BTD_ARMED;
+/// ocbmd's set-up code, four digits while its set-up session runs (the module docs, "The set-up code").
+pub const CODE_FILE: &str = box_common::flags::SETUP_CODE;
 /// The go: `pid=<the armed btd>` and the session's inputs as `KEY=VALUE` lines, written before the signal.
 pub const GO_FILE: &str = "/tmp/.btd_go";
 /// The go's answer: `ok <uptime ms>` or `fail <why>`, read by the supervisor.
@@ -184,6 +195,72 @@ impl Checks {
     }
 }
 
+/// The controller's name while it shows the set-up code `digits`.
+pub fn code_name(digits: &str) -> String {
+    format!("{} code {digits}", crate::ACCESSORY_BRAND)
+}
+
+/// What the armed controller shows: the set-up code's digits, or None (the armed name, invisible).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Shown(Option<String>);
+
+impl Shown {
+    /// What [`CODE_FILE`]'s text asks for (None: no file).
+    fn asked(text: Option<&str>) -> Shown {
+        Shown(text.and_then(box_common::flags::setup_code).map(str::to_string))
+    }
+
+    /// The scan mode the armed state holds the controller to: inquiry scan only while a code is shown, else none.
+    fn scan(&self) -> u32 {
+        if self.0.is_some() {
+            crate::hci::SCAN_INQUIRY
+        } else {
+            crate::hci::SCAN_NONE
+        }
+    }
+
+    /// The name the controller carries: the code's, or the armed name.
+    fn name(&self, armed_name: &str) -> String {
+        self.0.as_deref().map_or_else(|| armed_name.to_string(), code_name)
+    }
+}
+
+/// How a look at [`CODE_FILE`] went.
+#[derive(Debug, PartialEq, Eq)]
+enum Synced {
+    /// The controller shows what the file asks.
+    Same,
+    /// It did not, and now does.
+    Done,
+    /// It did not take it: looked at again [`CHECK_RETRY`] later.
+    Failed,
+}
+
+/// Bring the controller to what [`CODE_FILE`] asks when that is not what it shows ([`bt_bringup::present`]). The code
+/// itself is never logged here (the box log says when; the controller says what).
+fn sync_code(shown: &mut Shown, hci_dev: &str, armed_name: &str) -> Synced {
+    let want = Shown::asked(std::fs::read_to_string(CODE_FILE).ok().as_deref());
+    if want == *shown {
+        return Synced::Same;
+    }
+    match bt_bringup::present(hci_dev, &want.name(armed_name), want.scan()) {
+        Ok(()) => {
+            log(if want.0.is_some() {
+                "set-up code: the controller named for ocbmd's set-up session and discoverable (inquiry scan, no page \
+                 scan) until it ends"
+            } else {
+                "set-up code gone: the armed name back, invisible again"
+            });
+            *shown = want;
+            Synced::Done
+        }
+        Err(e) => {
+            log(&format!("set-up code: the controller did not take it ({e}) -- again in {} s", CHECK_RETRY.as_secs()));
+            Synced::Failed
+        }
+    }
+}
+
 /// The go's proof: up to [`GO_PROOF_TRIES`] round trips (`probe`), the first answer deciding. Ok with the scan mode
 /// the controller read, Err with the last failure.
 pub fn go_proof(mut probe: impl FnMut() -> std::io::Result<u8>) -> Result<u8, String> {
@@ -238,26 +315,43 @@ pub fn run(shutdown: &Arc<AtomicBool>, hci_dev: &str, name: &str) -> Outcome {
     ));
     let mut checks = Checks::default();
     let mut next_check = Instant::now() + CHECK_EVERY;
+    // A set-up code ocbmd put up before this btd was armed (its set-up session began while Bluetooth was not up yet).
+    let mut shown = Shown::default();
+    if sync_code(&mut shown, hci_dev, name) == Synced::Failed {
+        next_check = Instant::now() + CHECK_RETRY;
+    }
     loop {
         let woke = wait(&rx, next_check.saturating_duration_since(Instant::now()));
         if shutdown.load(Ordering::Relaxed) {
             unarm(me);
+            if shown.0.is_some() {
+                // Discoverable no longer; the supervisor powers Bluetooth down next, whose reset takes the name.
+                let _ = bt_bringup::go_quiet(hci_dev);
+            }
             log("SIGTERM while armed -- exiting");
             return Outcome::Exit(0);
         }
         if woke {
             match std::fs::read_to_string(GO_FILE).ok().and_then(|t| parse_go(&t, me)) {
-                Some(req) => return go(req, hci_dev, name),
-                None => log("woken with no go for this btd -- still armed"),
+                Some(req) => return go(req, hci_dev, &shown.name(name), shown.scan()),
+                None => match sync_code(&mut shown, hci_dev, name) {
+                    Synced::Same => log("woken with no go for this btd -- still armed"),
+                    Synced::Done => {}
+                    Synced::Failed => next_check = next_check.min(Instant::now() + CHECK_RETRY),
+                },
             }
         }
         if Instant::now() < next_check {
             continue;
         }
+        // The code's file first (a wake that never came), then the controller against what it should show.
+        let synced = sync_code(&mut shown, hci_dev, name);
+        let want = shown.scan();
         let found = match bt_bringup::audit(hci_dev, CHECK_WAIT) {
-            Ok(a) if a.invisible() => Found::Clean,
+            Ok(a) if a.is(want) => Found::Clean,
             Ok(a) => {
-                log(&format!("check: the controller reads scan 0x{:02x} with {} connection(s) -- hiding it again", a.scan, a.conns));
+                let fix = if want == crate::hci::SCAN_NONE { "hiding it again" } else { "back to the set-up code's inquiry scan" };
+                log(&format!("check: the controller reads scan 0x{:02x} with {} connection(s) -- {fix}", a.scan, a.conns));
                 Found::Visible
             }
             Err(e) => {
@@ -266,9 +360,9 @@ pub fn run(shutdown: &Arc<AtomicBool>, hci_dev: &str, name: &str) -> Outcome {
             }
         };
         match checks.after(found) {
-            Next::Wait(d) => next_check = Instant::now() + d,
+            Next::Wait(d) => next_check = Instant::now() + if synced == Synced::Failed { CHECK_RETRY } else { d },
             Next::Hide => {
-                if let Err(e) = bt_bringup::hide(hci_dev) {
+                if let Err(e) = bt_bringup::hide(hci_dev, want) {
                     log(&format!("check: hiding failed ({e})"));
                 }
                 next_check = Instant::now() + CHECK_RETRY;
@@ -283,8 +377,10 @@ pub fn run(shutdown: &Arc<AtomicBool>, hci_dev: &str, name: &str) -> Outcome {
 }
 
 /// The go: the inputs into the environment, the proof, the answer. No other thread runs yet (the control port and the
-/// session's threads start after the go), so setting the environment here races nothing.
-fn go(req: GoRequest, hci_dev: &str, name: &str) -> Outcome {
+/// session's threads start after the go), so setting the environment here races nothing. `name` and `scan`: what the
+/// controller shows now, the armed name and none, or the set-up code's while it is up (the session then rewrites the
+/// identity, its name being another).
+fn go(req: GoRequest, hci_dev: &str, name: &str, scan: u32) -> Outcome {
     let t0 = Instant::now();
     let _ = std::fs::remove_file(ARMED_FILE);
     let _ = std::fs::remove_file(GO_FILE);
@@ -297,13 +393,13 @@ fn go(req: GoRequest, hci_dev: &str, name: &str) -> Outcome {
     };
     let inputs = req.env.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" ");
     match proof {
-        Ok(scan) => {
+        Ok(proved) => {
             let at = box_common::timeline::now_ms().map_or_else(|| "-".to_string(), |ms| ms.to_string());
             if let Err(e) = write_atomic(GO_RESULT, &format!("ok {at}\n")) {
                 log(&format!("go: {GO_RESULT} not written ({e}) -- the supervisor will fall back after its wait"));
             }
-            if scan != crate::hci::SCAN_NONE as u8 {
-                log(&format!("go: the controller read scan 0x{scan:02x}: it was not invisible while armed"));
+            if proved != scan as u8 {
+                log(&format!("go: the controller read scan 0x{proved:02x}, not the armed state's 0x{scan:02x}"));
             }
             log(&format!("go: the controller answered in {} ms ({inputs}) -- a host session begins", t0.elapsed().as_millis()));
             Outcome::Go { armed_name: name.to_string() }
@@ -530,6 +626,29 @@ mod tests {
         assert!(reclaimed.is_ok(), "a dead holder's lock is reclaimed");
         drop(reclaimed);
         assert!(!dir.exists());
+    }
+
+    /// The set-up code's file as the armed state reads it: four digits name the controller for the code and hold it to
+    /// inquiry scan only, never page scan (listed, not connectable); no file, or anything else in it, is the armed name
+    /// and no scan. The name and its EIR fit, and a go while it is shown hands the session the code's name, which is
+    /// never the session's (so the session rewrites its identity).
+    #[test]
+    fn the_set_up_code_names_the_controller_and_makes_it_discoverable_only() {
+        let shown = Shown::asked(Some("2092\n"));
+        assert_eq!(shown.name("CarLink-ab12"), "CarLink code 2092");
+        assert_eq!(shown.scan(), crate::hci::SCAN_INQUIRY);
+        assert_eq!(shown.scan() & crate::hci::SCAN_PAGE, 0, "never connectable");
+        assert_ne!(shown.name("CarLink-ab12"), "CarLink-ab12", "a go while it is up rewrites the identity");
+        for not_a_code in [None, Some(""), Some("209"), Some("20921"), Some("abcd")] {
+            let s = Shown::asked(not_a_code);
+            assert_eq!(s, Shown::default(), "{not_a_code:?}");
+            assert_eq!((s.name("CarLink-ab12"), s.scan()), ("CarLink-ab12".to_string(), crate::hci::SCAN_NONE));
+        }
+        assert_eq!(code_name("0007"), "CarLink code 0007");
+        let eir = bt_bringup::eir_bytes(&code_name("2092"));
+        assert_eq!((eir[0] as usize, eir[1]), ("CarLink code 2092".len() + 2, 0x09), "the EIR's name is the code's");
+        assert_eq!(CODE_FILE, "/tmp/bt_setup_code", "ocbmd writes this path (box_common::flags::SETUP_CODE)");
+        assert_eq!(ARMED_FILE, "/tmp/.btd_armed", "the supervisor's BTD_ARMED_FILE");
     }
 
     /// The wait wakes on a signal through the pipe at once, and otherwise sleeps out its timeout.

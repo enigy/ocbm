@@ -327,7 +327,13 @@ pub struct Audit {
 impl Audit {
     /// Nothing can see it (no inquiry scan), nothing can connect to it (no page scan), and it holds no link.
     pub fn invisible(self) -> bool {
-        self.scan == crate::hci::SCAN_NONE as u8 && self.conns == 0
+        self.is(crate::hci::SCAN_NONE)
+    }
+
+    /// The scan mode the armed state holds it to (`scan`: none, or inquiry only while M3's set-up code is shown), and
+    /// no link.
+    pub fn is(self, scan: u32) -> bool {
+        self.scan == scan as u8 && self.conns == 0
     }
 }
 
@@ -340,14 +346,32 @@ pub fn audit(hci_dev: &str, wait: std::time::Duration) -> std::io::Result<Audit>
     Ok(Audit { scan, conns })
 }
 
-/// Make an armed controller invisible again after an [`audit`] found it otherwise: scan "none", waited for, and every
-/// link it holds disconnected. Nothing in the armed state turns a scan on or makes a link, so this is a repair of
-/// something outside btd, and the next audit says whether it held.
-pub fn hide(hci_dev: &str) -> std::io::Result<()> {
+/// Put an armed controller back to the armed state's scan mode `scan` after an [`audit`] found it otherwise ("none", or
+/// inquiry only while the set-up code is shown): written, waited for, and every link it holds disconnected. Nothing in
+/// the armed state turns a page scan on or makes a link, so this is a repair of something outside btd, and the next
+/// audit says whether it held.
+pub fn hide(hci_dev: &str, scan: u32) -> std::io::Result<()> {
     let dev = crate::hci::dev_id(hci_dev)?;
-    crate::hci::write_scan_enable_waited(dev, crate::hci::SCAN_NONE, ARMED_WAIT)?;
+    crate::hci::write_scan_enable_waited(dev, scan, ARMED_WAIT)?;
     for c in crate::hci::connections(dev)? {
         let _ = crate::hci::disconnect(dev, c.handle);
+    }
+    Ok(())
+}
+
+/// An armed controller's name (the local name and the EIR's, with the class and Simple Pairing written again as the arm
+/// wrote them) and scan mode, each write waited for: M3's set-up code ("CarLink code NNNN", inquiry scan) or the armed
+/// name again (no scan), `armed.rs`. The name goes on before a scan is turned on and after it is turned off, so a
+/// search never lists the box under the name it is leaving.
+pub fn present(hci_dev: &str, name: &str, scan: u32) -> std::io::Result<()> {
+    let dev = crate::hci::dev_id(hci_dev)?;
+    let off = scan == crate::hci::SCAN_NONE;
+    if off {
+        crate::hci::write_scan_enable_waited(dev, scan, ARMED_WAIT)?;
+    }
+    crate::hci::write_identity(dev, CLASS_OF_DEVICE, name, &eir_bytes(name))?;
+    if !off {
+        crate::hci::write_scan_enable_waited(dev, scan, ARMED_WAIT)?;
     }
     Ok(())
 }
@@ -449,6 +473,18 @@ mod tests {
             &eir[marker_start + 2..marker_start + 18],
             &CARPLAY_MARKER_UUID
         );
+    }
+
+    /// What an armed check accepts: the wanted scan mode and no link. Inquiry scan alone is the set-up code's (armed.rs),
+    /// never "invisible".
+    #[test]
+    fn an_audit_matches_the_armed_state_s_scan_and_no_link() {
+        use crate::hci::{SCAN_INQUIRY, SCAN_NONE, SCAN_PAGE};
+        assert!(Audit { scan: 0, conns: 0 }.invisible());
+        assert!(Audit { scan: 1, conns: 0 }.is(SCAN_INQUIRY) && !Audit { scan: 1, conns: 0 }.invisible());
+        assert!(!Audit { scan: 1, conns: 1 }.is(SCAN_INQUIRY), "a link is never the armed state's");
+        assert!(!Audit { scan: 3, conns: 0 }.is(SCAN_INQUIRY) && !Audit { scan: 2, conns: 0 }.is(SCAN_NONE));
+        assert_eq!(SCAN_PAGE & SCAN_INQUIRY, 0);
     }
 
     /// The default path's DOWN/UP (the 21 Nov review, I): skipped only on bt_on's "opened" word, with today's reason.

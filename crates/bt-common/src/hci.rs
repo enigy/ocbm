@@ -37,6 +37,9 @@ pub const PAGE_TIMEOUT_DEFAULT: u16 = 0x2000;
 pub const SCAN_PAGE_AND_INQUIRY: u32 = 0x03;
 /// Connectable but not discoverable: bonded phones can still page us, nobody new can find us.
 pub const SCAN_PAGE: u32 = 0x02;
+/// Discoverable but not connectable: a phone's or a car's Bluetooth search lists us (the name from the EIR), and
+/// nothing can connect. The armed btd's while it shows M3's set-up code (crates/vendor/wireless armed.rs).
+pub const SCAN_INQUIRY: u32 = 0x01;
 pub const SCAN_NONE: u32 = 0x00;
 
 const HCI_COMMAND_PKT: u8 = 0x01;

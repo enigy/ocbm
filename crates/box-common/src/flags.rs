@@ -21,6 +21,34 @@ pub const RADIO_OFF: &str = "/tmp/radio_off";
 pub const PROJECTION_OWNER: &str = "/tmp/projection_owner";
 /// Legacy CarPlay-only ownership flag still written by the wireless arm (av.rs). Read for back-compat.
 pub const CARPLAY_TRANSPORT: &str = "/tmp/carplay_transport";
+/// M3's set-up code while ocbmd's set-up session runs (ADDENDUM 5, 24 Nov 2026): four ASCII digits, written by ocbmd
+/// (`src/setup.rs`) and shown by the armed btd as the adapter's Bluetooth name (`crates/vendor/wireless` `armed.rs`); no
+/// file otherwise. tmpfs, and the name lives on the controller only: a power cut leaves nothing behind.
+pub const SETUP_CODE: &str = "/tmp/bt_setup_code";
+/// The armed btd's pid, written once it is armed (`armed.rs`): the supervisor's go and ocbmd's set-up code wake it.
+pub const BTD_ARMED: &str = "/tmp/.btd_armed";
+
+/// The code in [`SETUP_CODE`]'s text: exactly four ASCII digits, whitespace around them ignored; anything else is none.
+pub fn setup_code(text: &str) -> Option<&str> {
+    let t = text.trim();
+    (t.len() == 4 && t.bytes().all(|b| b.is_ascii_digit())).then_some(t)
+}
+
+/// The set-up code put in the file at `path` whole (its reader sees the old text or the new: one writer, ocbmd, so one
+/// temporary), or the file removed.
+pub fn put_setup_code(path: &str, code: Option<&str>) -> std::io::Result<()> {
+    match code {
+        Some(c) => {
+            let tmp = format!("{path}.tmp");
+            fs::write(&tmp, c)?;
+            fs::rename(&tmp, path)
+        }
+        None => match fs::remove_file(path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        },
+    }
+}
 
 /// Who owns the single phone-facing controller / projection session right now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -164,5 +192,22 @@ mod tests {
 
     fn owner_from(path: &Path) -> ProjectionOwner {
         ProjectionOwner::from_str(&fs::read_to_string(path).unwrap())
+    }
+
+    /// The set-up code's file, as ocbmd writes it and btd reads it: four digits or nothing.
+    #[test]
+    fn the_set_up_code_file_holds_four_digits_or_nothing() {
+        assert_eq!(setup_code("2092\n"), Some("2092"));
+        assert_eq!(setup_code(" 0007 "), Some("0007"));
+        for bad in ["", "209", "20920", "20a2", "-092", "2 92"] {
+            assert_eq!(setup_code(bad), None, "{bad:?}");
+        }
+        let path = std::env::temp_dir().join(format!("box-common-setup-code-{}", std::process::id()));
+        let p = path.to_str().unwrap();
+        put_setup_code(p, Some("3978")).unwrap();
+        assert_eq!(setup_code(&fs::read_to_string(&path).unwrap()), Some("3978"));
+        put_setup_code(p, None).unwrap();
+        assert!(!path.exists());
+        put_setup_code(p, None).unwrap(); // removing nothing is fine
     }
 }
