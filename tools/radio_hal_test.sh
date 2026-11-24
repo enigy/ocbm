@@ -272,7 +272,7 @@ EOF
 # holds is still there as it ends (a preload that ended meanwhile must not have taken it).
 R=$STUB_R
 h=down; [ -e "$R/state/hci0.up" ] && [ -e "$R/state/hci0.answers" ] && h=up
-echo "ap start iface=${RADIO_WLAN_IF:-} hci=$h mode=${1:-}" >> "$R/calls"
+echo "ap start iface=${RADIO_WLAN_IF:-} hci=$h mode=${1:-} follow=${RADIO_AP_CHANNEL-unset}" >> "$R/calls"
 [ "${1:-}" = PREP ] && exit 0
 sh -c 'echo $$ > "$1/state/hostapd.pid"; trap "exit 0" TERM; while :; do sleep 0.1; done' sh "$R" </dev/null >/dev/null 2>&1 &
 sleep "${AP_SECS:-0.3}"
@@ -1123,11 +1123,42 @@ case_round4() {
   check 'called "hciconfig hci0 down" && [ ! -e "$R/script/.radio_together_inflight" ]' "  and powered down to the between-sessions state"
 }
 
+case_follow() {
+  # ---- ADDENDUM 6 (24 Nov 2026): in STA mode the seam hands the AP layer the station's channel ----------------------
+  echo "== $SH: STA mode: the AP layer told the station's channel (the keeper's state), and nothing without a link"
+  unit
+  WLAN_SECS=0.3 FW_SECS=0.3 hal preload
+  mkdir -p "$R/sys/class/net/wlan0/wireless"   # the IW416's uAP BSS beside sta0 (drv_mode=3)
+  last_ap() { grep "^ap start" "$R/calls" | tail -1; }
+  printf 'iface=sta0\nstate=joined\nchannel=149\n' > "$R/tmp/wifi_link_state"   # a keeper's state left over: no link
+  hal wifi_ap_on
+  check '[ "$(rc wifi_ap_on)" = 0 ] && last_ap | grep -q "iface=sta0 .* follow=$"' \
+    "no link: the AP on the first interface (sta0) as in 2.7.1, given no channel to follow"
+  hal wifi_ap_off
+  printf 'key=%s\nssid_hex=6e6574\npsk=\n' "$(printf '11%.0s' $(seq 32))" > "$R/etc/ocbm/wifi_link"
+  hal wifi_ap_on
+  check '[ "$(rc wifi_ap_on)" = 0 ] && last_ap | grep -q "iface=wlan0 .* follow=149$"' \
+    "a hotspot set up, the station joined on 149: the AP on wlan0, told 149"
+  : > "$R/tmp/hostapd_session.conf"; hal wifi_ap_off
+  check '[ "$(rc wifi_ap_off)" = 0 ] && [ ! -e "$R/tmp/hostapd_session.conf" ]' \
+    "  the AP's teardown takes its session configuration with it"
+  printf 'iface=sta0\nstate=joining\nchannel=0\n' > "$R/tmp/wifi_link_state"; hal wifi_ap_on
+  check 'last_ap | grep -q "iface=wlan0 .* follow=0$"' "the station not on the hotspot: 0 (the AP layer keeps its own channel, and says so)"
+  hal wifi_ap_off; rm -f "$R/tmp/wifi_link_state"; hal wifi_ap_on
+  check 'last_ap | grep -q "iface=wlan0 .* follow=$"' "no keeper state yet: no channel to follow"
+  hal wifi_ap_off
+  echo "wlan0 CarLink-a1b2 192.168.43.1 36 0" > "$R/tmp/.radio_ap_prepared"
+  printf 'iface=sta0\nstate=joined\nchannel=44\n' > "$R/tmp/wifi_link_state"; hal wifi_ap_on
+  check 'said wifi_ap_on "AP configured ahead on wlan0" && last_ap | grep -q "iface=wlan0 .* follow=44$"' \
+    "the fast path (the configuration written ahead): told the station's 44 too"
+  hal wifi_ap_off
+}
+
 . "$HERE/test_shells.sh"
 for SH in ${SHELLS:-$(distinct_shells sh dash)}; do
   command -v "$SH" >/dev/null 2>&1 || { echo "== $SH: not installed, skipped"; continue; }
   R="$T/$(basename "$SH").root"
-  for c in ${RH_ONLY:-kept order switches fallback host handover review gpio line unpack locks boot round4 fwpush}; do "case_$c"; done
+  for c in ${RH_ONLY:-kept order switches fallback host handover review gpio line unpack locks boot round4 fwpush follow}; do "case_$c"; done
   reap
 done
 [ "$fails" -eq 0 ] && echo "radio_hal_test: all passed ($passes checks)" || { echo "radio_hal_test: $fails failed"; exit 1; }

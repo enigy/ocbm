@@ -431,6 +431,15 @@ ap_iface() {
   done
   wlan_iface
 }
+# The station's channel for the AP (ADDENDUM 6; radio_ap_up.sh's RADIO_AP_CHANNEL), from the keeper's state (iface=,
+# state=, channel=, in that order): joined, its channel; joining, 0; no link or no state, "". No fork. Sets _fch.
+WIFI_LINK_STATE=/tmp/wifi_link_state
+sta_channel() {
+  _fch=""; _sts=""; _stc=""
+  [ -f "$WIFI_LINK_FILE" ] || return 0
+  { read -r _sti; read -r _sts; read -r _stc; } 2>/dev/null <"$WIFI_LINK_STATE"
+  case $_sts in state=joined) _fch=${_stc#channel=} ;; state=joining) _fch=0 ;; esac
+}
 
 hci_dev() {
   for _hcid_d in /sys/class/bluetooth/hci*/; do
@@ -652,6 +661,7 @@ apply_sco() {  # $1 = hci dev; echoes what it did. 0 = applied, 3 = nothing to a
 # still there. Cheap on purpose, no fork: radio_ap_up.sh checks the rest (nothing it read changed since) before it
 # trusts it. Sets _api, the interface.
 AP_PREPARED=/tmp/.radio_ap_prepared
+AP_SESSION=/tmp/hostapd_session.conf
 ap_prepared_iface() {
   _api=""
   read -r _api _api_rest 2>/dev/null <"$AP_PREPARED"
@@ -691,7 +701,9 @@ do_wifi_ap_on() {
   # driver step, no configuration writes: about 0.9 s of every connect went there before hostapd started.
   if ap_prepared_iface && [ -x /script/radio_ap_up.sh ] && { ! sta_mode || [ "$_api" = "$(ap_iface 2>/dev/null)" ]; }; then
     log "AP configured ahead on $_api - launching it"
-    ONDEMAND_WIFI=1 RADIO_WLAN_IF="$_api" sh /script/radio_ap_up.sh AP 2>&1 | sed "s/^/$LOGP   /"
+    sta_channel
+    ONDEMAND_WIFI=1 RADIO_WLAN_IF="$_api" RADIO_AP_CHANNEL="$_fch" \
+      sh /script/radio_ap_up.sh AP 2>&1 | sed "s/^/$LOGP   /"
     _n=0; while [ "$_n" -lt 50 ]; do ap_running && break; _n=$((_n+1)); sleep 0.2; done
     if ap_running; then
       # The address the AP layer configured, from its stamp (rewritten if it configured afresh), and the MAC, both
@@ -771,7 +783,8 @@ do_wifi_ap_on() {
         return 1; }
       # RADIO_BOX_NAME is resolved HERE, not inside the AP layer, so the SSID and the Bluetooth
       # name provably come from one decision rather than two derivations that can disagree.
-      ONDEMAND_WIFI=1 RADIO_WLAN_IF="$_i" RADIO_BOX_NAME="$(box_name)" \
+      sta_channel
+      ONDEMAND_WIFI=1 RADIO_WLAN_IF="$_i" RADIO_BOX_NAME="$(box_name)" RADIO_AP_CHANNEL="$_fch" \
         sh /script/radio_ap_up.sh AP 2>&1 | sed "s/^/$LOGP   /"
       _n=0; while [ "$_n" -lt 50 ]; do ap_running && break; _n=$((_n+1)); sleep 0.2; done
       if ap_running; then
@@ -919,7 +932,7 @@ do_wifi_ap_off() {
   fi
   _n=0; while [ "$_n" -lt 25 ] && ap_running; do _n=$((_n+1)); sleep 0.2; done
   ap_running && { log "hostapd still running after teardown"; publish "$WLAN_STATE" "result=fail" "detail=ap-survived"; return 1; }
-  rm -f "$WLAN_STATE"
+  rm -f "$WLAN_STATE" "$AP_SESSION"   # with the AP: its configuration where it followed the station (radio_ap_up.sh)
   log "wifi AP down"
   return 0
 }
