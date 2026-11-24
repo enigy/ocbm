@@ -1,11 +1,12 @@
 //! M3: the set-up network. An adapter with no Wi-Fi link that no host has spoken to since power-up offers, 20 s after
 //! ocbmd's start and for 10 minutes, a set-up network from its own AP (`CarLink-Setup-xxxx`, a public WPA2 passphrase,
 //! client isolation: `radio_hal.sh setup_ap_on`), and listens on 192.168.43.1:7021 for the OCBS v1 exchange
-//! (`ocbm_link::setup_box_handshake`: P-256 ECDH, then OCBW records). One client at a time: the handshake within 5 s,
-//! then 60 s to MGMT_WIFI_LINK (Carlink shows the driver the network's name and waits for a tap first). Over that
-//! session the box takes CT_HELLO, CT_SETTIME, MGMT_GET_INFO and MGMT_WIFI_LINK and nothing else (no console, no file
-//! push: trust is first-come). The window ends after one set-up, at its 10 minutes, or as soon as any host speaks over
-//! USB; the set-up network goes, and the CarPlay AP's start stops it first in any case.
+//! (`ocbm_link::setup_box_handshake`: P-256 ECDH, then OCBW records). One client at a time: the handshake within 5 s in
+//! all, then 60 s in all to MGMT_WIFI_LINK (Carlink shows the driver the network's name and waits for a tap first). Over
+//! that session the box takes CT_HELLO and MGMT_WIFI_LINK and nothing else, answered on the set-up link itself
+//! (main.rs `Daemon::setup_frame`): no info, no clock, no console, no file push, since trust is first-come. A set-up
+//! link never holds the box and never counts as a host. The window ends after one set-up, at its 10 minutes, or at a
+//! USB host's first frame; the set-up network goes, and the CarPlay AP's start stops it first in any case.
 //!
 //! Each exchange's two public points are kept ([`Setup::transcript`]) for a short confirmation code the owner has not
 //! decided on yet (notes/ocbm.md, "M3 additions").
@@ -231,29 +232,9 @@ pub fn wanted() -> bool {
     true
 }
 
-/// What a set-up session may carry: CT_HELLO, CT_SETTIME, MGMT_GET_INFO and MGMT_WIFI_LINK.
-pub fn allowed(ch: u16, pl: &[u8]) -> bool {
-    use ocbm_proto as p;
-    match (ch, pl.first()) {
-        (p::CH_CTRL, Some(&p::CT_HELLO)) | (p::CH_CTRL, Some(&p::CT_SETTIME)) => true,
-        (p::CH_MGMT, Some(&p::MGMT_GET_INFO)) | (p::CH_MGMT, Some(&p::MGMT_WIFI_LINK)) => true,
-        _ => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ocbm_proto as p;
-
-    #[test]
-    fn a_set_up_session_carries_four_messages_and_nothing_else() {
-        assert!(allowed(p::CH_CTRL, &[p::CT_HELLO, 1]) && allowed(p::CH_MGMT, &[p::MGMT_WIFI_LINK]));
-        assert!(allowed(p::CH_CTRL, &[p::CT_SETTIME]) && allowed(p::CH_MGMT, &[p::MGMT_GET_INFO]));
-        assert!(!allowed(p::CH_CTRL, &[p::CT_MODE_SELECT, p::MODE_CONSOLE]), "no console");
-        assert!(!allowed(p::CH_FILE, &[p::FILE_OPEN]), "no file push");
-        assert!(!allowed(p::CH_MGMT, &[p::MGMT_UPDATE]) && !allowed(p::CH_CTRL, &[p::CT_SUBSCRIBE]));
-    }
 
     #[test]
     fn the_window_waits_then_gives_up_when_a_host_spoke_or_the_ap_never_came() {

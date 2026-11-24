@@ -3571,40 +3571,36 @@ impl Daemon {
                 };
                 self.mgmt_ack(verb, u8::from(!started));
             }
-            // The Wi-Fi link's set-up (wifi.rs), over whatever session the host has. Stored now, applied after the
-            // ACK has gone (wifi_tick). The log names what changed, never a key, a name or a hash.
+            // The Wi-Fi link's set-up (wifi.rs), over whatever session the host has (a set-up link's comes through
+            // Daemon::setup_frame instead). With no Wi-Fi mode only USB's host gets here.
             p::MGMT_WIFI_LINK => {
-                let ok = match wifi::parse_provision(&pl[1..]) {
-                    Ok(prov) => match wifi::store(&prov, wifi::LINK_FILE) {
-                        Ok(()) => {
-                            let what = match &prov {
-                                wifi::Provision::Clear => "the link removed",
-                                wifi::Provision::Set(c) if c.ssid.is_empty() => "a link key, no hotspot",
-                                wifi::Provision::Set(_) => "a link key and a hotspot",
-                            };
-                            // No Wi-Fi mode: USB's, unless a set-up link (M3) holds the box.
-                            let came = if self.wifi.on || self.wifi.via.is_some() { self.wifi.via } else { Some(Via::Usb) };
-                            eprintln!("[ocbmd] wifi: MGMT_WIFI_LINK stored ({what}, over {}); applied after the ACK", via_name(came));
-                            if let Some(Via::Wifi(id)) = came {
-                                self.setup.linked |= self.wifi.link_index(id).is_some_and(|i| self.wifi.links[i].setup);
-                            }
-                            self.wifi.pending = Some((Instant::now() + WIFI_APPLY_AFTER, came, self.wifi.conf.clone()));
-                            true
-                        }
-                        Err(e) => {
-                            eprintln!("[ocbmd] wifi: MGMT_WIFI_LINK could not be stored ({e}); nothing changed");
-                            false
-                        }
-                    },
-                    Err(why) => {
-                        eprintln!("[ocbmd] wifi: refused a MGMT_WIFI_LINK ({why}); nothing changed");
-                        false
-                    }
-                };
+                let came = if self.wifi.on { self.wifi.via } else { Some(Via::Usb) };
+                let ok = self.store_wifi_link(&pl[1..], came);
                 self.mgmt_ack(verb, u8::from(!ok));
             }
             _ => {}
         }
+    }
+
+    /// MGMT_WIFI_LINK's body stored, its apply pending for after the ACK (wifi_tick); true when stored. The log names
+    /// what changed, never a key, a name or a hash.
+    fn store_wifi_link(&mut self, body: &[u8], came: Option<Via>) -> bool {
+        let stored = wifi::parse_provision(body).and_then(|prov| wifi::store(&prov, wifi::LINK_FILE).map(|()| prov).map_err(|e| {
+            eprintln!("[ocbmd] wifi: MGMT_WIFI_LINK could not be stored ({e})");
+            "not stored"
+        }));
+        let what = match &stored {
+            Err(why) => {
+                eprintln!("[ocbmd] wifi: refused a MGMT_WIFI_LINK ({why}); nothing changed");
+                return false;
+            }
+            Ok(wifi::Provision::Clear) => "the link removed",
+            Ok(wifi::Provision::Set(c)) if c.ssid.is_empty() => "a link key, no hotspot",
+            Ok(wifi::Provision::Set(_)) => "a link key and a hotspot",
+        };
+        eprintln!("[ocbmd] wifi: MGMT_WIFI_LINK stored ({what}, over {}); applied after the ACK", via_name(came));
+        self.wifi.pending = Some((Instant::now() + WIFI_APPLY_AFTER, came, self.wifi.conf.clone()));
+        true
     }
 
     fn mgmt_ack(&mut self, verb: u8, status: u8) {
@@ -4219,8 +4215,6 @@ impl Daemon {
         let prev = std::mem::replace(&mut self.acc, out);
         match old {
             Some(Via::Usb) => self.wifi.usb_out = Some(prev),
-            // No Wi-Fi mode (a set-up link, M3): the loop's output was USB's own.
-            None if !self.wifi.on => self.wifi.usb_out = Some(prev),
             Some(Via::Wifi(oid)) => {
                 drop(prev);
                 if let Some(i) = self.wifi.link_index(oid) {
@@ -4244,9 +4238,7 @@ impl Daemon {
     fn release_box(&mut self, why: &str) {
         let Some(old) = self.wifi.via.take() else { return };
         self.wifi.publish_busy(None);
-        // No Wi-Fi mode (a set-up link went, M3): the loop's output is USB's again.
-        let next = if self.wifi.on { wifi::sink() } else { self.wifi.usb_out.take().unwrap_or_else(wifi::sink) };
-        let prev = std::mem::replace(&mut self.acc, next);
+        let prev = std::mem::replace(&mut self.acc, wifi::sink());
         if old == Via::Usb {
             self.wifi.usb_out = Some(prev);
         }
@@ -4284,16 +4276,109 @@ impl Daemon {
         }
     }
 
-    /// Each pass, in Wi-Fi mode or with a set-up pending: apply a stored MGMT_WIFI_LINK once due, close links that
-    /// sent no HELLO in time, and restart when a restart waits for an idle box.
+    /// One frame from Wi-Fi link `idx` (the loop's): a set-up link's to [`Daemon::setup_frame`], a host's through the
+    /// one-host gate ([`Daemon::admit`]). False: the link is to close.
+    fn link_frame(&mut self, idx: usize, ch: u16, flags: u8, pl: &[u8], now: Instant) -> bool {
+        let id = self.wifi.links[idx].id;
+        if self.wifi.links[idx].setup {
+            return self.setup_frame(idx, ch, pl);
+        }
+        match self.admit(Via::Wifi(id), ch, pl, now) {
+            Admit::Take => {
+                self.handle(ch, flags, pl);
+                true
+            }
+            Admit::Refuse(why) => {
+                eprintln!("[ocbmd] wifi: link {id} refused: {why}; closed");
+                false
+            }
+        }
+    }
+
+    /// A set-up link's frame (M3): CT_HELLO and MGMT_WIFI_LINK with a body, nothing else, each answered on that link
+    /// itself. A set-up link never holds the box and is never a host: the session's queues, sequence, host instance
+    /// and the install's records (`heard`, `answered`) stay as they were, and USB's frames go on being taken. Anything
+    /// else closes it (Carlink sends nothing else). False: the link is to close.
+    fn setup_frame(&mut self, idx: usize, ch: u16, pl: &[u8]) -> bool {
+        let id = self.wifi.links[idx].id;
+        let answer = match (ch, pl.first()) {
+            (p::CH_CTRL, Some(&p::CT_HELLO)) => {
+                let mut a = vec![p::CT_HELLO_ACK, p::VERSION];
+                a.extend_from_slice(&p::CAP_WIFI_LINK.to_le_bytes());
+                a.push(p::MODE_PROJECTION);
+                a
+            }
+            (p::CH_MGMT, Some(&p::MGMT_WIFI_LINK)) if pl.len() > 1 => {
+                let ok = self.store_wifi_link(&pl[1..], Some(Via::Wifi(id)));
+                self.setup.linked |= ok;
+                vec![p::MGMT_ACK, p::MGMT_WIFI_LINK, u8::from(!ok)]
+            }
+            _ => {
+                eprintln!("[ocbmd] setup: link {id} sent what a set-up session does not carry (ch {ch:#06x}); closed");
+                return false;
+            }
+        };
+        let l = &mut self.wifi.links[idx];
+        let mut f = Vec::with_capacity(p::HDR_LEN + answer.len());
+        p::frame_into(&mut f, ch, p::F_SOM | p::F_EOM, l.seq, &answer);
+        l.seq = l.seq.wrapping_add(1);
+        l.to_host.as_mut().is_some_and(|o| o.write_all(&f).is_ok())
+    }
+
+    /// A finished set-up exchange becomes a set-up link: one at a time, and only while the window is open (the
+    /// listener's own rule may lag a pass, and a set-up link must never outlive its window). Otherwise it is closed.
+    fn setup_link(&mut self, a: wifi::Authed) {
+        let id = a.id;
+        if !self.setup.active() || self.wifi.links.iter().any(|l| l.setup) {
+            eprintln!("[ocbmd] setup: link {id} closed: the window is over, or a set-up link is open already");
+            return;
+        }
+        match wifi::start_link(a) {
+            Ok(mut l) => {
+                l.setup = true;
+                self.wifi.links.push(l);
+            }
+            Err(e) => {
+                eprintln!("[ocbmd] setup: link {id} could not start ({e})");
+                self.setup.link_ended();
+            }
+        }
+    }
+
+    /// End the set-up window now (a USB host spoke, a host took the box, the set-up is done): the set-up network goes
+    /// and every set-up link closes, whatever the window's phase.
+    fn setup_end(&mut self, why: &str) {
+        if self.setup.active() {
+            eprintln!("[ocbmd] setup: {why}; the set-up network goes");
+        }
+        self.setup.close();
+        for l in self.wifi.links.iter().filter(|l| l.setup) {
+            l.close();
+        }
+    }
+
+    /// Each pass while the window waits or is open: its phase, and its links closed when it ends.
+    fn setup_tick(&mut self, now: Instant) {
+        let quiet = !self.heard && self.wifi.via.is_none() && !self.present;
+        if let Some(line) = self.setup.tick(now, quiet) {
+            eprintln!("[ocbmd] setup: {line}");
+            if !self.setup.active() {
+                self.setup_end("the window is over");
+            }
+        }
+    }
+
+    /// Each pass with a link, a set-up pending or a restart waiting: apply a stored MGMT_WIFI_LINK once due, close
+    /// links past their limits, and restart when a restart waits for an idle box.
     fn wifi_tick(&mut self, now: Instant, direct_io: bool) {
         if self.wifi.pending.as_ref().is_some_and(|(at, _, _)| now >= *at) {
             let (_, came, before) = self.wifi.pending.take().expect("checked just above");
             self.wifi_apply(came, before, now, direct_io);
         }
-        // A set-up link has TO_LINK from its exchange's end to MGMT_WIFI_LINK (the driver's tap comes before its HELLO).
-        for l in self.wifi.links.iter().filter(|l| l.setup && !self.setup.linked && now.duration_since(l.since) >= setup::TO_LINK) {
-            eprintln!("[ocbmd] setup: link {} sent no MGMT_WIFI_LINK in {} s; closed", l.id, setup::TO_LINK.as_secs());
+        // A set-up link has TO_LINK from its exchange's end, all told (the driver's confirm comes before its
+        // MGMT_WIFI_LINK), whatever the window's state or the set-up network's.
+        for l in self.wifi.links.iter().filter(|l| l.setup && now.duration_since(l.since) >= setup::TO_LINK) {
+            eprintln!("[ocbmd] setup: link {} past its {} s; closed", l.id, setup::TO_LINK.as_secs());
             l.close();
         }
         for l in self.wifi.links.iter().filter(|l| !l.setup && !l.admitted && now.duration_since(l.since) >= wifi::HELLO_WITHIN) {
@@ -4346,7 +4431,9 @@ impl Daemon {
                 } else {
                     match self.wifi.start(c) {
                         Ok(()) if came != Some(Via::Usb) => {
-                            // Set up over the set-up network (M3): its link closes below; the box waits for a host.
+                            // Set up over the set-up network (M3): its link closes below. Nobody holds the box: the
+                            // output goes to the sink and USB's waits aside, as at a Wi-Fi-mode start.
+                            self.wifi.usb_out = Some(std::mem::replace(&mut self.acc, wifi::sink()));
                             eprintln!("[ocbmd] wifi: set up over the set-up network: taking Wi-Fi hosts from now on");
                         }
                         Ok(()) => {
@@ -4373,11 +4460,9 @@ impl Daemon {
         if conf.is_none() && before.as_ref().is_some_and(|c| !c.ssid.is_empty()) {
             wifi::keeper_restart(false);
         }
-        // M3: one set-up a window: it ends now (its link closes just below, the set-up network goes).
-        if self.setup.linked {
-            self.setup.linked = false;
-            eprintln!("[ocbmd] setup: done; the set-up network goes");
-            self.setup.close();
+        // M3: one set-up a window: it ends now, its link with it.
+        if std::mem::take(&mut self.setup.linked) {
+            self.setup_end("done");
         }
         if let Some(Via::Wifi(id)) = came {
             if conf.is_none() || key_changed || hotspot_changed {
@@ -5269,7 +5354,14 @@ fn main() {
         // OR while a presence re-arm dip is pending so presence_tick can restore the flag on an
         // otherwise-idle box (without this the poll blocks on -1 and the dip never resolves).
         // Block indefinitely only when truly idle.
-        let timeout_ms = if d.subscribed || d.rearm_deadline.is_some() || d.wifi.on || d.wifi.pending.is_some() || d.setup.active() || matches!(d.setup.phase, setup::Phase::Waiting(_)) {
+        let timeout_ms = if d.subscribed
+            || d.rearm_deadline.is_some()
+            || d.wifi.on
+            || d.wifi.pending.is_some()
+            || !d.wifi.links.is_empty()
+            || d.setup.active()
+            || matches!(d.setup.phase, setup::Phase::Waiting(_))
+        {
             500
         } else {
             LOG_IDLE_POLL_MS
@@ -5511,7 +5603,6 @@ fn main() {
                 // A Wi-Fi link's input: its frames through the one-host gate (Daemon::admit), as USB's are.
                 Kind::Link(idx) => {
                     let Some(link) = d.wifi.links.get_mut(idx) else { continue };
-                    let id = link.id;
                     let frames: Vec<(u16, u8, Vec<u8>)> = match (&link.from_host).read(&mut rbuf) {
                         Ok(0) => {
                             links_lost.push(idx);
@@ -5531,21 +5622,11 @@ fn main() {
                             continue;
                         }
                     };
-                    let is_setup = d.wifi.links.get(idx).is_some_and(|l| l.setup);
                     for (ch, flags, pl) in frames {
-                        // A set-up session carries four messages and nothing else (setup.rs).
-                        if is_setup && !setup::allowed(ch, &pl) {
-                            eprintln!("[ocbmd] setup: link {id} sent what a set-up session does not carry (ch {ch:#06x}); dropped");
-                            continue;
-                        }
-                        match d.admit(Via::Wifi(id), ch, &pl, now_pass) {
-                            Admit::Take => d.handle(ch, flags, &pl),
-                            Admit::Refuse(why) => {
-                                eprintln!("[ocbmd] wifi: link {id} refused: {why}; closed");
-                                d.wifi.links[idx].close();
-                                links_lost.push(idx);
-                                break;
-                            }
+                        if !d.link_frame(idx, ch, flags, &pl, now_pass) {
+                            d.wifi.links[idx].close();
+                            links_lost.push(idx);
+                            break;
                         }
                     }
                 }
@@ -5576,25 +5657,12 @@ fn main() {
             }
         }
         for a in setup_new {
-            let id = a.id;
-            match wifi::start_link(a) {
-                Ok(mut l) => {
-                    l.setup = true;
-                    d.wifi.links.push(l);
-                }
-                Err(e) => {
-                    eprintln!("[ocbmd] setup: link {id} could not start ({e})");
-                    d.setup.link_ended();
-                }
-            }
+            d.setup_link(a);
         }
         if d.setup.active() || matches!(d.setup.phase, setup::Phase::Waiting(_)) {
-            let quiet = !d.heard && d.wifi.via.is_none() && !d.present;
-            if let Some(line) = d.setup.tick(Instant::now(), quiet) {
-                eprintln!("[ocbmd] setup: {line}");
-            }
+            d.setup_tick(Instant::now());
         }
-        if d.wifi.on || d.wifi.pending.is_some() || d.setup.active() {
+        if d.wifi.on || d.wifi.pending.is_some() || !d.wifi.links.is_empty() || d.wifi.restart_when_idle {
             d.wifi_tick(Instant::now(), direct_io);
         }
         // drop closed A/V connections (reverse index order keeps the rest valid)
@@ -7851,51 +7919,116 @@ mod tests {
 
     // ---- M3: a set-up session over the set-up network ----------------------------------------------------------------
 
+    /// A set-up link pushed on `d` as the loop's set-up links are: its output's read end, the host's socket.
+    fn setup_link_on(d: &mut Daemon, id: u64) -> (File, TcpStream) {
+        let (mut l, out, host) = wifi::test_link(id);
+        l.setup = true;
+        d.wifi.links.push(l);
+        (out, host)
+    }
+
+    fn closed(host: &mut TcpStream) -> bool {
+        host.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut b = [0u8; 16];
+        matches!(host.read(&mut b), Ok(0) | Err(_))
+    }
+
+    /// Through the loop's own per-frame call (Daemon::link_frame): the set-up session's HELLO and MGMT_WIFI_LINK are
+    /// answered on its link, with CAP_WIFI_LINK alone, and nothing of the daemon's own session changes (its queues,
+    /// sequence, host instance, the install's heard/answered records, USB's output); then the box takes Wi-Fi hosts,
+    /// the window ends, and the set-up link closes.
     #[test]
-    fn a_set_up_session_takes_hello_and_mgmt_wifi_link_then_the_box_takes_wifi_hosts_and_the_window_ends() {
+    fn a_set_up_session_is_answered_on_its_link_and_touches_nothing_of_the_session() {
         let _l = wifi_file_lock();
         let _flag = presence_flag_lock();
         let _ = std::fs::remove_file(wifi::LINK_FILE);
         let mut d = td(); // no Wi-Fi mode: the loop's output is USB's
         d.setup.phase = setup::Phase::Offered(Instant::now() + setup::WINDOW);
-        let (mut l, mut out, mut host) = wifi::test_link(1 << 33);
-        l.setup = true;
-        d.wifi.links.push(l);
+        (d.heard, d.answered) = (false, false); // a fresh boot's: no host heard yet
+        d.send(p::CH_CTRL, p::F_SOM | p::F_EOM, &[p::CT_HEARTBEAT]); // a frame queued for USB's host
+        let (seq, queued) = (d.seq, d.out_hi.len());
+        let (mut out, mut host) = setup_link_on(&mut d, 1 << 33);
         let t = Instant::now();
-        let h = hello(0x5e70_0001, b"");
-        assert_eq!(d.admit(Via::Wifi(1 << 33), p::CH_CTRL, &h, t), Admit::Take);
-        assert!(d.wifi.usb_out.is_some(), "USB's own output kept aside while the set-up link holds the box");
-        d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &h);
-        d.handle(p::CH_MGMT, p::F_SOM | p::F_EOM, &provision(0x41, "Example Hotspot", &"ef".repeat(32)));
-        d.drain();
+        assert!(d.link_frame(0, p::CH_CTRL, p::F_SOM | p::F_EOM, &hello(0x5e70_0001, b"head unit"), t));
+        assert!(d.link_frame(0, p::CH_CTRL, p::F_SOM | p::F_EOM, &hello(0x5e70_0001, b"head unit"), t), "a HELLO again (Carlink's 500 ms)");
+        assert!(d.link_frame(0, p::CH_MGMT, p::F_SOM | p::F_EOM, &provision(0x41, "Example Hotspot", &"ef".repeat(32)), t));
         let got = frames_out(&mut out);
+        let acks: Vec<_> = got.iter().filter(|(_, _, pl)| pl.first() == Some(&p::CT_HELLO_ACK)).collect();
+        assert_eq!(acks.len(), 2, "{got:?}");
+        assert_eq!(u32::from_le_bytes([acks[0].2[2], acks[0].2[3], acks[0].2[4], acks[0].2[5]]), p::CAP_WIFI_LINK, "no other capability");
         assert!(got.iter().any(|(ch, _, pl)| *ch == p::CH_MGMT && pl[..] == [p::MGMT_ACK, p::MGMT_WIFI_LINK, 0]), "{got:?}");
-        assert!(d.setup.linked);
-        let (at, _, _) = d.wifi.pending.clone().unwrap();
+        assert_eq!((d.seq, d.out_hi.len()), (seq, queued), "the session's sequence and queues untouched");
+        assert!(d.host_instance.is_none() && d.host_name.is_none() && !d.heard && !d.answered, "no host for the install's trials");
+        assert!(d.wifi.via.is_none() && d.wifi.usb_out.is_none(), "it never held the box");
+        let (at, came, _) = d.wifi.pending.clone().unwrap();
+        assert_eq!(came, Some(Via::Wifi(1 << 33)));
         d.wifi_tick(at, false);
         assert!(d.wifi.on, "the box takes Wi-Fi hosts now");
+        assert!(d.wifi.usb_out.is_some(), "USB's output waits aside, as at a Wi-Fi-mode start");
         assert_eq!(d.setup.phase, setup::Phase::Over, "one set-up a window");
-        host.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        let mut b = [0u8; 16];
-        assert!(matches!(host.read(&mut b), Ok(0) | Err(_)), "the set-up link closed after its ACK");
+        assert!(closed(&mut host), "the set-up link closed after its ACK");
         d.wifi.stop();
         let _ = std::fs::remove_file(wifi::LINK_FILE);
     }
 
+    /// Two messages and nothing else: the clock, the info (bonded phones' addresses, the serial), the console, a
+    /// subscription or a removal close the set-up link, and nothing is answered or done.
     #[test]
-    fn a_set_up_link_that_sends_nothing_is_closed_after_to_link() {
+    fn a_set_up_session_carries_hello_and_mgmt_wifi_link_and_nothing_else() {
         let mut d = td();
-        let (mut l, _out, mut host) = wifi::test_link(1 << 34);
-        l.setup = true;
-        let since = l.since;
-        d.wifi.links.push(l);
+        d.setup.phase = setup::Phase::Offered(Instant::now() + setup::WINDOW);
+        let mut settime = vec![p::CT_SETTIME];
+        settime.extend_from_slice(&1_700_000_000u64.to_le_bytes());
+        for (ch, pl) in [
+            (p::CH_CTRL, settime),
+            (p::CH_MGMT, vec![p::MGMT_GET_INFO]),
+            (p::CH_CTRL, vec![p::CT_MODE_SELECT, p::MODE_CONSOLE]),
+            (p::CH_CTRL, vec![p::CT_SUBSCRIBE]),
+            (p::CH_MGMT, vec![p::MGMT_WIFI_LINK]), // the removal: no body
+            (p::CH_FILE, vec![p::FILE_OPEN]),
+        ] {
+            let (mut out, _host) = setup_link_on(&mut d, 1 << 34);
+            assert!(!d.link_frame(0, ch, p::F_SOM | p::F_EOM, &pl, Instant::now()), "ch {ch:#06x} {:02x?}", &pl[..1]);
+            assert!(frames_out(&mut out).is_empty() && d.out_lo.is_empty() && d.out_hi.is_empty(), "nothing answered");
+            d.wifi.links.clear();
+        }
+        assert!(d.wifi.pending.is_none() && d.ptm.is_none() && !d.subscribed);
+    }
+
+    /// TO_LINK from the exchange's end, in all: with no Wi-Fi mode, the window over, and a MGMT_WIFI_LINK stored,
+    /// there is still no set-up link past it. A second set-up link, or one after the window, is closed at once.
+    #[test]
+    fn a_set_up_link_has_its_limit_whatever_the_window_and_only_one_is_open() {
+        let mut d = td();
+        let (_out, mut host) = setup_link_on(&mut d, 1 << 35);
+        let since = d.wifi.links[0].since;
+        d.setup.linked = true; // no exemption once its MGMT_WIFI_LINK was stored
         d.wifi_tick(since + setup::TO_LINK - Duration::from_secs(1), false);
-        d.wifi_tick(since + wifi::HELLO_WITHIN + Duration::from_secs(1), false);
         host.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
         let mut b = [0u8; 16];
-        assert!(matches!(host.read(&mut b), Err(_)), "still open: the driver's tap may come before its HELLO");
+        assert!(matches!(host.read(&mut b), Err(_)), "still open before its limit");
         d.wifi_tick(since + setup::TO_LINK, false);
-        host.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        assert!(matches!(host.read(&mut b), Ok(0) | Err(_)), "closed at TO_LINK");
+        assert!(closed(&mut host), "closed at TO_LINK, the window over (phase {:?})", d.setup.phase);
+        // The window open, one set-up link already: the next exchange's link is closed at once; and after the window.
+        d.wifi.links.clear();
+        d.setup.phase = setup::Phase::Offered(Instant::now() + setup::WINDOW);
+        let (_out1, _host1) = setup_link_on(&mut d, 1 << 38);
+        let (authed, mut second) = test_authed(1 << 36);
+        d.setup_link(authed);
+        assert!(closed(&mut second) && d.wifi.links.len() == 1, "one set-up link at a time");
+        d.wifi.links.clear();
+        d.setup.phase = setup::Phase::Over;
+        let (authed, mut late) = test_authed(1 << 37);
+        d.setup_link(authed);
+        assert!(closed(&mut late) && d.wifi.links.is_empty(), "none after the window");
+    }
+
+    /// A finished exchange as the listener hands it over, and the host's end of its socket.
+    fn test_authed(id: u64) -> (wifi::Authed, TcpStream) {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let host = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (stream, peer) = l.accept().unwrap();
+        let session = ocbm_link::Session { tx: ocbm_link::Sealer::new(&[1; 32]), rx: ocbm_link::Opener::new(&[2; 32]) };
+        (wifi::Authed { id, peer, stream, session }, host)
     }
 }
