@@ -60,6 +60,8 @@ command -v "${PKG_CONFIG:-pkg-config}" >/dev/null 2>&1 || export PKG_CONFIG=true
     ./configure --host=arm-linux-musleabihf --disable-shared --enable-static --disable-cli --disable-debug >/dev/null
   make -j8 lib/libnl-3.la lib/libnl-genl-3.la >/dev/null )
 
+# No debug output (CONFIG_NO_STDOUT_DEBUG): 184 KB less, which the update needs to fit a final adapter (measured 24 Nov:
+# 729,248 B with it, 545,712 B without); a bench that wants the supplicant's log puts a debug build in /tmp/bin.
 # wpa_supplicant: nl80211 + WEXT, the control interface (wpa_cli), internal crypto, and nothing else: no EAP, no WPS,
 # no P2P, no SAE (WPA2-PSK only), no D-Bus.
 cat > "$WPA_SRC/wpa_supplicant/.config" <<EOF
@@ -72,6 +74,7 @@ CONFIG_BACKEND=file
 CONFIG_TLS=internal
 CONFIG_INTERNAL_LIBTOMMATH=y
 CONFIG_NO_RANDOM_POOL=y
+CONFIG_NO_STDOUT_DEBUG=y
 EOF
 # Flags through the environment, not make's command line: a command-line CFLAGS replaces the Makefile's own -I additions.
 ( cd "$WPA_SRC/wpa_supplicant"
