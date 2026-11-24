@@ -57,6 +57,7 @@ WPALOG=$R/tmp/wifi_sta.log
 BOXLOG=$R/tmp/box.log
 HOSTAPD_CONF=$R/etc/hostapd.conf
 HEALTHY=$R/tmp/session_healthy
+ONE_IF=$R/tmp/.radio_one_iface
 SYS=$R/sys
 LOCK=$R/tmp/.wifi_sta_lock
 DHCP_HOOK=${WIFI_STA_DHCP_HOOK:-$R/script/wifi_sta_dhcp.sh}
@@ -120,7 +121,6 @@ sta_if() {
   done
   [ -n "$_sti_s" ] && [ -n "$_sti_o" ] && echo "$_sti_s"
 }
-any_wireless() { for _aw in "$SYS"/class/net/*/; do [ -e "$_aw/wireless" ] || [ -e "$_aw/phy80211" ] && return 0; done; return 1; }
 
 ap_up() { pidof hostapd >/dev/null 2>&1; }
 ap_channel() { _apc=$(sed -n 's/^channel=//p' "$HOSTAPD_CONF" 2>/dev/null | head -1); case "$_apc" in ''|*[!0-9]*) echo 0 ;; *) echo "$_apc" ;; esac; }
@@ -157,7 +157,7 @@ write_conf() {  # $1 = "" (every channel) or the one frequency to scan
   conf_freq=$1
 }
 
-publish() {  # $1 joined|joining, $2 channel
+publish() {  # $1 joined|joining|unsupported, $2 channel
   { echo "iface=$IF"; echo "state=$1"; echo "channel=$2"; } > "$STATE.new" 2>/dev/null && mv -f "$STATE.new" "$STATE"
 }
 
@@ -165,10 +165,12 @@ cli() { "$CLI" -p "$CTRL" -i "$IF" "$@" 2>/dev/null; }
 
 log "keeping the station on the hotspot set up in $CONF"
 mkdir -p "$CTRL" "$R/var/run" 2>/dev/null
-WPA=""; CLI=""; said_tools=0; said_if=""; said_ap_on_sta=0
+WPA=""; CLI=""; said_tools=0; said_ap_on_sta=0; none=0
 last_ch=""; last_mismatch=""; joined_at=""; down_since=$(up_s)
 paused=0; ap_since=""; last_full=0; conf_freq="x"
 while :; do
+  # No station on this unit (below): nothing changes before the next boot.
+  [ "$none" = 1 ] && { [ -n "${WIFI_STA_ONCE:-}" ] && exit 0; sleep "$TICK"; continue; }
   now=$(up_s)
   # The tools: a drop-in or a bench copy can come at any time.
   if [ -z "$WPA" ]; then
@@ -179,15 +181,16 @@ while :; do
     fi
     log "supplicant: $WPA"
   fi
-  # The interface: the driver loads with the boot preload or a session; with none, ask the seam for it.
+  # The interface: the driver loads with the boot preload or a session; with no station's interface, the seam loads it
+  # and says whether this unit has one (radio_hal.sh wifi_sta_up). Its 3, no station here (one wireless interface, its
+  # mark ONE_IF, or no mapped backend), holds for the boot: said once, published for ocbmd, not asked again.
   if [ -z "$IF" ]; then
     IF=$(sta_if)
     if [ -z "$IF" ]; then
-      if ! any_wireless; then
-        [ "$said_if" != none ] && { log "no wireless interface: loading the driver (radio_hal.sh wifi_sta_up)"; said_if=none; }
-        sh "$HAL" wifi_sta_up >> "$BOXLOG" 2>&1
-      elif [ "$said_if" != one ]; then
-        log "one wireless interface only: no station beside the AP on this unit's driver"; said_if=one
+      if [ -e "$ONE_IF" ]; then rc=3; else sh "$HAL" wifi_sta_up >> "$BOXLOG" 2>&1; rc=$?; fi
+      if [ "$rc" = 3 ]; then
+        none=1; publish unsupported 0
+        log "no station interface on this unit (one wireless interface, or no mapped backend): no Wi-Fi link here"
       fi
       [ -n "${WIFI_STA_ONCE:-}" ] && exit 0; sleep "$TICK"; continue
     fi
@@ -265,7 +268,6 @@ while :; do
       stop_pidfile "$WPA_PID"; down_since=$now
     fi
   fi
-  last_state=$wstate
   [ -n "${WIFI_STA_ONCE:-}" ] && exit 0
   sleep "$TICK"
 done

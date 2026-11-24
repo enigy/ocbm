@@ -410,6 +410,15 @@ sta_iface() {
   [ -n "$_sti_s" ] && [ -n "$_sti_o" ] && { echo "$_sti_s"; return 0; }
   return 1
 }
+# STA mode, the driver's first interface there: is a station's beside it? A driver's interfaces come from one probe, so a
+# second is there within 1 s of the first; none by then is a one-interface driver, marked for the boot (ONE_IF), so no
+# path waits for a station again and the keeper stops asking. 1: none.
+ONE_IF=/tmp/.radio_one_iface
+sta_settle() {
+  [ -e "$ONE_IF" ] && return 1
+  _ss=0; while [ "$_ss" -lt 10 ]; do sta_iface >/dev/null 2>&1 && return 0; _ss=$((_ss+1)); sleep 0.1; done
+  echo 1 > "$ONE_IF"; log "one wireless interface on this driver: no station beside the AP, so no Wi-Fi link here"; return 1
+}
 # The AP's interface: in STA mode the wireless interface that is not the station's (when there is one), else wlan_iface.
 ap_iface() {
   sta_mode || { wlan_iface; return; }
@@ -733,12 +742,9 @@ do_wifi_ap_on() {
       wlan_driver_up || {
         publish "$WLAN_STATE" "result=fail" "backend=mapped" "chipset=$RADIO_SDIO_DEVICE" "detail=driver-load"
         return 1; }
-      # Converge on the interface appearing, discovered by enumeration. In STA mode on both of the driver's interfaces
-      # (the station's and the AP's) for as long, then the AP takes whatever there is, as before.
-      _n=0; while [ "$_n" -lt 100 ]; do
-        if sta_mode; then sta_iface >/dev/null 2>&1 && break; else wlan_iface >/dev/null 2>&1 && break; fi
-        _n=$((_n+1)); sleep 0.1
-      done
+      # Converge on the interface appearing, discovered by enumeration; in STA mode a station's beside it, 1 s at most.
+      _n=0; while [ "$_n" -lt 100 ]; do wlan_iface >/dev/null 2>&1 && break; _n=$((_n+1)); sleep 0.1; done
+      sta_mode && sta_settle
       _i=$(ap_iface 2>/dev/null) || {
         log "driver loaded but no wireless interface appeared"
         publish "$WLAN_STATE" "result=fail" "backend=mapped" "chipset=$RADIO_SDIO_DEVICE" "detail=no-iface"
@@ -864,15 +870,18 @@ do_setup_ap_off() {
 }
 
 # The Wi-Fi link's station (wifi_sta.sh): this unit's WLAN driver loaded, and the station's interface (sta_iface: one
-# beside the AP's) up. Never an AP, an address or a scan. 2: already there; 3: no mapped backend or no STA mode.
+# beside the AP's) up. Never an AP, an address or a scan. 2: already there; 3: no station on this unit (no mapped
+# backend, no STA mode, one interface: sta_settle), which the keeper takes as final for the boot.
 do_wifi_sta_up() {
   sta_mode || { log "wifi_sta_up: no hotspot in $WIFI_LINK_FILE"; return 3; }
+  [ -e "$ONE_IF" ] && return 3
   _wsu=$(sta_iface 2>/dev/null) && { ifconfig "$_wsu" up 2>/dev/null; return 2; }
   caps || return 3
   [ "$RADIO_BACKEND" = mapped ] || { log "wifi_sta_up: backend ${RADIO_BACKEND:-none} has no station path"; return 3; }
   wlan_driver_up || return 1
-  _n=0; while [ "$_n" -lt 100 ] && ! sta_iface >/dev/null 2>&1; do _n=$((_n+1)); sleep 0.1; done
-  _wsu=$(sta_iface 2>/dev/null) || { log "wifi_sta_up: the driver is up, but no station interface beside the AP's"; return 1; }
+  _n=0; while [ "$_n" -lt 100 ] && ! wlan_iface >/dev/null 2>&1; do _n=$((_n+1)); sleep 0.1; done
+  sta_settle || return 3
+  _wsu=$(sta_iface 2>/dev/null) || return 1
   ifconfig "$_wsu" up 2>/dev/null
   log "wifi_sta_up: station interface $_wsu up"
   return 0

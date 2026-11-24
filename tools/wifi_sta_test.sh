@@ -56,10 +56,11 @@ cat > "$S/pidof" <<'EOF'
 [ "$1" = hostapd ] && [ -e "$STUB_R/hostapd.running" ]
 EOF
 chmod 755 "$S"/*
-# The seam's verb, stood in for.
+# The seam's verb, stood in for; hal3.sh as on a unit with no station (one wireless interface, or no mapped backend).
 cat > "$S/hal.sh" <<'EOF'
 echo "radio_hal $*" >> "$STUB_R/calls"
 EOF
+printf 'echo "radio_hal $*" >> "$STUB_R/calls"\nexit 3\n' > "$S/hal3.sh"
 
 unit() {  # $1 dir, $2 interfaces ("sta0 wlan0"), $3 psk: a scratch adapter with the link set up
   local R="$1" i
@@ -135,10 +136,21 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   check '[ ! -e "$R/var/run/wpa_sta.pid" ] && [ ! -e "$R/var/run/udhcpc_sta.pid" ] && [ ! -e "$R/tmp/wifi_link_state" ] && [ ! -d "$R/tmp/.wifi_sta_lock" ]' \
     "SIGTERM: the supplicant, the DHCP client, the state and the lock gone"
 
+  # Back-offs: what cannot change before the next boot, or for a while, is asked for and said once.
+  R="$T/c"; unit "$R" "sta0" "$HASH"
+  env STUB_R="$R" WIFI_STA_ROOT="$R" WIFI_STA_TICK=0.1 WIFI_STA_HAL="$S/hal3.sh" OCBM_TEST_PATH="$S${OCBM_TEST_PATH:+:$OCBM_TEST_PATH}" \
+    "$sh" "$KEEPER" >/dev/null 2>&1 &
+  BG=$!; sleep 1.2; kill "$BG"; wait "$BG" 2>/dev/null; BG=""
+  check '[ "$(grep -c "^radio_hal wifi_sta_up" "$R/calls")" = 1 ] && [ "$(grep -c "no station interface on this unit" "$R/tmp/box.log")" = 1 ] && ! grep -q "^wpa_supplicant" "$R/calls"' \
+    "no station on this unit (the seam's 3): asked once, said once, no supplicant"
+  R="$T/c1"; unit "$R" "sta0" "$HASH"; echo 1 > "$R/tmp/.radio_one_iface"
+  env STUB_R="$R" WIFI_STA_ROOT="$R" WIFI_STA_TICK=0.1 WIFI_STA_HAL="$S/hal.sh" OCBM_TEST_PATH="$S${OCBM_TEST_PATH:+:$OCBM_TEST_PATH}" \
+    "$sh" "$KEEPER" >/dev/null 2>&1 &
+  BG=$!; n=0; while [ "$n" -lt 20 ] && ! grep -qx "state=unsupported" "$R/tmp/wifi_link_state" 2>/dev/null; do n=$((n + 1)); sleep 0.1; done
+  check 'grep -qx "state=unsupported" "$R/tmp/wifi_link_state" && [ ! -e "$R/calls" ]' \
+    "  the seam's one-interface mark: not even asked, and state=unsupported for ocbmd"
+  kill "$BG"; wait "$BG" 2>/dev/null; BG=""
   # Waits.
-  R="$T/c"; unit "$R" "sta0" "$HASH"; keep "$R" "$sh"
-  check 'grep -q "one wireless interface only" "$R/tmp/box.log" && ! grep -q "^wpa_supplicant" "$R/calls" 2>/dev/null' \
-    "one wireless interface: no station beside the AP"
   R="$T/d"; unit "$R" "sta0 wlan0" "$HASH"; rm -f "$R/usr/sbin/ocbm-wpa_supplicant"; keep "$R" "$sh"
   check 'grep -q "no wpa_supplicant" "$R/tmp/box.log" && [ ! -e "$R/calls" ]' "no supplicant anywhere: it waits, starting nothing"
   R="$T/e"; unit "$R" "sta0 wlan0" "$HASH"; rm -f "$R/usr/sbin/ocbm-wpa_supplicant" "$R/usr/sbin/ocbm-wpa_cli"
@@ -208,6 +220,15 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   rm -rf "$R/sys/class/net/wlan0"
   check '[ "$(hal "$R" "$sh" "ap_iface")" = sta0 ] && ! hal "$R" "$sh" "sta_iface"' \
     "one wireless interface: the AP keeps it, and there is no station"
+  st='caps() { RADIO_BACKEND=mapped; return 0; }; wlan_driver_up() { return 0; }; log() { echo "log $*" >> "'"$R"'/calls"; }
+      do_wifi_sta_up; echo "rc=$?"'
+  mkdir -p "$R/tmp"; rm -f "$R/tmp/.radio_one_iface"; : > "$R/calls"; t0=$(date +%s)
+  check '[ "$(hal "$R" "$sh" "$st")" = rc=3 ] && [ -e "$R/tmp/.radio_one_iface" ] && grep -q "one wireless interface on this driver" "$R/calls"' \
+    "  wifi_sta_up says so (3) once the driver's probe has settled, and marks it for the boot"
+  check '[ $(( $(date +%s) - t0 )) -le 3 ]' "  in about a second, not the 10 s it waited before"
+  : > "$R/calls"
+  check '[ "$(hal "$R" "$sh" "$st")" = rc=3 ] && [ ! -s "$R/calls" ]' "  and at once after that, asking the driver nothing"
+  rm -f "$R/tmp/.radio_one_iface"
   mkdir -p "$R/sys/class/net/wlan0/wireless"
   : > "$R/calls"
   off='killall() { :; }; ap_dhcp_stop() { :; }; ap_running() { return 1; }; caps() { return 0; }

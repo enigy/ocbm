@@ -264,9 +264,11 @@ pub struct Sta {
     pub joined: bool,
     /// The hotspot's channel while joined, else 0.
     pub channel: u32,
+    /// No station on this unit (one wireless interface, or no mapped backend): the keeper's `state=unsupported`.
+    pub none: bool,
 }
 
-/// [`STA_STATE`]'s text: `iface=`, `state=joined|joining`, `channel=`.
+/// [`STA_STATE`]'s text: `iface=`, `state=joined|joining|unsupported`, `channel=`.
 pub fn parse_sta_state(text: &str) -> Sta {
     let mut s = Sta::default();
     for l in text.lines() {
@@ -274,6 +276,7 @@ pub fn parse_sta_state(text: &str) -> Sta {
             s.iface = v.trim().to_string();
         } else if let Some(v) = l.strip_prefix("state=") {
             s.joined = v.trim() == "joined";
+            s.none = v.trim() == "unsupported";
         } else if let Some(v) = l.strip_prefix("channel=") {
             s.channel = v.trim().parse().unwrap_or(0);
         }
@@ -808,6 +811,8 @@ pub fn info_json(set_up: bool, linked: bool, sta: Option<&Sta>, listening: bool,
         ("linked", sta.map_or(0, |s| s.channel))
     } else if listening || sta.is_some_and(|s| s.joined) {
         ("joined", sta.map_or(0, |s| s.channel))
+    } else if sta.is_some_and(|s| s.none) {
+        ("unsupported", 0)
     } else {
         ("joining", 0)
     };
@@ -1026,7 +1031,8 @@ mod tests {
     #[test]
     fn station_state_and_ap_channel_read_back() {
         let s = parse_sta_state("iface=sta0\nstate=joined\nchannel=149\n");
-        assert_eq!(s, Sta { iface: "sta0".into(), joined: true, channel: 149 });
+        assert_eq!(s, Sta { iface: "sta0".into(), joined: true, channel: 149, none: false });
+        assert!(parse_sta_state("iface=\nstate=unsupported\nchannel=0\n").none, "no station on this unit");
         assert_eq!(parse_sta_state("iface=sta0\nstate=joining\nchannel=149\n").channel, 0, "no channel unless joined");
         assert_eq!(ap_channel("interface=wlan0\nchannel=36\nhw_mode=a\n"), 36);
         assert_eq!(ap_channel("ssid=x\n"), 0);
@@ -1036,7 +1042,9 @@ mod tests {
 
     #[test]
     fn mgmt_info_names_states_and_channels_only() {
-        let joined = Sta { iface: "sta0".into(), joined: true, channel: 36 };
+        let joined = Sta { iface: "sta0".into(), joined: true, channel: 36, none: false };
+        let none = Sta { none: true, ..Sta::default() };
+        assert_eq!(info_json(true, false, Some(&none), false, 36), "{\"state\":\"unsupported\",\"channel\":0,\"ap_channel\":36}");
         assert_eq!(info_json(false, false, None, false, 36), "{\"state\":\"off\",\"channel\":0,\"ap_channel\":36}");
         assert_eq!(info_json(true, false, None, false, 36), "{\"state\":\"joining\",\"channel\":0,\"ap_channel\":36}");
         assert_eq!(info_json(true, false, Some(&joined), false, 36), "{\"state\":\"joined\",\"channel\":36,\"ap_channel\":36}");
