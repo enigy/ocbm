@@ -4195,8 +4195,8 @@ impl Daemon {
         if self.setup.phase != setup::Phase::Over || self.wifi.links.iter().any(|l| l.setup) {
             self.setup_end("a USB host spoke");
         }
-        if self.wifi.on {
-            self.admit(Via::Usb, ch, pl, now);
+        if self.wifi.on || self.wifi.usb_direct {
+            self.admit(Via::Usb, ch, pl, now); // on a reader-only start (usb_direct): ocbmd restarts for this host
         }
         self.handle(ch, flags, pl);
     }
@@ -4400,7 +4400,8 @@ impl Daemon {
             eprintln!("[ocbmd] wifi: link {} sent no HELLO in {} s; closed", l.id, wifi::HELLO_WITHIN.as_secs());
             l.close();
         }
-        if self.wifi.restart_when_idle && self.wifi.via.is_none() && !self.present && self.rearm_deadline.is_none() {
+        let quiet = self.last_frame.is_none_or(|t| now.saturating_duration_since(t) >= wifi::HOLD_SILENCE);
+        if self.wifi.restart_when_idle && self.wifi.via.is_none() && !self.present && self.rearm_deadline.is_none() && quiet {
             eprintln!("[ocbmd] wifi: restarting now that no host holds the box (the transports start afresh)");
             clear_session_state_for_exit(INSTALL_MODE_FILE, start_install_finish);
             std::process::exit(0);
@@ -4443,26 +4444,29 @@ impl Daemon {
                         }
                         eprintln!("[ocbmd] wifi: the listener takes the new link key from now on");
                     }
+                } else if direct_io && came == Some(Via::Usb) {
+                    // This driver serializes reads and writes, and this USB host's session runs on the loop's own
+                    // reads of it: a Wi-Fi host would stall whenever the USB host is silent, the loop asleep in
+                    // acc_read (the review of 24 Nov, G). The listener starts with ocbmd's next start instead, once
+                    // this host has gone quiet; the station joins the hotspot now.
+                    self.wifi.restart_when_idle = true;
+                    eprintln!("[ocbmd] wifi: set up over USB on a driver that serializes reads and writes: Wi-Fi hosts from the next start, once this USB host is quiet");
                 } else {
                     match self.wifi.start(c) {
                         Ok(()) if came != Some(Via::Usb) => {
                             // Set up over the set-up network (M3): its link closes below. Nobody holds the box: the
-                            // output goes to the sink and USB's waits aside, as at a Wi-Fi-mode start.
-                            self.wifi.usb_out = Some(std::mem::replace(&mut self.acc, wifi::sink()));
+                            // output goes to the sink and USB's waits aside, as at a Wi-Fi-mode start (on a reader-only
+                            // start, usb_direct, there is none: a USB host restarts ocbmd).
+                            if !self.wifi.usb_direct {
+                                self.wifi.usb_out = Some(std::mem::replace(&mut self.acc, wifi::sink()));
+                            }
                             eprintln!("[ocbmd] wifi: set up over the set-up network: taking Wi-Fi hosts from now on");
                         }
                         Ok(()) => {
                             // Set up over USB: that host holds the box, its session carries on beside the listener.
                             self.wifi.via = Some(Via::Usb);
                             self.wifi.last_host_frame = Some(now);
-                            if direct_io {
-                                // The loop reads this driver itself; the next start serves USB and Wi-Fi apart.
-                                self.wifi.usb_direct = true;
-                                self.wifi.restart_when_idle = true;
-                                eprintln!("[ocbmd] wifi: taking Wi-Fi hosts beside this USB session; on this driver ocbmd restarts once the USB host has gone");
-                            } else {
-                                eprintln!("[ocbmd] wifi: taking Wi-Fi hosts from now on, beside this USB session");
-                            }
+                            eprintln!("[ocbmd] wifi: taking Wi-Fi hosts from now on, beside this USB session");
                         }
                         Err(e) => eprintln!("[ocbmd] wifi: the listener could not start ({e}); USB only"),
                     }
@@ -5088,9 +5092,15 @@ fn main() {
     if usb_once && link_conf.is_some() {
         eprintln!("[ocbmd] wifi: this start is USB only (a USB host took the box on a driver that serializes reads and writes)");
     }
-    // On a serializing driver the Wi-Fi side reads USB on a thread of its own and never writes it: a USB host taking
-    // the box restarts ocbmd for one plain USB start (Daemon::take_box).
-    let (AccRelay { from_host, to_host }, writer_watch) = if wifi_mode && acc_io == AccIo::Direct {
+    let (heard, answered) = host_frames_on_record();
+    // M3: offered only on an adapter with no link, never used (setup.rs), whose boot no host has spoken in yet.
+    let setup_on = !wifi_mode && link_conf.is_none() && !usb_once && !heard && setup::wanted();
+    // On a serializing driver the Wi-Fi side, and a start that may offer the set-up network, read USB on a thread of
+    // their own and never write it: the loop's own read of the device sleeps in acc_read while no USB host speaks, and
+    // Wi-Fi hosts or set-up clients with it (the review of 24 Nov, G). A USB host's first frame restarts ocbmd for one
+    // plain USB start (Daemon::take_box).
+    let usb_reader_only = acc_io == AccIo::Direct && (wifi_mode || setup_on);
+    let (AccRelay { from_host, to_host }, writer_watch) = if usb_reader_only {
         start_acc_reader(acc).map(|from_host| (AccRelay { from_host, to_host: wifi::sink() }, None))
     } else {
         start_acc_io(acc, acc_io)
@@ -5133,12 +5143,11 @@ fn main() {
         eprintln!("[ocbmd] required A/V seam listener missing — exiting");
         std::process::exit(1);
     }
-    let (heard, answered) = host_frames_on_record();
     let mut wifi_side = wifi::Side::off();
     wifi_side.conf = link_conf.clone();
+    wifi_side.usb_direct = usb_reader_only;
     let acc_out = if wifi_mode {
         // Nobody holds the box yet: the output goes to the sink until a host takes it (Daemon::admit).
-        wifi_side.usb_direct = acc_io == AccIo::Direct;
         wifi_side.usb_out = (acc_io == AccIo::Relay).then_some(to_host);
         match wifi_side.start(link_conf.as_ref().expect("wifi_mode needs the link")) {
             Ok(()) => {
@@ -5224,8 +5233,7 @@ fn main() {
         wifi: wifi_side,
         selfs: None,
         attach_live: false,
-        // M3: offered only on an adapter with no link, whose boot no host has spoken in yet.
-        setup: if !wifi_mode && link_conf.is_none() && !usb_once && !heard && setup::wanted() { setup::Setup::waiting(Instant::now()) } else { setup::Setup::never() },
+        setup: if setup_on { setup::Setup::waiting(Instant::now()) } else { setup::Setup::never() },
     };
     let direct_io = acc_io == AccIo::Direct;
     let mut reasm = p::Reassembler::new();
@@ -8040,6 +8048,26 @@ mod tests {
         let (authed, mut late) = test_authed(1 << 37);
         d.setup_link(authed);
         assert!(closed(&mut late) && d.wifi.links.is_empty(), "none after the window");
+    }
+
+    /// A serializing driver (AccIo::Direct): a link set up over USB starts no listener beside the loop's own reads of
+    /// the device (a silent USB host would stall every Wi-Fi host); ocbmd restarts into Wi-Fi mode once that host is
+    /// quiet. After a set-up on a reader-only start (usb_direct, as the set-up window's start on such a driver is), Wi-Fi
+    /// hosts are taken at once and no USB output is kept: a USB host's frame restarts ocbmd instead.
+    #[test]
+    fn on_a_serializing_driver_no_listener_runs_beside_the_loops_own_reads_of_the_device() {
+        let _l = wifi_file_lock();
+        let c = wifi::LinkConf { key: ocbm_link::LinkKey([0x51; 32]), ssid: String::new(), psk: String::new() };
+        wifi::store(&wifi::Provision::Set(c), wifi::LINK_FILE).unwrap();
+        let mut d = td();
+        d.wifi_apply(Some(Via::Usb), None, Instant::now(), true);
+        assert!(!d.wifi.on && d.wifi.listener.is_none() && d.wifi.restart_when_idle, "the listener waits for the next start");
+        let mut d = td();
+        d.wifi.usb_direct = true;
+        d.wifi_apply(Some(Via::Wifi(1 << 40)), None, Instant::now(), true);
+        assert!(d.wifi.on && d.wifi.usb_out.is_none() && !d.wifi.restart_when_idle, "Wi-Fi hosts at once, nothing kept for USB");
+        d.wifi.stop();
+        let _ = std::fs::remove_file(wifi::LINK_FILE);
     }
 
     /// A finished exchange as the listener hands it over, and the host's end of its socket.
