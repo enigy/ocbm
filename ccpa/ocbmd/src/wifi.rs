@@ -611,6 +611,8 @@ pub struct Link {
     pub reasm: ocbm_proto::Reassembler,
     /// Its HELLO was taken: it holds (or held) the box.
     pub admitted: bool,
+    /// A set-up network session (setup.rs, M3): its own rules (four messages, 60 s to MGMT_WIFI_LINK).
+    pub setup: bool,
     pub since: Instant,
     sock: TcpStream,
 }
@@ -651,7 +653,7 @@ pub fn start_link(a: Authed) -> std::io::Result<Link> {
         .name("wifi-write".into())
         .stack_size(crate::RELAY_STACK)
         .spawn(move || link_writer(id, ws, tx, frames))?;
-    Ok(Link { id, peer, from_host, to_host: Some(to_host), reasm: ocbm_proto::Reassembler::new(), admitted: false, since: Instant::now(), sock: stream })
+    Ok(Link { id, peer, from_host, to_host: Some(to_host), reasm: ocbm_proto::Reassembler::new(), admitted: false, setup: false, since: Instant::now(), sock: stream })
 }
 
 fn link_reader(id: u64, mut s: TcpStream, mut rx: ocbm_link::Opener, mut host_bytes: File) {
@@ -900,6 +902,7 @@ pub fn test_link(id: u64) -> (Link, File, TcpStream) {
         to_host: Some(to_host),
         reasm: ocbm_proto::Reassembler::new(),
         admitted: false,
+        setup: false,
         since: Instant::now(),
         sock,
     };

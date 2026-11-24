@@ -634,6 +634,14 @@ up the adapter also starts its CarPlay session at power-up with no host, video p
 SUBSCRIBE (M2). ocbmd `src/wifi.rs` and `src/mdns.rs`, `/script/wifi_sta.sh`, and the Wi-Fi link section of
 docs/wireless/01_BT_AND_RADIO.md have the rest; the hand-off notes of 24 Nov hold the contract with Carlink.
 
+First set-up with no USB (M3, `src/setup.rs`, not benched): an adapter with no link that no host has spoken to offers,
+20 s after ocbmd's start and for 10 minutes, a set-up network `CarLink-Setup-xxxx` (public WPA2 passphrase
+`carlinksetup`, client isolation) and, on 192.168.43.1:7021, OCBS v1 (`crates/ocbm-link`): each side's P-256 point
+(65 B uncompressed) behind `"OCBS" 0x01`, the host first; HKDF-SHA256 over the ECDH X with both points as salt; then
+OCBW records. One client at a time, 5 s for the exchange, 60 s from its end to `MGMT_WIFI_LINK`; the session carries
+`CT_HELLO`, `CT_SETTIME`, `MGMT_GET_INFO` and `MGMT_WIFI_LINK` only, and the window ends after one set-up or when a USB
+host speaks. `OCBM_WIFI_RESET` on a stick removes the link for the next power-up.
+
 ## Route A: the phone's video inside CarPlay (OCBM 2.0, 12 Nov 2026)
 
 iOS 26 and later let a CarPlay head unit show the phone's AirPlay video. The box offers it in every

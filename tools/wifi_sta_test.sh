@@ -182,6 +182,7 @@ done
 # and hostapd.conf moved into a scratch root, sourced for its functions (as tools/radio_ap_up_test.sh does).
 hal_copy() {  # $1 root
   sed -e "s#/sys/#$1/sys/#g; s#/etc/ocbm/wifi_link#$1/etc/ocbm/wifi_link#g; s#/etc/hostapd.conf#$1/etc/hostapd.conf#g" \
+      -e "s#/etc/udhcpd.conf#$1/etc/udhcpd.conf#g; s#=/tmp/#=$1/tmp/#g; s# /tmp/udhcpd_setup# $1/tmp/udhcpd_setup#g" \
     "$REPO/ccpa/rootfs/script/radio_hal.sh" > "$1/radio_hal.sh"
 }
 hal() {  # $1 root, $2 shell, $3 commands (the functions sourced)
@@ -213,5 +214,23 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
     "an AP raised on sta0 before the link was set up: only its address goes, the interface stays up for the station"
   rm -f "$R/etc/ocbm/wifi_link"; : > "$R/calls"; hal "$R" "$sh" "$off"
   check 'grep -qx "ifconfig sta0 down" "$R/calls"' "no link: the teardown downs the first interface, as in 2.7.1"
+  # M3's set-up network: its configuration in /tmp from the CarPlay AP's, client isolation on, the flash file untouched.
+  mkdir -p "$R/tmp"
+  printf 'interface=sta0\nssid=CarLink-fd6c\nwpa_passphrase=private\nchannel=36\nhw_mode=a\n' > "$R/etc/hostapd.conf"
+  printf 'start\t192.168.43.100\ninterface\tsta0\nlease_file\t/var/lib/udhcpd.leases\n' > "$R/etc/udhcpd.conf"
+  before=$(cat "$R/etc/hostapd.conf")
+  on='caps() { RADIO_BACKEND=mapped; return 0; }; wlan_driver_up() { return 0; }; box_name() { echo CarLink-fd6c; }
+      ifconfig() { echo "ifconfig $*" >> "'"$R"'/calls"; }; setsid() { echo "setsid $*" >> "'"$R"'/calls"; }
+      ap_running() { [ -e "'"$R"'/up" ]; }; setup_dhcp_pids() { echo 1; }; sleep() { : > "'"$R"'/up"; }; log() { :; }
+      do_setup_ap_on; echo "rc=$?"'
+  : > "$R/calls"; rm -f "$R/up"
+  check '[ "$(hal "$R" "$sh" "$on")" = rc=0 ]' "setup_ap_on: the set-up network comes up"
+  check 'grep -qx "ssid=CarLink-Setup-fd6c" "$R/tmp/hostapd_setup.conf" && grep -qx "wpa_passphrase=carlinksetup" "$R/tmp/hostapd_setup.conf" && grep -qx "ap_isolate=1" "$R/tmp/hostapd_setup.conf"' \
+    "  CarLink-Setup-xxxx, the public passphrase, client isolation"
+  check '! grep -q "private" "$R/tmp/hostapd_setup.conf" && [ "$(cat "$R/etc/hostapd.conf")" = "$before" ]' \
+    "  the CarPlay AP's passphrase not carried over, its flash configuration untouched"
+  check 'grep -q "udhcpd -f $R/tmp/udhcpd_setup.conf" "$R/calls" && grep -q "lease_file	/tmp/udhcpd_setup.leases" "$R/tmp/udhcpd_setup.conf"' \
+    "  its own DHCP server and lease file in /tmp"
+  check 'grep -q "^ok sta0" "$R/tmp/.radio_setup_ap"' "  the marker ocbmd waits for"
 done
 [ "$fails" -eq 0 ] && echo "wifi_sta_test: all passed" || { echo "wifi_sta_test: $fails FAILED"; exit 1; }

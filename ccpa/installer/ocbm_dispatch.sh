@@ -369,6 +369,15 @@ final_note() {  # OCBM_RESTORE.txt on the stick: what OCBM_RESTORE does on a fin
 # nothing on the stick to say why. A final boot runs it for the note alone.
 restore_watch() {
   while :; do
+    # M3's reset path: OCBM_WIFI_RESET on a stick removes the Wi-Fi link (its key and hotspot, the kept session config
+    # and channel), so the next power-up offers the set-up network again. One use: renamed .done, with a note.
+    if stick_in && [ -e "$STICK/OCBM_WIFI_RESET" ]; then
+      mv -f "$STICK/OCBM_WIFI_RESET" "$STICK/OCBM_WIFI_RESET.done"
+      rm -f "$EO/wifi_link" "$EO/wifi_link.tmp" "$EO/wifi_session.yaml" "$EO/wifi_link_channel"
+      echo "The adapter's Wi-Fi link was removed. Power the adapter off and on: it then offers its set-up network (CarLink-Setup-...) for 10 minutes." > "$STICK/OCBM_WIFI_RESET.txt"
+      sync
+      log "OCBM_WIFI_RESET found on the stick: the Wi-Fi link removed (the set-up network from the next power-up)"
+    fi
     if stick_in && [ -e "$STICK/OCBM_RESTORE" ]; then
       if [ "$(cat "$S/ocbm_mode" 2>/dev/null)" = final ]; then
         [ -e "$STICK/OCBM_RESTORE.txt" ] || final_note

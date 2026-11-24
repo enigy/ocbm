@@ -813,8 +813,10 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
   `sta0` is inferred from the stock driver configuration, not measured; (3) what the driver does when the hotspot and the
   AP sit on different channels; (4) WPA3-only hotspots are not supported in this version (WPA2 and mixed are; the box
   gets the PBKDF2 hash, the supplicant has no SAE); (5) M2's self-started session: the phone's audio goes nowhere while no host is attached (60 s / 180 s holds);
-  the AP's channel pinned from the hotspot's last one is a design note only; (6) M3 (the set-up network) is a proposal:
-  the box's P-256 needs crates that are not in the offline cache.
+  the AP's channel pinned from the hotspot's last one is a design note only; (6) M3 (the set-up network) is built, not
+  benched: whether the stock hostapd takes `ap_isolate=1` (it refuses an unknown key, and then no set-up network is
+  offered), and what the set-up AP raised 20 s into a boot with no host yet costs a head unit that connects later; (7)
+  the supplicant's build (`tools/build_wpa_supplicant.sh`, its archives pinned) has not been run in the agent's session.
 
 - **An inbound RCS `'sync'` obliges a `'rply'`; the box logs and does not send one — BLOCKED, not
   merely unstarted.** `_controlServer_sendResponseInternal` writes `messageType = 0` while the

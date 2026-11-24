@@ -379,6 +379,9 @@ the host's arrival and the first frame, the PSK count is a lower bound: `PSK mis
 `/tmp/bench_wifi_link_if` holding an interface name: ocbmd's listener binds that interface's address instead of the
 station's (never the AP's subnet), e.g. a wired bench over NCM. A bench supplicant goes in `/tmp/bin` (`wpa_supplicant`,
 `wpa_cli`). What to look for: `[wifi_sta]` and `[ocbmd] wifi:` lines in the box log, MGMT_INFO's `wifi_link`.
+The set-up network (M3): off with `/tmp/bench_wifi_setup_off` or `/etc/ocbm/bench_wifi_setup_off` (the owner's
+`/etc/ocbm/wifi_setup_off` too); `OCBM_WIFI_RESET` on a stick removes the link for the next power-up; look for
+`[ocbmd] setup:` and `[radio_hal] set-up network` lines.
 
 ### Round 4 switches (22 Nov 2026; six on by default from 2.7.1)
 

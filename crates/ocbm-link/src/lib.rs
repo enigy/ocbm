@@ -40,6 +40,7 @@
 use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, Tag};
 use hkdf::Hkdf;
+use p256::elliptic_curve::sec1::ToEncodedPoint;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::io::{Read, Write};
@@ -360,6 +361,137 @@ pub fn host_handshake<S: Read + Write>(s: &mut S, key: &LinkKey, host_nonce: [u8
     Ok(Session { tx: Sealer::new(&h2b), rx: Opener::new(&b2h) })
 }
 
+// ---- OCBS v1: the set-up exchange (M3) ------------------------------------------------------------------------------
+//
+// An adapter with no link key offers a time-limited set-up network from its own AP (SSID [`SETUP_SSID_PREFIX`] + its
+// four hex digits, WPA2 passphrase [`SETUP_PASSPHRASE`], public on purpose). A host on it agrees keys with the box by an
+// unauthenticated P-256 ECDH, so nothing it then sends (the link key, the hotspot's WPA key) is readable from the air;
+// trust is first-come within the window (the adapter has no screen for a code). After the 70-byte exchange the session
+// is OCBW v1's record layer, the plain OCBM stream inside:
+//
+// ```text
+//   host -> box   "OCBS" ver=1 host_pub[65]     (P-256, SEC1 uncompressed: 0x04 | X | Y)   (70 B)
+//   box  -> host  "OCBS" ver=1 box_pub[65]                                                   (70 B)
+//   Z = the ECDH shared point's X (32 B, big-endian)
+//   keys: HKDF-SHA256(ikm = Z, salt = host_pub | box_pub), info "OCBS v1 host->box" / "OCBS v1 box->host", 32 B each
+// ```
+//
+// The two public points are the transcript a later short confirmation code can be derived from ([`Transcript`]).
+
+/// The set-up exchange's magic.
+pub const SETUP_MAGIC: [u8; 4] = *b"OCBS";
+/// The box listens for the set-up exchange on its AP's address, this port, while the set-up network is up.
+pub const SETUP_PORT: u16 = 7021;
+/// The set-up network's name: this and the box's four hex digits (those of its CarLink-xxxx name).
+pub const SETUP_SSID_PREFIX: &str = "CarLink-Setup-";
+/// The set-up network's WPA2 passphrase: fixed and documented; secrecy comes from the ECDH, not from this.
+pub const SETUP_PASSPHRASE: &str = "carlinksetup";
+/// Each side's opening: magic, version, an uncompressed P-256 point.
+pub const SETUP_HELLO_LEN: usize = 4 + 1 + 65;
+const SETUP_H2B: &[u8] = b"OCBS v1 host->box";
+const SETUP_B2H: &[u8] = b"OCBS v1 box->host";
+
+/// The two public points of a finished exchange, kept for a later short code (none is shown yet).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Transcript {
+    pub host_pub: [u8; 65],
+    pub box_pub: [u8; 65],
+}
+
+/// A P-256 key pair from 32 bytes of the CSPRNG: None when they are no valid scalar (zero, or not below the order),
+/// which [`setup_keypair`] answers by drawing again.
+pub fn setup_keypair_from(bytes: &[u8; 32]) -> Option<(p256::SecretKey, [u8; 65])> {
+    let sk = p256::SecretKey::from_slice(bytes).ok()?;
+    let mut pk = [0u8; 65];
+    pk.copy_from_slice(sk.public_key().to_encoded_point(false).as_bytes());
+    Some((sk, pk))
+}
+
+/// A fresh key pair for one exchange.
+pub fn setup_keypair() -> std::io::Result<(p256::SecretKey, [u8; 65])> {
+    loop {
+        if let Some(kp) = setup_keypair_from(&random32()?) {
+            return Ok(kp);
+        }
+    }
+}
+
+/// Z from our secret and the peer's point; None for a point that is not on the curve (or not uncompressed).
+pub fn setup_shared(secret: &p256::SecretKey, peer_pub: &[u8; 65]) -> Option<[u8; 32]> {
+    if peer_pub[0] != 0x04 {
+        return None;
+    }
+    let peer = p256::PublicKey::from_sec1_bytes(peer_pub).ok()?;
+    let shared = p256::ecdh::diffie_hellman(secret.to_nonzero_scalar(), peer.as_affine());
+    let mut z = [0u8; 32];
+    z.copy_from_slice(shared.raw_secret_bytes());
+    Some(z)
+}
+
+/// The two directions' record keys, (host->box, box->host), from Z and the transcript.
+pub fn setup_session_keys(z: &[u8; 32], t: &Transcript) -> ([u8; 32], [u8; 32]) {
+    let mut salt = [0u8; 130];
+    salt[..65].copy_from_slice(&t.host_pub);
+    salt[65..].copy_from_slice(&t.box_pub);
+    let hk = Hkdf::<Sha256>::new(Some(&salt), z);
+    let (mut h2b, mut b2h) = ([0u8; 32], [0u8; 32]);
+    hk.expand(SETUP_H2B, &mut h2b).expect("32 B is a valid HKDF length");
+    hk.expand(SETUP_B2H, &mut b2h).expect("32 B is a valid HKDF length");
+    (h2b, b2h)
+}
+
+fn setup_hello(pk: &[u8; 65]) -> [u8; SETUP_HELLO_LEN] {
+    let mut h = [0u8; SETUP_HELLO_LEN];
+    h[..4].copy_from_slice(&SETUP_MAGIC);
+    h[4] = VERSION;
+    h[5..].copy_from_slice(pk);
+    h
+}
+
+fn setup_peer(h: &[u8; SETUP_HELLO_LEN]) -> Result<[u8; 65], LinkError> {
+    if h[..4] != SETUP_MAGIC || h[4] != VERSION {
+        return Err(LinkError::BadHello);
+    }
+    let mut p = [0u8; 65];
+    p.copy_from_slice(&h[5..]);
+    Ok(p)
+}
+
+/// The box's side: read the host's 70 bytes, answer with its own, derive the keys. Blocking: give the stream the
+/// handshake limit first. A point off the curve ends it ([`LinkError::BadProof`]).
+pub fn setup_box_handshake<S: Read + Write>(
+    s: &mut S,
+    secret: &p256::SecretKey,
+    box_pub: &[u8; 65],
+) -> Result<(Session, Transcript), LinkError> {
+    let mut h = [0u8; SETUP_HELLO_LEN];
+    s.read_exact(&mut h)?;
+    let host_pub = setup_peer(&h)?;
+    let z = setup_shared(secret, &host_pub).ok_or(LinkError::BadProof)?;
+    s.write_all(&setup_hello(box_pub))?;
+    s.flush()?;
+    let t = Transcript { host_pub, box_pub: *box_pub };
+    let (h2b, b2h) = setup_session_keys(&z, &t);
+    Ok((Session { tx: Sealer::new(&b2h), rx: Opener::new(&h2b) }, t))
+}
+
+/// The host's side (the tests' and a bench's): send its point first, read the box's.
+pub fn setup_host_handshake<S: Read + Write>(
+    s: &mut S,
+    secret: &p256::SecretKey,
+    host_pub: &[u8; 65],
+) -> Result<(Session, Transcript), LinkError> {
+    s.write_all(&setup_hello(host_pub))?;
+    s.flush()?;
+    let mut h = [0u8; SETUP_HELLO_LEN];
+    s.read_exact(&mut h)?;
+    let box_pub = setup_peer(&h)?;
+    let z = setup_shared(secret, &box_pub).ok_or(LinkError::BadProof)?;
+    let t = Transcript { host_pub: *host_pub, box_pub };
+    let (h2b, b2h) = setup_session_keys(&z, &t);
+    Ok((Session { tx: Sealer::new(&h2b), rx: Opener::new(&b2h) }, t))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -543,4 +675,64 @@ mod tests {
         assert!(LinkKey::from_hex(&format!("+{}", "a".repeat(63))).is_none(), "from_str_radix would take a sign");
         assert_eq!(format!("{k:?}"), "LinkKey(<secret>)");
     }
+
+    // ---- OCBS v1 ----
+
+    const HOST_PUB: &str = "040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e5794";
+    const BOX_PUB: &str = "04d65a93977caa3d1b081852ff57a79e465f1660577304baead505dd3a48589cf350185e895372df6221ea3a137557e473fddb6755f05bd507c3c533fce9c91285";
+
+    /// The set-up exchange's vectors, as notes/ocbm.md gives them and Carlink reproduced with the JDK's EC classes.
+    #[test]
+    fn setup_known_answer_vectors() {
+        let (hs, hp) = setup_keypair_from(&[0x11; 32]).unwrap();
+        let (bs, bp) = setup_keypair_from(&[0x22; 32]).unwrap();
+        assert_eq!(hex(&hp), HOST_PUB);
+        assert_eq!(hex(&bp), BOX_PUB);
+        let z = setup_shared(&hs, &bp).unwrap();
+        assert_eq!(z, setup_shared(&bs, &hp).unwrap(), "both ways");
+        assert_eq!(hex(&z), "ccfc261f58193c98ca4ad4a53bbac6f0ee29bc4d48438090446908622ca79af6");
+        let (h2b, b2h) = setup_session_keys(&z, &Transcript { host_pub: hp, box_pub: bp });
+        assert_eq!(hex(&h2b), "263e0d8efff4f691378e9b34501d35b52dc05692b96021e40cc2e2505abcd4e4");
+        assert_eq!(hex(&b2h), "e414baa6ea6e0160cc2e31bfce7645e7b6c5db9657c5cb3af58e02e6fa3fada4");
+        assert!(setup_keypair_from(&[0; 32]).is_none(), "zero is no scalar");
+        assert!(setup_keypair_from(&[0xff; 32]).is_none(), "not below the order");
+    }
+
+    #[test]
+    fn setup_handshake_runs_both_ways_and_refuses_a_point_off_the_curve() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let t = std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let (bs, bp) = setup_keypair_from(&[0x22; 32]).unwrap();
+            setup_box_handshake(&mut s, &bs, &bp)
+        });
+        let mut c = TcpStream::connect(addr).unwrap();
+        let (hs, hp) = setup_keypair_from(&[0x11; 32]).unwrap();
+        let (mut h, ht) = setup_host_handshake(&mut c, &hs, &hp).unwrap();
+        let (mut b, bt) = t.join().unwrap().unwrap();
+        assert_eq!(ht, bt, "one transcript");
+        let rec = h.tx.seal(b"OCBM");
+        b.rx.push(&rec);
+        assert_eq!(b.rx.next().unwrap().unwrap(), b"OCBM");
+        // The first record each way, pinned (Carlink's loopback test pins the same pair).
+        assert_eq!(hex(&rec), SETUP_H2B_RECORD);
+        assert_eq!(hex(&b.tx.seal(b"OCBM")), SETUP_B2H_RECORD);
+        // A point off the curve: the box ends the exchange.
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let t = std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let (bs, bp) = setup_keypair_from(&[0x22; 32]).unwrap();
+            setup_box_handshake(&mut s, &bs, &bp).map(|_| ())
+        });
+        let mut c = TcpStream::connect(addr).unwrap();
+        let mut bad = setup_hello(&hp);
+        bad[69] ^= 1;
+        c.write_all(&bad).unwrap();
+        assert!(matches!(t.join().unwrap(), Err(LinkError::BadProof)));
+    }
+
+    const SETUP_H2B_RECORD: &str = "00000014e5b08769aa5c6ef9047ce44fca11b38a80cf5655";
+    const SETUP_B2H_RECORD: &str = "00000014badbeaa1861799c093909d6513c1d4421648deba";
 }

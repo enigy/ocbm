@@ -4,7 +4,8 @@
 # the Rust daemons) asks for "wifi up" / "bt up" and never names a chip, a module, a firmware
 # path or an attach helper.
 #
-# VERBS   probe | status | wifi_ap_on | wifi_ap_off | wifi_ap_prep | wifi_sta_up | bt_on | bt_off | preload
+# VERBS   probe | status | wifi_ap_on | wifi_ap_off | wifi_ap_prep | wifi_sta_up | setup_ap_on | setup_ap_off | bt_on |
+#         bt_off | preload
 # EXIT    0 converged now   1 ran and failed   2 already converged   3 unsupported on this unit
 #
 # wifi_ap_prep (16 Nov 2026) writes the AP's configuration ahead, with no host here and nothing raised: the files
@@ -673,6 +674,8 @@ do_wifi_ap_prep() {
 }
 
 do_wifi_ap_on() {
+  # M3: the CarPlay AP wins over a set-up network still up (ocbmd ends the window at a host's first frame anyway).
+  [ -e "$SETUP_MARK" ] && { log "a set-up network is up: down first for the CarPlay AP"; do_setup_ap_off; }
   # FAST PATH (16 Nov 2026). The configuration was written ahead (wifi_ap_prep) and the WLAN driver is loaded (its
   # interface is there): straight to the owned AP layer, whose first launch is then hostapd. No descriptor read, no
   # driver step, no configuration writes: about 0.9 s of every connect went there before hostapd started.
@@ -805,6 +808,58 @@ ap_dhcp_stop() {
   ap_pids_live $_ads || return 0
   log "the AP's DHCP server survived SIGKILL (a kernel wait?)"
   return 1
+}
+
+# ---- M3: the set-up network (ocbmd src/setup.rs) --------------------------------------------------------------------
+# An adapter with no Wi-Fi link and no host offers, for a while, a set-up network from its one AP: SSID CarLink-Setup-xxxx
+# (the box's own 4 hex), the public WPA2 passphrase "carlinksetup", 192.168.43.1/24 with DHCP, and CLIENT ISOLATION
+# (ap_isolate=1: a second client cannot reach the first, so it cannot stand between the head unit and the box). Its
+# hostapd and udhcpd configurations live in /tmp, made from the CarPlay AP's: the flash ones are never written. A
+# hostapd that refuses ap_isolate refuses the whole configuration, and then no set-up network is offered (the marker
+# below never says ok). The CarPlay AP's start (do_wifi_ap_on) stops a set-up AP first.
+SETUP_MARK=/tmp/.radio_setup_ap
+SETUP_HAPD=/tmp/hostapd_setup.conf
+SETUP_DHCP=/tmp/udhcpd_setup.conf
+setup_dhcp_pids() { ps 2>/dev/null | grep -v grep | grep "udhcpd .*udhcpd_setup.conf" | awk '{print $1}'; }
+do_setup_ap_on() {
+  rm -f "$SETUP_MARK"
+  ap_running && { log "setup_ap_on: an AP is running - no set-up network"; return 1; }
+  caps || return 3
+  [ "$RADIO_BACKEND" = mapped ] || { log "setup_ap_on: backend ${RADIO_BACKEND:-none} - no set-up network"; return 3; }
+  wlan_driver_up || return 1
+  _n=0; while [ "$_n" -lt 100 ] && ! wlan_iface >/dev/null 2>&1; do _n=$((_n+1)); sleep 0.1; done
+  _si=$(ap_iface 2>/dev/null) || { log "setup_ap_on: no wireless interface"; return 1; }
+  _ssfx=$(box_name | sed -n 's/^CarLink-\(....\)$/\1/p'); [ -n "$_ssfx" ] || _ssfx=0000
+  [ -f /etc/hostapd.conf ] || { log "setup_ap_on: no /etc/hostapd.conf to start from"; return 1; }
+  sed -e '/^interface=/d; /^ssid=/d; /^wpa_passphrase=/d; /^ap_isolate=/d; /^ctrl_interface/d' /etc/hostapd.conf > "$SETUP_HAPD.new" || return 1
+  printf 'interface=%s\nssid=CarLink-Setup-%s\nwpa_passphrase=carlinksetup\nap_isolate=1\n' "$_si" "$_ssfx" >> "$SETUP_HAPD.new"
+  mv -f "$SETUP_HAPD.new" "$SETUP_HAPD"
+  sed -e '/^[[:space:]]*interface[[:space:]]/d; /^[[:space:]]*lease_file[[:space:]]/d; /^[[:space:]]*pidfile[[:space:]]/d' /etc/udhcpd.conf > "$SETUP_DHCP" 2>/dev/null
+  printf 'interface\t%s\nlease_file\t/tmp/udhcpd_setup.leases\npidfile\t/tmp/udhcpd_setup.pid\n' "$_si" >> "$SETUP_DHCP"
+  ifconfig "$_si" 192.168.43.1 netmask 255.255.255.0 up || return 1
+  setsid hostapd "$SETUP_HAPD" </dev/null >>"$BOXLOG" 2>&1 &
+  setsid busybox udhcpd -f "$SETUP_DHCP" </dev/null >/dev/null 2>&1 &
+  _n=0; while [ "$_n" -lt 25 ] && ! ap_running; do _n=$((_n+1)); sleep 0.2; done
+  sleep 1
+  if ap_running && [ -n "$(setup_dhcp_pids)" ]; then
+    echo "ok $_si" > "$SETUP_MARK"
+    log "set-up network up on $_si (CarLink-Setup-$_ssfx, client isolation on)"
+    return 0
+  fi
+  log "set-up network did not come up on $_si (hostapd refused its configuration?)"
+  do_setup_ap_off
+  return 1
+}
+do_setup_ap_off() {
+  [ -e "$SETUP_MARK" ] || [ -e "$SETUP_HAPD" ] || return 2
+  _so=$(sed -n 's/^interface=//p' "$SETUP_HAPD" 2>/dev/null | head -1)
+  killall hostapd 2>/dev/null
+  for _sp in $(setup_dhcp_pids); do kill "$_sp" 2>/dev/null; done
+  _n=0; while [ "$_n" -lt 25 ] && { ap_running || [ -n "$(setup_dhcp_pids)" ]; }; do _n=$((_n+1)); sleep 0.2; done
+  [ -n "$_so" ] && ifconfig "$_so" 0.0.0.0 2>/dev/null
+  rm -f "$SETUP_MARK" "$SETUP_HAPD" "$SETUP_DHCP" /tmp/udhcpd_setup.leases /tmp/udhcpd_setup.pid
+  log "set-up network down"
+  return 0
 }
 
 # The Wi-Fi link's station (wifi_sta.sh): this unit's WLAN driver loaded, and the station's interface (sta_iface: one
@@ -1897,10 +1952,13 @@ case "$VERB" in
   # The Wi-Fi link's station (wifi_sta.sh): the WLAN driver loaded and the station's interface up, nothing else (no AP,
   # no address). Under the wlan lock, so it never meets a session's wifi_ap_on or the boot preload.
   wifi_sta_up) lock_take wlan || exit 1; do_wifi_sta_up; _r=$?; lock_drop wlan; exit $_r ;;
+  # M3's set-up network (ocbmd src/setup.rs), under the wlan lock like the CarPlay AP.
+  setup_ap_on)  lock_take wlan || exit 1; do_setup_ap_on;  _r=$?; lock_drop wlan; exit $_r ;;
+  setup_ap_off) lock_take wlan || exit 1; do_setup_ap_off; _r=$?; lock_drop wlan; exit $_r ;;
   # Both locks, wlan first (the supervisor's own order, one at a time, so no deadlock): bt_on loads
   # the WLAN driver, which an app-driven wifi_ap_on arriving mid-preload must not race. Each lock may have gone
   # earlier (do_preload, and the Wi-Fi side of a together attach), so each goes here only while it is still this one's.
   preload)     lock_take wlan || exit 1; lock_take bt || { lock_drop wlan; exit 1; }
                do_preload; _r=$?; trap - EXIT INT TERM HUP; lock_drop_own bt; lock_drop_own wlan; exit $_r ;;
-  *) echo "$LOGP usage: radio_hal.sh probe|status|wifi_ap_on|wifi_ap_off|wifi_ap_prep|wifi_sta_up|bt_on|bt_off|preload" >&2; exit 64 ;;
+  *) echo "$LOGP usage: radio_hal.sh probe|status|wifi_ap_on|wifi_ap_off|wifi_ap_prep|wifi_sta_up|setup_ap_on|setup_ap_off|bt_on|bt_off|preload" >&2; exit 64 ;;
 esac
