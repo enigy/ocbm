@@ -262,6 +262,13 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   check 'waitfor "is_old \"$d\" && [ -e \"$d/rebooted\" ]" 8' "heard and never answered: the old version back, and a restart"
   check 'result_is "$d" "rolled_back $NEW: ocbmd heard the host for 460 s and never answered it (kept $OLD)"' \
     "update_result names both versions and why"
+  # OCBM_WIFI_RESET in a final adapter's update trial, which runs no stick update: the reset is done all the same.
+  d="$T/$sh-wreset"; make_box "$d" final; make_pkg "$d/run/ocbm-update.tgz" ""
+  update "$sh" "$d"; restart "$d"; echo x > "$d/root/etc/ocbm/wifi_link"; echo x > "$d/root/etc/ocbm/host_seen"
+  touch "$d/stick/OCBM_WIFI_RESET"; echo "/dev/sda1 $d/stick vfat rw 0 0" > "$d/proc/mounts"; boot "$sh" "$d"
+  check 'waitfor "[ -e $d/stick/OCBM_WIFI_RESET.txt ]" 5 && [ ! -e "$d/root/etc/ocbm/wifi_link" ] && [ ! -e "$d/root/etc/ocbm/host_seen" ] && [ -e "$d/root/etc/ocbm/wifi_setup_once" ]' \
+    "OCBM_WIFI_RESET during a final adapter's update trial: the link and the record go, the leave is left"
+  check 'grep -qx placed "$d/root/etc/ocbm/update_pending" && [ ! -e "$d/rebooted" ]' "  and the trial stays open for its host"
   d="$T/$sh-heard"; make_box "$d" final; make_pkg "$d/run/ocbm-update.tgz" dispatch
   update "$sh" "$d"; restart "$d"; boot "$sh" "$d" ANSWER_SECS=3
   sleep 2; touch "$d/run/ocbmd_answered"

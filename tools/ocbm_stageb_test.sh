@@ -195,6 +195,19 @@ echo 40 > '$d/run/ocbmd_heard'; exit 1"
   touch "$d/stick/OCBM_RESTORE"
   check 'waitfor "[ -e $d/rebooted ]" 5 && reverted "$d"' "also when the stick goes in later"
 
+  echo "== $sh: OCBM_WIFI_RESET on a stick (the Wi-Fi link's reset, the one way a used adapter offers set-up again)"
+  for m in trial final; do
+    d="$T/$sh-wreset-$m"; make_box "$d" "$m"
+    for f in wifi_link wifi_session.yaml wifi_link_channel host_seen; do echo x > "$d/root/etc/ocbm/$f"; done
+    touch "$d/stick/OCBM_WIFI_RESET"; boot "$sh" "$d"
+    check 'waitfor "[ -e $d/stick/OCBM_WIFI_RESET.txt ]" 5 && [ -e "$d/stick/OCBM_WIFI_RESET.done" ] && [ ! -e "$d/stick/OCBM_WIFI_RESET" ]' \
+      "$m: used once (renamed .done), a note beside it"
+    check '( for f in wifi_link wifi_session.yaml wifi_link_channel host_seen; do [ ! -e "$d/root/etc/ocbm/$f" ] || exit 1; done )' \
+      "$m: the link, its kept config and channel, and the record that a host used the adapter, go"
+    check 'grep -qx reset "$d/root/etc/ocbm/wifi_setup_once" && grep -q "set-up network" "$d/stick/OCBM_WIFI_RESET.txt" && mode_is "$d" "$m" && [ ! -e "$d/rebooted" ]' \
+      "$m: the next start's leave is there; nothing else changed"
+  done
+
   echo "== $sh: missing pieces"
   d="$T/$sh-noocbmd"; make_box "$d" trial; rm -f "$d/root/usr/sbin/ocbmd"; boot "$sh" "$d"
   check '[ -e "$d/m.stock" ] && [ ! -e "$d/m.boot" ] && reverted "$d" && grep -q "/usr/sbin/ocbmd is missing" "$d/root/etc/ocbm/last_result.txt"' \

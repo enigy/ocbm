@@ -109,6 +109,7 @@ impl Setup {
                     match self.start_listener(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 43, 1), SETUP_PORT))) {
                         Ok(()) => {
                             self.phase = Phase::Offered(now + WINDOW);
+                            let _ = std::fs::remove_file(format!("{ROOT}{SETUP_ONCE}")); // a reset's leave is spent
                             return Some(format!("set-up network up; the set-up exchange on 192.168.43.1:{SETUP_PORT}, one client at a time"));
                         }
                         Err(e) => {
@@ -218,8 +219,8 @@ fn listen(l: TcpListener, busy: Arc<AtomicBool>, stop: Arc<AtomicBool>, ts: Arc<
     }
 }
 
-/// The set-up window is wanted: not switched off by the owner (/etc/ocbm/wifi_setup_off) or the bench
-/// (box_common::bench_switch("wifi_setup_off")).
+/// The set-up window may open at this start: not switched off by the owner (/etc/ocbm/wifi_setup_off) or the bench
+/// (box_common::bench_switch("wifi_setup_off")), and the adapter never used ([`used_because`]).
 pub fn wanted() -> bool {
     if std::path::Path::new("/etc/ocbm/wifi_setup_off").exists() {
         eprintln!("[ocbmd] setup: no set-up network (/etc/ocbm/wifi_setup_off)");
@@ -229,7 +230,64 @@ pub fn wanted() -> bool {
         eprintln!("[ocbmd] [bench] setup: no set-up network ({f})");
         return false;
     }
+    if let Some(why) = used_because(ROOT) {
+        eprintln!("[ocbmd] setup: no set-up network: {why}");
+        return false;
+    }
     true
+}
+
+/// The set-up network's history on flash (the review of 24 Nov, A: never on an adapter that has been used, which a
+/// stranger in range could otherwise provision). [`HOST_SEEN`]: a host's HELLO was taken here once, over USB or Wi-Fi
+/// (a set-up client's never is), written once. [`SETUP_ONCE`]: OCBM_WIFI_RESET's leave (ocbm_dispatch.sh, which also
+/// removes the link and HOST_SEEN): the next start may offer the set-up network whatever the history, and the leave
+/// goes once the network is up or a host's HELLO is taken.
+#[cfg(not(test))]
+const ROOT: &str = "";
+#[cfg(test)]
+const ROOT: &str = "/tmp/ocbmd_selftest_no_such_root";
+const HOST_SEEN: &str = "/etc/ocbm/host_seen";
+const SETUP_ONCE: &str = "/etc/ocbm/wifi_setup_once";
+
+/// Why this adapter may not offer the set-up network, under `root`; None: never used, or reset. Used means a host's
+/// HELLO taken once ([`HOST_SEEN`]), a phone bonded (a Bluetooth bond or a CarPlay pairing), a host's config kept
+/// (M2's), or an update recorded: an adapter updated from 2.7.1, which knew nothing of HOST_SEEN, has that record.
+pub fn used_because(root: &str) -> Option<&'static str> {
+    let has = |f: &str| std::path::Path::new(&format!("{root}{f}")).exists();
+    let size = |f: &str| std::fs::metadata(format!("{root}{f}")).map_or(0, |m| m.len());
+    if has(SETUP_ONCE) {
+        None
+    } else if has(HOST_SEEN) {
+        Some("a host has used this adapter")
+    } else if size("/etc/carplay/bt_link_keys") >= 25 || size("/etc/carplay_peers.bin") > 0 {
+        Some("a phone is bonded to it")
+    } else if has("/etc/ocbm/wifi_session.yaml") {
+        Some("it keeps a host's config")
+    } else if has("/etc/ocbm/update_result") || has("/etc/ocbm/update_pending") {
+        Some("it was updated")
+    } else {
+        None
+    }
+}
+
+/// A host's HELLO taken (main.rs `Daemon::handle`): [`HOST_SEEN`] written if it is not there, and a reset's leave
+/// gone. Once a process.
+pub fn host_seen() {
+    static NOTED: AtomicBool = AtomicBool::new(false);
+    if !NOTED.swap(true, Ordering::Relaxed) {
+        note_host_at(ROOT);
+    }
+}
+
+fn note_host_at(root: &str) {
+    let _ = std::fs::remove_file(format!("{root}{SETUP_ONCE}"));
+    let f = format!("{root}{HOST_SEEN}");
+    if !std::path::Path::new(&f).exists() {
+        match std::fs::write(&f, b"1\n") {
+            Ok(()) => eprintln!("[ocbmd] setup: a host's first HELLO on this adapter: no set-up network from now on ({HOST_SEEN})"),
+            Err(e) => eprintln!("[ocbmd] setup: could not write {HOST_SEEN} ({e})"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -249,6 +307,44 @@ mod tests {
         assert!(matches!(s.phase, Phase::Raising(_)));
         assert!(s.tick(t0 + OFFER_AFTER + RAISE_LIMIT, true).unwrap().contains("did not come up"));
         assert_eq!(s.phase, Phase::Over);
+    }
+
+    /// Who may be offered the set-up network: only an adapter with none of a host's traces, or one a reset left its
+    /// leave on; a host's HELLO writes the flag once and takes the leave away.
+    #[test]
+    fn only_an_adapter_never_used_or_reset_may_offer_the_set_up_network() {
+        let root = format!("/tmp/ocbmd_selftest_setup_root_{}", std::process::id());
+        let _ = std::fs::remove_dir_all(&root);
+        for d in ["/etc/ocbm", "/etc/carplay"] {
+            std::fs::create_dir_all(format!("{root}{d}")).unwrap();
+        }
+        let put = |f: &str, b: &[u8]| std::fs::write(format!("{root}{f}"), b).unwrap();
+        let gone = |f: &str| {
+            let _ = std::fs::remove_file(format!("{root}{f}"));
+        };
+        assert_eq!(used_because(&root), None, "a fresh install");
+        put("/etc/carplay/bt_link_keys", &[0; 24]);
+        assert_eq!(used_because(&root), None, "no whole bond record");
+        for (f, b) in [
+            ("/etc/carplay/bt_link_keys", &[0u8; 25][..]),
+            ("/etc/carplay_peers.bin", b"\x01i"),
+            ("/etc/ocbm/wifi_session.yaml", b"cfg"),
+            ("/etc/ocbm/update_result", b"committed"),
+            ("/etc/ocbm/update_pending", b"placed"),
+        ] {
+            put(f, b);
+            assert!(used_because(&root).is_some(), "{f}");
+            put(SETUP_ONCE, b"reset\n");
+            assert_eq!(used_because(&root), None, "{f}, but reset: the leave wins");
+            gone(SETUP_ONCE);
+            gone(f);
+        }
+        gone("/etc/carplay/bt_link_keys");
+        put(SETUP_ONCE, b"reset\n");
+        note_host_at(&root);
+        assert_eq!(used_because(&root), Some("a host has used this adapter"), "the leave is gone with the first HELLO");
+        assert!(!std::path::Path::new(&format!("{root}{SETUP_ONCE}")).exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn listening() -> (Setup, SocketAddr) {

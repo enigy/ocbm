@@ -3811,6 +3811,8 @@ impl Daemon {
                         p::MODE_PROJECTION
                     };
                     self.send(p::CH_CTRL, p::F_SOM | p::F_EOM, &a);
+                    // A host has used this adapter: no set-up network on it from now on (setup.rs).
+                    setup::host_seen();
                 } else if pl.len() >= 2 && pl[0] == p::CT_MODE_SELECT && pl[1] == p::MODE_CONSOLE {
                     self.start_console();
                 } else if pl.len() >= 9 && pl[0] == p::CT_SETTIME {
