@@ -19,8 +19,8 @@
 //!   `ocbm_link::KEEPALIVE_AFTER` (1 s) with nothing to send, and ends the link when one write has been stuck 3 s;
 //! - ONE HOST AT A TIME (main.rs `Daemon::admit`): the first host whose HELLO the box takes holds it, over USB or
 //!   Wi-Fi, until it leaves (CT_STOP, its link ends, or [`HOLD_SILENCE`] without a frame). A Wi-Fi host refused
-//!   meanwhile has its connection closed at once, before any OCBM byte; a USB host's frames are not taken. A HELLO
-//!   carrying the holder's own instance nonce is the same host on another transport, and takes the box at once.
+//!   meanwhile has its connection closed at once, before any OCBM byte. USB ALWAYS WINS: a USB host's frame takes the
+//!   box from a Wi-Fi holder at once (its link closes), and no USB frame is ever dropped.
 //!
 //! The mDNS advert for the hotspot is `mdns.rs`.
 

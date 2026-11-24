@@ -4161,10 +4161,11 @@ fn via_name(v: Option<Via>) -> String {
 /// The Wi-Fi link's side of the daemon: who holds the box, and the set-up applied (wifi.rs). Reached only in Wi-Fi
 /// mode (`wifi.on`), save [`Daemon::wifi_tick`]'s apply of a link set up over USB.
 impl Daemon {
-    /// May a frame from `via` be handled? Its transport's host holds the box, or takes it now: over USB the first
-    /// frame when nobody holds the box, as 2.7.1 took any host on the cable; over Wi-Fi the HELLO, which is all a host
-    /// sends until its HELLO_ACK. A holder that has spoken within [`wifi::HOLD_SILENCE`] keeps the box, unless the
-    /// HELLO carries its own instance nonce: then it is the same host on another transport, which takes the box.
+    /// May a frame from `via` be handled? Its transport's host holds the box, or takes it now. USB ALWAYS: a host on
+    /// the cable takes the box with any frame, from a Wi-Fi holder too (physical presence beats radio; 2.7.1 took any
+    /// host on the cable). Over Wi-Fi only the HELLO, which is all a host sends until its HELLO_ACK, and only from a
+    /// holder that has not spoken within [`wifi::HOLD_SILENCE`] (whoever it is: the listener closes a new connection
+    /// before its hello while the holder is fresh, so no nonce of the holder's could move the box sooner).
     fn admit(&mut self, via: Via, ch: u16, pl: &[u8], now: Instant) -> Admit {
         if self.wifi.via == Some(via) {
             // The listener's view of "busy" follows, at most once a second (a frame can come thousands of times a second).
@@ -4174,16 +4175,28 @@ impl Daemon {
             self.wifi.last_host_frame = Some(now);
             return Admit::Take;
         }
-        let nonce = wifi::hello_nonce(ch, pl);
-        if matches!(via, Via::Wifi(_)) && nonce.is_none() {
-            return Admit::Refuse("its first frame was no HELLO");
-        }
-        let same_host = nonce.is_some_and(|n| n != 0 && self.host_instance == Some(n));
-        if self.wifi.holder_fresh(now) && !same_host {
-            return Admit::Refuse("another host holds the box");
+        if via != Via::Usb {
+            if wifi::hello_nonce(ch, pl).is_none() {
+                return Admit::Refuse("its first frame was no HELLO");
+            }
+            if self.wifi.holder_fresh(now) {
+                return Admit::Refuse("another host holds the box");
+            }
         }
         self.take_box(via, now);
         Admit::Take
+    }
+
+    /// A frame from USB (the loop's): the set-up window and every set-up link end at once, in Wi-Fi mode USB takes the
+    /// box ([`Daemon::admit`]), and the frame is handled, as every USB frame was in 2.7.1.
+    fn usb_frame(&mut self, ch: u16, flags: u8, pl: &[u8], now: Instant) {
+        if self.setup.phase != setup::Phase::Over || self.wifi.links.iter().any(|l| l.setup) {
+            self.setup_end("a USB host spoke");
+        }
+        if self.wifi.on {
+            self.admit(Via::Usb, ch, pl, now);
+        }
+        self.handle(ch, flags, pl);
     }
 
     /// Give the box to `via`'s host: the loop's output becomes its transport's, the previous holder's Wi-Fi link (if
@@ -5253,8 +5266,6 @@ fn main() {
     // a fresh Vec each pass re-allocates both every wake. clear() keeps the capacity.
     let mut fds: Vec<libc::pollfd> = Vec::new();
     let mut kinds: Vec<Kind> = Vec::new();
-    // USB frames not taken while a Wi-Fi host held the box, for the log's count.
-    let mut usb_refused: u64 = 0;
     loop {
         // rebuild the pollfd set each pass: the accessory relay's two pipes (+POLLOUT if backlog) and the
         // device itself (hangup only) + PTY + the seams
@@ -5481,27 +5492,8 @@ fn main() {
                         }
                         Ok(n) => {
                             reasm.push(&rbuf[..n]);
-                            // M3: a USB host speaking ends the set-up window at once.
-                            if d.setup.active() && !matches!(d.wifi.via, Some(Via::Wifi(_))) {
-                                eprintln!("[ocbmd] setup: a USB host spoke; the set-up network goes");
-                                d.setup.close();
-                            }
                             while let Some((ch, flags, len)) = reasm.next(&mut plbuf) {
-                                // Wi-Fi mode: one host at a time (Daemon::admit); otherwise every frame, as in 2.7.1.
-                                // A set-up link holding the box (no Wi-Fi mode): USB waits for it, as for a Wi-Fi host.
-                                if !d.wifi.on && d.wifi.via.is_some() {
-                                    continue;
-                                }
-                                if !d.wifi.on {
-                                    d.handle(ch, flags, &plbuf[..len]); // no per-frame copy
-                                } else if let Admit::Refuse(why) = d.admit(Via::Usb, ch, &plbuf[..len], now_pass) {
-                                    usb_refused = usb_refused.wrapping_add(1);
-                                    if usb_refused == 1 || usb_refused % 100 == 0 {
-                                        eprintln!("[ocbmd] wifi: a USB host's frames are not taken: {why} ({usb_refused} so far)");
-                                    }
-                                } else {
-                                    d.handle(ch, flags, &plbuf[..len]);
-                                }
+                                d.usb_frame(ch, flags, &plbuf[..len], now_pass); // no per-frame copy
                             }
                         }
                         // Spurious wake, or a signal-interrupted read. ocbmd installs no signal
@@ -7652,10 +7644,10 @@ mod tests {
     }
 
     #[test]
-    fn a_host_holding_the_box_keeps_it_until_it_goes_quiet_and_the_same_host_may_move() {
+    fn a_wifi_holder_keeps_the_box_from_wifi_hosts_until_it_goes_quiet_but_usb_always_takes_it() {
         let mut d = td_wifi();
         let (l1, _o1, _h1) = wifi::test_link(1);
-        let (l2, _o2, _h2) = wifi::test_link(2);
+        let (l2, _o2, mut h2) = wifi::test_link(2);
         d.wifi.links.push(l1);
         d.wifi.links.push(l2);
         let t = Instant::now();
@@ -7663,20 +7655,43 @@ mod tests {
         assert_eq!(d.admit(Via::Usb, p::CH_CTRL, &hello(0xAAAA_0001, b""), t), Admit::Take);
         d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &hello(0xAAAA_0001, b""));
         assert_eq!(d.wifi.via, Some(Via::Usb));
-        // Another host over Wi-Fi is refused while USB has spoken within the hold.
+        // A host over Wi-Fi is refused while USB has spoken within the hold, even one with USB's own instance nonce
+        // (the same-host move is gone: the listener closes it before its hello anyway, notes/ocbm.md).
         let t5 = t + Duration::from_secs(5);
         assert!(matches!(d.admit(Via::Wifi(1), p::CH_CTRL, &hello(0xBBBB_0002, b""), t5), Admit::Refuse(_)));
+        assert!(matches!(d.admit(Via::Wifi(1), p::CH_CTRL, &hello(0xAAAA_0001, b""), t5), Admit::Refuse(_)));
         assert_eq!(d.wifi.via, Some(Via::Usb));
-        // The same host (its instance nonce) moving to Wi-Fi takes the box at once.
-        assert_eq!(d.admit(Via::Wifi(1), p::CH_CTRL, &hello(0xAAAA_0001, b""), t5), Admit::Take);
-        assert_eq!(d.wifi.via, Some(Via::Wifi(1)));
-        assert!(d.wifi.usb_out.is_some(), "USB's output kept aside");
-        // USB is refused now, until the Wi-Fi host has been quiet for HOLD_SILENCE...
-        assert!(matches!(d.admit(Via::Usb, p::CH_CTRL, &[p::CT_HEARTBEAT], t5), Admit::Refuse(_)));
-        // ...after which another host's HELLO takes the box, and the old link is closed.
-        let late = t5 + wifi::HOLD_SILENCE + Duration::from_millis(1);
+        // USB quiet for HOLD_SILENCE: a Wi-Fi host's HELLO takes the box.
+        let late = t5 + wifi::HOLD_SILENCE;
         assert_eq!(d.admit(Via::Wifi(2), p::CH_CTRL, &hello(0xCCCC_0003, b""), late), Admit::Take);
         assert_eq!(d.wifi.via, Some(Via::Wifi(2)));
+        assert!(d.wifi.usb_out.is_some(), "USB's output kept aside");
+        // Another Wi-Fi host is refused while that one is fresh; USB is never: it takes the box at once, and the Wi-Fi
+        // holder's link closes.
+        assert!(matches!(d.admit(Via::Wifi(1), p::CH_CTRL, &hello(0xDDDD_0004, b""), late), Admit::Refuse(_)));
+        d.usb_frame(p::CH_CTRL, p::F_SOM | p::F_EOM, &[p::CT_HEARTBEAT], late);
+        assert_eq!(d.wifi.via, Some(Via::Usb), "physical presence beats radio");
+        assert!(closed(&mut h2), "the Wi-Fi holder's link closed");
+    }
+
+    /// A USB host's frames are never dropped for the set-up window or a set-up link: its first frame ends the window
+    /// (even while it waits to be offered) and every set-up link, and is handled itself.
+    #[test]
+    fn a_usb_frame_ends_the_set_up_window_and_its_links_and_is_taken() {
+        let mut d = td();
+        d.setup.phase = setup::Phase::Offered(Instant::now() + setup::WINDOW);
+        let (mut out, mut host) = setup_link_on(&mut d, 1 << 39);
+        assert!(d.link_frame(0, p::CH_CTRL, p::F_SOM | p::F_EOM, &hello(0x5e70_0002, b""), Instant::now()));
+        d.usb_frame(p::CH_CTRL, p::F_SOM | p::F_EOM, &hello(0x0123_4567, b""), Instant::now());
+        assert_eq!(d.setup.phase, setup::Phase::Over);
+        assert!(closed(&mut host), "the set-up link ended");
+        assert!(sent(&mut d).iter().any(|(_, _, pl)| pl.first() == Some(&p::CT_HELLO_ACK)), "USB's HELLO answered");
+        assert_eq!(d.host_instance, Some(0x0123_4567));
+        assert!(frames_out(&mut out).iter().all(|(_, _, pl)| pl.first() == Some(&p::CT_HELLO_ACK)), "only the set-up HELLO's answer went there");
+        let mut d = td();
+        d.setup.phase = setup::Phase::Waiting(Instant::now());
+        d.usb_frame(p::CH_CTRL, p::F_SOM | p::F_EOM, &[p::CT_HEARTBEAT], Instant::now());
+        assert_eq!(d.setup.phase, setup::Phase::Over, "never offered after a USB host spoke");
     }
 
     #[test]
