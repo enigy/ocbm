@@ -371,8 +371,9 @@ restore_watch() {
   while :; do
     # M3's reset, the one way a used adapter offers the set-up network again (ocbmd setup.rs): OCBM_WIFI_RESET on a stick
     # removes the Wi-Fi link (its key and hotspot, the kept session config and channel) and the record that a host has
-    # used the adapter, and leaves wifi_setup_once for the next start. One use: renamed .done, with a note.
-    if stick_in && [ -e "$STICK/OCBM_WIFI_RESET" ]; then
+    # used the adapter, and leaves wifi_setup_once for the next start. One use: renamed .done, with a note. The shell's
+    # own test of each file comes first, so a look with neither on a stick forks nothing (stick_in's grep).
+    if [ -e "$STICK/OCBM_WIFI_RESET" ] && stick_in; then
       mv -f "$STICK/OCBM_WIFI_RESET" "$STICK/OCBM_WIFI_RESET.done"
       rm -f "$EO/wifi_link" "$EO/wifi_link.tmp" "$EO/wifi_session.yaml" "$EO/wifi_link_channel" "$EO/host_seen"
       echo reset > "$EO/wifi_setup_once"
@@ -380,7 +381,7 @@ restore_watch() {
       sync
       log "OCBM_WIFI_RESET found on the stick: the Wi-Fi link removed (the set-up network from the next power-up)"
     fi
-    if stick_in && [ -e "$STICK/OCBM_RESTORE" ]; then
+    if [ -e "$STICK/OCBM_RESTORE" ] && stick_in; then
       if [ "$(cat "$S/ocbm_mode" 2>/dev/null)" = final ]; then
         [ -e "$STICK/OCBM_RESTORE.txt" ] || final_note
       else

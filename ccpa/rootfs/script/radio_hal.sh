@@ -397,7 +397,8 @@ wlan_iface() {
 # interface, as before (sta0 on the IW416, by name order). A unit whose driver makes one interface only has no station
 # beside the AP: the AP keeps it, and the keeper says so. RADIO_STA_IF names the station's interface outright.
 WIFI_LINK_FILE=/etc/ocbm/wifi_link
-sta_mode() { grep -q '^ssid_hex=' "$WIFI_LINK_FILE" 2>/dev/null; }
+# The shell's own test first: an adapter with no link forks nothing more than 2.7.1 on any path that asks.
+sta_mode() { [ -f "$WIFI_LINK_FILE" ] && grep -q '^ssid_hex=' "$WIFI_LINK_FILE" 2>/dev/null; }
 sta_iface() {
   if [ -n "${RADIO_STA_IF:-}" ]; then [ -e "/sys/class/net/$RADIO_STA_IF" ] && { echo "$RADIO_STA_IF"; return 0; }; return 1; fi
   _sti_s=""; _sti_o=""

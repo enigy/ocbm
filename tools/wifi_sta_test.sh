@@ -194,9 +194,14 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   hal_copy "$R"
   check '[ "$(hal "$R" "$sh" "ap_iface")" = sta0 ] && ! hal "$R" "$sh" "sta_mode"' \
     "no link set up: the AP takes the first interface (sta0), as in 2.7.1"
+  gr='grep() { echo grep >> "'"$R"'/calls"; command grep "$@"; }; '
+  : > "$R/calls"; hal "$R" "$sh" "${gr}sta_mode; ap_iface >/dev/null; sta_mode"
+  check '! grep -q grep "$R/calls"' "  and forks no grep doing it (the shell's own test of the link file first)"
   printf 'key=%s\n' "$(printf '11%.0s' $(seq 32))" > "$R/etc/ocbm/wifi_link"
   check '[ "$(hal "$R" "$sh" "ap_iface")" = sta0 ]' "a link key with no hotspot: still the first interface"
   printf 'ssid_hex=6e6574\npsk=\n' >> "$R/etc/ocbm/wifi_link"
+  : > "$R/calls"; hal "$R" "$sh" "${gr}sta_mode"
+  check 'grep -q grep "$R/calls"' "  (with a link, the file is read)"
   check '[ "$(hal "$R" "$sh" "ap_iface")" = wlan0 ] && [ "$(hal "$R" "$sh" "sta_iface")" = sta0 ]' \
     "a hotspot set up: the station keeps sta0, the AP takes wlan0"
   check '[ "$(RADIO_STA_IF=wlan0 hal "$R" "$sh" "ap_iface")" = sta0 ]' "RADIO_STA_IF names the station's interface outright"
