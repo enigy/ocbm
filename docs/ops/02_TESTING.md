@@ -384,6 +384,14 @@ The set-up network (M3): off with `/tmp/bench_wifi_setup_off` or `/etc/ocbm/benc
 stick first (it removes the link and `/etc/ocbm/host_seen` and leaves `/etc/ocbm/wifi_setup_once`, in any mode, an
 update's trial too); look for `[ocbmd] setup:` (its `no set-up network: <why>` names the trace) and
 `[radio_hal] set-up network` lines.
+Its set-up code (ADDENDUM 5): `[ocbmd] setup: set-up code on Bluetooth (armed btd N)` once the head unit's first record
+opens (`no armed btd yet`: Bluetooth not armed, so no code is shown), `set-up code off …` when the session ends; in
+`/tmp/wl.log` the armed btd's `[armed] set-up code: …` and `[armed] set-up code gone: …`; `/tmp/bt_setup_code` holds the
+digits meanwhile, and `hciconfig hci0` reads `ISCAN` without `PSCAN` and the name `CarLink code NNNN`. Five sessions
+that showed a code and set nothing up close the set-up network until the next power-up (`/tmp/ocbmd_setup_closed`,
+removed by hand for another window at ocbmd's next start). UNMEASURED, for the bench: whether a phone's Bluetooth list
+(and the car's) shows the changed name in reasonable time, and whether it lists the box with inquiry scan alone (no page
+scan) by its EIR name.
 
 ### Round 4 switches (22 Nov 2026; six on by default from 2.7.1)
 

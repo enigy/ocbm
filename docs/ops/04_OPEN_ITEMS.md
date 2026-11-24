@@ -818,7 +818,13 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
   gets the PBKDF2 hash, the supplicant has no SAE); (5) M2's self-started session: the phone's audio goes nowhere while no host is attached (60 s / 180 s holds);
   the AP's channel pinned from the hotspot's last one is a design note only; (6) M3 (the set-up network) is built, not
   benched: whether the stock hostapd takes `ap_isolate=1` (it refuses an unknown key, and then no set-up network is
-  offered), and what the set-up AP raised 20 s into a boot with no host yet costs a head unit that connects later; (7)
+  offered), and what the set-up AP raised 20 s into a boot with no host yet costs a head unit that connects later; its
+  set-up code (24 Nov, ADDENDUM 5) is built, not benched: UNMEASURED whether a phone's Bluetooth list (and the car's)
+  shows the adapter's changed name `CarLink code NNNN` in reasonable time, and whether it lists a controller in inquiry
+  scan alone (no page scan, chosen so nothing can connect or bond to the code's name) by its EIR name; the code needs
+  btd's armed state, so an adapter whose Bluetooth is not armed (the preload or the arm switched off, an arm that
+  failed) shows none and the driver cannot confirm (the set-up then fails safe); the build needs a few KB more on flash
+  (the figure in the hand-off notes); (7)
   on a serializing USB driver (AccIo::Direct, the truck's) a USB host's frame restarts ocbmd for one plain USB start,
   which ends a self-started (M2) session: the phone's session starts again under that host, so M2's attach is not kept
   for USB hosts there (the loop cannot write the device while a reader thread waits in acc_read; interrupting that

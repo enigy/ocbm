@@ -640,12 +640,28 @@ on it, no bonded phone, no kept host config, no update record) offers, 20 s afte
 and for 10 minutes, a set-up network `CarLink-Setup-xxxx` (public WPA2 passphrase `carlinksetup`, client isolation)
 and, on 192.168.43.1:7021, OCBS v1 (`crates/ocbm-link`): each side's P-256 point (65 B uncompressed) behind
 `"OCBS" 0x01`, the host first; HKDF-SHA256 over the ECDH X with both points as salt; then OCBW records. One client at a
-time, 5 s in all for the exchange, 60 s in all from its end to `MGMT_WIFI_LINK`, whatever the window's state. The
-session carries `CT_HELLO` (answered `HELLO_ACK` with `CAP_WIFI_LINK` alone) and `MGMT_WIFI_LINK` with a body, nothing
-else: anything else closes it. A set-up link never holds the box and is no host (no queue, sequence, instance or
-install record of a host's changes). The window ends after one set-up, at its 10 minutes, or at a USB host's first
-frame. `OCBM_WIFI_RESET` on a stick is the one way a used adapter offers it again: it removes the link and the
-`host_seen` record and leaves `/etc/ocbm/wifi_setup_once` for the next start.
+time, 5 s in all for the exchange, its first record within 3 s, 180 s in all from the exchange's end to
+`MGMT_WIFI_LINK`, whatever the window's state. The session carries `CT_HELLO` (answered `HELLO_ACK` with `CAP_WIFI_LINK`
+alone) and `MGMT_WIFI_LINK` with a body, nothing else: anything else closes it. A set-up link never holds the box and is
+no host (no queue, sequence, instance or install record of a host's changes). The window ends after one set-up, at its
+10 minutes (a session in progress then finishes within its own 180 s: no new client, the set-up network up until that
+session ends), at a USB host's first frame, or after 5 sessions in it that showed a code and set nothing up (then until
+the next power-up). `OCBM_WIFI_RESET` on a stick is the one way a used adapter offers it again: it removes the link and
+the `host_seen` record and leaves `/etc/ocbm/wifi_setup_once` for the next start.
+
+The set-up code (ADDENDUM 5 of the hand-off plan, 24 Nov 2026; not benched): 4 decimal digits, zero-padded, of the first
+4 bytes of SHA-256(`"OCBS v1 code"` | host_pub | box_pub) read as a big-endian u32, modulo 10000
+(`ocbm_link::setup_code`; with the fixed points of the crate's tests the code is `2092`, and `3978` with the points
+swapped). No wire change: both sides hold the transcript when the exchange ends. Carlink shows it; once the set-up
+link's first record opens, the box names its Bluetooth controller `CarLink code NNNN` (local name and EIR) and keeps it
+discoverable (inquiry scan, no page scan) until that session ends for any reason, then puts its own name and policy
+back: the controller only, never `/etc/carplay_ident` or any file on flash (btd's armed state shows it,
+docs/wireless/01_BT_AND_RADIO.md, "Between host sessions: armed"). A second session in the window shows its own code.
+
+What the set-up code is for: it lets the driver see that Carlink is talking to THEIR adapter (not a neighbour's adapter
+in its own set-up window, not a stale network). It is NOT proof against an attacker in radio range who also fakes a
+Bluetooth name: a Bluetooth name is not an authenticated channel. First-come trust within the window stays the security
+model; the code is a check against mistakes.
 
 ## Route A: the phone's video inside CarPlay (OCBM 2.0, 12 Nov 2026)
 

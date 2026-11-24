@@ -610,6 +610,23 @@ phone that scans never finds the box, and a bonded one shows it "Not Connected";
 "CarLink-…": Bluetooth powered, scan 0x00 (page and inquiry off), 0 connection(s), …` and no `[reconnect]`,
 `[ssp-agent]` or `[sdp…]` line until `[armed] go: …`.
 
+**The one exception: M3's set-up code** (branch `wifi-link`, 24 Nov 2026; not benched). On an adapter offering its
+set-up network (docs/carplay/01_OCBM_PROTOCOL.md, "The Wi-Fi link"), ocbmd puts the set-up session's 4-digit code in
+`/tmp/bt_setup_code` once the head unit's first record opens, removes it when that session ends for any reason, and
+wakes the armed btd with SIGUSR1 after each change (the go's own wake; only a pid in `/tmp/.btd_armed` whose
+`/proc/<pid>/comm` is `btd`). Woken with no go, btd writes the name `CarLink code NNNN` (local name and EIR, the class
+and Simple Pairing as the arm wrote them) and Write_Scan_Enable `0x01`: inquiry scan only, so a phone's or a car's
+search lists the box and nothing can page it (no connection, no bond: no SSP agent runs while armed); with no file, its
+armed name and `0x00` again. The file is read at the arm too (a session that began while Bluetooth was not up yet: the
+code shows once a btd arms), at every wake and at every check, and the checks hold the controller to `0x01` while the
+code is up. A go while it is up passes the code's name as the arm's, so the session's bring-up rewrites the identity
+(the name differs). A SIGTERM while it is up writes scan none before btd exits (the supervisor's `bt_off` follows). No
+armed btd at all (the preload or the arm switched off, an arm that failed): the code is not shown, and ocbmd's line says
+so (`set-up code on: no armed btd yet`). Nothing goes to flash; `/tmp` and the controller forget it at a power cut. On a
+bench: `hciconfig hci0` reads `ISCAN` without `PSCAN`, `hciconfig hci0 name` the code's name, and `/tmp/wl.log` carries
+`[armed] set-up code: the controller named for ocbmd's set-up session and discoverable …` and later
+`[armed] set-up code gone: …`.
+
 **The go.** ocbmd raises `/tmp/host_present` and wakes the supervisor. `wireless_up` finds its armed btd ready
 (`btd_armed_ready`: the file names the btd it started, a live one, not a zombie) and calls `wireless_go`: the inhibit
 (`/tmp/radio_off`), `wireless: false` and a wired session owning the box each put the armed Bluetooth down instead,
