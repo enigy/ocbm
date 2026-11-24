@@ -433,7 +433,10 @@ host. `OCBMD_ACC_IO=direct|relay` overrides the choice on the bench. The first o
 out as it exits, so the host's next frame comes to the new one, which takes it as the answer to the
 HELLO in `/tmp/ocbmd_heard` (the truck, 2 Nov 21:06). A revert to stock keeps the flag, so the unit's
 next trial starts single-threaded (the truck's retry, 2 Nov 21:17: HELLO_ACK in 8 ms); a stock restore
-removes `/etc/ocbm` whole, the flag with it.
+removes `/etc/ocbm` whole, the flag with it. With the Wi-Fi link set up, such a unit reads the device on one thread
+that never writes it (`start_acc_reader`); that read, parked from ocbmd's start, went unanswered after Wi-Fi hosts on
+24 Nov (no end, no bytes), so the loop now ends it every 10 s with a signal and the thread opens the device again, as
+the single loop got a fresh read at each respawn; a failed read is followed by a fresh open a second later.
 
 ### The two physical ports
 

@@ -630,7 +630,9 @@ link after 3 s with nothing received. The 32-byte link key is made by the host a
 `MGMT_WIFI_LINK`, over whatever session it has. The box listens on its station interface's address only (port 7020),
 advertises `_ocbm._tcp` there (TXT `id` = an HMAC of the key), takes one host at a time over either transport (the first
 it takes holds the box against Wi-Fi hosts until it leaves or is silent for 10 s; a USB host's frame always takes it at
-once, from a Wi-Fi holder too, and no USB frame is ever dropped), and with no link set up behaves as 2.7.1. With a link set
+once, from a Wi-Fi holder too, and no USB frame is ever dropped; where the accessory driver serializes reads and writes,
+USB is read on a thread whose read is issued afresh every 10 s and after any failed read, ADDENDUM 7), and with no
+link set up behaves as 2.7.1. With a link set
 up the adapter also starts its CarPlay session at power-up with no host, video parked, and a host attaches to it at
 SUBSCRIBE (M2). One radio serves the hotspot and the adapter's own AP, so with a link set up the AP starts on the
 channel the station holds the hotspot on, never a radar channel (ADDENDUM 6), and MGMT_INFO's `wifi_link` gives the

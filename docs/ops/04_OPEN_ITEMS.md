@@ -833,7 +833,11 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
   on a serializing USB driver (AccIo::Direct, the truck's) a USB host's frame restarts ocbmd for one plain USB start,
   which ends a self-started (M2) session: the phone's session starts again under that host, so M2's attach is not kept
   for USB hosts there (the loop cannot write the device while a reader thread waits in acc_read; interrupting that
-  reader is the one route, untried). Wi-Fi hosts attach as on other units.
+  reader is the one route, untried for writes). Wi-Fi hosts attach as on other units. Benched 24 Nov (ADDENDUM 7):
+  after Wi-Fi hosts, a USB host got no answer and no log line for 7 minutes; the reader's one read, parked since
+  ocbmd's start, never completed. Now its read is issued afresh, the device opened again, every 10 s (a signal ends
+  it: EINTR) and a second after a failed read. Not benched: that this module completes the fresh read, and that its
+  wait takes the signal.
 
 - **An inbound RCS `'sync'` obliges a `'rply'`; the box logs and does not send one — BLOCKED, not
   merely unstarted.** `_controlServer_sendResponseInternal` writes `messageType = 0` while the
