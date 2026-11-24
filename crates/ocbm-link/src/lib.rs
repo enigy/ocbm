@@ -376,7 +376,10 @@ pub fn host_handshake<S: Read + Write>(s: &mut S, key: &LinkKey, host_nonce: [u8
 //   keys: HKDF-SHA256(ikm = Z, salt = host_pub | box_pub), info "OCBS v1 host->box" / "OCBS v1 box->host", 32 B each
 // ```
 //
-// The two public points are the transcript a later short confirmation code can be derived from ([`Transcript`]).
+// The two public points are the transcript the set-up code comes from ([`setup_code`]): four digits Carlink shows and
+// the box shows as its Bluetooth name, so the driver sees that Carlink is talking to THEIR adapter. It is a check against
+// mistakes, not proof against an attacker in radio range (a Bluetooth name is not an authenticated channel): first-come
+// trust within the window stays the security model. No wire change: both sides hold the transcript when it ends.
 
 /// The set-up exchange's magic.
 pub const SETUP_MAGIC: [u8; 4] = *b"OCBS";
@@ -390,8 +393,9 @@ pub const SETUP_PASSPHRASE: &str = "carlinksetup";
 pub const SETUP_HELLO_LEN: usize = 4 + 1 + 65;
 const SETUP_H2B: &[u8] = b"OCBS v1 host->box";
 const SETUP_B2H: &[u8] = b"OCBS v1 box->host";
+const SETUP_CODE_LABEL: &[u8] = b"OCBS v1 code";
 
-/// The two public points of a finished exchange, kept for a later short code (none is shown yet).
+/// The two public points of a finished exchange, the set-up code's input ([`setup_code`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Transcript {
     pub host_pub: [u8; 65],
@@ -438,6 +442,26 @@ pub fn setup_session_keys(z: &[u8; 32], t: &Transcript) -> ([u8; 32], [u8; 32]) 
     hk.expand(SETUP_H2B, &mut h2b).expect("32 B is a valid HKDF length");
     hk.expand(SETUP_B2H, &mut b2h).expect("32 B is a valid HKDF length");
     (h2b, b2h)
+}
+
+/// The set-up code: 4 decimal digits, zero-padded, of the first 4 bytes of SHA-256("OCBS v1 code" | host_pub | box_pub)
+/// read as a big-endian u32, modulo 10000. The host's point first, as in the key derivation's salt.
+pub fn setup_code(t: &Transcript) -> String {
+    code_digits(&code_digest(t))
+}
+
+fn code_digest(t: &Transcript) -> [u8; 32] {
+    use sha2::Digest;
+    let mut h = Sha256::new();
+    h.update(SETUP_CODE_LABEL);
+    h.update(t.host_pub);
+    h.update(t.box_pub);
+    h.finalize().into()
+}
+
+fn code_digits(digest: &[u8; 32]) -> String {
+    let n = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]);
+    format!("{:04}", n % 10_000)
 }
 
 fn setup_hello(pk: &[u8; 65]) -> [u8; SETUP_HELLO_LEN] {
@@ -735,4 +759,43 @@ mod tests {
 
     const SETUP_H2B_RECORD: &str = "00000014e5b08769aa5c6ef9047ce44fca11b38a80cf5655";
     const SETUP_B2H_RECORD: &str = "00000014badbeaa1861799c093909d6513c1d4421648deba";
+
+    /// The set-up code's vector (ADDENDUM 5, the architect's; Carlink pins the same): the note's fixed points give the
+    /// digest below and the code 2092. With the points swapped it would be 3978: the trap for the wrong order.
+    #[test]
+    fn the_set_up_code_is_pinned_and_takes_the_host_s_point_first() {
+        let (_, hp) = setup_keypair_from(&[0x11; 32]).unwrap();
+        let (_, bp) = setup_keypair_from(&[0x22; 32]).unwrap();
+        let t = Transcript { host_pub: hp, box_pub: bp };
+        assert_eq!(hex(&code_digest(&t)), "66ce8b3c25c5f65e6e40bed0735ce316977299b0ebb2c5031842d943933a6460");
+        assert_eq!(setup_code(&t), "2092");
+        let swapped = Transcript { host_pub: bp, box_pub: hp };
+        assert_eq!(setup_code(&swapped), "3978", "the points in the wrong order give another code");
+        // Both sides of a real exchange agree on it.
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let b = std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let (bs, bp) = setup_keypair().unwrap();
+            setup_box_handshake(&mut s, &bs, &bp).map(|(_, t)| setup_code(&t)).unwrap()
+        });
+        let mut c = TcpStream::connect(addr).unwrap();
+        let (hs, hp) = setup_keypair().unwrap();
+        let (_, ht) = setup_host_handshake(&mut c, &hs, &hp).unwrap();
+        assert_eq!(setup_code(&ht), b.join().unwrap());
+    }
+
+    /// Four digits whatever the value: zero-padded below 1000, the remainder of the whole u32.
+    #[test]
+    fn the_set_up_code_is_four_digits_zero_padded() {
+        let d = |b: [u8; 4]| {
+            let mut full = [0u8; 32];
+            full[..4].copy_from_slice(&b);
+            code_digits(&full)
+        };
+        assert_eq!(d([0, 0, 0, 7]), "0007");
+        assert_eq!(d([0, 0, 0x27, 0x10]), "0000", "10000 is 0");
+        assert_eq!(d([0xff; 4]), "7295", "4294967295 mod 10000, big-endian");
+        assert_eq!(d([0x01, 0, 0, 0]), "7216", "16777216: the first byte is the most significant");
+    }
 }
