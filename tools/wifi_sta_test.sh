@@ -216,16 +216,16 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   check 'grep -qx "ifconfig sta0 down" "$R/calls"' "no link: the teardown downs the first interface, as in 2.7.1"
   # M3's set-up network: its configuration in /tmp from the CarPlay AP's, client isolation on, the flash file untouched.
   mkdir -p "$R/tmp"
-  printf 'interface=sta0\nssid=CarLink-fd6c\nwpa_passphrase=private\nchannel=36\nhw_mode=a\n' > "$R/etc/hostapd.conf"
+  printf 'interface=sta0\nssid=CarLink-0a1b\nwpa_passphrase=private\nchannel=36\nhw_mode=a\n' > "$R/etc/hostapd.conf"
   printf 'start\t192.168.43.100\ninterface\tsta0\nlease_file\t/var/lib/udhcpd.leases\n' > "$R/etc/udhcpd.conf"
   before=$(cat "$R/etc/hostapd.conf")
-  on='caps() { RADIO_BACKEND=mapped; return 0; }; wlan_driver_up() { return 0; }; box_name() { echo CarLink-fd6c; }
+  on='caps() { RADIO_BACKEND=mapped; return 0; }; wlan_driver_up() { return 0; }; box_name() { echo CarLink-0a1b; }
       ifconfig() { echo "ifconfig $*" >> "'"$R"'/calls"; }; setsid() { echo "setsid $*" >> "'"$R"'/calls"; }
       ap_running() { [ -e "'"$R"'/up" ]; }; setup_dhcp_pids() { echo 1; }; sleep() { : > "'"$R"'/up"; }; log() { :; }
       do_setup_ap_on; echo "rc=$?"'
   : > "$R/calls"; rm -f "$R/up"
   check '[ "$(hal "$R" "$sh" "$on")" = rc=0 ]' "setup_ap_on: the set-up network comes up"
-  check 'grep -qx "ssid=CarLink-Setup-fd6c" "$R/tmp/hostapd_setup.conf" && grep -qx "wpa_passphrase=carlinksetup" "$R/tmp/hostapd_setup.conf" && grep -qx "ap_isolate=1" "$R/tmp/hostapd_setup.conf"' \
+  check 'grep -qx "ssid=CarLink-Setup-0a1b" "$R/tmp/hostapd_setup.conf" && grep -qx "wpa_passphrase=carlinksetup" "$R/tmp/hostapd_setup.conf" && grep -qx "ap_isolate=1" "$R/tmp/hostapd_setup.conf"' \
     "  CarLink-Setup-xxxx, the public passphrase, client isolation"
   check '! grep -q "private" "$R/tmp/hostapd_setup.conf" && [ "$(cat "$R/etc/hostapd.conf")" = "$before" ]' \
     "  the CarPlay AP's passphrase not carried over, its flash configuration untouched"
