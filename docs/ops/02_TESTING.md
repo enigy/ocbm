@@ -372,6 +372,14 @@ that never reached CarPlay, a wired preempt), so a second session's line counts 
 session's carplayd's. The phantom's pages count as absent. When ocbmd rotated `box.log` (it empties it at its cap) between
 the host's arrival and the first frame, the PSK count is a lower bound: `PSK mismatches >=N (box.log cut)`.
 
+### Wi-Fi link switches (branch `wifi-link`, 24 Nov 2026)
+
+`/tmp/bench_wifi_selfstart_off` or `/etc/ocbm/bench_wifi_selfstart_off` (set unless "off"; the owner's
+`/etc/ocbm/wifi_selfstart_off` too): no CarPlay session without a host (M2 off) on an adapter with the link set up.
+`/tmp/bench_wifi_link_if` holding an interface name: ocbmd's listener binds that interface's address instead of the
+station's (never the AP's subnet), e.g. a wired bench over NCM. A bench supplicant goes in `/tmp/bin` (`wpa_supplicant`,
+`wpa_cli`). What to look for: `[wifi_sta]` and `[ocbmd] wifi:` lines in the box log, MGMT_INFO's `wifi_link`.
+
 ### Round 4 switches (22 Nov 2026; six on by default from 2.7.1)
 
 Round 4 (branch `round4`, from 2.7.0) built these for the bench. The owner's decisions of 22 Nov 2026 made six of them

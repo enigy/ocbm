@@ -497,6 +497,37 @@ because BT attach waits for WLAN on this part, Bluetooth with it. Both forms now
 
 ---
 
+## The Wi-Fi link's station beside the AP (branch `wifi-link`, 24 Nov 2026; not benched)
+
+With a hotspot set up (an `ssid_hex=` line in `/etc/ocbm/wifi_link`, written by ocbmd for `MGMT_WIFI_LINK`) the adapter
+also joins the phone's Personal Hotspot as a station, so a head unit on that hotspot reaches ocbmd over TCP
+(docs/carplay/01_OCBM_PROTOCOL.md, "The Wi-Fi link"). Without the line nothing below runs.
+
+- **Interfaces, from the unit's own driver configuration.** The IW416's stock `wifi_mod_para.conf` (2025.10.15.1127, read
+  from the 18 Oct backup) says `drv_mode=3`, `sta_name=sta`, `uap_name=wlan`: one moal load makes `sta0`, the STA BSS,
+  and `wlan0`, the uAP BSS. The AP of 2.7.1 takes the first wireless interface by name, `sta0`, which hostapd switches to
+  the AP role, and leaves `wlan0` idle. In STA mode `radio_hal.sh` (`sta_mode`, `sta_iface`, `ap_iface`) gives the AP the
+  wireless interface that is NOT named `sta*` and the station `sta*`: each BSS in its own role, and the layout the
+  vendor's own STA mode uses (its supplicant on `sta0`). A unit whose driver makes one interface has no station beside
+  its AP; the AP keeps it. The AP's teardown never downs the station's interface. That the IW416 firmware runs the two
+  together on one channel is inferred, not measured.
+- **Never `/usr/sbin/wpa_supplicant`.** The vendor dispatcher's gate (`test -e /usr/sbin/wpa_supplicant &&
+  supportStaMode=1`) switches moal to `wifi_mod_para_p2psta.conf` (`drv_mode=5`, `wfd_name=wlan`: no uAP BSS at all), and
+  `radio_detect.sh` follows that gate on every unit, set up or not. The stock image ships no supplicant (the factory
+  survey of 27 Oct), so the keeper takes OCBM's own drop-in `/usr/sbin/ocbm-wpa_supplicant` and `ocbm-wpa_cli` (none is
+  bundled yet), a unit's own stock copy, or a bench copy in `/tmp/bin`, and waits without one.
+- **The keeper** (`/script/wifi_sta.sh`, started by `ocbm_boot.sh`): from power-up it keeps the station on the hotspot,
+  with the address and netmask from its DHCP hook (`wifi_sta_dhcp.sh`: no default route, never the AP's or NCM's subnet),
+  publishes `/tmp/wifi_link_state` for ocbmd and keeps the hotspot's last channel in `/etc/ocbm/wifi_link_channel`.
+  Driver load for it: the verb `wifi_sta_up`, under the wlan lock.
+- **Scans on the one radio.** None while joined. Not joined: with no AP up, the supplicant's own scans of every channel;
+  with the AP up and the CarPlay session not established (`/tmp/session_healthy` not 1, 40 s at most) none at all, so the
+  phone's join of the AP never meets an off-channel scan; then the AP's channel only, and one scan of every channel a
+  minute.
+- **Channels.** The AP keeps the channel `hostapd.conf` pins. A hotspot on another channel is logged in one line and shown
+  in MGMT_INFO (`wifi_link.channel` against `ap_channel`). What the driver does then (refuse, move the uAP, or time-share
+  the channels) is for the bench.
+
 ## Between host sessions: armed (Bluetooth powered, invisible)
 
 **Status: built and benched 16 Nov 2026** (branch `resident-bt` merged with `carplayd-early` into a local `round2`,
