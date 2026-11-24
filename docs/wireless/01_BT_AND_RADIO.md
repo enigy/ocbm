@@ -509,8 +509,12 @@ also joins the phone's Personal Hotspot as a station, so a head unit on that hot
   the AP role, and leaves `wlan0` idle. In STA mode `radio_hal.sh` (`sta_mode`, `sta_iface`, `ap_iface`) gives the AP the
   wireless interface that is NOT named `sta*` and the station `sta*`: each BSS in its own role, and the layout the
   vendor's own STA mode uses (its supplicant on `sta0`). A unit whose driver makes one interface has no station beside
-  its AP; the AP keeps it. The AP's teardown never downs the station's interface. That the IW416 firmware runs the two
-  together on one channel is inferred, not measured.
+  its AP; the AP keeps it. That is known 1 s after the driver's first interface appears (`sta_settle`: a driver's
+  interfaces come from one probe) and marked for the boot (`/tmp/.radio_one_iface`), so no path waits for a station
+  again, `wifi_sta_up` answers 3 at once, and the keeper publishes `state=unsupported` (MGMT_INFO `wifi_link` state
+  `"unsupported"`). An adapter with no link forks nothing for any of this (`sta_mode` tests the file first). The AP's
+  teardown never downs the station's interface. That the IW416 firmware runs the two together on one channel is
+  inferred, not measured.
 - **Never `/usr/sbin/wpa_supplicant`.** The vendor dispatcher's gate (`test -e /usr/sbin/wpa_supplicant &&
   supportStaMode=1`) switches moal to `wifi_mod_para_p2psta.conf` (`drv_mode=5`, `wfd_name=wlan`: no uAP BSS at all), and
   `radio_detect.sh` follows that gate on every unit, set up or not. The stock image ships no supplicant (the factory
@@ -524,11 +528,17 @@ also joins the phone's Personal Hotspot as a station, so a head unit on that hot
 - **The keeper** (`/script/wifi_sta.sh`, started by `ocbm_boot.sh`): from power-up it keeps the station on the hotspot,
   with the address and netmask from its DHCP hook (`wifi_sta_dhcp.sh`: no default route, never the AP's or NCM's subnet),
   publishes `/tmp/wifi_link_state` for ocbmd and keeps the hotspot's last channel in `/etc/ocbm/wifi_link_channel`.
-  Driver load for it: the verb `wifi_sta_up`, under the wlan lock.
-- **Scans on the one radio.** None while joined. Not joined: with no AP up, the supplicant's own scans of every channel;
-  with the AP up and the CarPlay session not established (`/tmp/session_healthy` not 1, 40 s at most) none at all, so the
-  phone's join of the AP never meets an off-channel scan; then the AP's channel only, and one scan of every channel a
-  minute.
+  Driver load for it: the verb `wifi_sta_up`, under the wlan lock. A supplicant that does not start, or does not stay,
+  is started again no sooner than 30 s after its last start and said once until it runs.
+- **Scans on the one radio.** None while joined. Not joined: with no session (no AP up, no host present), the
+  supplicant's own scans of every channel; with a session starting (the AP up, or `/tmp/host_present` 1: M2's own session
+  pages the bonded phones over Bluetooth before any AP) and not established (`/tmp/session_healthy` not 1, 40 s at most)
+  none at all, so the page, the phone's join of the AP and the session's set-up never meet a scan; then the AP's channel
+  only and one scan of every channel a minute, or every channel with no AP (a wired session).
+- **The listener and the advert stay on the station's side.** The listener takes connections from the station's
+  interface only (SO_BINDTODEVICE: under Linux's weak-host model the station's address alone would also answer on the
+  AP's or USB's network). The mDNS socket is bound to the group, 224.0.0.251:5353, so no unicast datagram for carplayd's
+  mdns-sd (its sockets: 0.0.0.0:5353, SO_REUSEPORT) can land in it.
 - **Channels.** The AP keeps the channel `hostapd.conf` pins. A hotspot on another channel is logged in one line and shown
   in MGMT_INFO (`wifi_link.channel` against `ap_channel`). What the driver does then (refuse, move the uAP, or time-share
   the channels) is for the bench.

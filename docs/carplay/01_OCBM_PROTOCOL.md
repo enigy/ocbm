@@ -629,18 +629,23 @@ HKDF-SHA256 direction keys, ChaCha20-Poly1305 records, an empty record as the ke
 link after 3 s with nothing received. The 32-byte link key is made by the host and handed over once with
 `MGMT_WIFI_LINK`, over whatever session it has. The box listens on its station interface's address only (port 7020),
 advertises `_ocbm._tcp` there (TXT `id` = an HMAC of the key), takes one host at a time over either transport (the first
-it takes holds the box until it leaves or is silent for 10 s), and with no link set up behaves as 2.7.1. With a link set
+it takes holds the box against Wi-Fi hosts until it leaves or is silent for 10 s; a USB host's frame always takes it at
+once, from a Wi-Fi holder too, and no USB frame is ever dropped), and with no link set up behaves as 2.7.1. With a link set
 up the adapter also starts its CarPlay session at power-up with no host, video parked, and a host attaches to it at
 SUBSCRIBE (M2). ocbmd `src/wifi.rs` and `src/mdns.rs`, `/script/wifi_sta.sh`, and the Wi-Fi link section of
 docs/wireless/01_BT_AND_RADIO.md have the rest; the hand-off notes of 24 Nov hold the contract with Carlink.
 
-First set-up with no USB (M3, `src/setup.rs`, not benched): an adapter with no link that no host has spoken to offers,
-20 s after ocbmd's start and for 10 minutes, a set-up network `CarLink-Setup-xxxx` (public WPA2 passphrase
-`carlinksetup`, client isolation) and, on 192.168.43.1:7021, OCBS v1 (`crates/ocbm-link`): each side's P-256 point
-(65 B uncompressed) behind `"OCBS" 0x01`, the host first; HKDF-SHA256 over the ECDH X with both points as salt; then
-OCBW records. One client at a time, 5 s for the exchange, 60 s from its end to `MGMT_WIFI_LINK`; the session carries
-`CT_HELLO`, `CT_SETTIME`, `MGMT_GET_INFO` and `MGMT_WIFI_LINK` only, and the window ends after one set-up or when a USB
-host speaks. `OCBM_WIFI_RESET` on a stick removes the link for the next power-up.
+First set-up with no USB (M3, `src/setup.rs`, not benched): an adapter NEVER USED (no link, no host's HELLO ever taken
+on it, no bonded phone, no kept host config, no update record) offers, 20 s after ocbmd's start if no host has spoken
+and for 10 minutes, a set-up network `CarLink-Setup-xxxx` (public WPA2 passphrase `carlinksetup`, client isolation)
+and, on 192.168.43.1:7021, OCBS v1 (`crates/ocbm-link`): each side's P-256 point (65 B uncompressed) behind
+`"OCBS" 0x01`, the host first; HKDF-SHA256 over the ECDH X with both points as salt; then OCBW records. One client at a
+time, 5 s in all for the exchange, 60 s in all from its end to `MGMT_WIFI_LINK`, whatever the window's state. The
+session carries `CT_HELLO` (answered `HELLO_ACK` with `CAP_WIFI_LINK` alone) and `MGMT_WIFI_LINK` with a body, nothing
+else: anything else closes it. A set-up link never holds the box and is no host (no queue, sequence, instance or
+install record of a host's changes). The window ends after one set-up, at its 10 minutes, or at a USB host's first
+frame. `OCBM_WIFI_RESET` on a stick is the one way a used adapter offers it again: it removes the link and the
+`host_seen` record and leaves `/etc/ocbm/wifi_setup_once` for the next start.
 
 ## Route A: the phone's video inside CarPlay (OCBM 2.0, 12 Nov 2026)
 
