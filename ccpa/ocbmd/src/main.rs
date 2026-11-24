@@ -4211,6 +4211,9 @@ impl Daemon {
                 // writes out. One plain USB start serves this host; the host's own HELLO retry carries on.
                 eprintln!("[ocbmd] wifi: a USB host on a driver that serializes reads and writes; restarting for one USB-only start");
                 wifi::set_usb_once();
+                if cfg!(test) {
+                    return; // the tests stop at the decision (USB_ONCE_FLAG written): the exit is the process's
+                }
                 clear_session_state_for_exit(INSTALL_MODE_FILE, start_install_finish);
                 std::process::exit(0);
             }
@@ -4795,17 +4798,104 @@ fn start_acc_relay(dev: File) -> std::io::Result<(AccRelay, std::sync::Arc<Write
 /// Read the accessory on a thread of its own and never write it: the Wi-Fi link's way with a driver that serializes
 /// reads and writes ([`AccIo::Direct`]), whose parked reader would keep any writer out. The loop then serves Wi-Fi
 /// hosts; a USB host's first frame restarts ocbmd for one plain USB start (`Daemon::take_box`).
-fn start_acc_reader(dev: File) -> std::io::Result<File> {
+///
+/// That thread is USB's only ear on such a start, and its read is issued afresh ([`usb_listen`]): every [`USB_REARM`]
+/// the loop ends it ([`usb_rearm`]), and the device is opened again; after a read that failed, a second later. One read
+/// parked from ocbmd's start was never completed after Wi-Fi hosts (ADDENDUM 7 of the Wi-Fi link plan, 24 Nov); 2.7.1's
+/// single loop got a fresh one at each exit for respawn and each restart the supervisor made of an idle ocbmd.
+fn start_acc_reader(
+    dev: File,
+    open: impl FnMut() -> std::io::Result<File> + Send + 'static,
+) -> std::io::Result<(File, std::thread::JoinHandle<()>)> {
     let (from_host, host_bytes) = cloexec_pipe()?;
     set_nonblocking(&from_host);
-    std::thread::Builder::new()
+    rearm_signal_install();
+    let h = std::thread::Builder::new()
         .name("acc-read".into())
         .stack_size(RELAY_STACK)
         .spawn(move || {
-            let why = relay(&dev, host_bytes, 16 * 1024);
+            let why = usb_listen(dev, host_bytes, open);
             eprintln!("[ocbmd] accessory reader stopped: {why}");
         })?;
-    Ok(from_host)
+    Ok((from_host, h))
+}
+
+/// How often the loop issues the reader-only start's USB read afresh ([`usb_rearm`]): well inside the 20 s Carlink
+/// sends HELLOs for (500 ms apart for 15 s), so a read the driver will not complete is replaced while a host asks.
+const USB_REARM: Duration = Duration::from_secs(10);
+/// The re-arm's signal. Nothing in or around ocbmd sends it; its handler does nothing and is installed without
+/// SA_RESTART, so a read it lands in returns EINTR.
+const REARM_SIGNAL: libc::c_int = libc::SIGUSR2;
+
+extern "C" fn rearm_noop(_: libc::c_int) {}
+
+fn rearm_signal_install() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // SAFETY: a zeroed sigaction with a handler that does nothing; no flags, an empty mask.
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = rearm_noop as extern "C" fn(libc::c_int) as libc::sighandler_t;
+            libc::sigemptyset(&mut sa.sa_mask);
+            libc::sigaction(REARM_SIGNAL, &sa, std::ptr::null_mut());
+        }
+    });
+}
+
+/// End the read the reader-only start's USB reader is parked in: it opens the device afresh ([`usb_listen`]). A signal
+/// that lands between two reads is lost; the next comes [`USB_REARM`] later.
+fn usb_rearm(reader: &std::thread::JoinHandle<()>) {
+    use std::os::unix::thread::JoinHandleExt;
+    // SAFETY: the handler is installed (start_acc_reader), and the thread is not joined, so its handle is valid.
+    unsafe { libc::pthread_kill(reader.as_pthread_t() as libc::pthread_t, REARM_SIGNAL) };
+}
+
+/// The reader-only start's USB reader: `dev` into `host_bytes`, for as long as the loop holds the pipe's other end. A
+/// read the re-arm ends is followed by a fresh `open()` at once; any other end of a read (a gadget torn down or reset)
+/// by one a second later, said once; so USB is never left unread while the process runs.
+fn usb_listen(mut dev: File, mut host_bytes: File, mut open: impl FnMut() -> std::io::Result<File>) -> String {
+    let mut buf = vec![0u8; 16 * 1024];
+    let mut said = false;
+    loop {
+        let failed = loop {
+            match (&dev).read(&mut buf) {
+                Ok(0) => break Some("end of stream".to_string()),
+                Ok(n) => {
+                    if let Err(e) = host_bytes.write_all(&buf[..n]) {
+                        return format!("write failed: {e}");
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => break None,
+                Err(e) => break Some(format!("read failed: {e}")),
+            }
+        };
+        drop(dev); // closed before the open: the device takes one opener at a time
+        let mut pfd = libc::pollfd { fd: host_bytes.as_raw_fd(), events: libc::POLLOUT, revents: 0 };
+        // SAFETY: one valid pollfd, no wait: has the loop's end of the pipe gone?
+        if unsafe { libc::poll(&mut pfd, 1, 0) } > 0 && pfd.revents & (libc::POLLERR | libc::POLLHUP) != 0 {
+            return "the loop's end closed".to_string();
+        }
+        match failed {
+            None => said = false,
+            Some(why) => {
+                if !std::mem::replace(&mut said, true) {
+                    eprintln!("[ocbmd] wifi: USB's read ended ({why}); the accessory is opened again each second");
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
+        dev = loop {
+            match open() {
+                Ok(d) => break d,
+                Err(e) => {
+                    if !std::mem::replace(&mut said, true) {
+                        eprintln!("[ocbmd] wifi: the accessory could not be opened again ({e}); trying each second");
+                    }
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+            }
+        };
+    }
 }
 
 /// How ocbmd reads and writes the accessory.
@@ -5142,10 +5232,11 @@ fn main() {
     // Wi-Fi hosts or set-up clients with it (the review of 24 Nov, G). A USB host's first frame restarts ocbmd for one
     // plain USB start (Daemon::take_box).
     let usb_reader_only = acc_io == AccIo::Direct && (wifi_mode || setup_on);
-    let (AccRelay { from_host, to_host }, writer_watch) = if usb_reader_only {
-        start_acc_reader(acc).map(|from_host| (AccRelay { from_host, to_host: wifi::sink() }, None))
+    let (AccRelay { from_host, to_host }, writer_watch, usb_reader) = if usb_reader_only {
+        start_acc_reader(acc, || OpenOptions::new().read(true).write(true).open(ACC_DEV))
+            .map(|(from_host, h)| (AccRelay { from_host, to_host: wifi::sink() }, None, Some(h)))
     } else {
-        start_acc_io(acc, acc_io)
+        start_acc_io(acc, acc_io).map(|(a, w)| (a, w, None))
     }
     .unwrap_or_else(|e| {
         eprintln!("[ocbmd] accessory I/O could not start ({e}) — exiting");
@@ -5307,6 +5398,7 @@ fn main() {
         d.self_session_start(Instant::now());
     }
     let mut last_alive_touch: Option<Instant> = None;
+    let mut usb_rearmed = Instant::now();
     // Auto-reap forked children (the CONSOLE root shell) so exited console sessions don't become
     // zombies. Nothing here waitpid()s, so ignoring SIGCHLD is safe and cleaner than tracking pids.
     //
@@ -5712,6 +5804,13 @@ fn main() {
         }
         if d.wifi.on || d.wifi.pending.is_some() || !d.wifi.links.is_empty() || d.wifi.restart_when_idle {
             d.wifi_tick(Instant::now(), direct_io);
+        }
+        // The reader-only start's USB read, issued afresh every USB_REARM (start_acc_reader): USB's only ear there.
+        if let Some(h) = usb_reader.as_ref() {
+            if now_pass.duration_since(usb_rearmed) >= USB_REARM {
+                usb_rearmed = now_pass;
+                usb_rearm(h);
+            }
         }
         // drop closed A/V connections (reverse index order keeps the rest valid)
         av_close.sort_unstable();
@@ -8114,6 +8213,149 @@ mod tests {
         assert!(d.wifi.on && d.wifi.usb_out.is_none() && !d.wifi.restart_when_idle, "Wi-Fi hosts at once, nothing kept for USB");
         d.wifi.stop();
         let _ = std::fs::remove_file(wifi::LINK_FILE);
+    }
+
+    // ---- ADDENDUM 7: USB heard on a reader-only start whatever the Wi-Fi hosts did -----------------------------
+
+    /// The tests that write wifi::USB_ONCE_FLAG (a reader-only start's restart for a USB host), one at a time.
+    fn usb_once_lock() -> std::sync::MutexGuard<'static, ()> {
+        static L: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        L.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A reader-only start's daemon (a driver that serializes reads and writes, Wi-Fi mode): no USB output kept, and a
+    /// USB host's frame restarts ocbmd, where the tests stop at the decision (Daemon::take_box: USB_ONCE_FLAG written).
+    fn td_reader_only() -> Daemon {
+        let mut d = td();
+        d.wifi.on = true;
+        d.wifi.usb_direct = true;
+        d
+    }
+
+    /// The loop's part for `within`: USB's pipe read into the reassembler and each frame to `usb_frame` (main's
+    /// Kind::Acc, line for line), and the reader re-armed every `rearm` (the loop's USB_REARM). True once a USB frame
+    /// made ocbmd restart for one USB-only start; false if the reader's pipe ended (the loop's usb_gone: USB unread
+    /// from then on).
+    fn usb_pump(
+        d: &mut Daemon,
+        from_host: &File,
+        reader: &std::thread::JoinHandle<()>,
+        rearm: Duration,
+        within: Duration,
+    ) -> bool {
+        let mut reasm = p::Reassembler::new();
+        let (mut rbuf, mut plbuf) = (vec![0u8; p::HDR_LEN + p::MAX_PAYLOAD], vec![0u8; p::MAX_PAYLOAD]);
+        let (start, mut rearmed) = (Instant::now(), Instant::now());
+        let restarted = || std::path::Path::new(wifi::USB_ONCE_FLAG).exists();
+        while start.elapsed() < within && !restarted() {
+            if rearmed.elapsed() >= rearm {
+                rearmed = Instant::now();
+                usb_rearm(reader);
+            }
+            let mut src = from_host;
+            match src.read(&mut rbuf) {
+                Ok(0) => return false,
+                Ok(n) => {
+                    reasm.push(&rbuf[..n]);
+                    while let Some((ch, flags, len)) = reasm.next(&mut plbuf) {
+                        d.usb_frame(ch, flags, &plbuf[..len], Instant::now());
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(10)),
+                Err(e) => panic!("USB's pipe: {e}"),
+            }
+        }
+        restarted()
+    }
+
+    /// The USB host's HELLO as the bytes it puts on the cable.
+    fn usb_hello(inst: u32) -> Vec<u8> {
+        let mut f = Vec::new();
+        p::frame_into(&mut f, p::CH_CTRL, p::F_SOM | p::F_EOM, 0, &hello(inst, b""));
+        f
+    }
+
+    /// The reader ends once the loop's end of its pipe has gone (only at ocbmd's exit there): re-armed, it looks.
+    fn reader_ends_with_its_pipe(from_host: File, reader: std::thread::JoinHandle<()>) {
+        drop(from_host);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !reader.is_finished() && Instant::now() < deadline {
+            usb_rearm(&reader);
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(reader.is_finished(), "the reader ends with the loop's end of its pipe");
+    }
+
+    /// ADDENDUM 7's bench (24 Nov): a Wi-Fi host holds the box and leaves by CT_STOP, another holds it and leaves by a
+    /// dead link (its writer's send failed), then a USB host speaks, and nothing ever answered it. ocbmd's own gate
+    /// takes USB after both (the tests above, and this one); what failed was the reader-only start's one read of the
+    /// device, parked since ocbmd's start, which the driver never completed. The fake: a pipe whose reader sees
+    /// nothing, ever (that read), and the device opened again, where the host's bytes land. Before the re-arm, they
+    /// were never read.
+    #[test]
+    fn a_usb_host_is_heard_after_wifi_hosts_left_though_the_read_parked_before_them_never_completes() {
+        let _once = usb_once_lock();
+        let _ = std::fs::remove_file(wifi::USB_ONCE_FLAG);
+        let (stale, stale_w) = cloexec_pipe().unwrap(); // nothing is ever written to it: the read the driver keeps
+        let (fresh, host) = cloexec_pipe().unwrap();
+        let _fresh = fresh.try_clone().unwrap(); // the host's bytes always land, read or not
+        let (from_host, reader) = start_acc_reader(stale, move || fresh.try_clone()).unwrap();
+        let mut d = td_reader_only();
+        let t = Instant::now();
+        // A Wi-Fi host holds the box and leaves by CT_STOP; its link then ends.
+        let (l1, _o1, _h1) = wifi::test_link(1);
+        d.wifi.links.push(l1);
+        assert_eq!(d.admit(Via::Wifi(1), p::CH_CTRL, &hello(0x0100_0001, b""), t), Admit::Take);
+        d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &hello(0x0100_0001, b""));
+        assert_eq!(d.admit(Via::Wifi(1), p::CH_CTRL, &[p::CT_STOP], t), Admit::Take);
+        d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &[p::CT_STOP]);
+        d.link_lost(0);
+        assert_eq!(d.wifi.via, None, "a host that stopped holds nothing");
+        // Another holds it and leaves by a dead link: its writer is gone, the box's next send fails (the bench's "send
+        // failed: Broken pipe"), and the loop drops the link.
+        let (l2, o2, _h2) = wifi::test_link(2);
+        d.wifi.links.push(l2);
+        assert_eq!(d.admit(Via::Wifi(2), p::CH_CTRL, &hello(0x0200_0002, b""), t), Admit::Take);
+        d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &hello(0x0200_0002, b""));
+        drop(o2);
+        d.drain();
+        d.link_lost(0);
+        assert_eq!(d.wifi.via, None, "a host whose link died holds nothing");
+        // The USB host speaks: heard within the re-arm (the loop's every USB_REARM; here every 200 ms).
+        (&host).write_all(&usb_hello(0x05b0_0001)).unwrap();
+        assert!(
+            usb_pump(&mut d, &from_host, &reader, Duration::from_millis(200), Duration::from_secs(5)),
+            "the USB host's HELLO restarts ocbmd for one USB-only start"
+        );
+        assert!(wifi::take_usb_once());
+        reader_ends_with_its_pipe(from_host, reader);
+        drop(stale_w);
+    }
+
+    /// USB always wins (decision B), also while a Wi-Fi host holds the box, and after a read of the device that ended
+    /// (a gadget torn down or reset: EIO, ENODEV, or here an end of stream): the device is opened again a second
+    /// later. Before, the loop read the pipe's end as "USB gone" and left USB unread until the box was idle.
+    #[test]
+    fn a_usb_host_takes_the_box_from_a_wifi_holder_after_the_read_of_the_device_ended() {
+        let _once = usb_once_lock();
+        let _ = std::fs::remove_file(wifi::USB_ONCE_FLAG);
+        let (gone, gone_w) = cloexec_pipe().unwrap();
+        drop(gone_w); // the gadget went: that read ends at once
+        let (fresh, host) = cloexec_pipe().unwrap();
+        let _fresh = fresh.try_clone().unwrap(); // the host's bytes always land, read or not
+        let (from_host, reader) = start_acc_reader(gone, move || fresh.try_clone()).unwrap();
+        let mut d = td_reader_only();
+        let (l, _o, _h) = wifi::test_link(3);
+        d.wifi.links.push(l);
+        assert_eq!(d.admit(Via::Wifi(3), p::CH_CTRL, &hello(0x0300_0003, b""), Instant::now()), Admit::Take);
+        assert_eq!(d.wifi.via, Some(Via::Wifi(3)));
+        (&host).write_all(&usb_hello(0x05b0_0002)).unwrap();
+        assert!(
+            usb_pump(&mut d, &from_host, &reader, USB_REARM, Duration::from_secs(5)),
+            "the USB host's HELLO restarts ocbmd for one USB-only start, a Wi-Fi host holding the box or not"
+        );
+        assert!(wifi::take_usb_once());
+        reader_ends_with_its_pipe(from_host, reader);
     }
 
     /// The set-up code's digits as the armed btd would read them, None with no file.
