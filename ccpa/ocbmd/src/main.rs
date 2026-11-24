@@ -4067,9 +4067,14 @@ impl Daemon {
                         // keys are gone: hand them again (`rekey_av`). A config re-push has no HELLO and
                         // keeps its keys, so it is left alone.
                         self.rekey_av |= reattached;
-                        // Wi-Fi mode: the same host back over the running session (its link lost within the heartbeat
-                        // grace) is handed what the phone said meanwhile, which went to the sink.
+                        // Wi-Fi mode: the same host back over the running session (its link lost within the
+                        // heartbeat grace) is told at once that the session runs, by the live CT_PROJ_MODE after the
+                        // replay, as at an attach (notes/carlink.md 9): without it the 24 Nov bench's reconnect waited
+                        // out Carlink's 3 s hold, since ss.attached stays true across a lost link and so this is not
+                        // the attach branch above. A session the host started is the same to Carlink (its hold ends
+                        // the same way). And it is handed what the phone said meanwhile, which went to the sink.
                         if reattached && self.wifi.on {
+                            self.attach_live = true;
                             self.meta_attach("the same host re-attached");
                         }
                         self.send(
@@ -8192,6 +8197,7 @@ mod tests {
         assert!(d.host_reattached);
         subscribe(&mut d, b"cfg: kept\n");
         assert!(d.selfs.as_ref().is_some_and(|s| s.attached), "not the attach branch: the same host's own");
+        assert!(d.attach_live, "C: the live CT_PROJ_MODE for the same host back as well");
         assert!(meta_out(&mut d).is_empty(), "the replay waits for the end of the record under way");
         let veh = meta_rec(r#"{"kind":"vehicleStatus","state":"start","want":[3]}"#);
         d.metadata_chunk(p::F_SOM | p::F_EOM, &[&tick[7..], &veh[..]].concat());
@@ -8212,7 +8218,25 @@ mod tests {
             subscribe(&mut usb, b"cfg: x\n");
         }
         assert!(meta_out(&mut usb).is_empty() && usb.rekey_av);
+        assert!(!usb.attach_live, "C: nor the live mode (USB-only: 2.7.1's reattach)");
         usb.go_idle(false);
+    }
+
+    /// C: in Wi-Fi mode the same host back over a session it started itself (no M2) gets the live CT_PROJ_MODE after
+    /// the replay as well; a fresh session, and a config re-push with no HELLO, do not.
+    #[test]
+    fn the_same_host_back_over_a_running_session_is_told_it_runs_at_once() {
+        let _flag = presence_flag_lock();
+        let mut d = td_wifi();
+        d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &hello(0x2200_0005, b""));
+        subscribe(&mut d, b"cfg: y\n");
+        assert!(!d.attach_live, "a fresh session: nothing to attach to");
+        subscribe(&mut d, b"cfg: y\n");
+        assert!(!d.attach_live, "a config re-push (no HELLO): the host never left");
+        d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &hello(0x2200_0005, b""));
+        subscribe(&mut d, b"cfg: y\n");
+        assert!(d.attach_live && d.rekey_av, "the same host back: told at once, fresh keys");
+        d.go_idle(false);
     }
 
     #[test]
