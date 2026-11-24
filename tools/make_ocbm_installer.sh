@@ -18,6 +18,8 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN_DIR="${BIN_DIR:-$REPO/target/armv7-unknown-linux-musleabihf/release}"
 IRS_BIN="${IRS_BIN:-$REPO/accessory_init/iap_role_switch.armv7}"
 INSTALLER_DIR="${INSTALLER_DIR:-$REPO/ccpa/installer}"
+# The Wi-Fi link's supplicant, built by tools/build_wpa_supplicant.sh (its sources are not in the repository).
+WPA_INSTALL_DIR="${WPA_INSTALL_DIR:-$REPO/scratchpad/wpa/install}"
 
 die() { printf 'make_ocbm_installer: %s\n' "$*" >&2; exit 1; }
 
@@ -28,10 +30,14 @@ payload() {  # SOURCE|PATH-ON-BOX: the programs and boot scripts, then Stage B/C
   echo "$REPO/ccpa/rootfs/script/ocbm_boot.sh|script/ocbm_boot.sh"
   echo "$REPO/tools/run_ocbmd.sh|script/run_ocbmd.sh"
   for s in radio_detect radio_hal radio_ap_up; do echo "$REPO/ccpa/rootfs/script/$s.sh|script/$s.sh"; done
-  # The Wi-Fi link's station keeper and its DHCP hook: inert until /etc/ocbm/wifi_link names a hotspot. No supplicant
-  # here: OCBM's own would go to usr/sbin/ocbm-wpa_supplicant (never usr/sbin/wpa_supplicant: the vendor's dispatcher
-  # reads that path as "STA mode" and loads the IW416's driver in another mode on every unit).
+  # The Wi-Fi link's station keeper and its DHCP hook: inert until /etc/ocbm/wifi_link names a hotspot. Its supplicant
+  # when tools/build_wpa_supplicant.sh has built it, as usr/sbin/ocbm-wpa_supplicant and ocbm-wpa_cli: never
+  # usr/sbin/wpa_supplicant, which the vendor's dispatcher reads as "STA mode" and then loads the IW416's driver in
+  # another mode on every unit.
   for s in wifi_sta wifi_sta_dhcp; do echo "$REPO/ccpa/rootfs/script/$s.sh|script/$s.sh"; done
+  if [ -x "$WPA_INSTALL_DIR/ocbm-wpa_supplicant" ] && [ -x "$WPA_INSTALL_DIR/ocbm-wpa_cli" ]; then
+    for b in ocbm-wpa_supplicant ocbm-wpa_cli; do echo "$WPA_INSTALL_DIR/$b|usr/sbin/$b"; done
+  fi
   for s in session_supervisor projection_up phone_reset run_supervisor; do echo "$REPO/tools/$s.sh|script/$s.sh"; done
   for s in ocbm_dispatch ocbm_selftest ocbm_revert ocbm_finish ocbm_update ocbm_restore; do echo "$INSTALLER_DIR/$s.sh|script/$s.sh"; done
   echo "$REPO/tools/stock_restore_box.sh|script/stock_restore_box.sh"   # ocbm_restore.sh's engine: back to stock from a stick
@@ -61,6 +67,11 @@ install -m 755 "$INSTALLER_DIR/once.sh" "$stage/tmp/once.sh"
 install -m 755 "$INSTALLER_DIR/finish.sh" "$stage/tmp/finish.sh"
 install -m 644 "$INSTALLER_DIR/prune.list" "$INSTALLER_DIR/identity.list" "$P/"
 install -m 644 "$REPO/ccpa/carplayd/fdk-aac.NOTICE" "$P/NOTICE.fdk-aac"   # carplayd links libfdk-aac: its licence travels with it
+if [ -x "$WPA_INSTALL_DIR/ocbm-wpa_supplicant" ]; then   # likewise wpa_supplicant (BSD) and the libnl it links (LGPL-2.1)
+  install -m 644 "$WPA_INSTALL_DIR/NOTICE.wpa_supplicant" "$WPA_INSTALL_DIR/NOTICE.libnl" "$P/"
+else
+  echo "make_ocbm_installer: no supplicant in $WPA_INSTALL_DIR (tools/build_wpa_supplicant.sh): the Wi-Fi link's station cannot join a hotspot from this image" >&2
+fi
 while IFS='|' read -r src dst; do
   mkdir -p "$P/$(dirname "$dst")"
   install -m 755 "$src" "$P/$dst"

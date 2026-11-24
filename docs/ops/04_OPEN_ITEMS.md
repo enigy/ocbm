@@ -808,10 +808,11 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
 - **The Wi-Fi link (branch `wifi-link`, 24 Nov 2026): built and unit-tested, NOT benched.** Open: (1) no WPA supplicant
   on the stock image: one must be bundled as `/usr/sbin/ocbm-wpa_supplicant` + `ocbm-wpa_cli` (never
   `/usr/sbin/wpa_supplicant`, which flips the IW416 driver mode on every unit) or pushed to `/tmp/bin` for the bench; a
-  build needs downloaded sources (wpa_supplicant 2.11, libnl 3.x); (2) the AP on `wlan0` (uAP BSS) beside the station on
+  build needs downloaded sources (wpa_supplicant 2.11, libnl 3.12.0; `tools/build_wpa_supplicant.sh` refuses until their
+  SHA-256 are pinned at the first download); (2) the AP on `wlan0` (uAP BSS) beside the station on
   `sta0` is inferred from the stock driver configuration, not measured; (3) what the driver does when the hotspot and the
-  AP sit on different channels; (4) a WPA3-only hotspot needs the passphrase and an SAE build (the box gets the PBKDF2
-  hash); (5) M2's self-started session: the phone's audio goes nowhere while no host is attached (60 s / 180 s holds);
+  AP sit on different channels; (4) WPA3-only hotspots are not supported in this version (WPA2 and mixed are; the box
+  gets the PBKDF2 hash, the supplicant has no SAE); (5) M2's self-started session: the phone's audio goes nowhere while no host is attached (60 s / 180 s holds);
   the AP's channel pinned from the hotspot's last one is a design note only; (6) M3 (the set-up network) is a proposal:
   the box's P-256 needs crates that are not in the offline cache.
 

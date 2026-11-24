@@ -14,6 +14,8 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
 INST="$REPO/ccpa/installer"
 T="$(mktemp -d "${TMPDIR:-/tmp}/ocbm_update_test.XXXXXX")"
+# Hermetic: a supplicant this host built (tools/build_wpa_supplicant.sh) stays out of the payloads built here.
+export WPA_INSTALL_DIR="$T/no_such_wpa_install"
 reap() { pkill -f "$T/" 2>/dev/null; sleep 0.2; }
 trap 'reap; if [ -n "${KEEP:-}" ]; then echo "scratch kept: $T"; else rm -rf "$T"; fi' EXIT
 fails=0
