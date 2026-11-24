@@ -14,6 +14,7 @@ path = "src/lib.rs"
 chacha20poly1305 = "0.10"
 hkdf = "0.12"
 hmac = "0.12"
-sha2 = "0.10"
+# `compress`: the set-up code's SHA-256 through the compression function HMAC links anyway (lib.rs `code_digest`).
+sha2 = { version = "0.10", features = ["compress"] }
 # OCBS v1, the set-up exchange (M3): P-256 ECDH, which the Android head unit has in its platform at API 32.
 p256 = { version = "0.13", default-features = false, features = ["ecdh"] }

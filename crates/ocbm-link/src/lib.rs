@@ -450,13 +450,28 @@ pub fn setup_code(t: &Transcript) -> String {
     code_digits(&code_digest(t))
 }
 
+/// SHA-256 of the 142 bytes `"OCBS v1 code" | host_pub | box_pub`, padded here to its three blocks and run through the
+/// crate's own compression function, which HMAC links into ocbmd already: `Sha256::digest` adds about 0.9 KB to the
+/// adapter's binary, where the update package has a few KB left (notes/ocbm.md). The tests hold it to `Sha256::digest`
+/// and to the pinned vector.
 fn code_digest(t: &Transcript) -> [u8; 32] {
-    use sha2::Digest;
-    let mut h = Sha256::new();
-    h.update(SETUP_CODE_LABEL);
-    h.update(t.host_pub);
-    h.update(t.box_pub);
-    h.finalize().into()
+    use sha2::digest::generic_array::GenericArray;
+    const LEN: usize = 12 + 65 + 65;
+    let mut m = [0u8; 192];
+    m[..12].copy_from_slice(SETUP_CODE_LABEL);
+    m[12..77].copy_from_slice(&t.host_pub);
+    m[77..LEN].copy_from_slice(&t.box_pub);
+    m[LEN] = 0x80;
+    m[184..].copy_from_slice(&(LEN as u64 * 8).to_be_bytes());
+    // FIPS 180-4's initial hash value for SHA-256.
+    let mut state = [0x6a09e667u32, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
+    let blocks = [*GenericArray::from_slice(&m[..64]), *GenericArray::from_slice(&m[64..128]), *GenericArray::from_slice(&m[128..])];
+    sha2::compress256(&mut state, &blocks);
+    let mut out = [0u8; 32];
+    for (o, w) in out.chunks_exact_mut(4).zip(state) {
+        o.copy_from_slice(&w.to_be_bytes());
+    }
+    out
 }
 
 fn code_digits(digest: &[u8; 32]) -> String {
@@ -771,6 +786,12 @@ mod tests {
         assert_eq!(setup_code(&t), "2092");
         let swapped = Transcript { host_pub: bp, box_pub: hp };
         assert_eq!(setup_code(&swapped), "3978", "the points in the wrong order give another code");
+        // The padding done by hand is SHA-256's own, for these points and others.
+        for t in [t.clone(), swapped, Transcript { host_pub: [0xa5; 65], box_pub: [0; 65] }] {
+            use sha2::Digest;
+            let whole: Vec<u8> = [&b"OCBS v1 code"[..], &t.host_pub, &t.box_pub].concat();
+            assert_eq!(code_digest(&t), <[u8; 32]>::from(Sha256::digest(&whole)));
+        }
         // Both sides of a real exchange agree on it.
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = l.local_addr().unwrap();
