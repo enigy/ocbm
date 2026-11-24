@@ -14,6 +14,10 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 mod jffs2;
+mod mdns;
+mod wifi;
+
+use wifi::Via;
 
 const ACC_DEV: &str = "/dev/usb_accessory";
 
@@ -33,6 +37,8 @@ const MIC_INGEST_ADDR: &str = "127.0.0.1:9112";
 enum Kind {
     Acc,    // the reader thread's pipe: what the host sent ([`start_acc_relay`])
     AccOut, // the writer thread's pipe: room for output, or POLLERR once that thread has ended
+    LinkWake,   // the Wi-Fi listener's pipe: an authenticated connection is waiting (wifi.rs)
+    Link(usize), // a Wi-Fi link's pipe: what its host sent (index into `Daemon::wifi.links`)
     Pty,
     Mic,             // the mic-uplink seam to carplayd (readable: `uplink on/off` back-channel)
     AvListen(usize), // a local A/V seam listener (index into av_listeners)
@@ -297,6 +303,18 @@ struct Daemon {
     /// those files at start ([`host_frames_on_record`]), so a restarted ocbmd carries on from the last.
     heard: bool,
     answered: bool,
+    /// The Wi-Fi link (wifi.rs): which transport's host holds the box, the listener, the links. Inert while no link
+    /// is set up: `acc` is then USB's output for good, as in 2.7.1.
+    wifi: wifi::Side,
+}
+
+/// What [`Daemon::admit`] says of a host frame, in Wi-Fi mode.
+#[derive(Debug, PartialEq, Eq)]
+enum Admit {
+    /// Its transport holds the box (now): handle it.
+    Take,
+    /// Another host holds the box: not handled (a Wi-Fi link is closed for it, a USB frame dropped).
+    Refuse(&'static str),
 }
 
 /// Host-presence heartbeat grace: if a subscribed host misses beats for this long, it is declared gone.
@@ -3487,6 +3505,34 @@ impl Daemon {
                 };
                 self.mgmt_ack(verb, u8::from(!started));
             }
+            // The Wi-Fi link's set-up (wifi.rs), over whatever session the host has. Stored now, applied after the
+            // ACK has gone (wifi_tick). The log names what changed, never a key, a name or a hash.
+            p::MGMT_WIFI_LINK => {
+                let ok = match wifi::parse_provision(&pl[1..]) {
+                    Ok(prov) => match wifi::store(&prov, wifi::LINK_FILE) {
+                        Ok(()) => {
+                            let what = match &prov {
+                                wifi::Provision::Clear => "the link removed",
+                                wifi::Provision::Set(c) if c.ssid.is_empty() => "a link key, no hotspot",
+                                wifi::Provision::Set(_) => "a link key and a hotspot",
+                            };
+                            let came = if self.wifi.on { self.wifi.via } else { Some(Via::Usb) };
+                            eprintln!("[ocbmd] wifi: MGMT_WIFI_LINK stored ({what}, over {}); applied after the ACK", via_name(came));
+                            self.wifi.pending = Some((Instant::now() + WIFI_APPLY_AFTER, came, self.wifi.conf.clone()));
+                            true
+                        }
+                        Err(e) => {
+                            eprintln!("[ocbmd] wifi: MGMT_WIFI_LINK could not be stored ({e}); nothing changed");
+                            false
+                        }
+                    },
+                    Err(why) => {
+                        eprintln!("[ocbmd] wifi: refused a MGMT_WIFI_LINK ({why}); nothing changed");
+                        false
+                    }
+                };
+                self.mgmt_ack(verb, u8::from(!ok));
+            }
             _ => {}
         }
     }
@@ -3545,7 +3591,8 @@ impl Daemon {
              \"transport\":\"{transport}\",\"host_present\":{host},\"phone_present\":{phone},\
              \"daemons\":{{\"ocbmd\":{d0},\"iap2d\":{d1},\"airplayd\":{d2},\"carplay_wireless\":{d3}}},\
              \"preload\":\"{preload}\",\"install\":\"{install}\",\"update\":\"{update}\",\"update_result\":\"{update_result}\",\
-             \"host_name\":\"{host_name}\",\"devices\":[{devs}]}}",
+             \"host_name\":\"{host_name}\",\"devices\":[{devs}],\"wifi_link\":{wifi_link}}}",
+            wifi_link = self.wifi.info(),
             install = install_mode(INSTALL_MODE_FILE),
             preload = preload_state(PRELOAD_OFF_FILE),
             update = update_state(UPDATE_PENDING, UPDATE_RESULT),
@@ -3675,7 +3722,7 @@ impl Daemon {
                     self.seq = 0;
                     let mut caps =
                         p::CAP_CONSOLE | p::CAP_FILE | p::CAP_PHONE_POLICY | p::CAP_PAIR_WINDOW
-                        | p::CAP_INSTALL | p::CAP_PHONE_SWITCH;
+                        | p::CAP_INSTALL | p::CAP_PHONE_SWITCH | p::CAP_WIFI_LINK;
                     if std::path::Path::new(UPDATE_SCRIPT).exists() {
                         caps |= p::CAP_UPDATE;
                     }
@@ -3925,6 +3972,10 @@ impl Daemon {
                     // event, so it is unaffected.
                     eprintln!("[ocbmd] session: STOP — host closed, ending the projection session");
                     self.go_idle(false);
+                    // Wi-Fi mode: the host has left, so another may take the box at once (wifi.rs, one host at a time).
+                    if self.wifi.on {
+                        self.release_box("it sent CT_STOP");
+                    }
                 } else if pl.first() == Some(&p::CT_RADIO) {
                     // App-commanded mid-session radio kill switch (docs/carplay/04_CAPABILITIES_AND_CONFIG.md radio gating). Actuation
                     // rides the proven flag-file→supervisor pattern (see /tmp/wireless_restart): the
@@ -3989,6 +4040,218 @@ impl Daemon {
             p::CH_MIC => self.forward_mic(pl), // mic PCM host -> carplayd -> iPhone (type-100 uplink)
             p::CH_MGMT => self.handle_mgmt(pl), // box management (the app's "CCPA" tab)
             _ => {}
+        }
+    }
+}
+
+/// A stored MGMT_WIFI_LINK is applied this long after its ACK was queued, so the ACK reaches the host over the session
+/// that asked before that session's link may close.
+const WIFI_APPLY_AFTER: Duration = Duration::from_millis(500);
+
+/// "USB", "Wi-Fi link 3", or "no transport", for the log.
+fn via_name(v: Option<Via>) -> String {
+    match v {
+        Some(Via::Usb) => "USB".to_string(),
+        Some(Via::Wifi(id)) => format!("Wi-Fi link {id}"),
+        None => "no transport".to_string(),
+    }
+}
+
+/// The Wi-Fi link's side of the daemon: who holds the box, and the set-up applied (wifi.rs). Reached only in Wi-Fi
+/// mode (`wifi.on`), save [`Daemon::wifi_tick`]'s apply of a link set up over USB.
+impl Daemon {
+    /// May a frame from `via` be handled? Its transport's host holds the box, or takes it now: over USB the first
+    /// frame when nobody holds the box, as 2.7.1 took any host on the cable; over Wi-Fi the HELLO, which is all a host
+    /// sends until its HELLO_ACK. A holder that has spoken within [`wifi::HOLD_SILENCE`] keeps the box, unless the
+    /// HELLO carries its own instance nonce: then it is the same host on another transport, which takes the box.
+    fn admit(&mut self, via: Via, ch: u16, pl: &[u8], now: Instant) -> Admit {
+        if self.wifi.via == Some(via) {
+            self.wifi.last_host_frame = Some(now);
+            return Admit::Take;
+        }
+        let nonce = wifi::hello_nonce(ch, pl);
+        if matches!(via, Via::Wifi(_)) && nonce.is_none() {
+            return Admit::Refuse("its first frame was no HELLO");
+        }
+        let same_host = nonce.is_some_and(|n| n != 0 && self.host_instance == Some(n));
+        if self.wifi.holder_fresh(now) && !same_host {
+            return Admit::Refuse("another host holds the box");
+        }
+        self.take_box(via, now);
+        Admit::Take
+    }
+
+    /// Give the box to `via`'s host: the loop's output becomes its transport's, the previous holder's Wi-Fi link (if
+    /// any) closes, and what was queued for the previous holder goes.
+    fn take_box(&mut self, via: Via, now: Instant) {
+        let old = self.wifi.via;
+        let out = match via {
+            Via::Usb if self.wifi.usb_direct => {
+                // This unit's driver serializes reads and writes: the Wi-Fi side's USB reader would keep the loop's
+                // writes out. One plain USB start serves this host; the host's own HELLO retry carries on.
+                eprintln!("[ocbmd] wifi: a USB host on a driver that serializes reads and writes; restarting for one USB-only start");
+                wifi::set_usb_once();
+                clear_session_state_for_exit(INSTALL_MODE_FILE, start_install_finish);
+                std::process::exit(0);
+            }
+            Via::Usb => match self.wifi.usb_out.take() {
+                Some(f) => f,
+                None => return,
+            },
+            Via::Wifi(id) => {
+                let Some(i) = self.wifi.link_index(id) else { return };
+                self.wifi.links[i].admitted = true;
+                match self.wifi.links[i].to_host.take() {
+                    Some(f) => f,
+                    None => return,
+                }
+            }
+        };
+        let prev = std::mem::replace(&mut self.acc, out);
+        match old {
+            Some(Via::Usb) => self.wifi.usb_out = Some(prev),
+            Some(Via::Wifi(oid)) => {
+                drop(prev);
+                if let Some(i) = self.wifi.link_index(oid) {
+                    self.wifi.links[i].close();
+                }
+            }
+            None => {}
+        }
+        self.clear_output();
+        self.wifi.via = Some(via);
+        self.wifi.last_host_frame = Some(now);
+        let peer = match via {
+            Via::Wifi(id) => self.wifi.link_index(id).map(|i| format!(" from {}", wifi::peer_short(&self.wifi.links[i].peer))).unwrap_or_default(),
+            Via::Usb => String::new(),
+        };
+        eprintln!("[ocbmd] wifi: the host over {}{peer} holds the box (before: {})", via_name(Some(via)), via_name(old));
+    }
+
+    /// Nobody holds the box now: the loop's output goes to the sink, so nothing queues for a host that is not there.
+    fn release_box(&mut self, why: &str) {
+        let Some(old) = self.wifi.via.take() else { return };
+        let prev = std::mem::replace(&mut self.acc, wifi::sink());
+        if old == Via::Usb {
+            self.wifi.usb_out = Some(prev);
+        }
+        self.clear_output();
+        eprintln!("[ocbmd] wifi: the host over {} let the box go ({why})", via_name(Some(old)));
+    }
+
+    /// Every output queue emptied and no queue mid-frame: they were the previous holder's.
+    fn clear_output(&mut self) {
+        for q in [
+            &mut self.out_hi,
+            &mut self.out_audio,
+            &mut self.out_video,
+            &mut self.out_alt_video,
+            &mut self.out_tunnel,
+            &mut self.out_console,
+            &mut self.out_log,
+            &mut self.out_lo,
+        ] {
+            q.clear();
+        }
+        self.wire_owner = None;
+        self.lo_resync = false;
+    }
+
+    /// A Wi-Fi link's input ended: drop it, and if its host held the box, the box is free. The session itself goes on
+    /// as after a USB host stopped reading: the heartbeat grace decides, and the same host's next link re-attaches.
+    fn link_lost(&mut self, idx: usize) {
+        let l = self.wifi.links.remove(idx);
+        if self.wifi.via == Some(Via::Wifi(l.id)) {
+            self.release_box("its link ended");
+        }
+    }
+
+    /// Each pass, in Wi-Fi mode or with a set-up pending: apply a stored MGMT_WIFI_LINK once due, close links that
+    /// sent no HELLO in time, and restart when a restart waits for an idle box.
+    fn wifi_tick(&mut self, now: Instant, direct_io: bool) {
+        if self.wifi.pending.as_ref().is_some_and(|(at, _, _)| now >= *at) {
+            let (_, came, before) = self.wifi.pending.take().expect("checked just above");
+            self.wifi_apply(came, before, now, direct_io);
+        }
+        for l in self.wifi.links.iter().filter(|l| !l.admitted && now.duration_since(l.since) >= wifi::HELLO_WITHIN) {
+            eprintln!("[ocbmd] wifi: link {} sent no HELLO in {} s; closed", l.id, wifi::HELLO_WITHIN.as_secs());
+            l.close();
+        }
+        if self.wifi.restart_when_idle && self.wifi.via.is_none() && !self.present && self.rearm_deadline.is_none() {
+            eprintln!("[ocbmd] wifi: restarting now that no host holds the box (the transports start afresh)");
+            clear_session_state_for_exit(INSTALL_MODE_FILE, start_install_finish);
+            std::process::exit(0);
+        }
+    }
+
+    /// Apply the link as stored: start or stop taking Wi-Fi hosts, hand the listener a new key, restart the station
+    /// keeper for a new hotspot; and when the request came over a Wi-Fi link that the change cuts (a new key, a new
+    /// hotspot, the link removed), close that link: its host reconnects.
+    fn wifi_apply(&mut self, came: Option<Via>, before: Option<wifi::LinkConf>, now: Instant, direct_io: bool) {
+        let conf = wifi::read_link_conf(wifi::LINK_FILE);
+        let key_changed = before.as_ref().map(|c| &c.key) != conf.as_ref().map(|c| &c.key);
+        let hotspot_changed = before.as_ref().map(|c| (&c.ssid, &c.psk)) != conf.as_ref().map(|c| (&c.ssid, &c.psk));
+        self.wifi.conf = conf.clone();
+        match &conf {
+            None => {
+                if self.wifi.on {
+                    if matches!(self.wifi.via, Some(Via::Wifi(_))) {
+                        self.release_box("the link was removed");
+                    }
+                    self.wifi.stop();
+                    if self.wifi.via.is_none() {
+                        // USB's output back as the loop's, for good: 2.7.1's daemon.
+                        if let Some(u) = self.wifi.usb_out.take() {
+                            self.acc = u;
+                        }
+                    }
+                    if self.wifi.usb_direct {
+                        self.wifi.restart_when_idle = true;
+                    }
+                }
+                eprintln!("[ocbmd] wifi: the link is removed: USB only from now on");
+            }
+            Some(c) => {
+                if self.wifi.on {
+                    if key_changed {
+                        if let Some(s) = self.wifi.shared.as_ref() {
+                            s.set_key(Some(c.key.clone()));
+                        }
+                        eprintln!("[ocbmd] wifi: the listener takes the new link key from now on");
+                    }
+                } else {
+                    match self.wifi.start(c) {
+                        Ok(()) => {
+                            // Set up over USB: that host holds the box, its session carries on beside the listener.
+                            self.wifi.via = Some(Via::Usb);
+                            self.wifi.last_host_frame = Some(now);
+                            if direct_io {
+                                // The loop reads this driver itself; the next start serves USB and Wi-Fi apart.
+                                self.wifi.usb_direct = true;
+                                self.wifi.restart_when_idle = true;
+                                eprintln!("[ocbmd] wifi: taking Wi-Fi hosts beside this USB session; on this driver ocbmd restarts once the USB host has gone");
+                            } else {
+                                eprintln!("[ocbmd] wifi: taking Wi-Fi hosts from now on, beside this USB session");
+                            }
+                        }
+                        Err(e) => eprintln!("[ocbmd] wifi: the listener could not start ({e}); USB only"),
+                    }
+                }
+                if hotspot_changed {
+                    wifi::keeper_restart(!c.ssid.is_empty());
+                }
+            }
+        }
+        if conf.is_none() && before.as_ref().is_some_and(|c| !c.ssid.is_empty()) {
+            wifi::keeper_restart(false);
+        }
+        if let Some(Via::Wifi(id)) = came {
+            if conf.is_none() || key_changed || hotspot_changed {
+                if let Some(i) = self.wifi.link_index(id) {
+                    eprintln!("[ocbmd] wifi: link {id} closed after its own set-up changed it; its host reconnects");
+                    self.wifi.links[i].close();
+                }
+            }
         }
     }
 }
@@ -4143,6 +4406,22 @@ fn start_acc_relay(dev: File) -> std::io::Result<(AccRelay, std::sync::Arc<Write
             eprintln!("[ocbmd] accessory writer stopped: {why}");
         })?;
     Ok((AccRelay { from_host, to_host }, watch))
+}
+
+/// Read the accessory on a thread of its own and never write it: the Wi-Fi link's way with a driver that serializes
+/// reads and writes ([`AccIo::Direct`]), whose parked reader would keep any writer out. The loop then serves Wi-Fi
+/// hosts; a USB host's first frame restarts ocbmd for one plain USB start (`Daemon::take_box`).
+fn start_acc_reader(dev: File) -> std::io::Result<File> {
+    let (from_host, host_bytes) = cloexec_pipe()?;
+    set_nonblocking(&from_host);
+    std::thread::Builder::new()
+        .name("acc-read".into())
+        .stack_size(RELAY_STACK)
+        .spawn(move || {
+            let why = relay(&dev, host_bytes, 16 * 1024);
+            eprintln!("[ocbmd] accessory reader stopped: {why}");
+        })?;
+    Ok(from_host)
 }
 
 /// How ocbmd reads and writes the accessory.
@@ -4463,7 +4742,22 @@ fn main() {
             AccIo::Direct => "single-threaded (this unit's driver serializes reads and writes)",
         }
     );
-    let (AccRelay { from_host, to_host }, writer_watch) = start_acc_io(acc, acc_io).unwrap_or_else(|e| {
+    // The Wi-Fi link (wifi.rs): with a link key on flash this start takes Wi-Fi hosts too. Without one, or for the one
+    // USB-only start after a USB host took the box on a serializing driver, this is the USB daemon of 2.7.1.
+    let usb_once = wifi::take_usb_once();
+    let link_conf = wifi::read_link_conf(wifi::LINK_FILE);
+    let wifi_mode = link_conf.is_some() && !usb_once;
+    if usb_once && link_conf.is_some() {
+        eprintln!("[ocbmd] wifi: this start is USB only (a USB host took the box on a driver that serializes reads and writes)");
+    }
+    // On a serializing driver the Wi-Fi side reads USB on a thread of its own and never writes it: a USB host taking
+    // the box restarts ocbmd for one plain USB start (Daemon::take_box).
+    let (AccRelay { from_host, to_host }, writer_watch) = if wifi_mode && acc_io == AccIo::Direct {
+        start_acc_reader(acc).map(|from_host| (AccRelay { from_host, to_host: wifi::sink() }, None))
+    } else {
+        start_acc_io(acc, acc_io)
+    }
+    .unwrap_or_else(|e| {
         eprintln!("[ocbmd] accessory I/O could not start ({e}) — exiting");
         std::process::exit(1);
     });
@@ -4502,8 +4796,35 @@ fn main() {
         std::process::exit(1);
     }
     let (heard, answered) = host_frames_on_record();
+    let mut wifi_side = wifi::Side::off();
+    wifi_side.conf = link_conf.clone();
+    let acc_out = if wifi_mode {
+        // Nobody holds the box yet: the output goes to the sink until a host takes it (Daemon::admit).
+        wifi_side.usb_direct = acc_io == AccIo::Direct;
+        wifi_side.usb_out = (acc_io == AccIo::Relay).then_some(to_host);
+        match wifi_side.start(link_conf.as_ref().expect("wifi_mode needs the link")) {
+            Ok(()) => {
+                eprintln!("[ocbmd] wifi: link set up: taking USB and Wi-Fi hosts, one at a time");
+                wifi::sink()
+            }
+            Err(e) => match wifi_side.usb_out.take() {
+                Some(u) => {
+                    eprintln!("[ocbmd] wifi: the listener could not start ({e}); USB hosts only this start");
+                    u
+                }
+                None => {
+                    // A serializing driver read on the Wi-Fi side's thread, and no Wi-Fi side: one plain USB start.
+                    eprintln!("[ocbmd] wifi: the listener could not start ({e}); restarting for one USB-only start");
+                    wifi::set_usb_once();
+                    std::process::exit(1);
+                }
+            },
+        }
+    } else {
+        to_host
+    };
     let mut d = Daemon {
-        acc: to_host,
+        acc: acc_out,
         seq: 0,
         ptm: None,
         file: FileState::default(),
@@ -4562,7 +4883,9 @@ fn main() {
         last_health_log: None,
         heard,
         answered,
+        wifi: wifi_side,
     };
+    let direct_io = acc_io == AccIo::Direct;
     let mut reasm = p::Reassembler::new();
     let mut rbuf = vec![0u8; p::HDR_LEN + p::MAX_PAYLOAD];
     let mut plbuf = vec![0u8; p::MAX_PAYLOAD];
@@ -4599,6 +4922,8 @@ fn main() {
     // a fresh Vec each pass re-allocates both every wake. clear() keeps the capacity.
     let mut fds: Vec<libc::pollfd> = Vec::new();
     let mut kinds: Vec<Kind> = Vec::new();
+    // USB frames not taken while a Wi-Fi host held the box, for the log's count.
+    let mut usb_refused: u64 = 0;
     loop {
         // rebuild the pollfd set each pass: the accessory relay's two pipes (+POLLOUT if backlog) and the
         // device itself (hangup only) + PTY + the seams
@@ -4612,12 +4937,24 @@ fn main() {
             || !d.out_lo.is_empty();
         fds.clear();
         kinds.clear();
-        fds.push(libc::pollfd {
-            fd: from_host.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        });
-        kinds.push(Kind::Acc);
+        // USB's input; not once its reader has ended while it did not hold the box (Wi-Fi mode carries on without it).
+        if !d.wifi.usb_gone {
+            fds.push(libc::pollfd {
+                fd: from_host.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            });
+            kinds.push(Kind::Acc);
+        }
+        // The Wi-Fi link (wifi.rs): authenticated connections waiting, and each link's input.
+        if let Some(l) = d.wifi.listener.as_ref() {
+            fds.push(libc::pollfd { fd: l.wake.as_raw_fd(), events: libc::POLLIN, revents: 0 });
+            kinds.push(Kind::LinkWake);
+        }
+        for (idx, l) in d.wifi.links.iter().enumerate() {
+            fds.push(libc::pollfd { fd: l.from_host.as_raw_fd(), events: libc::POLLIN, revents: 0 });
+            kinds.push(Kind::Link(idx));
+        }
         // Always in the set, so the writer thread's end (POLLERR) is seen even with nothing to send.
         fds.push(libc::pollfd {
             fd: d.acc.as_raw_fd(),
@@ -4682,7 +5019,7 @@ fn main() {
         // OR while a presence re-arm dip is pending so presence_tick can restore the flag on an
         // otherwise-idle box (without this the poll blocks on -1 and the dip never resolves).
         // Block indefinitely only when truly idle.
-        let timeout_ms = if d.subscribed || d.rearm_deadline.is_some() {
+        let timeout_ms = if d.subscribed || d.rearm_deadline.is_some() || d.wifi.on || d.wifi.pending.is_some() {
             500
         } else {
             LOG_IDLE_POLL_MS
@@ -4714,8 +5051,22 @@ fn main() {
         // mid-pass would shift the indices the pre-built `Kind::AvConn(idx)` entries hold, misrouting one
         // stream's bytes onto another's channel during a :9005 reconnect (audit M-a).
         let mut av_new: Vec<(TcpStream, u16)> = Vec::new(); // (stream, channel); pushed as fresh below
+        // Wi-Fi links that ended this pass, and links authenticated this pass: applied after it, as `av_new` is.
+        let mut links_lost: Vec<usize> = Vec::new();
+        let mut links_new: Vec<wifi::Authed> = Vec::new();
+        let now_pass = Instant::now();
         for i in 0..fds.len() {
             let re = fds[i].revents;
+            // A Wi-Fi link's writer thread ended (its host went): its pipe, the loop's output now, reports POLLERR.
+            // That is the link's end, not USB's.
+            if matches!(kinds[i], Kind::AccOut) && re & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+                if let Some(Via::Wifi(id)) = d.wifi.via {
+                    if let Some(idx) = d.wifi.link_index(id) {
+                        links_lost.push(idx);
+                    }
+                    continue;
+                }
+            }
             if re & libc::POLLIN == 0 {
                 // POLLIN is clear. If this is a hangup/error (POLLHUP/POLLERR/POLLNVAL), the fd is
                 // PERMANENTLY ready — testing only POLLIN skips it every pass, so poll() returns
@@ -4728,6 +5079,14 @@ fn main() {
                         Kind::Mic => d.drop_mic_seam("poll HUP/ERR"), // ensure_mic_seam reconnects on the next tick
                         Kind::AvConn(idx) => av_close.push(idx),
                         Kind::AvListen(_) => {} // a listen socket hangup shouldn't occur; nothing to drop
+                        Kind::Link(idx) => links_lost.push(idx),
+                        Kind::LinkWake => {}
+                        // Wi-Fi mode, and USB does not hold the box: carry on over Wi-Fi without it.
+                        Kind::Acc if d.wifi.on && d.wifi.via != Some(Via::Usb) => {
+                            eprintln!("[ocbmd] wifi: USB's reader ended while USB did not hold the box; carrying on over Wi-Fi (restart once idle)");
+                            d.wifi.usb_gone = true;
+                            d.wifi.restart_when_idle = true;
+                        }
                         Kind::Acc | Kind::AccOut => {
                             // The USB accessory transport itself is gone: a relay thread ended because
                             // its read or write of the device failed (a torn-down gadget fails both),
@@ -4756,7 +5115,20 @@ fn main() {
                     // Treat Ok(0) (EOF) and any non-WouldBlock error as transport death, taking the
                     // same exit-for-respawn path. This reads the reader thread's pipe: EOF there means
                     // the thread's read of the device failed and it ended (see `start_acc_relay`).
-                    match (&from_host).read(&mut rbuf) {
+                    let res = (&from_host).read(&mut rbuf);
+                    let ended = match &res {
+                        Ok(0) => true,
+                        Ok(_) => false,
+                        Err(e) => !matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted),
+                    };
+                    // Wi-Fi mode, and USB does not hold the box: carry on over Wi-Fi without it.
+                    if ended && d.wifi.on && d.wifi.via != Some(Via::Usb) {
+                        eprintln!("[ocbmd] wifi: USB's reader ended while USB did not hold the box; carrying on over Wi-Fi (restart once idle)");
+                        d.wifi.usb_gone = true;
+                        d.wifi.restart_when_idle = true;
+                        continue;
+                    }
+                    match res {
                         Ok(0) => {
                             eprintln!(
                                 "[ocbmd] accessory EOF on read — USB transport gone; exiting for respawn"
@@ -4767,7 +5139,17 @@ fn main() {
                         Ok(n) => {
                             reasm.push(&rbuf[..n]);
                             while let Some((ch, flags, len)) = reasm.next(&mut plbuf) {
-                                d.handle(ch, flags, &plbuf[..len]); // no per-frame copy
+                                // Wi-Fi mode: one host at a time (Daemon::admit); otherwise every frame, as in 2.7.1.
+                                if !d.wifi.on {
+                                    d.handle(ch, flags, &plbuf[..len]); // no per-frame copy
+                                } else if let Admit::Refuse(why) = d.admit(Via::Usb, ch, &plbuf[..len], now_pass) {
+                                    usb_refused = usb_refused.wrapping_add(1);
+                                    if usb_refused == 1 || usb_refused % 100 == 0 {
+                                        eprintln!("[ocbmd] wifi: a USB host's frames are not taken: {why} ({usb_refused} so far)");
+                                    }
+                                } else {
+                                    d.handle(ch, flags, &plbuf[..len]);
+                                }
                             }
                         }
                         // Spurious wake, or a signal-interrupted read. ocbmd installs no signal
@@ -4848,7 +5230,78 @@ fn main() {
                 }
                 // Never asked for POLLIN: the output pipe is polled for room only.
                 Kind::AccOut => {}
+                // Authenticated Wi-Fi connections: links once this pass is over (indices stay put meanwhile).
+                Kind::LinkWake => {
+                    if let Some(l) = d.wifi.listener.as_mut() {
+                        l.drain_wake();
+                        while let Ok(a) = l.rx.try_recv() {
+                            links_new.push(a);
+                        }
+                    }
+                }
+                // A Wi-Fi link's input: its frames through the one-host gate (Daemon::admit), as USB's are.
+                Kind::Link(idx) => {
+                    let Some(link) = d.wifi.links.get_mut(idx) else { continue };
+                    let id = link.id;
+                    let frames: Vec<(u16, u8, Vec<u8>)> = match (&link.from_host).read(&mut rbuf) {
+                        Ok(0) => {
+                            links_lost.push(idx);
+                            continue;
+                        }
+                        Ok(n) => {
+                            link.reasm.push(&rbuf[..n]);
+                            let mut v = Vec::new();
+                            while let Some((ch, flags, len)) = link.reasm.next(&mut plbuf) {
+                                v.push((ch, flags, plbuf[..len].to_vec()));
+                            }
+                            v
+                        }
+                        Err(ref e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) => continue,
+                        Err(_) => {
+                            links_lost.push(idx);
+                            continue;
+                        }
+                    };
+                    for (ch, flags, pl) in frames {
+                        match d.admit(Via::Wifi(id), ch, &pl, now_pass) {
+                            Admit::Take => d.handle(ch, flags, &pl),
+                            Admit::Refuse(why) => {
+                                eprintln!("[ocbmd] wifi: link {id} refused: {why}; closed");
+                                d.wifi.links[idx].close();
+                                links_lost.push(idx);
+                                break;
+                            }
+                        }
+                    }
+                }
             }
+        }
+        // The Wi-Fi links that ended (reverse index order keeps the rest valid), then the new ones, at most
+        // MAX_CANDIDATES waiting for their HELLO: the oldest waiting goes first.
+        links_lost.sort_unstable();
+        links_lost.dedup();
+        for &idx in links_lost.iter().rev() {
+            if idx < d.wifi.links.len() {
+                d.link_lost(idx);
+            }
+        }
+        for a in links_new {
+            let (id, peer) = (a.id, wifi::peer_short(&a.peer));
+            match wifi::start_link(a) {
+                Ok(l) => {
+                    while d.wifi.links.iter().filter(|l| !l.admitted).count() >= wifi::MAX_CANDIDATES {
+                        let Some(old) = d.wifi.links.iter().position(|l| !l.admitted) else { break };
+                        eprintln!("[ocbmd] wifi: link {} closed: too many links waiting for their HELLO", d.wifi.links[old].id);
+                        d.wifi.links.remove(old);
+                    }
+                    eprintln!("[ocbmd] wifi: link {id} from {peer} authenticated; waiting for its HELLO");
+                    d.wifi.links.push(l);
+                }
+                Err(e) => eprintln!("[ocbmd] wifi: link {id} from {peer} could not start ({e})"),
+            }
+        }
+        if d.wifi.on || d.wifi.pending.is_some() {
+            d.wifi_tick(Instant::now(), direct_io);
         }
         // drop closed A/V connections (reverse index order keeps the rest valid)
         av_close.sort_unstable();
@@ -5067,6 +5520,7 @@ mod tests {
             // ANSWERED_FILE to the two tests about them (host_frame_files_lock).
             heard: true,
             answered: true,
+            wifi: wifi::Side::off(),
         }
     }
 
@@ -6767,5 +7221,203 @@ mod tests {
         assert!(std::path::Path::new(ANSWERED_FILE).exists(), "the first non-HELLO frame is the answer");
         let _ = std::fs::remove_file(HEARD_FILE);
         let _ = std::fs::remove_file(ANSWERED_FILE);
+    }
+
+    // ---- the Wi-Fi link: one host at a time, and its set-up (wifi.rs) -------------------------------------------
+
+    /// A daemon in Wi-Fi mode with nobody holding the box: its output a sink, USB's kept aside.
+    fn td_wifi() -> Daemon {
+        let mut d = td();
+        d.wifi.on = true;
+        d.wifi.usb_out = Some(OpenOptions::new().write(true).open("/dev/null").unwrap());
+        d
+    }
+
+    /// What has reached a transport's output pipe, as frames.
+    fn frames_out(f: &mut File) -> Vec<(u16, u8, Vec<u8>)> {
+        let mut raw = Vec::new();
+        let mut b = [0u8; 4096];
+        while let Ok(n) = f.read(&mut b) {
+            if n == 0 {
+                break;
+            }
+            raw.extend_from_slice(&b[..n]);
+        }
+        let mut r = p::Reassembler::new();
+        r.push(&raw);
+        let mut out = vec![0u8; p::MAX_PAYLOAD];
+        let mut v = Vec::new();
+        while let Some((ch, fl, n)) = r.next(&mut out) {
+            v.push((ch, fl, out[..n].to_vec()));
+        }
+        v
+    }
+
+    #[test]
+    fn hello_ack_offers_the_wifi_link_capability() {
+        let mut d = td();
+        d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &hello(0x1111_0001, b""));
+        let ack = sent(&mut d).into_iter().find(|(_, _, pl)| pl.first() == Some(&p::CT_HELLO_ACK)).unwrap();
+        let caps = u32::from_le_bytes([ack.2[2], ack.2[3], ack.2[4], ack.2[5]]);
+        assert_ne!(caps & p::CAP_WIFI_LINK, 0);
+    }
+
+    #[test]
+    fn a_wifi_hosts_hello_takes_a_free_box_and_its_answer_goes_over_its_link() {
+        let mut d = td_wifi();
+        let (link, mut out, _host) = wifi::test_link(7);
+        d.wifi.links.push(link);
+        let t = Instant::now();
+        let hello7 = hello(0x0700_0007, b"");
+        assert_eq!(d.admit(Via::Wifi(7), p::CH_CTRL, &hello7, t), Admit::Take);
+        assert_eq!(d.wifi.via, Some(Via::Wifi(7)));
+        d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &hello7);
+        d.drain();
+        let got = frames_out(&mut out);
+        assert!(got.iter().any(|(ch, _, pl)| *ch == p::CH_CTRL && pl.first() == Some(&p::CT_HELLO_ACK)), "{got:?}");
+    }
+
+    #[test]
+    fn a_wifi_links_first_frame_must_be_its_hello() {
+        let mut d = td_wifi();
+        let (link, _out, _host) = wifi::test_link(3);
+        d.wifi.links.push(link);
+        assert!(matches!(d.admit(Via::Wifi(3), p::CH_CTRL, &[p::CT_HEARTBEAT], Instant::now()), Admit::Refuse(_)));
+        assert_eq!(d.wifi.via, None);
+    }
+
+    #[test]
+    fn a_host_holding_the_box_keeps_it_until_it_goes_quiet_and_the_same_host_may_move() {
+        let mut d = td_wifi();
+        let (l1, _o1, _h1) = wifi::test_link(1);
+        let (l2, _o2, _h2) = wifi::test_link(2);
+        d.wifi.links.push(l1);
+        d.wifi.links.push(l2);
+        let t = Instant::now();
+        // USB speaks first: it takes the free box (any frame, as in 2.7.1).
+        assert_eq!(d.admit(Via::Usb, p::CH_CTRL, &hello(0xAAAA_0001, b""), t), Admit::Take);
+        d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &hello(0xAAAA_0001, b""));
+        assert_eq!(d.wifi.via, Some(Via::Usb));
+        // Another host over Wi-Fi is refused while USB has spoken within the hold.
+        let t5 = t + Duration::from_secs(5);
+        assert!(matches!(d.admit(Via::Wifi(1), p::CH_CTRL, &hello(0xBBBB_0002, b""), t5), Admit::Refuse(_)));
+        assert_eq!(d.wifi.via, Some(Via::Usb));
+        // The same host (its instance nonce) moving to Wi-Fi takes the box at once.
+        assert_eq!(d.admit(Via::Wifi(1), p::CH_CTRL, &hello(0xAAAA_0001, b""), t5), Admit::Take);
+        assert_eq!(d.wifi.via, Some(Via::Wifi(1)));
+        assert!(d.wifi.usb_out.is_some(), "USB's output kept aside");
+        // USB is refused now, until the Wi-Fi host has been quiet for HOLD_SILENCE...
+        assert!(matches!(d.admit(Via::Usb, p::CH_CTRL, &[p::CT_HEARTBEAT], t5), Admit::Refuse(_)));
+        // ...after which another host's HELLO takes the box, and the old link is closed.
+        let late = t5 + wifi::HOLD_SILENCE + Duration::from_millis(1);
+        assert_eq!(d.admit(Via::Wifi(2), p::CH_CTRL, &hello(0xCCCC_0003, b""), late), Admit::Take);
+        assert_eq!(d.wifi.via, Some(Via::Wifi(2)));
+    }
+
+    #[test]
+    fn ct_stop_lets_the_box_go_and_the_output_goes_to_the_sink() {
+        let mut d = td_wifi();
+        let (l, _o, _h) = wifi::test_link(4);
+        d.wifi.links.push(l);
+        let t = Instant::now();
+        assert_eq!(d.admit(Via::Wifi(4), p::CH_CTRL, &hello(0x0400_0004, b""), t), Admit::Take);
+        d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &hello(0x0400_0004, b""));
+        assert_eq!(d.admit(Via::Wifi(4), p::CH_CTRL, &[p::CT_STOP], t), Admit::Take);
+        d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &[p::CT_STOP]);
+        assert_eq!(d.wifi.via, None, "a host that stopped holds nothing");
+        // USB now takes the box with its first frame.
+        assert_eq!(d.admit(Via::Usb, p::CH_CTRL, &[p::CT_HEARTBEAT], t), Admit::Take);
+        assert_eq!(d.wifi.via, Some(Via::Usb));
+    }
+
+    #[test]
+    fn a_lost_link_frees_the_box_for_the_next_host() {
+        let mut d = td_wifi();
+        let (l, _o, _h) = wifi::test_link(5);
+        d.wifi.links.push(l);
+        let t = Instant::now();
+        assert_eq!(d.admit(Via::Wifi(5), p::CH_CTRL, &hello(0x0500_0005, b""), t), Admit::Take);
+        d.link_lost(0);
+        assert_eq!(d.wifi.via, None);
+        assert!(d.wifi.links.is_empty());
+        assert_eq!(d.admit(Via::Usb, p::CH_CTRL, &[p::CT_HEARTBEAT], t), Admit::Take);
+    }
+
+    /// The tests that write wifi::LINK_FILE, one at a time.
+    fn wifi_file_lock() -> std::sync::MutexGuard<'static, ()> {
+        static L: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        L.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn provision(key: u8, ssid: &str, psk: &str) -> Vec<u8> {
+        let mut b = vec![p::MGMT_WIFI_LINK, 1];
+        b.extend_from_slice(&[key; 32]);
+        b.push(ssid.len() as u8);
+        b.extend_from_slice(ssid.as_bytes());
+        b.push(psk.len() as u8);
+        b.extend_from_slice(psk.as_bytes());
+        b
+    }
+
+    fn mgmt_acks(d: &mut Daemon) -> Vec<(u8, u8)> {
+        sent_lo(d).into_iter().filter(|(ch, _, pl)| *ch == p::CH_MGMT && pl.first() == Some(&p::MGMT_ACK)).map(|(_, _, pl)| (pl[1], pl[2])).collect()
+    }
+
+    #[test]
+    fn mgmt_wifi_link_is_stored_acked_then_applied_and_a_bad_body_changes_nothing() {
+        let _l = wifi_file_lock();
+        let _ = std::fs::remove_file(wifi::LINK_FILE);
+        let mut d = td();
+        d.handle_mgmt(&[p::MGMT_WIFI_LINK, 2, 0]);
+        assert_eq!(mgmt_acks(&mut d), vec![(p::MGMT_WIFI_LINK, 1)]);
+        assert!(!std::path::Path::new(wifi::LINK_FILE).exists(), "a refused body writes nothing");
+        assert!(d.wifi.pending.is_none());
+
+        d.handle_mgmt(&provision(0x21, "Example Hotspot", &"ab".repeat(32)));
+        assert_eq!(mgmt_acks(&mut d), vec![(p::MGMT_WIFI_LINK, 0)]);
+        let c = wifi::read_link_conf(wifi::LINK_FILE).expect("stored");
+        assert_eq!((c.key.0, c.ssid.as_str()), ([0x21; 32], "Example Hotspot"));
+        let (at, came, before) = d.wifi.pending.clone().expect("an apply pending");
+        assert_eq!((came, before), (Some(Via::Usb), None), "set up over USB, nothing before");
+        // Not before its time: the ACK goes first.
+        d.wifi_tick(at - Duration::from_millis(100), false);
+        assert!(d.wifi.pending.is_some() && !d.wifi.on);
+        // Clear: stored at once, applied after.
+        d.handle_mgmt(&[p::MGMT_WIFI_LINK]);
+        assert_eq!(mgmt_acks(&mut d), vec![(p::MGMT_WIFI_LINK, 0)]);
+        assert!(!std::path::Path::new(wifi::LINK_FILE).exists());
+        let _ = std::fs::remove_file(wifi::LINK_FILE);
+    }
+
+    #[test]
+    fn a_wifi_hosts_own_new_key_closes_its_link_after_the_ack() {
+        let _l = wifi_file_lock();
+        let mut d = td_wifi();
+        let first = wifi::LinkConf { key: ocbm_link::LinkKey([0x31; 32]), ssid: "net".into(), psk: "cd".repeat(32) };
+        wifi::store(&wifi::Provision::Set(first.clone()), wifi::LINK_FILE).unwrap();
+        d.wifi.conf = Some(first);
+        let (l, _o, mut host) = wifi::test_link(9);
+        d.wifi.links.push(l);
+        let t = Instant::now();
+        assert_eq!(d.admit(Via::Wifi(9), p::CH_CTRL, &hello(0x0900_0009, b""), t), Admit::Take);
+        // The same hotspot, a new key: stored, ACKed over the link, then the link closes.
+        d.handle_mgmt(&provision(0x32, "net", &"cd".repeat(32)));
+        let (at, came, _) = d.wifi.pending.clone().unwrap();
+        assert_eq!(came, Some(Via::Wifi(9)));
+        d.wifi_tick(at, false);
+        assert!(d.wifi.pending.is_none());
+        assert_eq!(d.wifi.conf.as_ref().map(|c| c.key.0), Some([0x32; 32]));
+        host.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut b = [0u8; 16];
+        assert!(matches!(host.read(&mut b), Ok(0) | Err(_)), "the host's link was closed");
+        let _ = std::fs::remove_file(wifi::LINK_FILE);
+    }
+
+    #[test]
+    fn mgmt_info_carries_the_wifi_link_object() {
+        let d = td();
+        let j = d.box_info_json();
+        assert!(j.contains("\"wifi_link\":{\"state\":\"off\",\"channel\":0,\"ap_channel\":"), "{j}");
+        assert!(j.ends_with("}}"), "{j}");
     }
 }

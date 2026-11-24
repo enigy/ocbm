@@ -593,6 +593,7 @@ dependencies = [
  "box-common",
  "libc",
  "miniz_oxide",
+ "ocbm-link",
  "ocbm-proto",
 ]
 

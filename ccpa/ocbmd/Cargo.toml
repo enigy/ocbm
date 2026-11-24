@@ -15,3 +15,6 @@ libc = "0.2"
 # inflate for `ocbmd jffs2-extract` (src/jffs2.rs): the on-adapter restore decodes the stick's flash dump
 # with no computer (Scott, 3 Nov). Pure Rust, no unsafe, no C.
 miniz_oxide = "0.8"
+# The Wi-Fi link (src/wifi.rs): OCBW v1, OCBM over TCP behind a pre-shared-key handshake and ChaCha20-Poly1305
+# records. Linked always; it runs only on an adapter whose link was set up (/etc/ocbm/wifi_link).
+ocbm-link = { path = "../../crates/ocbm-link" }

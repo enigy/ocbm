@@ -364,6 +364,18 @@ pub const MGMT_UPDATE: u8 = 0x0C;
 /// MGMT_CONNECT_DEVICE. Never ends a wired session: btd has none live then. MGMT_ACK status 1 = not a
 /// MAC, not bonded, or btd unreachable. Only on a box with CAP_PHONE_SWITCH.
 pub const MGMT_SWITCH_DEVICE: u8 = 0x0D;
+/// [MGMT_WIFI_LINK][ver 1][link key 32 B][ssid_len u8][ssid][psk_len u8][psk] -> set up the Wi-Fi link (OCBW v1,
+/// crate `ocbm-link`; ocbmd `src/wifi.rs`): the box keeps the key and the phone hotspot's name and WPA key in
+/// `/etc/ocbm/wifi_link` (0600), joins that hotspot on its station interface, and listens on it. `psk` = the
+/// hotspot's WPA key as 64 hex digits (PBKDF2-SHA1(passphrase, ssid, 4096, 32), worked out on the head unit so the
+/// passphrase never reaches the box), or the passphrase itself (8..=63 printable ASCII, no `"`), or empty for an
+/// open network. An empty ssid (with an empty psk) keeps the key only: the listener runs on a station interface
+/// that already has an address, no hotspot is joined. [MGMT_WIFI_LINK] with no body removes the link. MGMT_ACK
+/// status 0 = stored; the box then applies it about half a second later, beside the session that asked: a USB
+/// session carries on, a Wi-Fi session's link is closed when the key or the hotspot changed (or the link was
+/// removed), and its host reconnects. Status 1 = malformed, not storable, or the file could not be written: nothing
+/// changed. Only on a box with CAP_WIFI_LINK.
+pub const MGMT_WIFI_LINK: u8 = 0x0E;
                                             //   Box->host:
 pub const MGMT_INFO: u8 = 0x81; // [MGMT_INFO][utf8 JSON] — identity + health + bonded-device snapshot
 pub const MGMT_ACK: u8 = 0x82; // [MGMT_ACK][verb u8][status u8] — 0 ok / 1 error, echoing the request verb
@@ -380,6 +392,7 @@ pub const CAP_PAIR_WINDOW: u32 = 0x0000_0080; // box takes MGMT_PAIR_WINDOW and 
 pub const CAP_INSTALL: u32 = 0x0000_0100; // box takes MGMT_INSTALL_CONFIRM / MGMT_GO_STOCK and reports "install" in MGMT_INFO
 pub const CAP_UPDATE: u32 = 0x0000_0200; // box takes MGMT_UPDATE and reports "update" in MGMT_INFO
 pub const CAP_PHONE_SWITCH: u32 = 0x0000_0400; // box takes MGMT_SWITCH_DEVICE: Connect may end another phone's wireless session
+pub const CAP_WIFI_LINK: u32 = 0x0000_0800; // box takes MGMT_WIFI_LINK and reports "wifi_link" in MGMT_INFO
 
 // OCBM_CH_FILE sub-frame types. Host pushes one file at a time to the box so binary
 // deploys ride the reliable accessory pipe instead of corruption-prone base64-over-UART.
