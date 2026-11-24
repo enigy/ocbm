@@ -306,6 +306,57 @@ struct Daemon {
     /// The Wi-Fi link (wifi.rs): which transport's host holds the box, the listener, the links. Inert while no link
     /// is set up: `acc` is then USB's output for good, as in 2.7.1.
     wifi: wifi::Side,
+    /// M2: the CarPlay session this adapter started with no host ([`Daemon::self_session_start`]). None: every session
+    /// is a host's, as in 2.7.1.
+    selfs: Option<SelfSession>,
+    /// An attach to a running self-started session wants its live CT_PROJ_MODE after the replay (the attach signal,
+    /// notes/carlink.md 9): [`Daemon::proj_mode_tick`] sends it once.
+    attach_live: bool,
+}
+
+/// M2 (the owner's word, 23 Nov 2026): a CarPlay session an adapter with the Wi-Fi link set up starts at power-up with
+/// no host. Presence is held by the adapter itself (`/tmp/host_present` = 1), so the supervisor's session start runs as
+/// for a host: Bluetooth up and connectable, the bonded phones paged, the AP, carplayd. With no host holding the box
+/// the output is a sink: the video is parked (carplayd's seams drain, nothing waits for a host). A host that SUBSCRIBEs
+/// attaches: fresh A/V keys and a keyframe through the reattach path's re-key, or a restart when its config differs.
+struct SelfSession {
+    started: Instant,
+    /// The config the session runs with (the kept copy of the last host's, or a later host's).
+    cfg: Vec<u8>,
+    /// A host is attached to it now.
+    attached: bool,
+    /// When the last attached host left; the hold runs from there.
+    left: Option<Instant>,
+}
+
+/// A self-started session ends when no host has attached this long after it started...
+const SELF_FIRST_WAIT: Duration = Duration::from_secs(180);
+/// ...or this long after its last host left. The phone is in CarPlay all the while, its audio going to nobody, so the
+/// holds bridge a Carlink restart, a hotspot blip or the head unit's own start, and no more.
+const SELF_HOLD: Duration = Duration::from_secs(60);
+/// Set when a self-started session ended for want of a host: none starts again this boot (tmpfs).
+#[cfg(not(test))]
+const SELF_OVER_FILE: &str = "/tmp/ocbmd_self_session_over";
+#[cfg(test)]
+const SELF_OVER_FILE: &str = "/tmp/ocbmd_selftest_self_session_over";
+/// The last host's SUBSCRIBE config, kept on flash while the Wi-Fi link is set up: the self-started session runs with
+/// it, so its video is shaped for the head unit that will attach. Removed with the link.
+#[cfg(not(test))]
+const SESSION_CFG_FILE: &str = "/etc/ocbm/wifi_session.yaml";
+#[cfg(test)]
+const SESSION_CFG_FILE: &str = "/tmp/ocbmd_selftest_wifi_session.yaml";
+/// The owner's off switch for M2, on flash; the bench's is box_common::bench_switch("wifi_selfstart_off").
+#[cfg(not(test))]
+const SELF_OFF_FILE: &str = "/etc/ocbm/wifi_selfstart_off";
+#[cfg(test)]
+const SELF_OFF_FILE: &str = "/tmp/ocbmd_selftest_no_such_wifi_selfstart_off";
+
+/// Whether a config says `wireless: false` (the supervisor's own reading of it, cfg_snapshot).
+fn cfg_wireless_off(cfg: &[u8]) -> bool {
+    String::from_utf8_lossy(cfg).lines().any(|l| {
+        let l = l.trim().to_ascii_lowercase();
+        l.strip_prefix("wireless:").is_some_and(|v| v.trim_start().starts_with("false"))
+    })
 }
 
 /// What [`Daemon::admit`] says of a host frame, in Wi-Fi mode.
@@ -2193,11 +2244,17 @@ impl Daemon {
                         HEARTBEAT_GRACE
                     );
                     // Past grace = the session is over; return fully idle (docs/carplay/02_SESSION_LIFECYCLE.md). Signalled: the
-                    // host may still be listening and this is its cue to re-subscribe (audit 3.4).
-                    self.go_idle(true);
+                    // host may still be listening and this is its cue to re-subscribe (audit 3.4). M2: the adapter's own
+                    // session goes on parked instead, for a host to attach.
+                    if self.selfs.is_some() {
+                        self.self_session_host_left("its heartbeat stopped", true);
+                    } else {
+                        self.go_idle(true);
+                    }
                 }
             }
         }
+        self.self_session_tick(now);
         self.phone_tick(now);
         self.pairing_code_tick(now);
         self.bt_phase_tick(now);
@@ -2910,6 +2967,11 @@ impl Daemon {
             self.proj_mode = Some(now);
             self.send(p::CH_CTRL, mirror_flags(replay), &[p::CT_PROJ_MODE, now]);
             eprintln!("[ocbmd] projection mode -> host: {now}");
+        }
+        // M2's attach signal (notes/carlink.md 9): right after the replay, the running mode once more, live.
+        if std::mem::take(&mut self.attach_live) && self.proj_mode.is_some_and(|m| m != p::PM_NONE) {
+            self.send(p::CH_CTRL, mirror_flags(false), &[p::CT_PROJ_MODE, now]);
+            eprintln!("[ocbmd] projection mode -> host: {now} (live: the attached host's session is running)");
         }
     }
 
@@ -3885,7 +3947,37 @@ impl Daemon {
                         "[ocbmd] session: SUBSCRIBE ({} B config, cfg_changed={cfg_changed} replaced={replaced} reattached={reattached})",
                         self.cfg.len()
                     );
-                    if replaced {
+                    // M2: a host attaching to the session this adapter started (or kept after its last host left), or
+                    // replacing the one attached. Its config is kept for the next power-up's session.
+                    let m2 = self.selfs.as_ref().map(|ss| (!ss.attached || replaced, ss.cfg.as_slice() != &pl[1..]));
+                    if self.wifi.conf.is_some() {
+                        keep_session_cfg(&pl[1..]);
+                    }
+                    if let Some((true, differs)) = m2 {
+                        if let Some(ss) = self.selfs.as_mut() {
+                            ss.attached = true;
+                            ss.left = None;
+                            if differs {
+                                ss.cfg = pl[1..].to_vec();
+                            }
+                        }
+                        if differs {
+                            // Another config than the session runs with: the session starts again with the host's.
+                            eprintln!("[ocbmd] wifi: a host attaches with another config than the running session's: the session restarts with it");
+                            self.rearm_presence_silently();
+                        } else {
+                            // The session goes on: fresh A/V keys and a keyframe (the reattach path's re-key), and the
+                            // live CT_PROJ_MODE after the replay says it runs.
+                            eprintln!("[ocbmd] wifi: a host attaches to the running session (re-keying its A/V seams)");
+                            self.rekey_av = true;
+                            self.attach_live = true;
+                        }
+                        self.send(
+                            p::CH_CTRL,
+                            p::F_SOM | p::F_EOM,
+                            &[p::CT_SESSION_EVENT, p::SEV_HOST_PRESENT],
+                        );
+                    } else if replaced {
                         // A REPLACEMENT host whose predecessor died without CT_STOP: presence never
                         // dropped, so it owes the teardown+re-arm CT_STOP would have done. carplayd
                         // re-establishes on the GONE->PRESENT edge. Silently, though — see
@@ -3970,8 +4062,13 @@ impl Daemon {
                     // would sit unread in the gadget FIFO and be the FIRST frame the NEXT host reads —
                     // see `go_idle`'s contract. The supervisor's teardown rides the flag file, not the
                     // event, so it is unaffected.
-                    eprintln!("[ocbmd] session: STOP — host closed, ending the projection session");
-                    self.go_idle(false);
+                    if self.selfs.is_some() {
+                        // M2: the session is the adapter's: it goes on parked for SELF_HOLD for a host to attach.
+                        self.self_session_host_left("it sent CT_STOP", false);
+                    } else {
+                        eprintln!("[ocbmd] session: STOP — host closed, ending the projection session");
+                        self.go_idle(false);
+                    }
                     // Wi-Fi mode: the host has left, so another may take the box at once (wifi.rs, one host at a time).
                     if self.wifi.on {
                         self.release_box("it sent CT_STOP");
@@ -4215,6 +4312,7 @@ impl Daemon {
                         self.wifi.restart_when_idle = true;
                     }
                 }
+                let _ = std::fs::remove_file(SESSION_CFG_FILE);
                 eprintln!("[ocbmd] wifi: the link is removed: USB only from now on");
             }
             Some(c) => {
@@ -4259,6 +4357,110 @@ impl Daemon {
                 }
             }
         }
+    }
+}
+
+/// Keep `cfg` as the next self-started session's config, on flash only when it changed.
+fn keep_session_cfg(cfg: &[u8]) {
+    if cfg.is_empty() || std::fs::read(SESSION_CFG_FILE).is_ok_and(|kept| kept == cfg) {
+        return;
+    }
+    let tmp = format!("{SESSION_CFG_FILE}.tmp");
+    if std::fs::write(&tmp, cfg).and_then(|_| std::fs::rename(&tmp, SESSION_CFG_FILE)).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        eprintln!("[ocbmd] wifi: could not keep the session config for the next start");
+    }
+}
+
+/// M2: whether this start may begin a session with no host (the link set up, no switch off, none ended this boot).
+fn self_start_wanted() -> bool {
+    if std::path::Path::new(SELF_OVER_FILE).exists() {
+        return false;
+    }
+    if std::path::Path::new(SELF_OFF_FILE).exists() {
+        eprintln!("[ocbmd] wifi: no session without a host ({SELF_OFF_FILE}): the adapter waits for a host");
+        return false;
+    }
+    if let Some((_, f)) = box_common::bench_switch("wifi_selfstart_off") {
+        eprintln!("[ocbmd] [bench] wifi: no session without a host ({f})");
+        return false;
+    }
+    true
+}
+
+/// M2, the session this adapter starts by itself (Wi-Fi mode).
+impl Daemon {
+    /// Start the CarPlay session with no host: the kept config landed for carplayd and the supervisor, and presence
+    /// raised as a host's SUBSCRIBE raises it, so the supervisor's own session start runs (Bluetooth, the bonded phones
+    /// paged, the AP, carplayd). The connect timeline's origin is this moment.
+    fn self_session_start(&mut self, now: Instant) {
+        let cfg = std::fs::read(SESSION_CFG_FILE).unwrap_or_default();
+        if cfg_wireless_off(&cfg) {
+            eprintln!("[ocbmd] wifi: the kept config says wireless: false; no session without a host");
+            return;
+        }
+        self.cfg = cfg.clone();
+        if cfg.is_empty() {
+            clear_cfg_file();
+        } else {
+            write_cfg_file(&self.cfg);
+        }
+        eprintln!(
+            "[ocbmd] wifi: starting the CarPlay session with no host (Bluetooth up, the bonded phones paged, the video parked until a host attaches; {} B config kept)",
+            cfg.len()
+        );
+        self.selfs = Some(SelfSession { started: now, cfg, attached: false, left: None });
+        self.set_present(true);
+    }
+
+    /// The attached host left a self-started session: the session goes on, parked, and the host's own state goes (as
+    /// `go_idle` drops it): its subscription, its latches, its radio inhibit, its mic and input seams, its log stream.
+    fn self_session_host_left(&mut self, why: &str, notify_host: bool) {
+        if notify_host {
+            self.send(p::CH_CTRL, p::F_SOM | p::F_EOM, &[p::CT_SESSION_EVENT, p::SEV_HOST_GONE]);
+        }
+        self.subscribed = false;
+        self.host_replaced = false;
+        self.host_reattached = false;
+        self.rekey_av = false;
+        self.attach_live = false;
+        let _ = std::fs::remove_file(RADIO_OFF_FLAG);
+        self.mic_sock = None;
+        self.mic_rx.clear();
+        self.mic_uplink_on = false;
+        self.input_sock = None;
+        self.log_reset();
+        if let Some(ss) = self.selfs.as_mut() {
+            ss.attached = false;
+            ss.left = Some(Instant::now());
+        }
+        eprintln!(
+            "[ocbmd] wifi: the host left ({why}); the CarPlay session goes on, parked, {} s for a host to attach",
+            SELF_HOLD.as_secs()
+        );
+    }
+
+    /// End a self-started session no host came to in time: presence drops (the supervisor's complete teardown lets the
+    /// phone go), and none starts again this boot; a host's arrival is then today's session start.
+    fn self_session_tick(&mut self, now: Instant) {
+        let Some(ss) = self.selfs.as_ref() else { return };
+        if ss.attached {
+            return;
+        }
+        let (since, wait, why) = match ss.left {
+            Some(t) => (t, SELF_HOLD, "no host came back"),
+            None => (ss.started, SELF_FIRST_WAIT, "no host attached"),
+        };
+        if now.duration_since(since) < wait {
+            return;
+        }
+        eprintln!(
+            "[ocbmd] wifi: ending the CarPlay session this adapter started: {why} in {} s; the adapter waits for a host",
+            wait.as_secs()
+        );
+        self.selfs = None;
+        let _ = std::fs::write(SELF_OVER_FILE, b"1\n");
+        self.go_idle(false);
     }
 }
 
@@ -4890,6 +5092,8 @@ fn main() {
         heard,
         answered,
         wifi: wifi_side,
+        selfs: None,
+        attach_live: false,
     };
     let direct_io = acc_io == AccIo::Direct;
     let mut reasm = p::Reassembler::new();
@@ -4911,6 +5115,10 @@ fn main() {
     // of one left behind by a predecessor, so a new instance never inherits a stale "wedged" reading.
     if let Err(e) = File::create(ALIVE_FILE) {
         eprintln!("[ocbmd] cannot create {ALIVE_FILE} ({e}) — supervisor liveness unavailable");
+    }
+    // M2: with the Wi-Fi link set up, the CarPlay session starts now, with no host (Daemon::self_session_start).
+    if d.wifi.on && self_start_wanted() {
+        d.self_session_start(Instant::now());
     }
     let mut last_alive_touch: Option<Instant> = None;
     // Auto-reap forked children (the CONSOLE root shell) so exited console sessions don't become
@@ -5527,6 +5735,8 @@ mod tests {
             heard: true,
             answered: true,
             wifi: wifi::Side::off(),
+            selfs: None,
+            attach_live: false,
         }
     }
 
@@ -7425,5 +7635,136 @@ mod tests {
         let j = d.box_info_json();
         assert!(j.contains("\"wifi_link\":{\"state\":\"off\",\"channel\":0,\"ap_channel\":"), "{j}");
         assert!(j.ends_with("}}"), "{j}");
+    }
+
+    // ---- M2: the session this adapter starts with no host ----------------------------------------------------------
+
+    fn subscribe(d: &mut Daemon, cfg: &[u8]) {
+        let mut pl = vec![p::CT_SUBSCRIBE];
+        pl.extend_from_slice(cfg);
+        d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &pl);
+    }
+
+    fn sevs(d: &mut Daemon) -> Vec<u8> {
+        sent(d).into_iter().filter(|(_, _, pl)| pl.first() == Some(&p::CT_SESSION_EVENT)).map(|(_, _, pl)| pl[1]).collect()
+    }
+
+    #[test]
+    fn a_self_started_session_holds_presence_with_the_kept_config_and_no_heartbeat_watchdog() {
+        let _flag = presence_flag_lock();
+        std::fs::write(SESSION_CFG_FILE, b"cfg: kept\n").unwrap();
+        let mut d = td();
+        let t0 = Instant::now();
+        d.self_session_start(t0);
+        assert!(d.present && !d.subscribed && d.selfs.is_some());
+        assert_eq!(d.cfg, b"cfg: kept\n");
+        assert_eq!(std::fs::read_to_string(HOST_PRESENT_FLAG).unwrap().trim(), "1", "the supervisor's session start");
+        // No host, no heartbeat: nothing ends it before SELF_FIRST_WAIT.
+        d.presence_tick(t0 + HEARTBEAT_GRACE + Duration::from_secs(5));
+        assert!(d.present && d.selfs.is_some());
+        let _ = std::fs::remove_file(SESSION_CFG_FILE);
+    }
+
+    #[test]
+    fn a_kept_config_that_says_wireless_false_starts_nothing() {
+        let _flag = presence_flag_lock();
+        std::fs::write(SESSION_CFG_FILE, b"name: x\nwireless: false\n").unwrap();
+        let mut d = td();
+        d.self_session_start(Instant::now());
+        assert!(!d.present && d.selfs.is_none());
+        let _ = std::fs::remove_file(SESSION_CFG_FILE);
+        assert!(cfg_wireless_off(b"  Wireless:   FALSE") && !cfg_wireless_off(b"wireless: true\n"));
+    }
+
+    #[test]
+    fn a_host_with_the_same_config_attaches_to_the_running_session_without_a_restart() {
+        let _flag = presence_flag_lock();
+        std::fs::write(SESSION_CFG_FILE, b"cfg: kept\n").unwrap();
+        let mut d = td();
+        d.self_session_start(Instant::now());
+        let _ = sent(&mut d);
+        d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &hello(0x2200_0001, b""));
+        subscribe(&mut d, b"cfg: kept\n");
+        assert!(d.rekey_av, "fresh A/V keys and a keyframe for the attached host");
+        assert!(d.attach_live, "the live CT_PROJ_MODE after the replay");
+        assert!(d.rearm_deadline.is_none(), "no presence dip: the session goes on");
+        assert!(d.present && d.subscribed && d.selfs.as_ref().is_some_and(|s| s.attached));
+        assert_eq!(sevs(&mut d), vec![p::SEV_HOST_PRESENT]);
+        let _ = std::fs::remove_file(SESSION_CFG_FILE);
+    }
+
+    #[test]
+    fn a_host_with_another_config_restarts_the_session_with_its_own() {
+        let _flag = presence_flag_lock();
+        let _ = std::fs::remove_file(SESSION_CFG_FILE);
+        let mut d = td();
+        d.self_session_start(Instant::now()); // no kept config: compiled defaults
+        d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &hello(0x2200_0002, b""));
+        subscribe(&mut d, b"cfg: the head unit's\n");
+        assert!(d.rearm_deadline.is_some(), "the supervisor's re-arm: the session starts again with the host's config");
+        assert!(!d.attach_live && !d.rekey_av);
+        assert_eq!(d.selfs.as_ref().unwrap().cfg, b"cfg: the head unit's\n");
+        assert_eq!(std::fs::read_to_string(HOST_PRESENT_FLAG).unwrap().trim(), "0", "the dip the supervisor sees");
+    }
+
+    #[test]
+    fn a_host_that_leaves_a_self_started_session_leaves_it_running_for_the_hold_then_it_ends() {
+        let _flag = presence_flag_lock();
+        let _ = std::fs::remove_file(SELF_OVER_FILE);
+        std::fs::write(SESSION_CFG_FILE, b"cfg: kept\n").unwrap();
+        let mut d = td();
+        d.self_session_start(Instant::now());
+        subscribe(&mut d, b"cfg: kept\n");
+        let _ = sent(&mut d);
+        d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &[p::CT_STOP]);
+        assert!(d.present && !d.subscribed, "CT_STOP: the session goes on, the host's subscription goes");
+        let left = d.selfs.as_ref().unwrap().left.expect("the hold runs");
+        assert!(sevs(&mut d).is_empty(), "a host that sent CT_STOP is not signalled");
+        d.presence_tick(left + SELF_HOLD - Duration::from_secs(1));
+        assert!(d.present, "within the hold");
+        // A host back within the hold attaches again.
+        subscribe(&mut d, b"cfg: kept\n");
+        assert!(d.selfs.as_ref().unwrap().attached && d.rekey_av);
+        // Its heartbeat stops: the session goes on again, and the stalled host is told to re-subscribe.
+        let _ = sent(&mut d);
+        d.last_hb = Some(Instant::now() - HEARTBEAT_GRACE - Duration::from_secs(1));
+        d.presence_tick(Instant::now());
+        assert!(d.present && !d.subscribed);
+        assert_eq!(sevs(&mut d), vec![p::SEV_HOST_GONE]);
+        // Nobody within SELF_HOLD: it ends, and none starts again this boot.
+        let left = d.selfs.as_ref().unwrap().left.unwrap();
+        d.presence_tick(left + SELF_HOLD);
+        assert!(!d.present && d.selfs.is_none());
+        assert_eq!(std::fs::read_to_string(HOST_PRESENT_FLAG).unwrap().trim(), "0");
+        assert!(std::path::Path::new(SELF_OVER_FILE).exists() && !self_start_wanted());
+        let _ = std::fs::remove_file(SELF_OVER_FILE);
+        let _ = std::fs::remove_file(SESSION_CFG_FILE);
+    }
+
+    #[test]
+    fn a_self_started_session_no_host_comes_to_ends_after_the_first_wait() {
+        let _flag = presence_flag_lock();
+        let _ = std::fs::remove_file(SELF_OVER_FILE);
+        let mut d = td();
+        let t0 = Instant::now();
+        d.self_session_start(t0);
+        d.presence_tick(t0 + SELF_FIRST_WAIT - Duration::from_secs(1));
+        assert!(d.present);
+        d.presence_tick(t0 + SELF_FIRST_WAIT);
+        assert!(!d.present && d.selfs.is_none());
+        let _ = std::fs::remove_file(SELF_OVER_FILE);
+    }
+
+    #[test]
+    fn the_session_config_is_kept_only_while_the_link_is_set_up() {
+        let _flag = presence_flag_lock();
+        let _ = std::fs::remove_file(SESSION_CFG_FILE);
+        let mut d = td();
+        subscribe(&mut d, b"cfg: a\n");
+        assert!(!std::path::Path::new(SESSION_CFG_FILE).exists(), "no link: the config stays ephemeral, as in 2.7.1");
+        d.wifi.conf = Some(wifi::LinkConf { key: ocbm_link::LinkKey([1; 32]), ssid: String::new(), psk: String::new() });
+        subscribe(&mut d, b"cfg: b\n");
+        assert_eq!(std::fs::read(SESSION_CFG_FILE).unwrap(), b"cfg: b\n");
+        let _ = std::fs::remove_file(SESSION_CFG_FILE);
     }
 }
