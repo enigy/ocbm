@@ -52,7 +52,9 @@ NL_SRC=$W/src/${NL_TGZ%.tar.gz}
 CC_ARM="zig cc -target arm-linux-musleabihf -mcpu=cortex_a7"
 export ZIG_GLOBAL_CACHE_DIR="${ZIG_GLOBAL_CACHE_DIR:-$W/zigcache}" ZIG_LOCAL_CACHE_DIR="${ZIG_LOCAL_CACHE_DIR:-$W/zigcache}"
 
-# libnl: its two libraries, static.
+# libnl: its two libraries, static. Its configure stops without a pkg-config, which it only wants for its own unit
+# tests (not built here): where the host has none (this Mac), `true` stands in.
+command -v "${PKG_CONFIG:-pkg-config}" >/dev/null 2>&1 || export PKG_CONFIG=true
 ( cd "$NL_SRC"
   CC="$CC_ARM" AR="zig ar" RANLIB="zig ranlib" CFLAGS="-Os -ffunction-sections -fdata-sections" \
     ./configure --host=arm-linux-musleabihf --disable-shared --enable-static --disable-cli --disable-debug >/dev/null
