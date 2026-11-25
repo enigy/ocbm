@@ -297,6 +297,30 @@ pub fn read_sta(path: &str) -> Option<Sta> {
     std::fs::read_to_string(path).ok().map(|t| parse_sta_state(&t))
 }
 
+/// M2 (ADDENDUM 9): there while the adapter's own session runs with no host attached. The AP's start then gives the
+/// station a head start (radio_ap_up.sh), and the keeper looks for the hotspot more often (wifi_sta.sh).
+#[cfg(not(test))]
+pub const PARKED_FLAG: &str = "/tmp/wifi_self_parked";
+#[cfg(test)]
+pub const PARKED_FLAG: &str = "/tmp/ocbmd_selftest_wifi_self_parked";
+
+pub fn set_parked(on: bool) {
+    if on {
+        let _ = std::fs::write(PARKED_FLAG, b"1\n");
+    } else {
+        let _ = std::fs::remove_file(PARKED_FLAG);
+    }
+}
+
+/// The keeper's `elsewhere=<channel> <uptime s>` (ADDENDUM 9): two looks in a row heard the hotspot on that channel,
+/// one an AP may use, while the AP runs on another and the station is not on the hotspot. The channel, when the keeper
+/// said it within `fresh` s of `now_s`.
+pub fn elsewhere(text: &str, now_s: u64, fresh: u64) -> Option<u32> {
+    let (ch, at) = text.lines().find_map(|l| l.strip_prefix("elsewhere="))?.trim().split_once(' ')?;
+    let (ch, at): (u32, u64) = (ch.parse().ok()?, at.trim().parse().ok()?);
+    (ch != 0 && at <= now_s + 1 && now_s.saturating_sub(at) <= fresh).then_some(ch)
+}
+
 /// The IPv4 address and netmask of `iface`, if it has one.
 pub fn iface_v4(iface: &str) -> Option<(Ipv4Addr, Ipv4Addr)> {
     if iface.is_empty() {

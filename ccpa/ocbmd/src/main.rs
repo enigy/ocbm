@@ -335,7 +335,16 @@ struct SelfSession {
     attached: bool,
     /// When the last attached host left; the hold runs from there.
     left: Option<Instant>,
+    /// It started again once on the hotspot's channel (ADDENDUM 9, [`Daemon::self_session_tick`]); never twice.
+    moved: bool,
+    /// When the keeper's state was last read for that.
+    looked: Option<Instant>,
 }
+
+/// ADDENDUM 9: how often a self-started session with no host reads the keeper's state for the hotspot heard on a
+/// channel other than the AP's, and how old (s) the keeper's word may be.
+const SELF_MOVE_LOOK: Duration = Duration::from_secs(2);
+const SELF_MOVE_FRESH: u64 = 30;
 
 /// A self-started session ends when no host has attached this long after it started...
 const SELF_FIRST_WAIT: Duration = Duration::from_secs(180);
@@ -4026,6 +4035,7 @@ impl Daemon {
                         if let Some(ss) = self.selfs.as_mut() {
                             ss.attached = true;
                             ss.left = None;
+                            wifi::set_parked(false);
                             if differs {
                                 ss.cfg = pl[1..].to_vec();
                             }
@@ -4663,7 +4673,8 @@ impl Daemon {
             "[ocbmd] wifi: starting the CarPlay session with no host (Bluetooth up, the bonded phones paged, the video parked until a host attaches; {} B config kept)",
             cfg.len()
         );
-        self.selfs = Some(SelfSession { started: now, cfg, attached: false, left: None });
+        self.selfs = Some(SelfSession { started: now, cfg, attached: false, left: None, moved: false, looked: None });
+        wifi::set_parked(true);
         self.set_present(true);
     }
 
@@ -4687,6 +4698,7 @@ impl Daemon {
         if let Some(ss) = self.selfs.as_mut() {
             ss.attached = false;
             ss.left = Some(Instant::now());
+            wifi::set_parked(true);
         }
         eprintln!(
             "[ocbmd] wifi: the host left ({why}); the CarPlay session goes on, parked, {} s for a host to attach",
@@ -4696,11 +4708,34 @@ impl Daemon {
 
     /// End a self-started session no host came to in time: presence drops (the supervisor's complete teardown lets the
     /// phone go), and none starts again this boot; a host's arrival is then today's session start.
+    ///
+    /// ADDENDUM 9: one radio, so while the AP runs on one channel and the hotspot is on another the station never
+    /// joins and no Wi-Fi host can reach the adapter. When the keeper says two looks in a row heard the hotspot on a
+    /// channel an AP may use and the AP is elsewhere (`elsewhere=`), a session with no host attached starts again,
+    /// once: presence dips (the supervisor's re-arm, as for a host with another config), the AP goes down, and its next
+    /// start takes the hotspot's channel (radio_ap_up.sh). The phone leaves CarPlay and comes back, about a cold start;
+    /// nobody watches a parked session. A session a host is attached to is never moved (ADDENDUM 6).
     fn self_session_tick(&mut self, now: Instant) {
-        let Some(ss) = self.selfs.as_ref() else { return };
+        let Some(ss) = self.selfs.as_mut() else { return };
         if ss.attached {
             return;
         }
+        if !ss.moved && ss.looked.is_none_or(|t| now.duration_since(t) >= SELF_MOVE_LOOK) {
+            ss.looked = Some(now);
+            let now_s = box_common::timeline::now_ms().unwrap_or(0) / 1000;
+            let text = std::fs::read_to_string(wifi::STA_STATE).unwrap_or_default();
+            if let Some(ch) = wifi::elsewhere(&text, now_s, SELF_MOVE_FRESH) {
+                (ss.moved, ss.started, ss.left) = (true, now, None);
+                let ap = wifi::ap_channel(&wifi::ap_conf_text(wifi::AP_SESSION_CONF, wifi::HOSTAPD_CONF));
+                eprintln!(
+                    "[ocbmd] wifi: the hotspot is heard on channel {ch} and the AP runs on {ap}: no host can reach \
+                     the adapter while they differ; the session with no host starts again so the AP takes {ch} (once)"
+                );
+                self.rearm_presence_silently();
+                return;
+            }
+        }
+        let Some(ss) = self.selfs.as_ref() else { return };
         let (since, wait, why) = match ss.left {
             Some(t) => (t, SELF_HOLD, "no host came back"),
             None => (ss.started, SELF_FIRST_WAIT, "no host attached"),
@@ -4713,6 +4748,7 @@ impl Daemon {
             wait.as_secs()
         );
         self.selfs = None;
+        wifi::set_parked(false);
         let _ = std::fs::write(SELF_OVER_FILE, b"1\n");
         self.go_idle(false);
     }
@@ -5475,7 +5511,9 @@ fn main() {
     if let Err(e) = File::create(ALIVE_FILE) {
         eprintln!("[ocbmd] cannot create {ALIVE_FILE} ({e}) — supervisor liveness unavailable");
     }
-    // M2: with the Wi-Fi link set up, the CarPlay session starts now, with no host (Daemon::self_session_start).
+    // M2: with the Wi-Fi link set up, the CarPlay session starts now, with no host (Daemon::self_session_start). A
+    // parked mark an earlier ocbmd left goes first (a USB-only start, say, has no session of its own).
+    wifi::set_parked(false);
     if d.wifi.on && self_start_wanted() {
         d.self_session_start(Instant::now());
     }
@@ -8251,6 +8289,83 @@ mod tests {
         d.presence_tick(t0 + SELF_FIRST_WAIT);
         assert!(!d.present && d.selfs.is_none());
         let _ = std::fs::remove_file(SELF_OVER_FILE);
+    }
+
+    /// ADDENDUM 9: the hotspot heard on another channel than the AP's and no host attached: the session starts again,
+    /// once (the supervisor's re-arm), so the AP's next start takes the hotspot's channel; never on a stale word, never
+    /// twice, and its first wait runs again from there. The parked mark is there while no host is attached.
+    #[test]
+    fn a_self_started_session_with_no_host_starts_again_once_when_the_hotspot_is_heard_elsewhere() {
+        let _flag = presence_flag_lock();
+        let _ = std::fs::remove_file(SELF_OVER_FILE);
+        let parked = || std::path::Path::new(wifi::PARKED_FLAG).exists();
+        let state = |at: u64| format!("iface=sta0\nstate=joining\nchannel=0\nseen=6 {at}\nelsewhere=6 {at}\n");
+        let now_s = box_common::timeline::now_ms().unwrap() / 1000;
+        let mut d = td();
+        let t0 = Instant::now();
+        d.self_session_start(t0);
+        assert!(parked(), "the adapter's own session, no host: parked");
+        std::fs::write(wifi::STA_STATE, state(now_s.saturating_sub(SELF_MOVE_FRESH + 5))).unwrap();
+        d.presence_tick(t0 + Duration::from_secs(1));
+        assert!(d.rearm_deadline.is_none() && !d.selfs.as_ref().unwrap().moved, "the keeper's word too old: nothing");
+        std::fs::write(wifi::STA_STATE, state(now_s)).unwrap();
+        d.presence_tick(t0 + Duration::from_secs(2));
+        assert!(d.rearm_deadline.is_none(), "read again only every SELF_MOVE_LOOK");
+        let moved = t0 + Duration::from_secs(4);
+        d.presence_tick(moved);
+        assert!(d.rearm_deadline.is_some() && d.present, "the re-arm: the flag dips, the host-facing presence stays");
+        assert_eq!(std::fs::read_to_string(HOST_PRESENT_FLAG).unwrap().trim(), "0");
+        assert!(d.selfs.as_ref().is_some_and(|s| s.moved && s.started == moved) && parked());
+        d.presence_tick(moved + REARM_HOLD + Duration::from_secs(1));
+        let flag = || std::fs::read_to_string(HOST_PRESENT_FLAG).unwrap().trim().to_string();
+        assert_eq!(flag(), "1", "back up: the session starts again");
+        d.presence_tick(moved + Duration::from_secs(10));
+        assert!(d.rearm_deadline.is_none(), "never twice");
+        d.presence_tick(moved + SELF_FIRST_WAIT - Duration::from_secs(1));
+        assert!(d.selfs.is_some(), "its first wait runs from the move");
+        d.presence_tick(moved + SELF_FIRST_WAIT);
+        assert!(d.selfs.is_none() && !parked(), "then it ends, and the mark goes");
+        let _ = std::fs::remove_file(SELF_OVER_FILE);
+        let _ = std::fs::remove_file(wifi::STA_STATE);
+    }
+
+    #[test]
+    fn a_self_started_session_a_host_is_attached_to_is_never_moved() {
+        let _flag = presence_flag_lock();
+        let _ = std::fs::remove_file(SELF_OVER_FILE);
+        std::fs::write(SESSION_CFG_FILE, b"cfg: kept\n").unwrap();
+        let now_s = box_common::timeline::now_ms().unwrap() / 1000;
+        let mut d = td();
+        let t0 = Instant::now();
+        d.self_session_start(t0);
+        d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &hello(0x2200_0009, b""));
+        subscribe(&mut d, b"cfg: kept\n");
+        assert!(!std::path::Path::new(wifi::PARKED_FLAG).exists(), "a host attached: not parked");
+        let word = format!("iface=sta0\nstate=joining\nchannel=0\nelsewhere=6 {now_s}\n");
+        std::fs::write(wifi::STA_STATE, word).unwrap();
+        d.presence_tick(t0 + Duration::from_secs(3));
+        assert!(d.rearm_deadline.is_none() && !d.selfs.as_ref().unwrap().moved, "nothing moves under a host");
+        d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &[p::CT_STOP]);
+        assert!(std::path::Path::new(wifi::PARKED_FLAG).exists(), "the host left: parked again");
+        d.go_idle(false);
+        d.selfs = None;
+        wifi::set_parked(false);
+        let _ = std::fs::remove_file(SESSION_CFG_FILE);
+        let _ = std::fs::remove_file(wifi::STA_STATE);
+    }
+
+    #[test]
+    fn the_keepers_elsewhere_word_is_read_with_its_age() {
+        let full = "iface=sta0\nstate=joining\nchannel=0\nseen=6 100\nelsewhere=6 100\n";
+        assert_eq!(wifi::elsewhere(full, 120, 30), Some(6));
+        assert_eq!(wifi::elsewhere("elsewhere=11 100\n", 131, 30), None, "older than 30 s");
+        assert_eq!(wifi::elsewhere("elsewhere=11 100\n", 101, 30), Some(11));
+        assert_eq!(wifi::elsewhere("elsewhere=11 200\n", 101, 30), None, "said after now: not this boot's");
+        assert_eq!(wifi::elsewhere("seen=6 100\n", 100, 30), None);
+        assert_eq!(wifi::elsewhere("elsewhere=0 100\n", 100, 30), None);
+        assert_eq!(wifi::elsewhere("elsewhere=x 100\n", 100, 30), None);
+        let s = wifi::parse_sta_state(full);
+        assert!(!s.joined && s.channel == 0 && s.iface == "sta0", "the lines after channel= change nothing else");
     }
 
     #[test]
