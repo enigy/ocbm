@@ -1,62 +1,36 @@
 #!/bin/sh
 ########################
-# wifi_sta.sh - the Wi-Fi link's station keeper: keep the station interface joined to the phone's hotspot so a host
-# can reach ocbmd over it (ccpa/ocbmd/src/wifi.rs), from power-up and for the life of the adapter. Started by
-# ocbm_boot.sh, and again by ocbmd when MGMT_WIFI_LINK changes the hotspot, only while /etc/ocbm/wifi_link has an
-# ssid_hex= line. One instance (its lock holds its pid; SIGTERM stops it, its supplicant and its DHCP client).
+# wifi_sta.sh - the Wi-Fi link's station keeper: keeps the station joined to the phone's hotspot, from power-up and for
+# the life of the adapter, so a host can reach ocbmd over it (ccpa/ocbmd/src/wifi.rs). Started by ocbm_boot.sh, and
+# again by ocbmd when MGMT_WIFI_LINK changes the hotspot, only while /etc/ocbm/wifi_link has an ssid_hex= line. One
+# instance (its lock holds its pid; SIGTERM stops it, its supplicant and its DHCP client). A keeper of its own: the
+# hotspot may come on before power-up, at the Bluetooth connect, late or by hand, whatever the session does.
 #
-# WHY A KEEPER OF ITS OWN. The supervisor raises and drops the session's AP on host-presence edges. The hotspot may be
-# on before power-up, come on at the Bluetooth connect, come on late or by hand, so the station link has to be looked
-# for from power-up, whatever the session does, and outlive every session.
+# ONE RADIO (docs/wireless/01_BT_AND_RADIO.md, "The Wi-Fi link's station beside the AP", has the detail). The station
+# and the session's AP share the unit's one radio and its channel: radio_hal.sh's STA mode puts the AP on the other
+# wireless interface of the same driver load (the IW416's sta0, its STA BSS, and wlan0, its uAP BSS); this keeper
+# takes the station's (RADIO_STA_IF, else the one named sta*, only beside another) and never touches the AP's.
+# WHAT IT SCANS. Joined: nothing. Not joined: at a supplicant's start with no AP up (no host but the adapter's own
+# session) the FIRST LOOK, the hotspot's last channel, then the channels an AP may use (the AP of the adapter's own
+# session waits for it, radio_ap_up.sh); a session starting and not established: NO scan for up to START_QUIET s,
+# but the adapter's own session with no AP yet and the hotspot heard scans and joins there alone; the AP up: its
+# channel only, a look each FIND_EVERY s (PARKED_FIND with no host); no AP: every channel, a look each IDLE_FIND s.
+# A look is `ocbmd wpa ... find` (ccpa/ocbmd/src/wpa.rs: a probe by name, the kept address for a hidden hotspot; never
+# over a join); its result is the state's seen= line, twice elsewhere its elsewhere= line. What the supplicant scans
+# changes in place (SET_NETWORK; never RECONFIGURE, which cuts a join). A look that hears the hotspot held back after
+# failed joins (TEMP-DISABLED) has it try again. Beside each supplicant a monitor, `ocbmd wpa ... events 0`, writes
+# its joins into the box log and counts unanswered authentications (MISSES, for the guard below). ADDENDUM 13: hostapd
+# starting (radio_ap_up.sh's AP_START), no scan and no join; after MISS_GUARD unanswered authentications in a row, none
+# while the AP runs (the IW416's driver resets the radio at its fifth). The AP follows the station's channel at its
+# start; nothing moves an AP under a host.
 #
-# ONE RADIO. The station and the session's AP share the unit's one radio and its channel. radio_hal.sh's STA mode puts
-# the AP on the other wireless interface of the same driver load (the IW416's drv_mode=3 makes sta0, its STA BSS, and
-# wlan0, its uAP BSS); this keeper takes the station's (RADIO_STA_IF, else the wireless interface named sta*, only when
-# another wireless interface exists beside it). It never touches the AP's interface, and waits while an AP raised
-# before the link was set up still runs on the station's. While the AP runs the station can join on its channel only.
-#
-# WHAT IT SCANS, AND WHEN (docs/wireless/01_BT_AND_RADIO.md). Joined: nothing. Not joined:
-#   - at each supplicant start with no AP up (and no host but the adapter's own session): the FIRST LOOK, the hotspot's
-#     last channel alone, then the channels an AP may use (ADDENDUM 9: the AP of the adapter's own session waits for
-#     it, radio_ap_up.sh, and takes the channel it heard);
-#   - a session starting (the AP up, or a host present) and not yet established (/tmp/session_healthy not 1), for up
-#     to START_QUIET seconds: NO scan (the supplicant's DISCONNECT), so the phone's page, its join of the AP and the
-#     session's set-up never meet one; but the adapter's own session with no AP yet and the hotspot heard: scans and
-#     joins on that channel alone, so the station may join before the AP comes;
-#   - with the AP up: scans and joins on its channel only (scan_freq, freq_list), and a look over the channels an AP
-#     may use each FIND_EVERY s (PARKED_FIND s while the adapter's own session has no host, the first at once when
-#     its AP is not where the hotspot was last heard);
-#   - no AP up: every channel, and a look each IDLE_FIND s.
-# A look is `ocbmd wpa ... find` (ccpa/ocbmd/src/wpa.rs): where the hotspot is heard, said when that changes. It takes
-# the supplicant's own results of the last few seconds when they hold the hotspot, and scans nothing over a join under
-# way (ADDENDUM 11); else it scans with a probe for the hotspot by name, which a hidden hotspot answers (an iPhone hides
-# its name whenever its hotspot screen is closed), and knows a hidden one also by the address kept for it. Its result is
-# the state's seen= line; two looks in a row that heard the hotspot on a channel an AP may use, while the AP runs on
-# another, its elsewhere= line (ocbmd then starts its own session with no host again there, once). One that hears the
-# hotspot while the supplicant holds it back after failed joins (TEMP-DISABLED) has it try again at once. The
-# supplicant never hands scanning to the driver (disable_scan_offload), and what it scans changes in place (its
-# network's scan_freq and freq_list, SET_NETWORK: never a RECONFIGURE, which would cut a join under way).
-# ITS JOINS, AS THEY HAPPEN. Beside each supplicant a monitor, `ocbmd wpa ... events 0`, writes its join events into
-# the box log (names, codes and each step's time; repeats folded into one line a minute; no names, no addresses).
-# CHANNELS (ADDENDUM 6). The AP starts on the station's channel where an AP may (radio_ap_up.sh); they differ only when
-# the station joined after the AP came up, or on a channel no AP may use (a radar one): said plainly while the AP runs,
-# once a change. Nothing moves the AP under a host; its next start follows.
-#
-# /etc/ocbm/wifi_link (ocbmd writes it, 0600): key= (ocbmd's), ssid_hex= (the hotspot's name in hex), psk= (64 hex
-# digits: the PBKDF2 hash, worked out on the head unit; or the passphrase; or empty: an open network).
-# Kept beside it, each written when it changes (0600, never logged): the hotspot's last channel, joined or heard
-# (wifi_link_channel); its address, joined or heard by name (wifi_link_bssid: an iPhone's stays the same; heard by name
-# under another, the new one is kept; a new set-up clears it, wifi.rs); the station's own address at its last start
-# (wifi_link_sta: whether the phone sees the same device each time). The state for ocbmd and the AP layer in
-# /tmp/wifi_link_state.
-#
-# The supplicant: OCBM's own drop-in, /usr/sbin/ocbm-wpa_supplicant, never at /usr/sbin/wpa_supplicant (the vendor's
-# dispatcher reads THAT path's existence as "STA mode" and loads another driver mode, on every unit, set up or not);
-# else a unit's own stock copy at /usr/sbin; else a bench copy in /tmp/bin. The stock 2025.10.15.1127 image ships none
-# (the factory survey, 27 Oct). Without one the keeper waits, one line a minute. Its control socket (ctrl_interface
-# below) is spoken to by `ocbmd wpa`, not wpa_cli, which the adapter no longer carries (24 Nov 2026: 68 KB of flash).
-# Called by its bare name: the respawn wrapper's `pgrep -f /usr/sbin/ocbmd` (run_ocbmd.sh), and ocbm_boot.sh's
-# watchdog with it, never take one of these runs for the daemon; `pidof ocbmd` does see one (the monitor, all along).
+# /etc/ocbm/wifi_link (ocbmd's, 0600): key=, ssid_hex= (the name in hex), psk= (64 hex digits, the PBKDF2 hash; or the
+# passphrase; or empty: open). Beside it, written when they change (0600, never logged): the hotspot's last channel
+# (wifi_link_channel), its address (wifi_link_bssid; a new set-up clears it), the station's own at its last start
+# (wifi_link_sta). The state for ocbmd and the AP layer: /tmp/wifi_link_state.
+# The supplicant: OCBM's /usr/sbin/ocbm-wpa_supplicant (never /usr/sbin/wpa_supplicant: the vendor's dispatcher takes
+# THAT path as "STA mode" and loads another driver mode), else a unit's own, else a bench copy in /tmp/bin; spoken to
+# with `ocbmd wpa` by its bare name (the daemon's watchdogs look for /usr/sbin/ocbmd; `pidof ocbmd` sees the monitor).
 #
 # Test hooks (tools/wifi_sta_test.sh): WIFI_STA_ROOT (a scratch root for every path below), WIFI_STA_TICK,
 # WIFI_STA_ONCE (one pass, then exit), RADIO_STA_IF.
@@ -82,6 +56,8 @@ HEALTHY=$R/tmp/session_healthy
 PRESENT=$R/tmp/host_present
 PARKED=$R/tmp/wifi_self_parked          # ocbmd's: the adapter's own session runs with no host
 WLAN_LOCK=$R/tmp/.radio_lock_wlan       # the seam's: a driver load or an AP's start under way
+AP_START=$R/tmp/.radio_ap_start         # radio_ap_up.sh's: hostapd starting, the station held still (its pid)
+MISSES=$R/tmp/wifi_sta_misses           # the monitor's: authentications in a row with no answer
 ONE_IF=$R/tmp/.radio_one_iface
 SYS=$R/sys
 LOCK=$R/tmp/.wifi_sta_lock
@@ -93,10 +69,21 @@ FIND_EVERY=60           # s: a look while a session runs on the AP and the stati
 PARKED_FIND=20          # s: the same while the adapter's own session has no host (its video parked)
 IDLE_FIND=30            # s: a look while no AP is up and the station is not joined
 RESTART_AFTER=300       # s without joining (not paused): the supplicant starts afresh
+MISS_GUARD=3            # unanswered authentications in a row after which no join is tried while the AP runs
 AP_FREQS=2412-2462,5180-5240,5745-5825   # the channels an AP may use (ap_may_use), as SCAN's freq= ranges
 
 log() { _lu=""; read -r _lu _li 2>/dev/null <"$R/proc/uptime"; printf '%s [up %s] %s\n' "$L" "${_lu:-?}" "$*" >> "$BOXLOG"; }
 up_s() { _us=""; read -r _us _ui 2>/dev/null <"$R/proc/uptime"; echo "${_us%.*}"; }
+# A bench switch (docs/ops/02_TESTING.md): /tmp/bench_$1, else /etc/ocbm/bench_$1 (a cold boot's), the first there
+# deciding. 0: set, its first line in _bv ("" for "on" or none: the default), its file in _bvf; 1: "off"; 2: no file.
+bench() {
+  for _bvf in "$R/tmp/bench_$1" "$R/etc/ocbm/bench_$1"; do
+    [ -e "$_bvf" ] || continue
+    _bv=""; read -r _bv 2>/dev/null <"$_bvf"; [ "$_bv" = on ] && _bv=""
+    [ "$_bv" != off ]; return
+  done
+  return 2
+}
 
 # ---- one instance ----------------------------------------------------------------------------------------------
 if ! mkdir "$LOCK" 2>/dev/null; then
@@ -272,7 +259,22 @@ watch_events() {
   pid_of "$EV_PID" >/dev/null && return 0
   [ "$now" -ge "$ev_next" ] || return 0
   ev_next=$((now + 10))
-  ( ocbmd wpa -p "$CTRL" "$IF" events 0 >> "$BOXLOG" 2>/dev/null </dev/null & echo $! > "$EV_PID" )
+  ( ocbmd wpa -p "$CTRL" "$IF" events 0 "$MISSES" >> "$BOXLOG" 2>/dev/null </dev/null & echo $! > "$EV_PID" )
+}
+ap_starting() { _as=""; read -r _as 2>/dev/null <"$AP_START" && [ -n "$_as" ] && kill -0 "$_as" 2>/dev/null; }
+# Bench only (ADDENDUM 13): sta_drvdbg, the radio driver's debug mask (0x237 when the file names none: the IW416 moal
+# driver's default 0x207 and its command and event lines, its HostMlme auth timeout and remain-on-channel ones among
+# them, in dmesg). Through the station's /proc/mwlan debug file (moal's mask and its mlan's), else moal's parameter: the
+# keeper's one chip-specific line, a bench aid that does nothing where neither is. Again when the file changes.
+drvdbg() {
+  bench sta_drvdbg || return 0
+  _dm=${_bv:-0x237}; [ "$_dm" = "$dbg_set" ] && return 0
+  dbg_set=$_dm; _dw=$SYS/module/moal/parameters/drvdbg
+  case $_dm in 0x[0-9a-fA-F]*|[0-9]*) ;; *) log "[bench] sta_drvdbg ($_bvf): $_dm is no mask"; return 0 ;; esac
+  for _df in "$R"/proc/mwlan/*/"$IF"/debug; do [ -e "$_df" ] && echo "drvdbg=$_dm" 2>/dev/null >"$_df" && _dw=$_df; done
+  case $_dw in */debug) ;; *) echo "$_dm" 2>/dev/null >"$_dw" ;; esac
+  _dn=""; read -r _dn 2>/dev/null <"$SYS/module/moal/parameters/drvdbg"
+  log "[bench] sta_drvdbg ($_bvf): the radio driver's debug mask $_dm through $_dw (its parameter: ${_dn:-none})"
 }
 
 log "keeping the station on the hotspot set up in $CONF"
@@ -280,7 +282,7 @@ mkdir -p "$CTRL" "$R/var/run" 2>/dev/null
 WPA=""; said_tools=0; said_ap_on_sta=0; none=0; wpa_down=0; wpa_next=0; lk_n=0
 last_ch=""; last_mismatch=""; joined_at=""; down_since=$(up_s)
 paused=0; ap_since=""; last_find=0; conf_freq="x"; wstate=""; last_ws=""; ws_said=0; ev_next=0; held_said=-300
-looked=0; seen_ch=""; seen_at=0; else_ch=""; else_n=0; last_plan=""; find_down=0; sta_said=0
+looked=0; seen_ch=""; seen_at=0; else_ch=""; else_n=0; last_plan=""; find_down=0; sta_said=0; dbg_set=""
 while :; do
   # No station on this unit (below): nothing changes before the next boot.
   [ "$none" = 1 ] && { [ -n "${WIFI_STA_ONCE:-}" ] && exit 0; sleep "$TICK"; continue; }
@@ -344,8 +346,9 @@ while :; do
     [ "$wpa_down" = 1 ] || log "starting the supplicant on $IF"
     if "$WPA" -B -P "$WPA_PID" -D nl80211,wext -i "$IF" -c "$WPACONF" >> "$WPALOG" 2>&1; then
       # Its pid file too: the daemon writes it after the socket is there (25 Nov bench: a start taken for a failure).
+      # 2 s at most (it is there a few ms after the socket; a loaded Mac's test stand-in took over 1 s).
       _w=0
-      while [ "$_w" -lt 10 ] && { [ ! -e "$CTRL/$IF" ] || ! pid_of "$WPA_PID" >/dev/null; }; do
+      while [ "$_w" -lt 20 ] && { [ ! -e "$CTRL/$IF" ] || ! pid_of "$WPA_PID" >/dev/null; }; do
         _w=$((_w + 1)); sleep 0.1
       done
     fi
@@ -356,7 +359,7 @@ while :; do
     wpa_down=1; no_look; [ -n "${WIFI_STA_ONCE:-}" ] && exit 0; sleep "$TICK"; continue
   fi
   wpa_down=0
-  watch_events
+  watch_events; drvdbg
   st=$(cli status)
   wstate=$(echo "$st" | sed -n 's/^wpa_state=//p')
   freq=$(echo "$st" | sed -n 's/^freq=//p')
@@ -404,13 +407,27 @@ while :; do
     hp=""; read -r hp 2>/dev/null <"$PRESENT"
     healthy=""; read -r healthy 2>/dev/null <"$HEALTHY"
     parked=0; [ -e "$PARKED" ] && parked=1
+    # The AP layer's hold (ADDENDUM 13): while its start runs; that over, taken as the keeper's own pause.
+    hold=0; if ap_starting; then hold=1; elif [ -e "$AP_START" ]; then rm -f "$AP_START"; paused=1; fi
+    misses=0; read -r misses 2>/dev/null <"$MISSES"; case $misses in ''|*[!0-9]*) misses=0 ;; esac
+    guard=$MISS_GUARD; bench sta_miss_guard; case $? in 0) guard=${_bv:-$MISS_GUARD} ;; 1) guard=0 ;; esac
+    case $guard in ''|*[!0-9]*) guard=$MISS_GUARD ;; esac
     # The first look at this supplicant's start: no AP up, and no host but the adapter's own session (a USB host's
     # start is never held up by a scan).
-    [ "$looked" = 0 ] && [ "$up" = 0 ] && { [ "$hp" != 1 ] || [ "$parked" = 1 ]; } && first_look
+    [ "$looked" = 0 ] && [ "$up" = 0 ] && [ "$hold" = 0 ] && { [ "$hp" != 1 ] || [ "$parked" = 1 ]; } && first_look
     publish joining 0
     if [ "$up" = 1 ] || [ "$hp" = 1 ]; then [ -n "$ap_since" ] || ap_since=$now; else ap_since=""; fi
     starting=0; [ -n "$ap_since" ] && [ "$healthy" != 1 ] && [ $((now - ap_since)) -lt "$START_QUIET" ] && starting=1
-    if [ "$starting" = 1 ] && [ "$up" = 0 ] && [ "$parked" = 1 ] && [ "${seen_ch:-0}" != 0 ]; then
+    if [ "$hold" = 1 ]; then
+      # ADDENDUM 13: hostapd starting, the station held still by the AP layer (radio_ap_up.sh's DISCONNECT, after a join
+      # under way had ended): a pause, so the rules below put it back once the AP is up (or did not come).
+      paused=1; plan "the AP is starting: no scans and no joins until it is up"
+    elif [ "$up" = 1 ] && [ "$guard" != 0 ] && [ "$misses" -ge "$guard" ]; then
+      # ADDENDUM 13: the IW416's moal driver resets the radio at its fifth unanswered authentication in a row (its
+      # firmware loaded again, the AP's phone dropped): none tried while the AP runs, once the monitor counted $guard.
+      [ "$paused" = 1 ] || in_join || { cli disconnect >/dev/null; paused=1; }
+      plan "$misses authentications in a row unanswered: no joins while the AP runs (the driver resets the radio at 5)"
+    elif [ "$starting" = 1 ] && [ "$up" = 0 ] && [ "$parked" = 1 ] && [ "${seen_ch:-0}" != 0 ]; then
       on_channel "$seen_ch"
       plan "the adapter's own session starting, no AP yet: scans and joins on the hotspot's channel $seen_ch only"
     elif [ "$starting" = 1 ]; then
