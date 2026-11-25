@@ -821,8 +821,14 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
   bench's failure stays) and HT40+ there, and what the radio does when the station joins another channel during a
   session; (4) WPA3-only hotspots are not supported in this version (WPA2 and mixed are; the box
   gets the PBKDF2 hash, the supplicant has no SAE); (5) M2's self-started session: the phone's audio goes nowhere while no host is attached (60 s / 180 s holds);
-  an AP started before the station has joined (at a boot, say) takes `hostapd.conf`'s channel: the hotspot's last one
-  is kept, not used; (6) M3 (the set-up network) is built, not
+  at power-up its AP waits up to 4 s for the station's first look and starts on the channel that heard the hotspot, else
+  on its last channel (ADDENDUM 9, 24 Nov, after the evening bench's AP on 36 beside a hotspot on 2.4 GHz 6), 20 MHz at
+  2.4 GHz; heard elsewhere twice while it runs with no host, it starts again once there. Not benched: the look's timing
+  at power-up, the phone and the hotspot on a 20 MHz 2.4 GHz channel shared three ways, the restart. A USB host's AP
+  keeps its own channel when the station is not on the hotspot. That bench's second fault (no join for six minutes after
+  the AP went down, the hotspot on the air) is not explained by the code: the keeper now logs the supplicant's state,
+  each look's result and a join's events, keeps its own scans (no driver scheduled scan) and looks every 30 s; (6) M3
+  (the set-up network) is built, not
   benched: whether the stock hostapd takes `ap_isolate=1` (it refuses an unknown key, and then no set-up network is
   offered), and what the set-up AP raised 20 s into a boot with no host yet costs a head unit that connects later; its
   set-up code (24 Nov, ADDENDUM 5) is built, not benched: UNMEASURED whether a phone's Bluetooth list (and the car's)

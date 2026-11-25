@@ -530,16 +530,33 @@ also joins the phone's Personal Hotspot as a station, so a head unit on that hot
 - **WPA3-only hotspots are not supported in this version** (WPA2 and WPA2/WPA3 mixed are): the box receives the
   hotspot key as its PBKDF2 hash, which serves WPA2-PSK only, and the supplicant is built without SAE.
 - **The keeper** (`/script/wifi_sta.sh`, started by `ocbm_boot.sh`): from power-up it keeps the station on the hotspot,
-  with the address and netmask from its DHCP hook (`wifi_sta_dhcp.sh`: no default route, never the AP's or NCM's subnet),
-  publishes `/tmp/wifi_link_state` for ocbmd and keeps the hotspot's last channel in `/etc/ocbm/wifi_link_channel`.
-  Driver load for it: the verb `wifi_sta_up`, under the wlan lock. A supplicant that does not start, or does not stay,
-  is started again no sooner than 30 s after its last start and said once until it runs.
-- **Scans on the one radio.** None while joined. Not joined: with no session (no AP up, no host present), the
-  supplicant's own scans of every channel; with a session starting (the AP up, or `/tmp/host_present` 1: M2's own session
-  pages the bonded phones over Bluetooth before any AP) and not established (`/tmp/session_healthy` not 1, 40 s at most)
-  none at all, so the page, the phone's join of the AP and the session's set-up never meet a scan; then the AP's channel
-  only (the one it runs on: the hotspot's last where it followed it, below) and one scan of every channel a minute, or
-  every channel with no AP (a wired session).
+  with the address and netmask from its DHCP hook (`wifi_sta_dhcp.sh`: no default route, never the AP's or NCM's
+  subnet), publishes `/tmp/wifi_link_state` for ocbmd and the AP layer (`iface=`, `state=`, `channel=`, then the last
+  look's `seen=<channel> <uptime>` and, below, `elsewhere=`) and keeps the hotspot's last channel, joined or heard, in
+  `/etc/ocbm/wifi_link_channel`. Driver load for it: the verb `wifi_sta_up`, under the wlan lock; while that lock is
+  held (the boot preload loading the driver) it looks for its interface every 0.2 s instead of queueing behind it, 15 s
+  at most, and waits for its supplicant's socket rather than a fixed second. A supplicant that does not start, or does
+  not stay, is started again no sooner than 30 s after its last start and said once until it runs. With no supplicant or
+  no station it publishes `seen=0`, so no AP start waits for a look that cannot come.
+- **Scans on the one radio** (ADDENDUM 9 of the hand-off plan, 24 Nov 2026, for the looks). None while joined. Not
+  joined: at each supplicant start with no AP up, and no host but the adapter's own session (M2), the *first look*: the
+  hotspot's last channel alone (the supplicant's own first scan too, `initial_freq_list`; a fraction of a second where
+  it was last time), then the channels an AP may use; its result is published at once. With a session starting (the AP
+  up, or `/tmp/host_present` 1: M2's own session pages the bonded phones over Bluetooth before any AP) and not
+  established (`/tmp/session_healthy` not 1, 40 s at most) no scan at all, so the page, the phone's join of the AP and
+  the session's set-up never meet one; the one exception is the adapter's own session before its AP comes, when the
+  first look heard the hotspot: scans and joins on that channel alone, so the station may join first. A USB host's start
+  is never held up by a look. With the AP up the station scans AND joins on the AP's channel only (`scan_freq`,
+  `freq_list`): one radio cannot join elsewhere while the AP runs, and each try off it took the radio from the phone
+  (the evening bench: an authentication on 2437 beside the AP on 36, then the driver's `bss_start Fails`); a *look* over
+  the channels an AP may use (no radar channel) each 60 s, or each 20 s and the first at once while the adapter's own
+  session has no host (its video parked). With no AP up: every channel, and a look each 30 s (a wired session too). A
+  look is `ocbmd wpa <if> find` (ccpa/ocbmd/src/wpa.rs): a scan, where it heard the hotspot (from the BSS table, entries
+  it did not hear left out) and the join the supplicant starts on it, followed to its end; the keeper says the channel
+  and dBm when they change, and the join's events (names and numeric codes, never a name or an address) when they
+  change. The supplicant scans for itself (`disable_scan_offload=1`): wpa_supplicant 2.11 hands its scans to the
+  driver's scheduled scan after three that found nothing (`wpa_supplicant_req_sched_scan`), and nothing on this radio
+  has shown that the driver reports them.
 - **The listener and the advert stay on the station's side.** The listener takes connections from the station's
   interface only (SO_BINDTODEVICE: under Linux's weak-host model the station's address alone would also answer on the
   AP's or USB's network). The mDNS socket is bound to the group, 224.0.0.251:5353, so no unicast datagram for carplayd's
@@ -558,16 +575,34 @@ also joins the phone's Personal Hotspot as a station, so a head unit on that hot
   - **Where an AP may start:** the US domain the unit's `hostapd.conf` asks for (`country_code=US` in the factory file
     of 28 Oct and the dev adapter's of 21 Oct: 802.11n, HT40+ on 36, VHT off) without radar detection: 1-11, 36-48
     (U-NII-1), 149-165 (U-NII-3). Never 52-144 (DFS), nor any other. HT40 on its pair's side: 36/40, 44/48, 149/153,
-    157/161 (HT40+ on the lower channel, HT40- on the upper), 1-7 HT40+ and 8-11 HT40- at 2.4 GHz; 165 and 14 have
-    no pair, 20 MHz there. In STA mode `/etc/wifi_use_24G` gives way: the AP goes to the station's band.
+    157/161 (HT40+ on the lower channel, HT40- on the upper), 1-7 HT40+ and 8-11 HT40- at 2.4 GHz; 165 and 14 have no
+    pair, 20 MHz there. In STA mode `/etc/wifi_use_24G` gives way: the AP goes to the station's band.
+  - **At power-up, the adapter's own session** (ADDENDUM 9, the evening bench of 24 Nov on b860672): M2's AP came up at
+    about 10 s on `hostapd.conf`'s 36 before the keeper had published anything (its supplicant started at 10.0 s, its
+    first word was a second later), so the station never joined the hotspot on 2.4 GHz channel 6 and no Wi-Fi host could
+    reach the adapter in the 180 s the session ran. Now, while the adapter's own session runs with no host
+    (`/tmp/wifi_self_parked`, ocbmd's) and the station is not on the hotspot, `radio_ap_up.sh` (`ap_head`) waits up to
+    4 s, while the keeper runs, for its first look, and starts the AP on the channel the look heard the hotspot on, else
+    on the hotspot's last channel (`/etc/ocbm/wifi_link_channel`, where an AP may), else on its own; said in one line
+    with the wait. Any other start (a USB host's) waits for nothing and keeps its own channel when the station is not on
+    the hotspot, as before.
+  - **2.4 GHz** (the owner's head unit needs the hotspot's Maximize Compatibility, so 1-11 is the product's normal
+    case): the session's configuration is `hw_mode=g`, 20 MHz (`ht_capab=[SHORT-GI-20]`, the factory file's own 2.4 GHz
+    line: no 20/40 coexistence scan at hostapd's start, nothing on the channel next to the hotspot's) and no VHT line.
+    The phone is told the channel in the 0x5703 as at 5 GHz (a channel number, from which iOS takes the band).
+  - **Heard elsewhere while the AP runs:** two looks in a row that heard the hotspot on another channel an AP may use
+    (the keeper's `elsewhere=`): the adapter's own session with no host attached starts again, once (ocbmd's re-arm: the
+    phone leaves CarPlay and comes back, about a cold start), and its next AP takes that channel. A session a host is
+    attached to is never moved.
   - **Not associated, or on a channel no AP may use** (a radar one): the AP keeps its own channel, as before, and the
-    box log says why; the station stays joined, so MGMT_INFO shows `joined` with the two channels and Carlink its
-    line. A followed channel hostapd refuses (it exits in its start-up: a domain with no AP there, say) costs one try:
-    the AP then starts on its own channel, also said.
-  - **During a session nothing moves.** The station joining after the AP is up finds the hotspot on the AP's channel
-    (the phone's hotspot follows the phone's link, as benched). A station on another channel while the AP runs (it came
-    up before the station joined) is said once by the keeper and reported in MGMT_INFO; the next AP start follows.
-    What the radio does meanwhile (refuse the association, move the uAP, time-share the two channels) is for the bench.
+    box log says why; the station stays joined, so MGMT_INFO shows `joined` with the two channels and Carlink its line.
+    A followed channel hostapd refuses (it exits in its start-up: a domain with no AP there, say) costs one try: the AP
+    then starts on its own channel, also said.
+  - **During a session a host holds nothing moves.** The station joining after the AP is up finds the hotspot on the
+    AP's channel (the phone's hotspot follows the phone's link, as benched). A station on another channel while the AP
+    runs (it came up before the station joined) is said once by the keeper and reported in MGMT_INFO; the next AP start
+    follows. What the radio does meanwhile (refuse the association, move the uAP, time-share the two channels) is for
+    the bench.
 
 ## Between host sessions: armed (Bluetooth powered, invisible)
 

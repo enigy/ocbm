@@ -391,6 +391,21 @@ first), `4`/`5` (fin-wait: the box shut first), `7` (a reset), then `unacked`, `
 line (`wifi: link N at uptime ...`). At an attach, and at the same host's return: `session: <why>: the session's
 metadata replayed (N B: nowPlaying x2, location, ...)` (or `... goes at the end of the record under way`, or `no
 metadata of the session's kept to replay`) and `projection mode -> host: 2 (live: ...)`.
+The AP on the hotspot's channel at power-up (ADDENDUM 9, 24 Nov 2026; 2.4 GHz is the truck's case): the keeper's
+`[wifi_sta]` lines say what it scans when that changes (`the adapter's own session starting, no AP yet: scans and joins
+on the hotspot's channel N only`, `CarPlay is starting: no scans until it runs (40 s at most)`, `scans and joins on the
+AP's channel N only; a look over the channels an AP may use every 20 s` (60 s with a host), `scans every channel (no AP
+up); ...`), each look whose result changed (`the hotspot heard on channel N (D dBm)`, `the hotspot not heard (channels
+...)`), a join's events (`supplicant: trying freq=2437, assoc-reject status_code=1, ssid-temp-disabled ...`: names and
+codes only) and the supplicant's state (`supplicant: SCANNING`, one line in 10 s at most). radio_ap_up.sh says
+`STA mode, the adapter's own session: channel N, heard there by the station's look (waited M ms for the station)` (or
+`the hotspot's last (not heard now)`, `the station joined the hotspot there`, `the hotspot not heard and no last
+channel`) and `STA mode: the AP follows the station to channel 6 (hw_mode=g, 20 MHz)`; ocbmd, when the adapter's own
+session with no host starts again on the hotspot's channel, `wifi: the hotspot is heard on channel N and the AP runs on
+M: ... (once)`. By hand: `ocbmd wpa sta0 find 2412-2462,5180-5240,5745-5825` (one frequency, or none for every
+channel) prints `seen <channel> <dBm>` per sighting (or `seen 0`) and the join's `event` lines; `/tmp/wifi_link_state`
+holds the last look's `seen=<channel> <uptime>` and, while two looks in a row heard the hotspot on another channel than
+the AP's, `elsewhere=`; `/tmp/wifi_self_parked` is there while the adapter's own session has no host.
 The set-up network (M3): off with `/tmp/bench_wifi_setup_off` or `/etc/ocbm/bench_wifi_setup_off` (the owner's
 `/etc/ocbm/wifi_setup_off` too); offered only on an adapter never used, so a bench adapter needs `OCBM_WIFI_RESET` on a
 stick first (it removes the link and `/etc/ocbm/host_seen` and leaves `/etc/ocbm/wifi_setup_once`, in any mode, an

@@ -641,8 +641,10 @@ now-playing, route guidance, maneuver, lane, call, location and vehicle-status r
 artwork; not the command plists or route A's `dataStream` requests), as the seam's own records and at a record
 boundary of the channel's stream; a host takes them as the phone's, and one it already had changes nothing. One radio
 serves the hotspot and the adapter's own AP, so with a link set up the AP starts on the channel the station holds the
-hotspot on, never a radar channel (ADDENDUM 6), and MGMT_INFO's `wifi_link` gives the hotspot's `channel` beside the
-`ap_channel` the AP runs on. ocbmd `src/wifi.rs` and `src/mdns.rs`,
+hotspot on, never a radar channel (ADDENDUM 6), 20 MHz at 2.4 GHz; the adapter's own session with no host first waits
+up to 4 s for the station's look at power-up and takes the channel it heard, else the hotspot's last, and starts again
+once on the hotspot's channel when it is heard elsewhere (ADDENDUM 9). MGMT_INFO's `wifi_link` gives the hotspot's
+`channel` beside the `ap_channel` the AP runs on. ocbmd `src/wifi.rs` and `src/mdns.rs`,
 `/script/wifi_sta.sh`, and the Wi-Fi link section of docs/wireless/01_BT_AND_RADIO.md have the rest; the hand-off notes
 of 24 Nov hold the contract with Carlink.
 
