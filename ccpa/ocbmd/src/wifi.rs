@@ -195,8 +195,10 @@ pub fn parse_provision(body: &[u8]) -> Result<Provision, &'static str> {
 }
 
 /// Carry a provision out on flash: [`LINK_FILE`] written 0600 through a synced temporary and a rename, or removed.
+/// Either way, once done, the hotspot's address the station keeper kept beside it (`<path>_bssid`, ADDENDUM 11) goes:
+/// a new set-up learns its hotspot's address afresh (the owner's rule, 25 Nov 2026).
 pub fn store(p: &Provision, path: &str) -> std::io::Result<()> {
-    match p {
+    let done = match p {
         Provision::Clear => match std::fs::remove_file(path) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
             _ => Ok(()),
@@ -218,7 +220,11 @@ pub fn store(p: &Provision, path: &str) -> std::io::Result<()> {
             }
             std::fs::rename(&tmp, path)
         }
+    };
+    if done.is_ok() {
+        let _ = std::fs::remove_file(format!("{path}_bssid"));
     }
+    done
 }
 
 // ---- the station keeper -------------------------------------------------------------------------------------------
@@ -1249,11 +1255,15 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let path = format!("/tmp/ocbmd_selftest_wifi_store_{}", std::process::id());
         let c = LinkConf { key: LinkKey([9; 32]), ssid: "net".into(), psk: "cd".repeat(32) };
+        let kept = format!("{path}_bssid"); // the keeper's kept hotspot address: a new set-up clears it
+        std::fs::write(&kept, "02:11:22:33:44:55\n").unwrap();
         store(&Provision::Set(c.clone()), &path).unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         assert_eq!(read_link_conf(&path), Some(c));
+        assert!(!std::path::Path::new(&kept).exists(), "a new set-up: the kept address gone");
+        std::fs::write(&kept, "02:11:22:33:44:55\n").unwrap();
         store(&Provision::Clear, &path).unwrap();
-        assert!(!std::path::Path::new(&path).exists());
+        assert!(!std::path::Path::new(&path).exists() && !std::path::Path::new(&kept).exists());
         store(&Provision::Clear, &path).unwrap(); // removing nothing is fine
         assert_eq!(parse_link_file("key=short\n"), None);
     }
