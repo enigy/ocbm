@@ -406,8 +406,8 @@ by its address` when the hotspot's beacon hid its name, `the hotspot not heard (
 its steps' times (`supplicant: authenticating freq=2437`, `trying freq=2437 (+N ms)`, `associated (+N ms)`, `connected
 (+N ms)`; `no answer to the authentication (+N ms, now SCANNING)` for a step that ended unsaid; `auth-reject ...
 status_code=N`, `assoc-reject status_code=N`, `ssid-temp-disabled auth_failures=N duration=D reason=CONN_FAILED`;
-repeats in one `again in the last 60 s: ...` line a minute: names and codes only). docs/wireless/01_BT_AND_RADIO.md, "A
-join that fails", says which line tells which cause. radio_ap_up.sh says
+repeats in one `again in the last 60 s: ...` line a minute: names and codes only). docs/wireless/01_BT_AND_RADIO.md,
+"The authentication's 2.4 s", says what the driver does and which line tells which cause. radio_ap_up.sh says
 `STA mode, the adapter's own session: channel N, heard there by the station's look (waited M ms for the station)` (or
 `the hotspot's last (not heard now)`, `the station joined the hotspot there`, `the hotspot not heard and no last
 channel`) and `STA mode: the AP follows the station to channel 6 (hw_mode=g, 20 MHz)`; ocbmd, when the adapter's own
@@ -420,6 +420,36 @@ the last look's `seen=<channel> <uptime>` and, while two looks in a row heard th
 AP's, `elsewhere=`; `/tmp/wifi_self_parked` is there while the adapter's own session has no host.
 `/etc/ocbm/wifi_link_bssid` and `/etc/ocbm/wifi_link_sta` hold the hotspot's and the station's addresses (0600; read
 them by hand, never paste them anywhere public).
+The station's joins (ADDENDUM 13, 25 Nov 2026; docs/wireless/01_BT_AND_RADIO.md, "The authentication's 2.4 s"): six
+switches, each `/tmp/bench_<name>` or, for a cold boot, `/etc/ocbm/bench_<name>`, `/tmp` read first; `off` is off; an
+empty file or `on` is the default value; a number sets it. Read where they act, so a `/tmp` file takes effect at the
+next join, AP start or keeper pass, except `sta_modparam`, which acts at the driver's load (a power-up).
+- `sta_modparam` (none): one line, a module's name and its `NAME=VALUE` words, added to that module's insmod at the
+  driver's load: `moal host_mlme=0` (the firmware's own join, the AP's SME in the firmware too: unbenched). Line
+  `[radio_hal] ... [bench] sta_modparam (<file>): moal loads with host_mlme=0`; then no `HostMlme sta0 send auth` in
+  dmesg, the monitor's `trying freq=..` with no `authenticating` before it, and `wlan: Connected to bssid ...
+  successfully` on a join. Back: remove the file (or `off` in `/tmp` before the power-up) and power up again.
+- `sta_drvdbg` (off; set: 0x237, or the mask written): the radio driver's debug mask, through
+  `/proc/mwlan/adapter0/sta0/debug` (moal's and mlan's) else moal's parameter; again when the file changes. Line
+  `[wifi_sta] ... [bench] sta_drvdbg (<file>): the radio driver's debug mask 0x237 through <path> (its parameter: 567)`;
+  then dmesg holds `FW_REMAIN_ON_CHANNEL_EXPIRED cookie = ...`, `wlan: HostMlme auth timeout`, `HostMlme sta0: Received
+  auth frame type = 0x0`, `Remain on Channel: chan=6, ...`, `wlan: HostMlme sta0 auth success`. The mask lasts until
+  the next power-up; `0x207` puts the default back. MEVENT (0x20) also prints the firmware's events, a few more
+  lines while a phone streams.
+- `sta_join_wait` (6 s; `off`: no wait): how long the AP of the adapter's own session waits for a join under way once
+  the first look heard the hotspot. Line `[radio_ap_up] STA mode, the adapter's own session: channel N, ... (waited M ms
+  for the station, then J ms for its join[, held still while hostapd starts | , a join still under way: the AP starts
+  beside it])`, or `channel N, the station joined the hotspot there (...)`.
+- `sta_join_first` (off; set: 10 s, or the seconds): that AP waits instead until the station is on the hotspot, its
+  retries included, up to that long (the station first, then the AP on its channel). Same line.
+- `sta_ap_hold` (on; `off`: not): not joined at the end of the wait, the station held still while hostapd starts (the
+  AP layer's DISCONNECT and `/tmp/.radio_ap_start`). Line `held still while hostapd starts` above, and the keeper's
+  `the AP is starting: no scans and no joins until it is up`.
+- `sta_miss_guard` (3; `off`: none): after that many unanswered authentications in a row (the monitor's count,
+  `/tmp/wifi_sta_misses`), no join is tried while an AP is up. Line `N authentications in a row unanswered: no joins
+  while the AP runs (the driver resets the radio at 5)`. Look for the driver's own reset in dmesg every bench: `WiFi
+  Reset due to auth timeout cnt 5`, `Start to process hanging`, `WIFI auto_fw_reload: fw_reload=1`, `FW Reload
+  successfully.` (the AP and its phone drop with it).
 The set-up network (M3): off with `/tmp/bench_wifi_setup_off` or `/etc/ocbm/bench_wifi_setup_off` (the owner's
 `/etc/ocbm/wifi_setup_off` too); offered only on an adapter never used, so a bench adapter needs `OCBM_WIFI_RESET` on a
 stick first (it removes the link and `/etc/ocbm/host_seen` and leaves `/etc/ocbm/wifi_setup_once`, in any mode, an

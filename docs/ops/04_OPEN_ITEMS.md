@@ -835,8 +835,16 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
   unanswered, or answered about 2.4 s late and no association, then TEMP-DISABLED (OPEN, the blocker). For it the
   supplicant's joins are now logged as they happen with each step's time (its monitor), nothing of the keeper's cuts a
   join under way (SET_NETWORK in place of RECONFIGURE, no pause or restart over one), a look that hears the hotspot
-  clears the supplicant's back-off, and the station's own address is compared with its last start's; the candidates
-  and the line that tells each are in docs/wireless/01_BT_AND_RADIO.md, "A join that fails"; (6) M3
+  clears the supplicant's back-off, and the station's own address is compared with its last start's. The bench of
+  557b6b9 (ADDENDUM 12) and the stock driver's code (ADDENDUM 13, docs/wireless/01_BT_AND_RADIO.md, "The
+  authentication's 2.4 s"): the 2.4 s is moal's host-MLME remain-on-channel, fixed in its code; the phone's answer
+  reaches the host just after it ends and is passed by; why the frame or its answer waits for that end is not shown
+  (2.4 GHz only so far). Built, not benched: the AP of the adapter's own session waits for a join under way (6 s) and
+  holds the station still through hostapd's start; no join while an AP is up after 3 unanswered authentications in a
+  row, because moal resets the radio (its firmware reloaded, the AP's phone dropped) at the fifth, once in 15 minutes
+  at most; bench switches for the firmware's own join (`moal host_mlme=0`, which moves the AP's authentication into
+  the firmware too), the station joining before the AP, and the driver's debug mask. OPEN: which of them gives a
+  join; whether the driver's reset fired on 25 Nov (dmesg `WiFi Reset due to auth timeout`); (6) M3
   (the set-up network) is built, not
   benched: whether the stock hostapd takes `ap_isolate=1` (it refuses an unknown key, and then no set-up network is
   offered), and what the set-up AP raised 20 s into a boot with no host yet costs a head unit that connects later; its

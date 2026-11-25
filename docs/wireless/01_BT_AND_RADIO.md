@@ -599,7 +599,8 @@ also joins the phone's Personal Hotspot as a station, so a head unit on that hot
     it is), said once in 5 minutes: `the hotspot heard while the supplicant held it back after failed joins: it tries
     again now`. Not while the station is paused for a CarPlay start.
 - **Its joins, as they happen** (ADDENDUM 11). Beside each supplicant the keeper runs a monitor of its control socket,
-  `ocbmd wpa <if> events 0` (ATTACH and LEVEL 2: this build has no debug output, and its MSG_DEBUG `wpa_msg` lines, the
+  `ocbmd wpa <if> events 0 /tmp/wifi_sta_misses` (the file: its count of unanswered authentications, ADDENDUM 13,
+  below) (ATTACH and LEVEL 2: this build has no debug output, and its MSG_DEBUG `wpa_msg` lines, the
   SME's own 5 s timers among them, are all there is beyond the events), into the box log: `[wifi_sta] [up N]
   supplicant: <event>`, names and numeric codes only, never a name or an address. A join's steps carry the time since
   its authentication began (`authenticating freq=2437`, `trying freq=2437 (+2412 ms)`, `associated (+2450 ms)`,
@@ -612,36 +613,90 @@ also joins the phone's Personal Hotspot as a station, so a head unit on that hot
   that lives all along, `pidof ocbmd` counts it: ocbm_boot.sh's failover watchdog (`pgrep -f /usr/sbin/ocbmd`, as the
   respawn wrapper), the supervisor's L2 check (the full path) and the trial self-test (an ` wpa ` command line left
   out) look for the daemon without it; the supervisor's `pkill -x ocbmd` ends it, and the keeper starts it again.
-- **A join that fails: what tells the causes apart** (the bench of 25 Nov: the driver's `HostMlme sta0 send auth to
-  bssid` with no answer, 4 times of 7, or an auth received about 2.4 s later and then no association; the network
-  TEMP-DISABLED). From the 2.11 source and the stock moal driver's own messages (its strings in the factory image); the
-  monitor's lines and dmesg together:
-
-  - *The phone does not answer* (its hidden-hotspot policy, a client limit, the phone busy elsewhere):
-    `authenticating` then `no answer to the authentication (+N ms ...)`, N the driver's wait each time; dmesg
-    `wlan: HostMlme auth timeout` and no `Received auth frame`; with the hotspot screen open the same adapter joins.
-  - *The driver's wait ended before the answer came:* dmesg `wlan: HostMlme auth timeout` before `HostMlme sta0:
-    Received auth frame type = 0x..`, then `HostMlme sta0: Drop auth frame, auth_flag=..`; the monitor's `no answer
-    to the authentication (+N ms ...)` shorter than the answer's 2.4 s.
-  - *The answer came after the supplicant had left AUTHENTICATING* (sme.c `sme_event_auth` passes it by, unsaid in
-    this build): dmesg `Received auth frame` with no `Drop` after it, and no `trying` from the monitor; its `no answer
-    ...` came first.
-  - *The answer taken, the association not answered:* `trying freq=2437 (+N ms)`, then `no answer to the association
-    (+N ms ...)` or `no answer to the association in 5 s`, or `assoc-reject status_code=N` (with `timeout`); dmesg
-    `bss_start Fails`, `Failed to connect`.
-  - *The phone refused:* `auth-reject auth_type=0 auth_transaction=2 status_code=N` or `assoc-reject status_code=N`
-    (17: too many clients).
-  - *The key:* `associated` then `the key handshake timed out` or `4-way handshake failed (the key?)`.
-  - *The radio away from the channel when the answer came* (the AP on another channel; Bluetooth during the adapter's
-    own session): failures only with an AP up (`[radio_ap_up]` lines) or with the session's Bluetooth busy (btd's
-    lines at the same uptime); dmesg `HostMlme sta0: Set remain on Channel: with status=N`.
-  - *The driver refused the step:* `the driver refused the authentication`; dmesg `pending auth on going`, `Fail to
-    send packet status=N`, `Fail to configure remain on channel`.
-  - *Ours* (a pause, a channel change, a restart over a join): none now, a join under way is waited for; the keeper's
-    lines beside it say what it did (`CarPlay is starting`, `not joined for 300 s`).
-  - *A new device to the phone at each start:* `the station's own address: new since its last start`.
-  - *The back-off stretching the retries:* `ssid-temp-disabled ... duration=D`, and the look's `... held it back
-    after failed joins: it tries again now`.
+- **The authentication's 2.4 s: what the stock driver does** (ADDENDUM 12 and 13 of the hand-off plan, 25 Nov 2026).
+  The bench of 557b6b9: with no AP up, the driver's `wlan: HostMlme sta0 send auth to bssid ...`, then `wlan: HostMlme
+  Auth received from ...` 2.41 s later every time, about 20 ms after the monitor's `no answer to the authentication
+  (+2406 ms, now SCANNING)`. FOUND by disassembling the factory image's moal.ko (`iw416_ko.tar.gz`, driver
+  `MXM5X--437.p20`; its symbols, relocations and strings; nothing run):
+  - *Host MLME.* moal's `host_mlme` parameter is on by default (1) and the stock `wifi_mod_para.conf` leaves it. With it
+    `woal_register_cfg80211` gives cfg80211 the `auth` and `assoc` operations and takes `connect` and `disconnect` away,
+    so wpa_supplicant 2.11 runs its own SME (driver_nl80211_capa.c: the wiphy lists AUTHENTICATE): an
+    NL80211_CMD_AUTHENTICATE per attempt. A connect command, even forced (`force_connect_cmd`), finds no `connect`
+    and goes through cfg80211's own SME onto the same operation (Linux's cfg80211, not read from the unit's 3.14).
+  - *The wait is a remain-on-channel.* `woal_cfg80211_authenticate` asks the firmware to stay on the network's channel
+    for 2400 ms (the literal in its call to `woal_cfg80211_remain_on_channel_cfg`), marks the authentication pending,
+    and queues the frame it built as a raw management frame. When the firmware says that stay has expired with the
+    authentication still pending, moal calls `cfg80211_auth_timeout` (dmesg `wlan: HostMlme auth timeout`) and clears
+    the pending flag and host MLME for the interface. The supplicant hears TIMED_OUT and moves on in silence (sme.c
+    `sme_event_auth_timed_out`; its own authentication timer is 5 s and never comes first). Nothing sets the 2400:
+    no module parameter, no supplicant key.
+  - *The late answer is passed by.* The `Auth received` line is mlan's, the moment the firmware hands the phone's answer
+    up. moal treats an authentication frame as the answer only while host MLME and the pending flag are set; after the
+    expiry neither is, so no `Received auth frame` or `Drop auth frame` follows and the supplicant never sees it.
+  - *Power save is off on the card.* The stock file's `ps_mode=2` and `auto_ds=2` apply to the card (the interface names
+    of the same block, `sta0` and `wlan0`, do; `/sys/module/moal/parameters` shows the module's own defaults, not the
+    card's), and moal refuses cfg80211's default power save on the station while `ps_mode` is 2.
+  - *The driver resets the radio at the fifth.* moal counts the authentication frames it sends with no authentication
+    frame received since (in host MLME); at the fifth in a row it calls `woal_reset_wifi(.., "auth timeout")`, at most
+    once in 900 s and at any time the first time a boot: dmesg `WiFi Reset due to auth timeout cnt 5`, `Start to
+    process hanging`, every interface's link down, and with moal's `auto_fw_reload` (default 1, not set by the stock
+    file) `WIFI auto_fw_reload: fw_reload=1` and the firmware loaded again over SDIO (`FW Reload successfully.`). The
+    AP and the phone on it go with it. 2.11's own retries make five in about 25 s: a rescan 0.1, 0.5 and 1 s after the
+    first three failures, then TEMP-DISABLED 10, 20, 30 s.
+  - *INFERRED, not shown by any code read:* why the answer comes only as the stay ends. Every sample lands 10-20 ms
+    after the expiry, and the one answered in time (ADDENDUM 12, case a, at +1842 ms) came as hostapd started the uAP
+    on the same channel: the frame leaves the radio only when the radio's channel plan changes, or Bluetooth's share
+    of the 2.4 GHz radio holds a host-built frame through the stay. Every 25 Nov attempt was at 2.4 GHz; the 24 Nov
+    joins that worked were at 5 GHz (149 with no AP, 36 beside a running AP) and one at 2.4 GHz (channel 6, no AP, right
+    after a password send). A phone slow to answer would not land that close to the expiry every time.
+  - *Seen in dmesg* (the driver's default mask, `drvdbg` 0x207, shows MMSG and MERROR lines): `send auth to bssid`,
+    mlan's `Auth received from`, `pending auth on going`, `Fail to configure remain on channel`, `HostMlme sta0: Set
+    remain on Channel: with status=N`, `Fail to send packet status=N`, `bss_start Fails`, `WiFi Reset due to ...`,
+    `Start to process hanging`. With the bench's `sta_drvdbg` (0x237: MCMND 0x10 and MEVENT 0x20 added) also
+    `FW_REMAIN_ON_CHANNEL_EXPIRED cookie = ...` and `wlan: HostMlme auth timeout` (MEVENT), `HostMlme sta0: Received
+    auth frame type = 0x0` (MEVENT), `Remain on Channel: chan=6, offset=.. width=..` and `wlan: HostMlme sta0 auth
+    success` (MCMND). The mask is moal's `drvdbg`, writable at run time: `echo "drvdbg=0x237" >
+    /proc/mwlan/adapter0/sta0/debug` sets moal's and its mlan's, `/sys/module/moal/parameters/drvdbg` moal's alone.
+- **What the keeper and the AP layer do about it** (ADDENDUM 13, built 25 Nov on 557b6b9; not benched):
+  - *The AP of the adapter's own session waits for a join under way* (`radio_ap_up.sh` `ap_join`): once the first look
+    heard the hotspot, from the supplicant's STATUS every 0.2 s (`ocbmd wpa`), 6 s at most (the authentication alone
+    takes 2.4 s): joined, the AP takes its channel; still under way at the bound, the AP starts beside it (said). With
+    the bench's `sta_join_first` it waits instead for the station to be on the hotspot, up to that many seconds (10),
+    its retries included. A USB host's AP never waits.
+  - *No join begins in hostapd's start.* Not joined at the end of that wait, the AP layer stops the supplicant
+    (DISCONNECT, never over a join under way) and writes `/tmp/.radio_ap_start` (its pid) until its start is over; the
+    keeper takes that as its own pause (`the AP is starting: no scans and no joins until it is up`) and its start rules
+    put the station back (the session running, 40 s at most; at once if no AP came).
+  - *No fifth miss while the AP runs.* The monitor keeps the count of authentications in a row with no answer in
+    `/tmp/wifi_sta_misses` (one more for each that ended unanswered or on the SME's 5 s timer, none again after any
+    answer: the association tried, a refusal, a join; a refusal by the driver sent no frame and does not count); at 3
+    the keeper tries no join while an AP is up (`3 authentications in a row unanswered: no joins while the AP runs (the
+    driver resets the radio at 5)`), and goes on when the AP is down, where a reset drops no phone. The file lasts the
+    boot, as the driver's count does (a reset the driver made with no AP up is not seen: the count stays high, so it
+    errs toward holding).
+  - *The quick retry the plan asked for is 2.11's own:* its first three retries come 0.1 to 1 s after each failure, and
+    the bench's case b shows them failing alike; more from the keeper would only bring the driver's reset sooner. Not
+    built.
+  - *Firmware MLME* (the bench's `sta_modparam`: `moal host_mlme=0` in `/etc/ocbm/bench_sta_modparam`, then a
+    power-up): moal keeps `connect` (`woal_cfg80211_connect`: the firmware's own join, no remain-on-channel, no
+    host-built frame, no counter), and 2.11 then connects with NL80211_CMD_CONNECT by itself (`trying freq=..` with no
+    `authenticating` before it; dmesg `wlan: Connected to bssid ... successfully`, or `can't find targe AP` when moal's
+    own scan table lacks the hidden hotspot by name). Its cost is the AP's side: moal tests the same flag in its uAP
+    start, its beacon filter, its management frame registration and transmit and its station add and delete, and
+    without it says the AP's SME is the firmware's (`WIPHY_FLAG_HAVE_AP_SME`): so, INFERRED from those, the phone's
+    authentication and association of the AP move into the firmware and hostapd learns of stations from the driver.
+    Stock never ran so; not benched. The same one insmod at the boot preload with a word more: no reload, nothing on a
+    USB host's time to picture from the load itself. Changing it at run time would need the driver unloaded and loaded
+    again (the AP and the station down for the driver's load, 3.8 s in the 24 Nov boot log beside the Bluetooth
+    firmware's push, and Bluetooth's side under that unknown): not built.
+  - *The rest of the candidates, and their lines* (the monitor's beside dmesg): the answer taken and the association not
+    answered (`trying freq=2437 (+N ms)` then `no answer to the association ...`, `assoc-reject status_code=N`; dmesg
+    `bss_start Fails`, `Failed to connect`); the phone refusing (`auth-reject ... status_code=N`, 17: too many
+    clients); the key (`associated` then `the key handshake timed out` or `4-way handshake failed (the key?)`); the
+    driver refusing the step (`the driver refused the authentication`; dmesg `pending auth on going`, `Fail to
+    configure remain on channel`, `bssid not found in scan list`: moal's own scan table lacks the network); a new
+    device to the phone at each start (`the station's own address: new since its last start`); the back-off
+    (`ssid-temp-disabled ... duration=D`, the look's `... it tries again now`).
 
 - **The listener and the advert stay on the station's side.** The listener takes connections from the station's
   interface only (SO_BINDTODEVICE: under Linux's weak-host model the station's address alone would also answer on the
@@ -670,8 +725,11 @@ also joins the phone's Personal Hotspot as a station, so a head unit on that hot
     (`/tmp/wifi_self_parked`, ocbmd's) and the station is not on the hotspot, `radio_ap_up.sh` (`ap_head`) waits up to
     4 s, while the keeper runs, for its first look, and starts the AP on the channel the look heard the hotspot on, else
     on the hotspot's last channel (`/etc/ocbm/wifi_link_channel`, where an AP may), else on its own; said in one line
-    with the wait. Any other start (a USB host's) waits for nothing and keeps its own channel when the station is not on
-    the hotspot, as before.
+    with the wait. Where the look heard it, it also waits for a join under way (ADDENDUM 13, above: 6 s at most) and
+    holds the station still through hostapd's start: `STA mode, the adapter's own session: channel 6, heard there by
+    the station's look (waited 300 ms for the station, then 2400 ms for its join, held still while hostapd starts)`.
+    Any other start (a USB host's) waits for nothing and keeps its own channel when the station is not on the hotspot,
+    as before.
   - **2.4 GHz** (the owner's head unit needs the hotspot's Maximize Compatibility, so 1-11 is the product's normal
     case): the session's configuration is `hw_mode=g`, 20 MHz (`ht_capab=[SHORT-GI-20]`, the factory file's own 2.4 GHz
     line: no 20/40 coexistence scan at hostapd's start, nothing on the channel next to the hotspot's) and no VHT line.
