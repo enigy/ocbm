@@ -310,7 +310,11 @@ while :; do
     ifconfig "$IF" 0.0.0.0 up 2>/dev/null
     [ "$wpa_down" = 1 ] || log "starting the supplicant on $IF"
     if "$WPA" -B -P "$WPA_PID" -D nl80211,wext -i "$IF" -c "$WPACONF" >> "$WPALOG" 2>&1; then
-      _w=0; while [ "$_w" -lt 10 ] && [ ! -e "$CTRL/$IF" ]; do _w=$((_w + 1)); sleep 0.1; done
+      # Its pid file too: the daemon writes it after the socket is there (25 Nov bench: a start taken for a failure).
+      _w=0
+      while [ "$_w" -lt 10 ] && { [ ! -e "$CTRL/$IF" ] || ! pid_of "$WPA_PID" >/dev/null; }; do
+        _w=$((_w + 1)); sleep 0.1
+      done
     fi
     paused=0; looked=0
   fi
