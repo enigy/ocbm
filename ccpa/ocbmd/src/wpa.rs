@@ -110,7 +110,7 @@ pub fn cli(args: &[String]) -> Option<i32> {
 }
 
 fn usage() -> i32 {
-    eprintln!("usage: ocbmd wpa [-p CTRL_DIR] IFACE COMMAND [ARG...]   e.g. ocbmd wpa sta0 status; sta0 find [FREQS]");
+    eprintln!("usage: ocbmd wpa [-p CTRL_DIR] IFACE COMMAND [ARG...] | find [FREQS] [quick]");
     2
 }
 

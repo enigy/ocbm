@@ -401,8 +401,8 @@ codes only) and the supplicant's state (`supplicant: SCANNING`, one line in 10 s
 `STA mode, the adapter's own session: channel N, heard there by the station's look (waited M ms for the station)` (or
 `the hotspot's last (not heard now)`, `the station joined the hotspot there`, `the hotspot not heard and no last
 channel`) and `STA mode: the AP follows the station to channel 6 (hw_mode=g, 20 MHz)`; ocbmd, when the adapter's own
-session with no host starts again on the hotspot's channel, `wifi: the hotspot is heard on channel N and the AP runs on
-M: ... (once)`. By hand: `ocbmd wpa sta0 find 2412-2462,5180-5240,5745-5825` (one frequency, or none for every
+session with no host starts again on the hotspot's channel, `wifi: the hotspot is heard on channel N, the AP runs on
+M: ... starts again on N (once)`. By hand: `ocbmd wpa sta0 find 2412-2462,5180-5240,5745-5825` (one frequency, or none for every
 channel) prints `seen <channel> <dBm>` per sighting (or `seen 0`) and the join's `event` lines; `/tmp/wifi_link_state`
 holds the last look's `seen=<channel> <uptime>` and, while two looks in a row heard the hotspot on another channel than
 the AP's, `elsewhere=`; `/tmp/wifi_self_parked` is there while the adapter's own session has no host.

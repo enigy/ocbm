@@ -4728,8 +4728,8 @@ impl Daemon {
                 (ss.moved, ss.started, ss.left) = (true, now, None);
                 let ap = wifi::ap_channel(&wifi::ap_conf_text(wifi::AP_SESSION_CONF, wifi::HOSTAPD_CONF));
                 eprintln!(
-                    "[ocbmd] wifi: the hotspot is heard on channel {ch} and the AP runs on {ap}: no host can reach \
-                     the adapter while they differ; the session with no host starts again so the AP takes {ch} (once)"
+                    "[ocbmd] wifi: the hotspot is heard on channel {ch}, the AP runs on {ap}: no Wi-Fi host can \
+                     reach the adapter; the session with no host starts again on {ch} (once)"
                 );
                 self.rearm_presence_silently();
                 return;
