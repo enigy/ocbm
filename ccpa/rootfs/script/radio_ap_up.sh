@@ -210,23 +210,13 @@ ap_configure() {
     && sed -i "s/192\.168\.[0-9]*\.100/${base}.100/; s/192\.168\.[0-9]*\.200/${base}.200/" "$_uc" 2>/dev/null
   # Point udhcpd at the interface we are actually serving.
   grep '^interface' "$_uc" 2>/dev/null | grep -qvxF "interface	$IF" && sed -i "s/^interface.*/interface	$IF/" "$_uc"
-  # THE AP'S DHCP SERVER IS BUSYBOX'S udhcpd (1.32.1, the one serving NCM), NOT THE VENDOR'S v0.9.9-pre.
-  # An iPhone rejoining a network it knows keeps its old address and asks for it again (INIT-REBOOT). The
-  # vendor's server stays silent on such a request from a client it has no lease for (upstream udhcp:
-  # "else remain silent"), so the phone ran CarPlay on its old address for ~5 s, then DISCOVERed, and the
-  # session died when it was handed another. Keeping the lease file (bench 2026-11-02) covered AP restarts
-  # and power cuts, but not the first session after a conversion, or after a Restore and reinstall, where
-  # no lease exists (the Mac, 10 Nov: the LIVI bench at 16:58 got a new address and dropped). BusyBox's
-  # udhcpd NAKs a REQUEST it has no lease for ("No, we don't have this IP for you"), and the phone takes
-  # a fresh address within a second, before CarPlay starts.
-  #
-  # Same file, same pool, lease and interface as before. Three keys BusyBox's server needs, set if absent:
-  # the lease file (on the jffs2 root, kept across AP restarts and power cuts) and the pidfile the
-  # teardown paths kill by, which the stock file names already, and auto_time. BusyBox writes leases on
-  # that timer and at exit, where the vendor's wrote them at every ACK, and a drive ends in a power cut.
-  # Its lease file has another format (a timestamp, then 36-byte records); a vendor-format file reads as
-  # a timestamp from far outside its 12-hour window, so BusyBox ignores it and rewrites it in its own. A
-  # file older than that window, or one the clock jumped past at boot, is ignored too: the NAK covers it.
+  # THE AP'S DHCP SERVER IS BUSYBOX'S udhcpd (1.32.1, the one serving NCM), NOT THE VENDOR'S v0.9.9-pre, which stays
+  # silent on an iPhone's INIT-REBOOT for an address it has no lease for: the phone ran CarPlay on its old address for
+  # ~5 s, then DISCOVERed, and the session died (no lease exists after a conversion or a Restore: the Mac, 10 Nov).
+  # BusyBox's NAKs it, and the phone takes a fresh address within a second. Same file, pool, lease and interface; three
+  # keys it needs, set if absent: the lease file (jffs2, kept across AP restarts and power cuts), the pidfile the
+  # teardowns kill by, and auto_time (it writes leases on that timer and at exit; a drive ends in a power cut). A
+  # vendor-format or stale lease file reads as outside its 12-hour window and is rewritten: the NAK covers it.
   _dhcp_key "$_uc" lease_file /var/lib/udhcpd.leases
   _dhcp_key "$_uc" pidfile /var/run/udhcpd.pid
   _dhcp_key "$_uc" auto_time 60
@@ -356,7 +346,7 @@ say() { echo "$L $*"; echo "$L $*" 2>/dev/null >>"$AP_BOXLOG"; }   # the box log
 AP_PARKED=/tmp/wifi_self_parked; STA_ST=/tmp/wifi_link_state; STA_KEPT=/etc/ocbm/wifi_link_channel
 STA_LOCK=/tmp/.wifi_sta_lock/pid; HEAD_START=${HEAD_START:-40}
 ap_head() {
-  _hn=0; _hw=""
+  _hn=0; _hw=""; _jn=0; _jh=""
   while :; do
     _a=""; _b=""; _c=""; _d=""; _k=""
     { read -r _a; read -r _b; read -r _c; read -r _d; } 2>/dev/null <"$1$STA_ST"
@@ -368,6 +358,9 @@ ap_head() {
   done
   if [ -z "$_hw" ]; then
     _d=${_d#seen=}; _d=${_d%% *}
+    case $_d in [1-9]*) ap_join "$1" "${_a#iface=}" ;; esac
+  fi
+  if [ -z "$_hw" ]; then
     case $_d in
       [1-9]*) _fc=$_d; _hw="heard there by the station's look" ;;
       *) _k=""; read -r _k 2>/dev/null <"$1$STA_KEPT"
@@ -375,7 +368,50 @@ ap_head() {
     esac
   fi
   say "STA mode, the adapter's own session: ${_hw:+channel $_fc, }${_hw:-the hotspot not heard and no last channel}" \
-      "(waited $((_hn * 100)) ms for the station)"
+      "(waited $((_hn * 100)) ms for the station${_jn#0}${_jh})"
+}
+# ADDENDUM 13 (the 25 Nov bench, case a: an authentication answered as hostapd started on its channel, then the
+# association refused). The look heard the hotspot: a join under way is waited for, from the supplicant's STATUS every
+# 0.2 s: JOIN_WAIT s at most (the bench's sta_join_wait; off: none), the authentication alone taking the IW416's
+# driver 2.4 s; with the bench's sta_join_first (s, 10 when it names none), until the station is on the hotspot, its
+# retries too. Joined: its channel. Not: before hostapd starts the station is held still (DISCONNECT, never over a join
+# under way; the bench's sta_ap_hold off: not), and AP_START (this start's pid) says so to the keeper, which holds it
+# while this start runs and then takes it as its own pause (and the file) whatever this start's end, so no join begins
+# in hostapd's start and the keeper's own rules put the station back. Sets _fc, _hw; _jn and _jh for the line.
+AP_START=/tmp/.radio_ap_start; JOIN_WAIT=6; STA_CTRL=/var/run/wpa_supplicant
+bench() {  # $1 name, $2 root: as the keeper's (wifi_sta.sh): 0 set (_bv), 1 off, 2 no file
+  for _bvf in "$2/tmp/bench_$1" "$2/etc/ocbm/bench_$1"; do
+    [ -e "$_bvf" ] || continue
+    _bv=""; read -r _bv 2>/dev/null <"$_bvf"; [ "$_bv" = on ] && _bv=""
+    [ "$_bv" != off ]; return
+  done
+  return 2
+}
+ap_join() {  # $1 root, $2 the station's interface
+  _jw=$JOIN_WAIT; bench sta_join_wait "$1"; case $? in 0) _jw=${_bv:-$JOIN_WAIT} ;; 1) _jw=0 ;; esac
+  _jf=0; bench sta_join_first "$1" && _jf=${_bv:-10}
+  case $_jw in ''|*[!0-9]*) _jw=$JOIN_WAIT ;; esac; case $_jf in ''|*[!0-9]*) _jf=10 ;; esac
+  [ "$_jf" -gt "$_jw" ] && _jw=$_jf
+  _jj=0
+  while :; do
+    _js=$(timeout 1 ocbmd wpa -p "$1$STA_CTRL" "$2" status 2>/dev/null)
+    case $_js in
+      *wpa_state=COMPLETED*) _jq=${_js#*freq=}; _jq=${_jq%%[!0-9]*}; _fc=0
+        case $_jq in 24[0-9][0-9]) _fc=$(( (_jq - 2407) / 5 )) ;; 5[0-9][0-9][0-9]) _fc=$(( (_jq - 5000) / 5 )) ;; esac
+        _hw="the station joined the hotspot there"; break ;;
+      *wpa_state=AUTHENTICATING*|*wpa_state=ASSOCIAT*|*wpa_state=*HANDSHAKE*) _jj=1 ;;
+      '') _jj=0; break ;;
+      *) _jj=0 ;;
+    esac
+    [ "$_jn" -lt $((_jw * 5)) ] && { [ "$_jj" = 1 ] || [ "$_jn" -lt $((_jf * 5)) ]; } || break
+    _jn=$((_jn + 1)); sleep 0.2
+  done
+  [ "$_jn" = 0 ] || _jn=", then $((_jn * 200)) ms for its join"
+  [ -z "$_hw" ] && [ -n "$_js" ] || return 0
+  if [ "$_jj" = 1 ]; then _jh=", a join still under way: the AP starts beside it"; return 0; fi
+  bench sta_ap_hold "$1"; [ $? = 1 ] && return 0
+  echo $$ 2>/dev/null >"$1$AP_START" && timeout 1 ocbmd wpa -p "$1$STA_CTRL" "$2" disconnect >/dev/null 2>&1 \
+    && _jh=", held still while hostapd starts"
 }
 # hostapd's configuration (_hrun) under root $1: AP_SESSION (tmpfs, 0600: hostapd.conf with the station's channel, band
 # and HT40 side; 20 MHz and no VHT at 2.4 GHz, as the factory file's own 2.4 GHz line) when it follows, else

@@ -433,6 +433,69 @@ EOF
     "not the adapter's own session (a USB host's start, say): no wait, its own channel, as before"
   park; st joined 149; last_ch 6; r=$(pfol 149 40)
   check '[ "$r" = "149 $SC" ] && ! logged "own session"' "the station on the hotspot when the seam asked: followed, no look waited for"
+
+  # ADDENDUM 13: the look heard the hotspot. A join under way is waited for, from the supplicant's STATUS (a stand-in
+  # ocbmd's, its states one a request), up to sta_join_wait (6 s; off: none), or with sta_join_first until the station
+  # is on the hotspot; not joined, the station is held still while hostapd starts (DISCONNECT, never over a join, and
+  # the mark the keeper reads; sta_ap_hold off: not).
+  echo "== $sh: STA mode, the adapter's own session: a join under way waited for, the station held still for hostapd"
+  J="$T/joinbin"; JS="$T/joinst"; mkdir -p "$J"
+  printf '#!/bin/sh\nshift\nexec "$@"\n' > "$J/timeout"
+  cat > "$J/ocbmd" <<'EOF'
+#!/bin/sh
+# ocbmd wpa -p DIR IFACE status|disconnect: STATUS from the first line of $JS/states ("STATE [FREQ]", taken off while
+# more follow; no file: no supplicant answers), every request noted in $JS/asked.
+shift; echo "$4 $3" >> "$JS/asked"
+[ "$4" = status ] || { echo OK; exit 0; }
+[ -s "$JS/states" ] || exit 1
+l=$(sed -n 1p "$JS/states")
+[ -n "$(sed -n 2p "$JS/states")" ] && { sed 1d "$JS/states" > "$JS/states.x"; mv -f "$JS/states.x" "$JS/states"; }
+set -- $l; echo "wpa_state=$1"; [ -n "${2:-}" ] && echo "freq=$2"
+exit 0
+EOF
+  chmod 755 "$J"/*
+  jcase() {  # the states, one a line; then the adapter's own session, the look heard the hotspot on 6
+    park; st joining 0 "seen=6 12"; last_ch 11; rm -rf "$JS"; mkdir -p "$JS"
+    [ $# = 0 ] || printf '%s\n' "$@" > "$JS/states"
+  }
+  pjoin() {  # ap_follow as pfol 0 40, the stand-in on its PATH: "ch _hrun"
+    env RADIO_AP_CHANNEL=0 HEAD_START=40 RADIO_AP_UP_FUNCS=1 AP_BOXLOG="$F/tmp/box.log" JS="$JS" \
+      OCBM_TEST_PATH="$J${OCBM_TEST_PATH:+:$OCBM_TEST_PATH}" \
+      "$sh" -c '. "$1"; ch=36; ap_follow "$2" > "$2.out" 2>&1; echo "$ch $_hrun"' sh "$AP" "$F"
+  }
+  asked() { grep -c "^$1 sta0$" "$JS/asked" 2>/dev/null; }
+  held() { [ -s "$F/tmp/.radio_ap_start" ] && [ "$(asked disconnect)" = 1 ]; }
+  jcase SCANNING; r=$(pjoin)
+  check '[ "$r" = "6 $SC" ] && held && logged "channel 6, heard there by the station.s look (waited 0 ms for the station, held still while hostapd starts)"' \
+    "no join under way: no wait, and the station held still for hostapd's start (DISCONNECT, the keeper's mark)"
+  check '[ "$(asked status)" = 1 ]' "  one STATUS asked"
+  jcase AUTHENTICATING AUTHENTICATING AUTHENTICATING SCANNING; r=$(pjoin)
+  check '[ "$r" = "6 $SC" ] && held && logged "(waited 0 ms for the station, then 600 ms for its join, held still while hostapd starts)"' \
+    "a join under way (0.6 s): waited for, then the hold"
+  jcase AUTHENTICATING ASSOCIATING "COMPLETED 2462"; r=$(pjoin)
+  check '[ "$r" = "11 $SC" ] && [ ! -e "$F/tmp/.radio_ap_start" ] && [ "$(asked disconnect)" = 0 ] && logged "channel 11, the station joined the hotspot there (waited 0 ms for the station, then 400 ms for its join)"' \
+    "the join completes (on 11): the AP takes its channel, nothing held"
+  jcase AUTHENTICATING; echo 1 > "$F/tmp/bench_sta_join_wait"; t0=$(date +%s); r=$(pjoin)
+  check '[ "$r" = "6 $SC" ] && [ "$(asked disconnect)" = 0 ] && [ ! -e "$F/tmp/.radio_ap_start" ] && logged "then 1000 ms for its join, a join still under way: the AP starts beside it)" && [ $(( $(date +%s) - t0 )) -le 3 ]' \
+    "  the bench's sta_join_wait 1: a join still under way after 1 s, the AP starts beside it (never a DISCONNECT over it)"
+  jcase AUTHENTICATING; echo off > "$F/tmp/bench_sta_join_wait"; r=$(pjoin)
+  check '[ "$(asked status)" = 1 ] && [ "$(asked disconnect)" = 0 ] && logged "(waited 0 ms for the station, a join still under way: the AP starts beside it)"' \
+    "  sta_join_wait off: no wait (as before ADDENDUM 13)"
+  jcase SCANNING SCANNING SCANNING AUTHENTICATING "COMPLETED 2437"; : > "$F/tmp/bench_sta_join_first"; r=$(pjoin)
+  check '[ "$r" = "6 $SC" ] && [ "$(asked disconnect)" = 0 ] && logged "channel 6, the station joined the hotspot there (waited 0 ms for the station, then 800 ms for its join)"' \
+    "the bench's sta_join_first: waited through the attempts' gaps until the station joined"
+  jcase SCANNING; echo 1 > "$F/etc/ocbm/bench_sta_join_first"
+  t0=$(date +%s); r=$(pjoin)
+  check 'held && logged "then 1000 ms for its join, held still while hostapd starts)" && [ $(( $(date +%s) - t0 )) -le 3 ]' \
+    "  sta_join_first 1 (on flash, for a cold boot), never joined: 1 s, then the hold"
+  jcase SCANNING; echo off > "$F/tmp/bench_sta_ap_hold"; r=$(pjoin)
+  check '[ "$(asked disconnect)" = 0 ] && [ ! -e "$F/tmp/.radio_ap_start" ] && logged "(waited 0 ms for the station)"' \
+    "the bench's sta_ap_hold off: nothing held"
+  jcase; r=$(pjoin)
+  check '[ "$r" = "6 $SC" ] && [ ! -e "$F/tmp/.radio_ap_start" ] && [ "$(asked disconnect)" = 0 ] && logged "(waited 0 ms for the station)"' \
+    "no supplicant answering: no wait, nothing held"
+  jcase SCANNING; st joining 0 "seen=0 12"; r=$(pjoin)
+  check '[ "$r" = "11 $SC" ] && [ ! -e "$JS/asked" ]' "the look did not hear the hotspot: no STATUS asked (the keeper holds the station itself)"
   mkf; r=$(fol 149)
   check '[ "$(ls -l "$SC" | cut -c1-10)" = "-rw-------" ] && [ ! -e "$SC.new" ]' "the session's configuration is 0600 (the AP's passphrase is in it)"
   check 'grep -q "the AP follows the station to channel 149 (hw_mode=a, HT40+)" "$F/tmp/box.log" && grep -q "follows the station to channel 149" "$F.out"' \
