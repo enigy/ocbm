@@ -370,12 +370,13 @@ final_note() {  # OCBM_RESTORE.txt on the stick: what OCBM_RESTORE does on a fin
 restore_watch() {
   while :; do
     # M3's reset, the one way a used adapter offers the set-up network again (ocbmd setup.rs): OCBM_WIFI_RESET on a stick
-    # removes the Wi-Fi link (its key and hotspot, the kept session config and channel) and the record that a host has
-    # used the adapter, and leaves wifi_setup_once for the next start. One use: renamed .done, with a note. The shell's
-    # own test of each file comes first, so a look with neither on a stick forks nothing (stick_in's grep).
+    # removes the Wi-Fi link (its key and hotspot, the kept session config, channel and addresses) and the record that a
+    # host has used the adapter, and leaves wifi_setup_once for the next start. One use: renamed .done, with a note. The
+    # shell's own test of each file comes first, so a look with neither on a stick forks nothing (stick_in's grep).
     if [ -e "$STICK/OCBM_WIFI_RESET" ] && stick_in; then
       mv -f "$STICK/OCBM_WIFI_RESET" "$STICK/OCBM_WIFI_RESET.done"
-      rm -f "$EO/wifi_link" "$EO/wifi_link.tmp" "$EO/wifi_session.yaml" "$EO/wifi_link_channel" "$EO/host_seen"
+      rm -f "$EO/wifi_link" "$EO/wifi_link.tmp" "$EO/wifi_session.yaml" "$EO/wifi_link_channel" "$EO/wifi_link_bssid" \
+        "$EO/wifi_link_sta" "$EO/host_seen"
       echo reset > "$EO/wifi_setup_once"
       echo "The adapter's Wi-Fi link was removed. Power the adapter off and on: if no host connects in its first 20 s, it then offers its set-up network (CarLink-Setup-...) for 10 minutes." > "$STICK/OCBM_WIFI_RESET.txt"
       sync

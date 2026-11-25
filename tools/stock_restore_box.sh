@@ -94,7 +94,8 @@ script/radio_preload script/radio_preload_off script/.radio_preload_inflight scr
 script/radio_preload_late script/radio_together_off script/.radio_together_inflight script/.radio_together_failed \
 script/radio_handover_on script/radio_handover_off \
 script/wifi_sta.sh script/wifi_sta_dhcp.sh etc/ocbm/wifi_link etc/ocbm/wifi_link.tmp etc/ocbm/wifi_link_channel \
-etc/ocbm/wifi_session.yaml etc/ocbm/wifi_selfstart_off etc/ocbm/wifi_setup_off etc/ocbm/wifi_setup_once"
+etc/ocbm/wifi_link_bssid etc/ocbm/wifi_link_sta etc/ocbm/wifi_session.yaml etc/ocbm/wifi_selfstart_off \
+etc/ocbm/wifi_setup_off etc/ocbm/wifi_setup_once"
 # OCBM's radio seam, payload, and its boot preload's state (radio_hal.sh do_preload): radio_* to is_radio(), so the
 # guard kept the off flag, and an install after the go-back started with the preload off (the Mac, 13 Nov). The radio
 # order's switch and its guard's state the same (20 Nov). The kept descriptor (/etc/ocbm/kept_radio_caps) goes with
