@@ -42,13 +42,24 @@ REAL_TAR="$(command -v tar)"
 cat > "$S/insmod" <<'EOF'
 #!/bin/sh
 # insmod FILE [args]: the module listed in /proc/modules. moal brings its interface (sta0) up WLAN_SECS in (its firmware
-# download and start), with state/moal.loading there meanwhile; hci_uart registers the n_hci line discipline.
+# download and start), with state/moal.loading there meanwhile; hci_uart registers the n_hci line discipline. A module
+# loaded from a bench copy (<name>.bench.ko) keeps its own name, as the kernel takes it from the module. moal reads its
+# mod_para= file as the kernel's firmware loader finds it: in the loader's path first (a path with a newline matches
+# nothing), else under /lib/firmware; its host_mlme= and drv_mode= lines are noted.
 R=$STUB_R
-m=${1##*/}; m=${m%.ko}
+f=${1##*/}; m=${f%.ko}; m=${m%.bench}
 echo "insmod $m start" >> "$R/calls"
+[ "$f" = "$m.ko" ] || echo "insmod $m from $f" >> "$R/calls"
 shift; echo "loaded $m with: $*" >> "$R/calls"
 case "$m" in
-  moal) : > "$R/state/moal.loading"; sleep "${WLAN_SECS:-0.6}"
+  moal) for a in "$@"; do
+          case "$a" in mod_para=*)
+            p=${a#mod_para=}; d="$R/lib/firmware"; fp="$R/sys/module/firmware_class/parameters/path"
+            [ -s "$fp" ] && [ "$(wc -l < "$fp" | tr -d ' ')" = 0 ] && [ -f "$(cat "$fp")/$p" ] && d=$(cat "$fp")
+            echo "moal reads $p from ${d#$R/}: $(grep -E '^[[:space:]]*(host_mlme|drv_mode)=' "$d/$p" 2>/dev/null | tr -d ' \t' | tr '\n' ' ')" >> "$R/calls" ;;
+          esac
+        done
+        : > "$R/state/moal.loading"; sleep "${WLAN_SECS:-0.6}"
         mkdir -p "$R/sys/class/net/sta0/wireless"; echo 02:00:00:00:00:01 > "$R/sys/class/net/sta0/address"
         rm -f "$R/state/moal.loading" ;;
   hci_uart) echo "n_hci 15" >> "$R/proc/tty/ldiscs" ;;
@@ -1158,18 +1169,49 @@ case_follow() {
   hal wifi_ap_off
 }
 
+# The unit's own parameter file (the IW416's shape) and the kernel firmware loader's path, unset (FWP, set by the case).
+conf() {
+  printf 'SDIW416 = {\n\tfw_name=nxp/sdioiw416_wlan_v0.bin\n\tdrv_mode=3\n\tsta_name=sta\n\tps_mode=2\n}\n' \
+    > "$R/lib/firmware/nxp/wifi_mod_para.conf"
+  mkdir -p "${FWP%/*}"; : > "$FWP"
+}
+plain() { grep -qxF "loaded moal with: mod_para=nxp/wifi_mod_para.conf" "$R/calls"; }   # the unit's own load line
+
 case_modparam() {
-  # ---- ADDENDUM 13 (25 Nov 2026), bench only: words for one module's insmod, the module named by the file -----------
-  echo "== $SH: the bench's sta_modparam: words added to the named module's insmod at its load"
-  unit
+  # ---- ADDENDUM 13 and 15 (25 Nov 2026), bench only: a module's words at its load, the module named by the file -----
+  echo "== $SH: the bench's sta_modparam: in a copy of the module's parameter file, the one the load reads"
+  FWP="$R/sys/module/firmware_class/parameters/path"; CP="$R/tmp/fw/nxp/wifi_mod_para.conf"; BL="$R/etc/ocbm/bench_sta_modparam"
+  unit; conf
+  WLAN_SECS=0.3 FW_SECS=0.3 hal preload
+  check 'plain && called "moal reads nxp/wifi_mod_para.conf from lib/firmware: drv_mode=3 " && [ ! -e "$CP" ] && [ ! -s "$FWP" ]' \
+    "no file: the unit's own load line and file, the loader's path untouched"
+  unit; conf; echo "moal host_mlme=0" > "$BL"
+  WLAN_SECS=0.3 FW_SECS=0.3 hal preload
+  printf 'SDIW416 = {\n\tfw_name=nxp/sdioiw416_wlan_v0.bin\n\tdrv_mode=3\n\tsta_name=sta\n\tps_mode=2\n\thost_mlme=0\n}\n' > "$R/expect"
+  check 'plain && cmp -s "$R/expect" "$CP" && called "moal reads nxp/wifi_mod_para.conf from tmp/fw: drv_mode=3 host_mlme=0 "' \
+    "on flash, at the boot preload's load: the words in a copy of the file, at its block's end; the load reads the copy"
+  check '[ "$(cat "$FWP")" = "$R/tmp/fw" ] && [ "$(wc -l < "$FWP" | tr -d " ")" = 0 ] && ! called "loaded mlan with: host_mlme"' \
+    "  the loader's path set to the copy's tree, with no newline (one would match nothing); mlan as it was"
+  check 'said preload "[bench] sta_modparam ($BL): moal reads host_mlme=0 from $R/tmp/fw/nxp/wifi_mod_para.conf, in its block"' \
+    "  said"
+  unit; conf; echo "moal drv_mode=1 host_mlme=0" > "$BL"
   WLAN_SECS=0.3 FW_SECS=0.3 hal bt_on
-  check 'called "loaded moal with: mod_para=nxp/wifi_mod_para.conf" && ! called "loaded moal with: mod_para=nxp/wifi_mod_para.conf "' \
-    "no file: the unit's own load line, as before"
-  unit; echo "moal host_mlme=0" > "$R/etc/ocbm/bench_sta_modparam"
+  check 'plain && called "moal reads nxp/wifi_mod_para.conf from tmp/fw: drv_mode=3 drv_mode=1 host_mlme=0 "' \
+    "  a word the file has already: after the file's own, so it is the one the driver keeps"
+  unit; conf; mkdir -p "${CP%/*}"; echo stale > "$CP"; printf %s "$R/tmp/fw" > "$FWP"
+  WLAN_SECS=0.3 FW_SECS=0.3 hal bt_on
+  check 'plain && [ ! -e "$CP" ] && called "moal reads nxp/wifi_mod_para.conf from lib/firmware: drv_mode=3 "' \
+    "  no file now, a copy from an earlier load this boot: removed, the unit's own file read"
+  unit; conf; rm -f "$R/lib/firmware/nxp/wifi_mod_para.conf"; echo "moal host_mlme=0" > "$BL"
+  WLAN_SECS=0.3 FW_SECS=0.3 hal bt_on
+  check 'called "loaded moal with: mod_para=nxp/wifi_mod_para.conf host_mlme=0" && [ ! -e "$CP" ] && [ ! -s "$FWP" ]' \
+    "  no parameter file to copy: on the insmod line"
+  unit; echo "moal host_mlme=0" > "$BL"
   WLAN_SECS=0.3 FW_SECS=0.3 hal bt_on
   check 'called "loaded moal with: mod_para=nxp/wifi_mod_para.conf host_mlme=0" && called "loaded mlan with: " && ! called "loaded mlan with: host_mlme"' \
-    "on flash (a cold boot's: the preload loads the driver): moal loads with host_mlme=0, mlan as it was"
-  check 'said bt_on "[bench] sta_modparam ($R/etc/ocbm/bench_sta_modparam): moal loads with host_mlme=0"' "  said"
+    "  no loader path (no firmware_class parameter): moal loads with host_mlme=0 on its line, mlan as it was"
+  check 'said bt_on "[bench] sta_modparam ($BL): moal loads with host_mlme=0" && said bt_on "[bench] moal: insmod $R/tmp/moal.ko mod_para=nxp/wifi_mod_para.conf host_mlme=0"' \
+    "  said, with the line run"
   unit; echo "moal host_mlme=0" > "$R/etc/ocbm/bench_sta_modparam"; echo off > "$R/tmp/bench_sta_modparam"
   WLAN_SECS=0.3 FW_SECS=0.3 hal bt_on
   check '! called "host_mlme" && ! said bt_on "sta_modparam"' "  \"off\" in /tmp over the flash file: none"
@@ -1183,11 +1225,59 @@ case_modparam() {
     "  the module the file names, and that one only"
 }
 
+case_drvpatch() {
+  # ---- ADDENDUM 15 (25 Nov 2026), bench only: the module from a copy with named bytes changed, its file's sha256 first --
+  echo "== $SH: the bench's sta_drvpatch: a copy of the module with the bytes named, only from the file named"
+  BP="$R/etc/ocbm/bench_sta_drvpatch"; FWP="$R/sys/module/firmware_class/parameters/path"
+  fake() {  # a module of 16 KB with 0a at 1000 and 01 at 9000, in the unit's tarball; KS its sha256
+    dd if=/dev/zero bs=1024 count=16 2>/dev/null | tr '\0' 'Z' > "$R/ko/moal.ko"
+    printf '\012' | dd of="$R/ko/moal.ko" bs=1 seek=1000 count=1 conv=notrunc 2>/dev/null
+    printf '\001' | dd of="$R/ko/moal.ko" bs=1 seek=9000 count=1 conv=notrunc 2>/dev/null
+    (cd "$R/ko" && "$REAL_TAR" -czf "$R/lib/firmware/nxp/iw416_ko.tar.gz" hci_uart.ko mlan.ko moal.ko)
+    KS=$(sha256sum "$R/ko/moal.ko" | cut -d' ' -f1)
+  }
+  diffs() { cmp -l "$R/tmp/moal.ko" "$R/tmp/moal.bench.ko" 2>/dev/null | sed 's/^ *//; s/  */ /g' | tr '\n' ';'; }
+  unit; fake; echo "moal $KS 1000:0a:ea 9000:01:00" > "$BP"
+  WLAN_SECS=0.3 FW_SECS=0.3 hal preload
+  check 'called "insmod moal from moal.bench.ko" && grep -qxF "loaded moal with: mod_para=nxp/wifi_mod_para.conf" "$R/calls" && [ "$(diffs)" = "1001 12 352;9001 1 0;" ]' \
+    "on flash, at the boot preload's load: moal from a copy that differs by those two bytes and no other"
+  check 'grep -q "^moal " "$R/proc/modules" && cmp -s "$R/ko/moal.ko" "$R/tmp/moal.ko" && ! called "insmod mlan from"' \
+    "  loaded under its own name, the unpacked file left as it was, mlan as it was"
+  check 'said preload "[bench] sta_drvpatch ($BP): moal loads from $R/tmp/moal.bench.ko, these bytes changed: 1000:0a:ea 9000:01:00" && said preload "[bench] moal: insmod $R/tmp/moal.bench.ko mod_para=nxp/wifi_mod_para.conf"' \
+    "  said, with the line run"
+  unit; fake; echo "moal $(printf %064d 0) 1000:0a:ea" > "$BP"
+  WLAN_SECS=0.3 FW_SECS=0.3 hal bt_on
+  check '! called "insmod moal from" && [ ! -e "$R/tmp/moal.bench.ko" ] && said bt_on "[bench] sta_drvpatch ($BP): refused, $R/tmp/moal.ko is not that moal (sha256 $KS)"' \
+    "  another file than the one named (its sha256): refused, said, the module as it is"
+  unit; fake; echo "moal $KS 1000:0b:ea" > "$BP"
+  WLAN_SECS=0.3 FW_SECS=0.3 hal bt_on
+  check '! called "insmod moal from" && [ ! -e "$R/tmp/moal.bench.ko" ] && said bt_on "[bench] sta_drvpatch ($BP): refused, the bytes named are not the ones that changed in a copy"' \
+    "  a byte that is not the one named: refused, no copy left, the module as it is"
+  unit; fake; echo "moal $KS 1000:0a:ea 9000:1:00" > "$BP"
+  WLAN_SECS=0.3 FW_SECS=0.3 hal bt_on
+  check '! called "insmod moal from" && [ ! -e "$R/tmp/moal.bench.ko" ] && said bt_on "refused, the bytes named"' \
+    "  a byte not written as two hex digits: refused"
+  unit; fake; echo "moal $KS" > "$BP"
+  WLAN_SECS=0.3 FW_SECS=0.3 hal bt_on
+  check '! called "insmod moal from" && said bt_on "[bench] sta_drvpatch ($BP): refused"' "  no bytes named: refused"
+  unit; fake; echo "moal $KS 1000:0a:ea" > "$BP"; echo off > "$R/tmp/bench_sta_drvpatch"
+  WLAN_SECS=0.3 FW_SECS=0.3 hal bt_on
+  check '! called "insmod moal from" && ! said bt_on "sta_drvpatch"' "  \"off\" in /tmp over the flash file: none"
+  unit; fake; echo "mlan $KS 1000:0a:ea" > "$BP"
+  WLAN_SECS=0.3 FW_SECS=0.3 hal bt_on
+  check '! called "insmod moal from" && [ ! -e "$R/tmp/moal.bench.ko" ] && said bt_on "[bench] sta_drvpatch ($BP): refused, $R/tmp/mlan.ko is not that mlan"' \
+    "  the module the file names, and that one only"
+  unit; fake; conf; echo "moal $KS 9000:01:00" > "$BP"; echo "moal host_mlme=0" > "$R/etc/ocbm/bench_sta_modparam"
+  WLAN_SECS=0.3 FW_SECS=0.3 hal preload
+  check 'called "insmod moal from moal.bench.ko" && [ "$(diffs)" = "9001 1 0;" ] && called "moal reads nxp/wifi_mod_para.conf from tmp/fw: drv_mode=3 host_mlme=0 "' \
+    "  with sta_modparam (ADDENDUM 15's fwmlme): the copy of the module, and the words in the copy of its file"
+}
+
 . "$HERE/test_shells.sh"
 for SH in ${SHELLS:-$(distinct_shells sh dash)}; do
   command -v "$SH" >/dev/null 2>&1 || { echo "== $SH: not installed, skipped"; continue; }
   R="$T/$(basename "$SH").root"
-  for c in ${RH_ONLY:-kept order switches fallback host handover review gpio line unpack locks boot round4 fwpush follow modparam}; do "case_$c"; done
+  for c in ${RH_ONLY:-kept order switches fallback host handover review gpio line unpack locks boot round4 fwpush follow modparam drvpatch}; do "case_$c"; done
   reap
 done
 [ "$fails" -eq 0 ] && echo "radio_hal_test: all passed ($passes checks)" || { echo "radio_hal_test: $fails failed"; exit 1; }

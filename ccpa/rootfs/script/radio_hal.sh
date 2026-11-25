@@ -566,20 +566,71 @@ wlan_driver_up() {
   return $_wdr
 }
 
-# Bench only (ADDENDUM 13 of the Wi-Fi link plan): words added to one module's insmod, from /tmp/bench_sta_modparam or,
-# for a cold boot (the preload loads the driver), /etc/ocbm/bench_sta_modparam: one line, the module's name, then its
-# NAME=VALUE words (the IW416's `moal host_mlme=0`). The file names the module, so this script names none; anything
-# but plain words is refused, said. A module already loaded takes it at its next load (the next power-up). Sets _mpx.
-mod_extra() {
-  _mpx=""
-  for _mpf in /tmp/bench_sta_modparam /etc/ocbm/bench_sta_modparam; do
-    [ -e "$_mpf" ] || continue
-    _mpm=""; _mpw=""; read -r _mpm _mpw 2>/dev/null <"$_mpf"
-    [ "$_mpm" = "$1" ] || return 0
-    case "$_mpw" in ''|*[!A-Za-z0-9_=.,\ -]*) log "[bench] sta_modparam ($_mpf): refused, not plain NAME=VALUE words" ;;
-      *) _mpx=$_mpw; log "[bench] sta_modparam ($_mpf): $1 loads with $_mpx" ;; esac
-    return 0
+# Bench only (the Wi-Fi link plan's ADDENDUM 13 and 15), at a module's load (a power-up: the preload loads the driver):
+# /tmp/bench_<name>, else /etc/ocbm/bench_<name>; "off" in /tmp over the flash file. Each file names its module, so this
+# script names none. sta_modparam: `<module> NAME=VALUE...`, plain words. A module whose insmod names a parameter file
+# (mod_para=) reads them from a copy of it at /tmp/fw, the kernel firmware loader's first path, inside its first
+# block after the file's own lines: a driver that takes its command line first and then the block (the IW416's moal)
+# keeps the block's word. Without that path, or for any other module: on its insmod line. sta_drvpatch: `<module>
+# <sha256> OFFSET:OLD:NEW...` (decimal offset, hex bytes): the module loads from a copy with those bytes changed, only
+# when its file has that sha256 and `cmp -l` then lists those bytes and no other; else as it is, said. Sets _blc.
+BENCH_FW=/tmp/fw
+bench_load() {  # $1 the module, $2 its insmod line
+  _blc=$2; _blw=""
+  for _blf in /tmp/bench_sta_modparam /etc/ocbm/bench_sta_modparam; do
+    [ -e "$_blf" ] || continue
+    _blm=""; _blx=""; read -r _blm _blx 2>/dev/null <"$_blf"
+    [ "$_blm" = "$1" ] && case "$_blx" in ''|*[!A-Za-z0-9_=.,\ -]*)
+      log "[bench] sta_modparam ($_blf): refused, not plain NAME=VALUE words" ;; *) _blw=$_blx ;; esac
+    break
   done
+  _blp=""; case " $2 " in *" mod_para="*) _blp=${2##*mod_para=}; _blp=${_blp%% *} ;; esac
+  case "$_blp" in /*|*..*) _blp="" ;; esac
+  if [ -n "$_blp" ]; then
+    rm -f "$BENCH_FW/$_blp"
+    case "$_blp" in */*) _bld=$BENCH_FW/${_blp%/*} ;; *) _bld=$BENCH_FW ;; esac
+    if [ -n "$_blw" ] && [ -e /sys/module/firmware_class/parameters/path ] && mkdir -p "$_bld" 2>/dev/null &&
+       awk -v w="$_blw" 'index($0, "{") { b = 1 } b && !d && index($0, "}") { n = split(w, a, " ")
+         for (i = 1; i <= n; i++) print "\t" a[i]; d = 1 } { print } END { exit !d }' \
+         "/lib/firmware/$_blp" > "$BENCH_FW/$_blp" 2>/dev/null &&
+       printf %s "$BENCH_FW" 2>/dev/null > /sys/module/firmware_class/parameters/path; then
+      log "[bench] sta_modparam ($_blf): $1 reads $_blw from $BENCH_FW/$_blp, in its block"
+      _blw=""
+    else rm -f "$BENCH_FW/$_blp"; fi
+  fi
+  [ -n "$_blw" ] && { _blc="$_blc $_blw"; log "[bench] sta_modparam ($_blf): $1 loads with $_blw"; }
+  for _blf in /tmp/bench_sta_drvpatch /etc/ocbm/bench_sta_drvpatch; do
+    [ -e "$_blf" ] || continue
+    _blm=""; _bls=""; _blx=""; read -r _blm _bls _blx 2>/dev/null <"$_blf"
+    [ "$_blm" = "$1" ] && drv_patch "$1"
+    break
+  done
+  return 0
+}
+drv_patch() {  # $1 the module; bench_load's _blf, _bls (sha256), _blx (the bytes) and _blc
+  _dpk=""; for _dpw in $_blc; do case "$_dpw" in *.ko) _dpk=$_dpw ;; esac; done
+  _dpo=${_dpk%.ko}.bench.ko; rm -f "$_dpo"
+  _dps=""; [ -n "$_dpk" ] && _dps=$(sha256sum "$_dpk" 2>/dev/null); _dps=${_dps%% *}
+  [ -n "$_dps" ] && [ "$_dps" = "$_bls" ] && [ -n "$_blx" ] || {
+    log "[bench] sta_drvpatch ($_blf): refused, ${_dpk:-no file} is not that $1 (sha256 ${_dps:-none})"; return 0; }
+  cp "$_dpk" "$_dpo" 2>/dev/null || { log "[bench] sta_drvpatch ($_blf): refused, no copy"; return 0; }
+  _dpe=""
+  for _dpw in $_blx; do
+    _dpf=${_dpw%%:*}; _dpv=${_dpw#*:}; _dpa=${_dpv%%:*}; _dpb=${_dpv#*:}
+    case "$_dpf" in ''|*[!0-9]*) _dpe=x; break ;; esac
+    case "$_dpa:$_dpb" in [0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]) ;; *) _dpe=x; break ;; esac
+    printf "\\$(printf %03o "0x$_dpb")" | dd of="$_dpo" bs=1 seek="$_dpf" count=1 conv=notrunc 2>/dev/null ||
+      { _dpe=x; break; }
+    _dpe="$_dpe$((_dpf + 1)) $(printf %o "0x$_dpa") $(printf %o "0x$_dpb")
+"
+  done
+  _dpe=$(printf %s "$_dpe" | sort -n); _dpc=$(cmp -l "$_dpk" "$_dpo" 2>/dev/null | sed 's/^ *//; s/  */ /g')
+  if [ "$_dpc" = "$_dpe" ]; then
+    _dpn=""; for _dpw in $_blc; do [ "$_dpw" = "$_dpk" ] && _dpw=$_dpo; _dpn="${_dpn:+$_dpn }$_dpw"; done; _blc=$_dpn
+    log "[bench] sta_drvpatch ($_blf): $1 loads from $_dpo, these bytes changed: $_blx"
+  else
+    rm -f "$_dpo"; log "[bench] sta_drvpatch ($_blf): refused, the bytes named are not the ones that changed in a copy"
+  fi
 }
 wlan_driver_load() {
   ko_unpack || log "driver tarball ${RADIO_KO_TARBALL:-<none>} did not unpack"
@@ -598,8 +649,9 @@ wlan_driver_load() {
     else
       boot_mark wlan_start   # the boot line: the first module this boot loads (the first stamp stands)
       _wdl_loaded=1
-      mod_extra "$_mod"
-      $_cmd $_mpx 2>&1 | sed "s|^|$LOGP   |"
+      bench_load "$_mod" "$_cmd"
+      [ "$_blc" = "$_cmd" ] || log "[bench] $_mod: $_blc"
+      $_blc 2>&1 | sed "s|^|$LOGP   |"
     fi
     IFS=';'
   done
