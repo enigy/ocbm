@@ -838,13 +838,15 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
   clears the supplicant's back-off, and the station's own address is compared with its last start's. The bench of
   557b6b9 (ADDENDUM 12) and the stock driver's code (ADDENDUM 13, docs/wireless/01_BT_AND_RADIO.md, "The
   authentication's 2.4 s"): the 2.4 s is moal's host-MLME remain-on-channel, fixed in its code; the phone's answer
-  reaches the host just after it ends and is passed by; why the frame or its answer waits for that end is not shown
-  (2.4 GHz only so far). Built, not benched: the AP of the adapter's own session waits for a join under way (6 s) and
-  holds the station still through hostapd's start; no join while an AP is up after 3 unanswered authentications in a
-  row, because moal resets the radio (its firmware reloaded, the AP's phone dropped) at the fifth, once in 15 minutes
-  at most; bench switches for the firmware's own join (`moal host_mlme=0`, which moves the AP's authentication into
-  the firmware too), the station joining before the AP, and the driver's debug mask. OPEN: which of them gives a
-  join; whether the driver's reset fired on 25 Nov (dmesg `WiFi Reset due to auth timeout`); (6) M3
+  reaches the host just after it ends and is passed by; why the frame or its answer waits for that end is not shown,
+  and it is 2.4 GHz only (the 25 Nov control on 149: 7 ms, joined; nothing the driver sends differs by band,
+  ADDENDUM 15). Built, not benched: the AP of the adapter's own session waits for a join under way (6 s) and holds the
+  station still through hostapd's start; no join while an AP is up after 3 unanswered authentications in a row
+  (ADDENDUM 13's guard against moal's fifth-miss reset, which ADDENDUM 15 found to be the driver's data path only: not
+  this firmware's); the station joining before the AP; the driver's debug mask; and (ADDENDUM 15) `sta_modparam` into
+  a copy of moal's parameter file and `sta_drvpatch`, a driver copy with named bytes: the answer after the stay taken,
+  no stay, or the firmware's own join (`host_mlme=0` alone is overridden by the card). OPEN: whether Bluetooth's share
+  of 2.4 GHz is the cause (the phone's Bluetooth off for one attempt), and which copy gives a join; (6) M3
   (the set-up network) is built, not
   benched: whether the stock hostapd takes `ap_isolate=1` (it refuses an unknown key, and then no set-up network is
   offered), and what the set-up AP raised 20 s into a boot with no host yet costs a head unit that connects later; its

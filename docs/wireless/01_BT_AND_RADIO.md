@@ -623,32 +623,42 @@ also joins the phone's Personal Hotspot as a station, so a head unit on that hot
     so wpa_supplicant 2.11 runs its own SME (driver_nl80211_capa.c: the wiphy lists AUTHENTICATE): an
     NL80211_CMD_AUTHENTICATE per attempt. A connect command, even forced (`force_connect_cmd`), finds no `connect`
     and goes through cfg80211's own SME onto the same operation (Linux's cfg80211, not read from the unit's 3.14).
+    **The card forces it** (ADDENDUM 15): woal_add_card, right after the command line and then the conf block were
+    read (the block's `host_mlme=0` prints `host_mlme=disable`), takes the IW416's card table and, its
+    `host_mlme_required` byte being 1, sets host MLME again. No parameter, conf line or /proc knob turns it off; only a
+    driver copy with that byte changed (the bench's `sta_drvpatch`, below).
   - *The wait is a remain-on-channel.* `woal_cfg80211_authenticate` asks the firmware to stay on the network's channel
-    for 2400 ms (the literal in its call to `woal_cfg80211_remain_on_channel_cfg`), marks the authentication pending,
-    and queues the frame it built as a raw management frame. When the firmware says that stay has expired with the
-    authentication still pending, moal calls `cfg80211_auth_timeout` (dmesg `wlan: HostMlme auth timeout`) and clears
-    the pending flag and host MLME for the interface. The supplicant hears TIMED_OUT and moves on in silence (sme.c
-    `sme_event_auth_timed_out`; its own authentication timer is 5 s and never comes first). Nothing sets the 2400:
-    no module parameter, no supplicant key.
+    for 2400 ms (the literal in its call to `woal_cfg80211_remain_on_channel_cfg`; 20 MHz, the channel's band, asked
+    whenever no authentication is pending, whatever else runs on that channel), marks the authentication pending, and
+    sends the frame it built as the firmware command TX_FRAME (0x0283: band, channel, the station's TxPD, the
+    firmware's own rate, no transmit-status request), because this firmware says it takes frames by command
+    (`cmd_tx_data`; the AP's own frames from hostapd go the same way). When the firmware says that stay has expired
+    with the authentication still pending, moal calls `cfg80211_auth_timeout` (dmesg `wlan: HostMlme auth timeout`)
+    and clears the pending flag and host MLME for the interface. The supplicant hears TIMED_OUT and moves on in
+    silence (sme.c `sme_event_auth_timed_out`; its own authentication timer is 5 s and never comes first). Nothing
+    sets the 2400: no module parameter, no supplicant key.
   - *The late answer is passed by.* The `Auth received` line is mlan's, the moment the firmware hands the phone's answer
     up. moal treats an authentication frame as the answer only while host MLME and the pending flag are set; after the
     expiry neither is, so no `Received auth frame` or `Drop auth frame` follows and the supplicant never sees it.
   - *Power save is off on the card.* The stock file's `ps_mode=2` and `auto_ds=2` apply to the card (the interface names
     of the same block, `sta0` and `wlan0`, do; `/sys/module/moal/parameters` shows the module's own defaults, not the
     card's), and moal refuses cfg80211's default power save on the station while `ps_mode` is 2.
-  - *The driver resets the radio at the fifth.* moal counts the authentication frames it sends with no authentication
-    frame received since (in host MLME); at the fifth in a row it calls `woal_reset_wifi(.., "auth timeout")`, at most
-    once in 900 s and at any time the first time a boot: dmesg `WiFi Reset due to auth timeout cnt 5`, `Start to
-    process hanging`, every interface's link down, and with moal's `auto_fw_reload` (default 1, not set by the stock
-    file) `WIFI auto_fw_reload: fw_reload=1` and the firmware loaded again over SDIO (`FW Reload successfully.`). The
-    AP and the phone on it go with it. 2.11's own retries make five in about 25 s: a rescan 0.1, 0.5 and 1 s after the
-    first three failures, then TEMP-DISABLED 10, 20, 30 s.
+  - *No reset from failed authentications on this firmware* (ADDENDUM 15 corrects ADDENDUM 13). moal does count the
+    authentications it sends with none answered and calls `woal_reset_wifi(.., "auth timeout")` at the fifth
+    (`WiFi Reset due to auth timeout cnt 5`, `Start to process hanging`, with `auto_fw_reload` the firmware loaded
+    again), but only on its data path; the command path this firmware uses returns before the count. A second count
+    does reset the radio: five deauthentications received while connected (`WiFi Reset due to EAPOL timeout cnt 5`).
   - *INFERRED, not shown by any code read:* why the answer comes only as the stay ends. Every sample lands 10-20 ms
     after the expiry, and the one answered in time (ADDENDUM 12, case a, at +1842 ms) came as hostapd started the uAP
-    on the same channel: the frame leaves the radio only when the radio's channel plan changes, or Bluetooth's share
-    of the 2.4 GHz radio holds a host-built frame through the stay. Every 25 Nov attempt was at 2.4 GHz; the 24 Nov
-    joins that worked were at 5 GHz (149 with no AP, 36 beside a running AP) and one at 2.4 GHz (channel 6, no AP, right
-    after a password send). A phone slow to answer would not land that close to the expiry every time.
+    on the same channel. **It is 2.4 GHz only**: the control of 25 Nov 18:10 (the same build and boot, the hotspot moved
+    to 149) authenticated in 7 ms and joined in 39 ms, three seconds after an unanswered attempt on 2437; the 24 Nov
+    joins were at 5 GHz but one. Nothing the driver sends differs by band (the stay, the command's fields, the
+    receive mask: read for ADDENDUM 15), so the cause is the firmware's or the air's. Ranked: Bluetooth's share of 2.4
+    GHz on this combo chip (`hciconfig hci0 down` closes only the host's side: a link or page scan the controller
+    holds goes on), or the phone's own; a stay on channel 6 (a P2P social channel) kept as a listen; less likely the
+    rates or power (the AP's frames take the same command and table and reach the phone). The firmware's own
+    association after an answer in time also went unanswered once (0xfffc). The firmware's coexistence changes print
+    `EVENT: BT coex wlan param update` and `coex_scan=.. coex_win=.. tx_win=.. rx_win=..` with MEVENT (0x20).
   - *Seen in dmesg* (the driver's default mask, `drvdbg` 0x207, shows MMSG and MERROR lines): `send auth to bssid`,
     mlan's `Auth received from`, `pending auth on going`, `Fail to configure remain on channel`, `HostMlme sta0: Set
     remain on Channel: with status=N`, `Fail to send packet status=N`, `bss_start Fails`, `WiFi Reset due to ...`,
@@ -673,22 +683,34 @@ also joins the phone's Personal Hotspot as a station, so a head unit on that hot
     the keeper tries no join while an AP is up (`3 authentications in a row unanswered: no joins while the AP runs (the
     driver resets the radio at 5)`), and goes on when the AP is down, where a reset drops no phone. The file lasts the
     boot, as the driver's count does (a reset the driver made with no AP up is not seen: the count stays high, so it
-    errs toward holding).
+    errs toward holding). **Its premise does not hold on this firmware** (ADDENDUM 15, above: no reset from failed
+    authentications), and the line's parenthesis repeats it; the guard now only holds joins back while the AP runs
+    (`off` in `bench_sta_miss_guard` for the bench; whether to keep it is the owner's).
   - *The quick retry the plan asked for is 2.11's own:* its first three retries come 0.1 to 1 s after each failure, and
-    the bench's case b shows them failing alike; more from the keeper would only bring the driver's reset sooner. Not
-    built.
-  - *Firmware MLME* (the bench's `sta_modparam`: `moal host_mlme=0` in `/etc/ocbm/bench_sta_modparam`, then a
-    power-up): moal keeps `connect` (`woal_cfg80211_connect`: the firmware's own join, no remain-on-channel, no
+    the bench's case b shows them failing alike. Not built.
+  - *Firmware MLME* (ADDENDUM 15: the bench's `sta_drvpatch` with the card's `host_mlme_required` byte changed, and
+    `moal host_mlme=0` in `/etc/ocbm/bench_sta_modparam`, then a power-up; `host_mlme=0` alone is overridden by the
+    card): moal keeps `connect` (`woal_cfg80211_connect`: the firmware's own join, no remain-on-channel, no
     host-built frame, no counter), and 2.11 then connects with NL80211_CMD_CONNECT by itself (`trying freq=..` with no
     `authenticating` before it; dmesg `wlan: Connected to bssid ... successfully`, or `can't find targe AP` when moal's
     own scan table lacks the hidden hotspot by name). Its cost is the AP's side: moal tests the same flag in its uAP
     start, its beacon filter, its management frame registration and transmit and its station add and delete, and
     without it says the AP's SME is the firmware's (`WIPHY_FLAG_HAVE_AP_SME`): so, INFERRED from those, the phone's
     authentication and association of the AP move into the firmware and hostapd learns of stations from the driver.
-    Stock never ran so; not benched. The same one insmod at the boot preload with a word more: no reload, nothing on a
-    USB host's time to picture from the load itself. Changing it at run time would need the driver unloaded and loaded
-    again (the AP and the station down for the driver's load, 3.8 s in the 24 Nov boot log beside the Bluetooth
-    firmware's push, and Bluetooth's side under that unknown): not built.
+    Stock never ran so; not benched. The same one insmod at the boot preload (from the copies the two files make): no
+    reload, nothing on a USB host's time to picture from the load itself. Changing it at run time would need the driver
+    unloaded and loaded again (the AP and the station down for the driver's load, 3.8 s in the 24 Nov boot log beside
+    the Bluetooth firmware's push, and Bluetooth's side under that unknown): not built.
+  - *The bench's driver copies* (ADDENDUM 15; radio_hal.sh, off unless the file is there). `sta_modparam` puts its words
+    for a module whose insmod names a parameter file (moal's `mod_para=`) into a copy of that file at `/tmp/fw`, inside
+    its block after the file's own lines, and points the kernel firmware loader's path
+    (`/sys/module/firmware_class/parameters/path`) there: moal reads the command line first and the block after it, so
+    only there does a word the block names win. `sta_drvpatch` (`<module> <sha256> OFFSET:OLD:NEW...`) loads the module
+    from a copy with those bytes changed, only when its file has that sha256 and the copy differs by exactly those
+    bytes. The lines for moal 437.p20 (docs/ops/02_TESTING.md): *late*, the stay's expiry no longer ends a pending
+    authentication and a new one is not refused for it, so the answer that reaches the driver 10 ms after the stay is
+    taken; *nostay*, no stay at all, the frame going as the AP's own do (only with the AP on the hotspot's channel);
+    *fwmlme*, the card's byte, for the firmware's own join above.
   - *The rest of the candidates, and their lines* (the monitor's beside dmesg): the answer taken and the association not
     answered (`trying freq=2437 (+N ms)` then `no answer to the association ...`, `assoc-reject status_code=N`; dmesg
     `bss_start Fails`, `Failed to connect`); the phone refusing (`auth-reject ... status_code=N`, 17: too many

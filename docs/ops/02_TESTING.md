@@ -420,15 +420,28 @@ the last look's `seen=<channel> <uptime>` and, while two looks in a row heard th
 AP's, `elsewhere=`; `/tmp/wifi_self_parked` is there while the adapter's own session has no host.
 `/etc/ocbm/wifi_link_bssid` and `/etc/ocbm/wifi_link_sta` hold the hotspot's and the station's addresses (0600; read
 them by hand, never paste them anywhere public).
-The station's joins (ADDENDUM 13, 25 Nov 2026; docs/wireless/01_BT_AND_RADIO.md, "The authentication's 2.4 s"): six
-switches, each `/tmp/bench_<name>` or, for a cold boot, `/etc/ocbm/bench_<name>`, `/tmp` read first; `off` is off; an
-empty file or `on` is the default value; a number sets it. Read where they act, so a `/tmp` file takes effect at the
-next join, AP start or keeper pass, except `sta_modparam`, which acts at the driver's load (a power-up).
-- `sta_modparam` (none): one line, a module's name and its `NAME=VALUE` words, added to that module's insmod at the
-  driver's load: `moal host_mlme=0` (the firmware's own join, the AP's SME in the firmware too: unbenched). Line
-  `[radio_hal] ... [bench] sta_modparam (<file>): moal loads with host_mlme=0`; then no `HostMlme sta0 send auth` in
-  dmesg, the monitor's `trying freq=..` with no `authenticating` before it, and `wlan: Connected to bssid ...
-  successfully` on a join. Back: remove the file (or `off` in `/tmp` before the power-up) and power up again.
+The station's joins (ADDENDUM 13 and 15, 25 Nov 2026; docs/wireless/01_BT_AND_RADIO.md, "The authentication's 2.4
+s"): seven switches, each `/tmp/bench_<name>` or, for a cold boot, `/etc/ocbm/bench_<name>`, `/tmp` read first; `off`
+is off; an empty file or `on` is the default value; a number sets it. Read where they act, so a `/tmp` file takes
+effect at the next join, AP start or keeper pass, except `sta_modparam` and `sta_drvpatch`, which act at the driver's
+load (a power-up).
+- `sta_modparam` (none): one line, a module's name and its `NAME=VALUE` words, for that module at the driver's load
+  (ADDENDUM 15): a module whose insmod names a parameter file (moal's `mod_para=nxp/wifi_mod_para.conf`) reads them
+  from a copy of it at `/tmp/fw`, inside its block after the file's own lines, the kernel firmware loader's path
+  pointed there; any other module on its insmod line. Line `[radio_hal] ... [bench] sta_modparam (<file>): moal reads
+  host_mlme=0 from /tmp/fw/nxp/wifi_mod_para.conf, in its block` (or `... loads with ...` on the line), and `[bench]
+  moal: <the line run>`. moal's `host_mlme=0` alone changes nothing: the IW416's card forces host MLME (with
+  `sta_drvpatch`'s fwmlme line it is the firmware's own join, the AP's SME in the firmware too: unbenched). Back:
+  remove the file (or `off` in `/tmp` before the power-up) and power up again.
+- `sta_drvpatch` (none): `<module> <sha256> OFFSET:OLD:NEW...` (decimal offset, hex bytes): the module loads from
+  `/tmp/<name>.bench.ko`, a copy with those bytes changed, only when its file has that sha256 and the copy differs by
+  exactly those bytes (`cmp -l`); else as it is (`... refused, ...`). Line `[bench] sta_drvpatch (<file>): moal loads
+  from /tmp/moal.bench.ko, these bytes changed: ...`. For moal 437.p20 (sha256
+  `a5a893b863709fa2c575e9361ff10101f638fbf07a004f8b2fc6dc0e9da5524d`; set `M=` to it in the shell, each command one
+  line): late `echo "moal $M 128851:0a:ea 376935:0a:ea" > /etc/ocbm/bench_sta_drvpatch` (the answer after the stay
+  taken: dmesg `FW_REMAIN_ON_CHANNEL_EXPIRED` with no `HostMlme auth timeout` after it, then `auth success`); nostay,
+  the same with ` 377435:1a:ea` (no `Remain on Channel` before `send auth`; only with the AP on the hotspot's
+  channel); fwmlme `echo "moal $M 615439:01:00" > ...` with `moal host_mlme=0` in `sta_modparam`.
 - `sta_drvdbg` (off; set: 0x237, or the mask written): the radio driver's debug mask, through
   `/proc/mwlan/adapter0/sta0/debug` (moal's and mlan's) else moal's parameter; again when the file changes. Line
   `[wifi_sta] ... [bench] sta_drvdbg (<file>): the radio driver's debug mask 0x237 through <path> (its parameter: 567)`;
@@ -447,9 +460,10 @@ next join, AP start or keeper pass, except `sta_modparam`, which acts at the dri
   `the AP is starting: no scans and no joins until it is up`.
 - `sta_miss_guard` (3; `off`: none): after that many unanswered authentications in a row (the monitor's count,
   `/tmp/wifi_sta_misses`), no join is tried while an AP is up. Line `N authentications in a row unanswered: no joins
-  while the AP runs (the driver resets the radio at 5)`. Look for the driver's own reset in dmesg every bench: `WiFi
-  Reset due to auth timeout cnt 5`, `Start to process hanging`, `WIFI auto_fw_reload: fw_reload=1`, `FW Reload
-  successfully.` (the AP and its phone drop with it).
+  while the AP runs (the driver resets the radio at 5)`. ADDENDUM 15: that reset is the driver's data path only, and
+  this firmware's authentications go by command, so the guard guards nothing here; `off` for the join benches. Still
+  look in dmesg every bench: `WiFi Reset due to`, `Start to process hanging`, `WIFI auto_fw_reload: fw_reload=1`, `FW
+  Reload successfully.` (now expected only from `EAPOL timeout`, five deauthentications while connected).
 The set-up network (M3): off with `/tmp/bench_wifi_setup_off` or `/etc/ocbm/bench_wifi_setup_off` (the owner's
 `/etc/ocbm/wifi_setup_off` too); offered only on an adapter never used, so a bench adapter needs `OCBM_WIFI_RESET` on a
 stick first (it removes the link and `/etc/ocbm/host_seen` and leaves `/etc/ocbm/wifi_setup_once`, in any mode, an
