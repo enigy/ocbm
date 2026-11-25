@@ -341,6 +341,15 @@ echo 40 > '$d/run/ocbmd_heard'; exit 1"
   gadget accessory 2d00; : > "$d/dev/usb_accessory"; "$d/bin/$name" 30 & ocbmd_pid=$!
   selftest; rc=$?
   check '[ $rc = 0 ] && [ "$(tail -1 "$d/st.out")" = "PASSED in 0 s" ] && grep -q "running (pid" "$d/st.out"' "passes on a working adapter"
+  # The Wi-Fi link keeper's `ocbmd wpa` runs are no daemon (its supplicant's monitor lives all along, ADDENDUM 11).
+  mkdir -p "$d/proc/$ocbmd_pid"
+  printf 'ocbmd\0wpa\0-p\0/var/run/wpa_supplicant\0sta0\0events\0%s\0' 0 > "$d/proc/$ocbmd_pid/cmdline"
+  selftest PROC="$d/proc"; rc=$?
+  check '[ $rc = 1 ] && tail -1 "$d/st.out" | grep -q "ocbmd is not running$"' \
+    "an ocbmd wpa run (the keeper's monitor) is not the daemon"
+  printf '/usr/sbin/ocbmd\0' > "$d/proc/$ocbmd_pid/cmdline"; selftest PROC="$d/proc"; rc=$?
+  check '[ $rc = 0 ] && [ "$(tail -1 "$d/st.out")" = "PASSED in 0 s" ]' "  the daemon itself is"
+  rm -rf "$d/proc"
   gadget mass_storage a4a5; selftest; rc=$?
   check '[ $rc = 1 ] && tail -1 "$d/st.out" | grep -q "^FAILED after 1 s: the USB gadget is not the OCBM accessory$"' "fails while the port is in stick sharing"
   gadget accessory 2d00 12d1; selftest; rc=$?

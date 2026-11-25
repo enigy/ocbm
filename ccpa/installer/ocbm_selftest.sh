@@ -13,8 +13,9 @@
 # No host is needed: CONNECTED or CONFIGURED is reported, not required. Prints one line per check,
 # and the verdict last (the dispatcher quotes that line).
 #
-# Test hooks (tools/ocbm_stageb_test.sh): SYS DEVDIR RUN SECS OCBMD RADIO_DETECT
+# Test hooks (tools/ocbm_stageb_test.sh): SYS DEVDIR RUN SECS OCBMD RADIO_DETECT PROC
 SYS="${SYS:-/sys}"
+PROC="${PROC:-/proc}"
 DEVDIR="${DEVDIR:-/dev}"
 RUN="${RUN:-/tmp}"
 SECS="${SECS:-30}"
@@ -41,7 +42,13 @@ node_ok() { [ -e "$DEVDIR/usb_accessory" ]; }
 # busybox pidof matches the process name, argv[0]'s basename or the executable. Not busybox pgrep -x:
 # it matches all of argv[0], so it never sees an ocbmd started as /usr/sbin/ocbmd (factory bench,
 # 2026-10-28: a healthy trial reverted). pgrep -x is for hosts without pidof (macOS, the tests).
-ocbmd_pids() { if command -v pidof >/dev/null 2>&1; then pidof "$OCBMD"; else pgrep -x "$OCBMD"; fi 2>/dev/null; }
+# Left out by their command line: the Wi-Fi link keeper's `ocbmd wpa` runs, one of which (its supplicant's monitor)
+# lives as long as the supplicant (ADDENDUM 11, 25 Nov 2026); it is no daemon.
+ocbmd_pids() {
+  for _p in $(if command -v pidof >/dev/null 2>&1; then pidof "$OCBMD"; else pgrep -x "$OCBMD"; fi 2>/dev/null); do
+    case " $(tr '\0' ' ' 2>/dev/null <"$PROC/$_p/cmdline") " in *" wpa "*) ;; *) echo "$_p" ;; esac
+  done
+}
 ocbmd_ok() { [ -n "$(ocbmd_pids)" ]; }
 
 i=0
