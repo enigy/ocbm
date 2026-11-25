@@ -365,8 +365,11 @@ while :; do
       plan "CarPlay is starting: no scans until it runs (${START_QUIET} s at most)"
     elif [ "$up" = 1 ]; then
       apc=$(ap_channel); every=$FIND_EVERY; [ "$parked" = 1 ] && every=$PARKED_FIND
-      # Back from the start's pause: the first look a full period on, or at once in the adapter's own session.
-      [ "$paused" = 1 ] && { last_find=$now; [ "$parked" = 1 ] && last_find=$((now - every)); }
+      # Back from the start's pause: the first look a full period on; at once in the adapter's own session when the
+      # AP is not where the hotspot was last heard (where it is, the station joins there by itself).
+      if [ "$paused" = 1 ]; then
+        last_find=$now; [ "$parked" = 1 ] && [ "${seen_ch:-0}" != "$apc" ] && last_find=$((now - every))
+      fi
       on_channel "$apc"
       plan "scans and joins on the AP's channel $apc only; a look over the channels an AP may use every $every s"
       if [ $((now - last_find)) -ge "$every" ]; then
