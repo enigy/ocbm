@@ -27,26 +27,36 @@
 #     may use each FIND_EVERY s (PARKED_FIND s while the adapter's own session has no host, the first at once when
 #     its AP is not where the hotspot was last heard);
 #   - no AP up: every channel, and a look each IDLE_FIND s.
-# A look is `ocbmd wpa ... find` (ccpa/ocbmd/src/wpa.rs): where the hotspot is heard, and the supplicant's join events
-# (names and codes only), said when they change. Its result is the state's seen= line; two looks in a row that heard
-# the hotspot on a channel an AP may use, while the AP runs on another, its elsewhere= line (ocbmd then starts its own
-# session with no host again there, once). The supplicant never hands scanning to the driver (disable_scan_offload).
+# A look is `ocbmd wpa ... find` (ccpa/ocbmd/src/wpa.rs): where the hotspot is heard, said when that changes. It takes
+# the supplicant's own results of the last few seconds when they hold the hotspot, and scans nothing over a join under
+# way (ADDENDUM 11); else it scans with a probe for the hotspot by name, which a hidden hotspot answers (an iPhone hides
+# its name whenever its hotspot screen is closed), and knows a hidden one also by the address kept for it. Its result is
+# the state's seen= line; two looks in a row that heard the hotspot on a channel an AP may use, while the AP runs on
+# another, its elsewhere= line (ocbmd then starts its own session with no host again there, once). One that hears the
+# hotspot while the supplicant holds it back after failed joins (TEMP-DISABLED) has it try again at once. The
+# supplicant never hands scanning to the driver (disable_scan_offload), and what it scans changes in place (its
+# network's scan_freq and freq_list, SET_NETWORK: never a RECONFIGURE, which would cut a join under way).
+# ITS JOINS, AS THEY HAPPEN. Beside each supplicant a monitor, `ocbmd wpa ... events 0`, writes its join events into
+# the box log (names, codes and each step's time; repeats folded into one line a minute; no names, no addresses).
 # CHANNELS (ADDENDUM 6). The AP starts on the station's channel where an AP may (radio_ap_up.sh); they differ only when
 # the station joined after the AP came up, or on a channel no AP may use (a radar one): said plainly while the AP runs,
 # once a change. Nothing moves the AP under a host; its next start follows.
 #
 # /etc/ocbm/wifi_link (ocbmd writes it, 0600): key= (ocbmd's), ssid_hex= (the hotspot's name in hex), psk= (64 hex
 # digits: the PBKDF2 hash, worked out on the head unit; or the passphrase; or empty: an open network).
-# The hotspot's last channel, joined or heard, is kept in /etc/ocbm/wifi_link_channel (written when it changes); the
-# state for ocbmd and the AP layer in /tmp/wifi_link_state.
+# Kept beside it, each written when it changes (0600, never logged): the hotspot's last channel, joined or heard
+# (wifi_link_channel); its address, joined or heard by name (wifi_link_bssid: an iPhone's stays the same; heard by name
+# under another, the new one is kept; a new set-up clears it, wifi.rs); the station's own address at its last start
+# (wifi_link_sta: whether the phone sees the same device each time). The state for ocbmd and the AP layer in
+# /tmp/wifi_link_state.
 #
 # The supplicant: OCBM's own drop-in, /usr/sbin/ocbm-wpa_supplicant, never at /usr/sbin/wpa_supplicant (the vendor's
 # dispatcher reads THAT path's existence as "STA mode" and loads another driver mode, on every unit, set up or not);
 # else a unit's own stock copy at /usr/sbin; else a bench copy in /tmp/bin. The stock 2025.10.15.1127 image ships none
 # (the factory survey, 27 Oct). Without one the keeper waits, one line a minute. Its control socket (ctrl_interface
 # below) is spoken to by `ocbmd wpa`, not wpa_cli, which the adapter no longer carries (24 Nov 2026: 68 KB of flash).
-# Called by its bare name: the respawn wrapper's `pgrep -f /usr/sbin/ocbmd` (run_ocbmd.sh) never takes one of these
-# short runs for the daemon; `pidof ocbmd` does see one while it lasts (a few ms; a look a few s).
+# Called by its bare name: the respawn wrapper's `pgrep -f /usr/sbin/ocbmd` (run_ocbmd.sh), and ocbm_boot.sh's
+# watchdog with it, never take one of these runs for the daemon; `pidof ocbmd` does see one (the monitor, all along).
 #
 # Test hooks (tools/wifi_sta_test.sh): WIFI_STA_ROOT (a scratch root for every path below), WIFI_STA_TICK,
 # WIFI_STA_ONCE (one pass, then exit), RADIO_STA_IF.
@@ -57,10 +67,13 @@ L="[wifi_sta]"
 R=${WIFI_STA_ROOT:-}
 CONF=$R/etc/ocbm/wifi_link
 CHANNEL_MEMO=$R/etc/ocbm/wifi_link_channel
+BSSID_MEMO=$R/etc/ocbm/wifi_link_bssid
+STA_MEMO=$R/etc/ocbm/wifi_link_sta
 STATE=$R/tmp/wifi_link_state
 WPACONF=$R/tmp/wpa_sta.conf
 CTRL=$R/var/run/wpa_supplicant
 WPA_PID=$R/var/run/wpa_sta.pid
+EV_PID=$R/var/run/wpa_events.pid
 DHCP_PID=$R/var/run/udhcpc_sta.pid
 WPALOG=$R/tmp/wifi_sta.log
 BOXLOG=$R/tmp/box.log
@@ -102,9 +115,11 @@ stop_pidfile() {  # $1 pid file: SIGTERM, up to 2 s, then SIGKILL
   rm -f "$1"
 }
 IF=""
+# The supplicant and its monitor (a new supplicant gets a new one at once).
+stop_wpa() { stop_pidfile "$EV_PID"; stop_pidfile "$WPA_PID"; ev_next=0; }
 cleanup() {
   stop_pidfile "$DHCP_PID"
-  stop_pidfile "$WPA_PID"
+  stop_wpa
   [ -n "$IF" ] && ifconfig "$IF" 0.0.0.0 2>/dev/null
   rm -f "$STATE" "$WPACONF" "$WPACONF.new"
   rm -rf "$LOCK"
@@ -191,9 +206,9 @@ publish() {
 }
 # No look will come (no supplicant, no station): said in the state, so no AP start waits for one.
 no_look() { [ -n "$seen_ch" ] || { seen_ch=0; seen_at=$(up_s); publish joining 0; }; }
-keep_channel() {  # $1 the hotspot's channel, kept on flash when it changes
-  _kept=""; read -r _kept 2>/dev/null <"$CHANNEL_MEMO"
-  [ "$_kept" = "$1" ] || { echo "$1" > "$CHANNEL_MEMO.new" 2>/dev/null && mv -f "$CHANNEL_MEMO.new" "$CHANNEL_MEMO"; }
+keep() {  # $1 file, $2 its one line: on flash (0600) when it changes. Addresses in them are never logged.
+  _kv=""; read -r _kv 2>/dev/null <"$1"
+  [ "$_kv" = "$2" ] || { ( umask 077; echo "$2" > "$1.new" ) 2>/dev/null && mv -f "$1.new" "$1"; }
 }
 plan() { [ "$*" = "$last_plan" ] || { last_plan="$*"; log "$*"; }; }   # what it scans, said when that changes
 
@@ -202,53 +217,70 @@ cli() { ocbmd wpa -p "$CTRL" "$IF" "$@" 2>/dev/null; }
 in_join() {
   case $wstate in AUTHENTICATING|ASSOCIATING|ASSOCIATED|4WAY_HANDSHAKE|GROUP_HANDSHAKE) return 0 ;; esac; return 1
 }
-# Scans and joins on one channel ($1) alone (not under a join in progress), the supplicant on again if paused.
+# The supplicant scans and joins on $1 MHz alone, "" every channel: its network's scan_freq and freq_list set in place
+# (SET_NETWORK leaves a join under way alone, wpa_supplicant 2.11), the file kept the same for its next start.
+plan_freq() {
+  [ "$conf_freq" = "$1" ] && return 0
+  write_conf "$1"; cli set_network 0 scan_freq "${1:-0}" >/dev/null; cli set_network 0 freq_list "${1:-0}" >/dev/null
+}
+# Scans and joins on one channel ($1) alone, the supplicant on again if paused.
 on_channel() {
-  _of=$(freq_of "$1")
-  [ "$_of" != 0 ] && [ "$conf_freq" != "$_of" ] && ! in_join && { write_conf "$_of"; cli reconfigure >/dev/null; }
+  _of=$(freq_of "$1"); [ "$_of" = 0 ] || plan_freq "$_of"
   [ "$paused" = 1 ] && { cli reconnect >/dev/null; paused=0; }
 }
-# A look over $1's frequencies ($2 quick: no join followed): seen_ch (0 none) and seen_at; said when the result
-# changes, the join's events too.
+# A look over $1's frequencies: seen_ch (0 none) and seen_at, said when that changes. Heard while the supplicant holds
+# the hotspot back after failed joins (TEMP-DISABLED, 10 s to 5 min), not paused: SELECT_NETWORK, which has it try
+# again at once (ENABLE_NETWORK leaves an enabled network's back-off as it is, wpa_supplicant 2.11).
 find_now() {
-  _fo=$(ocbmd wpa -p "$CTRL" "$IF" find "$1" ${2:+quick} 2>/dev/null) || {
+  _fo=$(ocbmd wpa -p "$CTRL" "$IF" find "$1" "$BSSID_MEMO" 2>/dev/null) || {
     [ "$find_down" = 1 ] || log "a look got no answer from the supplicant"; find_down=1; return 1; }
-  find_down=0; _fc=0; _fl=""; _fe=""
-  while read -r _f1 _f2 _f3; do
-    case $_f1 in
-      seen) [ "$_fc" = 0 ] && { _fc=${_f2:-0}; _fl=${_f3:-?}; } ;;
-      event) _fe="${_fe:+$_fe, }$_f2${_f3:+ $_f3}" ;;
-    esac
+  find_down=0; _fc=0; _fl=""; _fh=""
+  while read -r _f1 _f2 _f3 _f4; do
+    [ "$_f1" = seen ] && [ "$_fc" = 0 ] && { _fc=${_f2:-0}; _fl=${_f3:-?}; _fh=${_f4:-}; }
   done <<EOF
 $_fo
 EOF
   seen_at=$(up_s)
   if [ "$_fc" != "$seen_ch" ]; then
     if [ "$_fc" = 0 ]; then log "the hotspot not heard (channels $1)"
-    else log "the hotspot heard on channel $_fc ($_fl dBm)"; keep_channel "$_fc"; fi
+    else log "the hotspot heard on channel $_fc ($_fl dBm${_fh:+, its name hidden: known by its address})"
+      keep "$CHANNEL_MEMO" "$_fc"; fi
   fi
   seen_ch=$_fc
-  [ -n "$_fe" ] && [ "$_fe" != "$last_events" ] && log "supplicant: $_fe"
-  last_events=$_fe
+  if [ "$_fc" != 0 ] && [ "$paused" = 0 ]; then
+    case $(cli list_networks) in *TEMP-DISABLED*)
+      cli select_network 0 >/dev/null
+      [ $((seen_at - held_said)) -lt 300 ] || { held_said=$seen_at
+        log "the hotspot heard while the supplicant held it back after failed joins: it tries again now"; } ;;
+    esac
+  fi
 }
 # The first look at a supplicant's start: the hotspot's last channel alone (a fraction of a second where it was last
-# time), then the channels an AP may use; quick (no join followed) and published at once: the AP of the adapter's own
-# session waits for it. The supplicant's state read again after it: a join it started is not cut by a reconfigure.
+# time), then the channels an AP may use; published at once: the AP of the adapter's own session waits for it. The
+# supplicant's state read again after it (the pause below leaves a join of the adapter's own session alone).
 first_look() {
   looked=1; last_find=$now; seen_ch=""
   _lc=""; read -r _lc 2>/dev/null <"$CHANNEL_MEMO"
-  ap_may_use "$_lc" && find_now "$(freq_of "$_lc")" quick
-  [ "${seen_ch:-0}" = 0 ] && find_now "$AP_FREQS" quick
+  ap_may_use "$_lc" && find_now "$(freq_of "$_lc")"
+  [ "${seen_ch:-0}" = 0 ] && find_now "$AP_FREQS"
   no_look; publish joining 0
   wstate=$(cli status | sed -n 's/^wpa_state=//p')
+}
+# The supplicant's join events into the box log as they come (`ocbmd wpa ... events 0`: it ends with its supplicant),
+# started again no sooner than 10 s after it last was. A child of a subshell, so nothing waits on it.
+watch_events() {
+  pid_of "$EV_PID" >/dev/null && return 0
+  [ "$now" -ge "$ev_next" ] || return 0
+  ev_next=$((now + 10))
+  ( ocbmd wpa -p "$CTRL" "$IF" events 0 >> "$BOXLOG" 2>/dev/null </dev/null & echo $! > "$EV_PID" )
 }
 
 log "keeping the station on the hotspot set up in $CONF"
 mkdir -p "$CTRL" "$R/var/run" 2>/dev/null
 WPA=""; said_tools=0; said_ap_on_sta=0; none=0; wpa_down=0; wpa_next=0; lk_n=0
 last_ch=""; last_mismatch=""; joined_at=""; down_since=$(up_s)
-paused=0; ap_since=""; last_find=0; conf_freq="x"; wstate=""; last_ws=""; ws_said=0
-looked=0; seen_ch=""; seen_at=0; else_ch=""; else_n=0; last_events=""; last_plan=""; find_down=0
+paused=0; ap_since=""; last_find=0; conf_freq="x"; wstate=""; last_ws=""; ws_said=0; ev_next=0; held_said=-300
+looked=0; seen_ch=""; seen_at=0; else_ch=""; else_n=0; last_plan=""; find_down=0; sta_said=0
 while :; do
   # No station on this unit (below): nothing changes before the next boot.
   [ "$none" = 1 ] && { [ -n "${WIFI_STA_ONCE:-}" ] && exit 0; sleep "$TICK"; continue; }
@@ -288,7 +320,7 @@ while :; do
   # The interface gone (the driver unloaded): its supplicant and DHCP client with it; looked for again.
   if [ ! -e "$SYS/class/net/$IF" ]; then
     log "$IF is gone: the station starts again when an interface is back"
-    stop_pidfile "$DHCP_PID"; stop_pidfile "$WPA_PID"; IF=""; joined_at=""; publish joining 0 2>/dev/null
+    stop_pidfile "$DHCP_PID"; stop_wpa; IF=""; joined_at=""; publish joining 0 2>/dev/null
     [ -n "${WIFI_STA_ONCE:-}" ] && exit 0; sleep "$TICK"; continue
   fi
   # An AP raised before the link was set up may still run on the station's interface: it goes at the session's end.
@@ -308,6 +340,7 @@ while :; do
       write_conf "" "$_lf"
     fi
     ifconfig "$IF" 0.0.0.0 up 2>/dev/null
+    stop_pidfile "$EV_PID"; ev_next=0   # a monitor of the one before, if it is still there
     [ "$wpa_down" = 1 ] || log "starting the supplicant on $IF"
     if "$WPA" -B -P "$WPA_PID" -D nl80211,wext -i "$IF" -c "$WPACONF" >> "$WPALOG" 2>&1; then
       # Its pid file too: the daemon writes it after the socket is there (25 Nov bench: a start taken for a failure).
@@ -323,19 +356,34 @@ while :; do
     wpa_down=1; no_look; [ -n "${WIFI_STA_ONCE:-}" ] && exit 0; sleep "$TICK"; continue
   fi
   wpa_down=0
+  watch_events
   st=$(cli status)
   wstate=$(echo "$st" | sed -n 's/^wpa_state=//p')
   freq=$(echo "$st" | sed -n 's/^freq=//p')
+  # The station's own address against its last start's, once (never logged): a new one, the phone sees a new device.
+  if [ "$sta_said" = 0 ]; then
+    _a=$(echo "$st" | sed -n 's/^address=//p'); _k=""; read -r _k 2>/dev/null <"$STA_MEMO"
+    if [ -n "$_a" ]; then
+      sta_said=1
+      if [ "$_k" = "$_a" ]; then log "the station's own address: the one it had at its last start"
+      elif [ -n "$_k" ]; then log "the station's own address: new since its last start (a new device to the phone)"; fi
+      keep "$STA_MEMO" "$_a"
+    fi
+  fi
   # The supplicant's own state, when it changes, at most one line each 10 s (a flapping one folds).
   if [ "$wstate" != "$last_ws" ] && [ $((now - ws_said)) -ge 10 ]; then
     last_ws=$wstate; ws_said=$now; log "supplicant: ${wstate:-no answer}"
   fi
   if [ "$wstate" = COMPLETED ]; then
     ch=$(chan_of "${freq:-0}")
-    [ -n "$joined_at" ] || { joined_at=$now; log "$IF joined the hotspot on channel $ch"; }
+    if [ -z "$joined_at" ]; then
+      joined_at=$now; log "$IF joined the hotspot on channel $ch"
+      # Its address, for the looks while its name is hidden.
+      _b=$(echo "$st" | sed -n 's/^bssid=//p'); [ -n "$_b" ] && keep "$BSSID_MEMO" "$_b"
+    fi
     pid_of "$DHCP_PID" >/dev/null || udhcpc -i "$IF" -b -R -p "$DHCP_PID" -s "$DHCP_HOOK" >> "$WPALOG" 2>&1
     else_n=0; publish joined "$ch"
-    if [ "$ch" != "$last_ch" ] && [ "$ch" != 0 ]; then last_ch=$ch; keep_channel "$ch"; fi
+    if [ "$ch" != "$last_ch" ] && [ "$ch" != 0 ]; then last_ch=$ch; keep "$CHANNEL_MEMO" "$ch"; fi
     # An AP running on another channel (it came up before the station joined, or the hotspot's is no AP's): said once a
     # change. It stays for its session; its next start follows where an AP may (ADDENDUM 6).
     mm=""; ap_up && mm="$ch/$(ap_channel)"
@@ -366,7 +414,8 @@ while :; do
       on_channel "$seen_ch"
       plan "the adapter's own session starting, no AP yet: scans and joins on the hotspot's channel $seen_ch only"
     elif [ "$starting" = 1 ]; then
-      [ "$paused" = 1 ] || { cli disconnect >/dev/null; paused=1; }
+      # A join of the adapter's own session under way finishes first (its next pass pauses, if it failed).
+      [ "$paused" = 1 ] || { [ "$parked" = 1 ] && in_join; } || { cli disconnect >/dev/null; paused=1; }
       plan "CarPlay is starting: no scans until it runs (${START_QUIET} s at most)"
     elif [ "$up" = 1 ]; then
       apc=$(ap_channel); every=$FIND_EVERY; [ "$parked" = 1 ] && every=$PARKED_FIND
@@ -391,7 +440,7 @@ while :; do
       fi
     else
       else_ch=""; else_n=0
-      [ "$conf_freq" != "" ] && ! in_join && { write_conf ""; cli reconfigure >/dev/null; }
+      plan_freq ""
       [ "$paused" = 1 ] && { cli reconnect >/dev/null; paused=0; }
       plan "scans every channel (no AP up); a look over the channels an AP may use every ${IDLE_FIND} s"
       if [ "$looked" = 1 ] && [ $((now - last_find)) -ge "$IDLE_FIND" ]; then
@@ -399,9 +448,9 @@ while :; do
       fi
     fi
     # Stuck where it does not leave by itself (a hotspot back on another channel, say): start afresh, not paused.
-    if [ "$paused" = 0 ] && [ $((now - down_since)) -ge "$RESTART_AFTER" ]; then
+    if [ "$paused" = 0 ] && ! in_join && [ $((now - down_since)) -ge "$RESTART_AFTER" ]; then
       log "$IF not joined for ${RESTART_AFTER} s: the supplicant starts afresh"
-      stop_pidfile "$WPA_PID"; down_since=$now
+      stop_wpa; down_since=$now
     fi
   fi
   [ -n "${WIFI_STA_ONCE:-}" ] && exit 0
