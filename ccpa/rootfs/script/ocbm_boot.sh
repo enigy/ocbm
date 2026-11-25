@@ -243,14 +243,16 @@ touch /tmp/UDiskPassThroughMode
     i=0; while [ ! -e /dev/usb_accessory ] && [ "$i" -lt 60 ]; do i=$((i+1)); sleep 1; done
     [ -e /dev/usb_accessory ] || fail "/dev/usb_accessory never appeared in ${i}s"
     misses=0; t=0
+    # The daemon by its full path, as the respawn wrapper (run_ocbmd.sh) finds it: `pidof ocbmd` also counts the Wi-Fi
+    # link keeper's `ocbmd wpa` runs (its supplicant's monitor lives as long as the supplicant, ADDENDUM 11).
     while [ "$t" -lt 120 ]; do
-      if pidof ocbmd >/dev/null 2>&1; then misses=0; else
+      if pgrep -f /usr/sbin/ocbmd >/dev/null 2>&1; then misses=0; else
         misses=$((misses+1))
         [ "$misses" -ge 4 ] && fail "ocbmd not running on $misses consecutive checks by ${t}s"
       fi
       sleep 5; t=$((t+5))
     done
-    echo "$(date) OCBM healthy at ${t}s (ocbmd pid=$(pidof ocbmd))" >> "$W"
+    echo "$(date) OCBM healthy at ${t}s (ocbmd pid=$(pgrep -f /usr/sbin/ocbmd))" >> "$W"
   ) &
   fi
 ) &
