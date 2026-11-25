@@ -36,7 +36,8 @@
 //! this way, and never locks the hotspot out: the supplicant joins by name). Nothing it prints comes from an address
 //! or a name.
 //!
-//! `events SECS` (ADDENDUM 11): the supplicant's join events as they come, for SECS s (0: until it ends): [`events`].
+//! `events SECS [FILE]` (ADDENDUM 11): the supplicant's join events as they come, for SECS s (0: until it ends):
+//! [`events`]. FILE (ADDENDUM 13) keeps how many authentications in a row went unanswered, for the keeper's guard.
 //!
 //! Exit status: 0 a reply came, whatever it says (as wpa_cli), `find`'s look ended, or `events` ran; 1 no supplicant
 //! answered on `DIR/IFACE` within 10 s, the socket failed, or `find`'s scan failed or did not end (said on stderr);
@@ -108,9 +109,9 @@ pub fn cli(args: &[String]) -> Option<i32> {
                 }
             })
         }
-        [w, s] if w == "events" => {
+        [w, s, f @ ..] if w == "events" && f.len() <= 1 => {
             let Ok(secs) = s.parse() else { return Some(usage()) };
-            Some(match events(path, iface, secs, client) {
+            Some(match events(path, iface, secs, client, f.first().map(String::as_str)) {
                 Ok(()) => 0,
                 Err(e) => {
                     eprintln!("ocbmd wpa: events on {dir}/{iface}: {e}");
@@ -139,7 +140,7 @@ pub fn cli(args: &[String]) -> Option<i32> {
 }
 
 fn usage() -> i32 {
-    eprintln!("usage: ocbmd wpa [-p DIR] IFACE COMMAND [ARG...] | find [FREQS] [KEPT] | events SECS");
+    eprintln!("usage: ocbmd wpa [-p DIR] IFACE COMMAND [ARG...] | find [FREQS] [KEPT] | events SECS [FILE]");
     2
 }
 
@@ -581,15 +582,15 @@ fn unquoted(s: &str) -> String {
 /// began, `(+N ms)`; a step that ends with no event of its own, as this build's supplicant ends one the driver timed
 /// out (sme.c `sme_event_auth_timed_out` says nothing at MSG_INFO), is said with its time and the state it left for,
 /// from STATUS every 250 ms while a step is under way. Bounded: within a minute each line once, then one line with how
-/// often each came again.
-fn events(dir: &Path, iface: &str, secs: u64, client_dir: &Path) -> std::io::Result<()> {
+/// often each came again. `misses`: the file of [`Watch::missed`]'s count.
+fn events(dir: &Path, iface: &str, secs: u64, client_dir: &Path, misses: Option<&str>) -> std::io::Result<()> {
     let mut c = Conn::open(dir, iface, client_dir)?;
     if !c.ask("ATTACH", REPLY_WAIT)?.starts_with(b"OK") {
         return Err(other("the supplicant took no monitor"));
     }
     let _ = c.ask("LEVEL 2", REPLY_WAIT);
     let end = Instant::now() + Duration::from_secs(if secs == 0 { 1 << 31 } else { secs });
-    let mut w = Watch { step: None, since: Instant::now(), keys: Vec::new(), again: Vec::new(), out: Vec::new() };
+    let mut w = Watch::new(misses);
     let mut live = true;
     while live && Instant::now() < end {
         let wait = Instant::now() + if w.step.is_some() { POLL } else { PING_EVERY };
@@ -621,20 +622,49 @@ fn events(dir: &Path, iface: &str, secs: u64, client_dir: &Path) -> std::io::Res
 }
 
 /// `events`' state: the join step under way (when its authentication began, which step), the window's lines and how
-/// often each came again (two lists: no new generic code on flash), and the lines to print.
+/// often each came again (two lists: no new generic code on flash), the lines to print, and the unanswered
+/// authentications in a row with the file they are kept in.
 struct Watch {
     step: Option<(Instant, &'static str)>,
     since: Instant,
     keys: Vec<String>,
     again: Vec<u32>,
     out: Vec<String>,
+    miss: Option<(String, u32)>,
 }
 
 impl Watch {
+    /// The count goes on from the file's (one boot's: the keeper's is in /tmp, and a new monitor comes with each
+    /// supplicant), as the radio driver's own does.
+    fn new(misses: Option<&str>) -> Watch {
+        let had = |f: &str| std::fs::read_to_string(f).map_or(0, |s| s.trim().parse().unwrap_or(0));
+        let miss = misses.map(|f| (f.to_string(), had(f)));
+        Watch { step: None, since: Instant::now(), keys: Vec::new(), again: Vec::new(), out: Vec::new(), miss }
+    }
+
+    /// ADDENDUM 13: an authentication that went unanswered (`true`), or one answered (`false`: the association tried,
+    /// a refusal, a join made). The IW416's moal driver counts the first kind the same way, and at its fifth in a row
+    /// resets the radio (`WiFi Reset due to auth timeout cnt 5`, its firmware loaded again: every link on it drops), so
+    /// the keeper holds the station back before then while a phone uses the AP.
+    fn missed(&mut self, yes: bool) {
+        if let Some((f, n)) = &mut self.miss {
+            let m = if yes { *n + 1 } else { 0 };
+            if m != *n {
+                *n = m;
+                let _ = std::fs::write(f, format!("{m}\n"));
+            }
+        }
+    }
+
     fn event(&mut self, e: &str) {
         let Some(m) = mask(e) else { return };
         if m == "network-not-found" {
             return;
+        }
+        if ["trying", "auth-reject", "connected"].iter().any(|p| m.starts_with(p)) {
+            self.missed(false);
+        } else if m.starts_with("no answer to the authentication") {
+            self.missed(true);
         }
         // A new attempt, or the network held back after a failure, while a step is under way: it ended unsaid.
         if m.starts_with("authenticating") || m.starts_with("ssid-temp-disabled") {
@@ -651,7 +681,9 @@ impl Watch {
         self.step = if m.starts_with("authenticating") {
             Some((Instant::now(), "the authentication"))
         } else if m.starts_with("trying") {
-            self.step.map(|(t, _)| (t, "the association"))
+            // With no authentication of its own before it, the driver's own join (ADDENDUM 13, moal's host_mlme=0:
+            // a connect command) starts here.
+            Some((self.step.map_or_else(Instant::now, |(t, _)| t), "the association"))
         } else if m.starts_with("associated") {
             self.step.map(|(t, _)| (t, "the key handshake"))
         } else if ENDS.iter().any(|p| m.starts_with(p)) {
@@ -672,6 +704,7 @@ impl Watch {
     /// The step under way ended with no event of its own (`now`: the state it left for, if known).
     fn silent(&mut self, now: &str) {
         if let Some((t, s)) = self.step.take() {
+            self.missed(s == "the authentication");
             let key = format!("no answer to {s}");
             let mut line = format!("{key} (+{} ms", t.elapsed().as_millis());
             if !now.is_empty() {
@@ -1098,7 +1131,7 @@ mod tests {
     /// left out.
     #[test]
     fn events_tell_a_joins_steps_and_its_silent_end_and_fold_repeats() {
-        let mut w = Watch { step: None, since: Instant::now(), keys: Vec::new(), again: Vec::new(), out: Vec::new() };
+        let mut w = Watch::new(None);
         w.event("CTRL-EVENT-NETWORK-NOT-FOUND ");
         assert!(w.out.is_empty(), "the hotspot away: the looks say so, not this");
         w.event("SME: Trying to authenticate with 02:11:22:33:44:55 (SSID='Example' freq=2437 MHz)");
@@ -1158,9 +1191,71 @@ mod tests {
             asked
         });
         let t = Instant::now();
-        events(&dir, "sta0", 30, &dir).unwrap();
+        let misses = dir.join("misses");
+        std::fs::write(&misses, "2\n").unwrap();
+        events(&dir, "sta0", 30, &dir, misses.to_str()).unwrap();
         assert!(t.elapsed() < Duration::from_secs(5), "ended with the supplicant, not at its 30 s");
         assert_eq!(sup.join().unwrap(), ["ATTACH", "LEVEL 2", "DETACH"]);
+        let n = std::fs::read_to_string(&misses).unwrap();
+        assert_eq!(n, "3\n", "the SME's own 5 s timer: one more, from the file's");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ADDENDUM 13: the authentications in a row that went unanswered, the radio driver's own count (moal resets the
+    /// radio at its fifth), kept in the file the keeper reads: one more for each that ended unsaid or on the SME's 5 s
+    /// timer, none again once one is answered (the association tried, a refusal, a join); none for a refusal by the
+    /// driver (no frame went out) or a step after the authentication.
+    #[test]
+    fn events_count_the_unanswered_authentications_in_a_row_in_their_file() {
+        let dir = scratch("misses");
+        let f = dir.join("misses");
+        let read = || std::fs::read_to_string(&f).unwrap_or_default();
+        let auth = "SME: Trying to authenticate with 02:11:22:33:44:55 (SSID='Example' freq=2437 MHz)";
+        let mut w = Watch::new(f.to_str());
+        w.event(auth);
+        w.status(b"wpa_state=SCANNING\n");
+        assert_eq!(read(), "1\n", "no answer, its end seen in STATUS");
+        w.event(auth);
+        w.event(auth);
+        assert_eq!(read(), "2\n", "ended by the next attempt");
+        w.event("SME: Authentication timeout");
+        assert_eq!(read(), "3\n", "the SME's own timer");
+        w.event(auth);
+        w.event("SME: Authentication request to the driver failed");
+        assert_eq!(read(), "3\n", "the driver refused it: no frame went out, not counted");
+        let mut w = Watch::new(f.to_str());
+        w.event(auth);
+        w.event("CTRL-EVENT-SSID-TEMP-DISABLED id=0 ssid=\"Example\" auth_failures=1 duration=10 reason=CONN_FAILED");
+        assert_eq!(read(), "4\n", "a new monitor (the next supplicant) goes on from the file's count");
+        w.event(auth);
+        w.event("Trying to associate with 02:11:22:33:44:55 (SSID='Example' freq=2437 MHz)");
+        assert_eq!(read(), "0\n", "answered: the association tried");
+        w.status(b"wpa_state=DISCONNECTED\n");
+        assert_eq!(read(), "0\n", "the association unanswered is not an unanswered authentication");
+        w.event(auth);
+        w.event("CTRL-EVENT-AUTH-REJECT 02:11:22:33:44:55 auth_type=0 auth_transaction=2 status_code=17");
+        assert_eq!(read(), "0\n", "a refusal is an answer");
+        assert!(!w.out.iter().any(|l| l.contains("02:11") || l.contains("Example")), "{:?}", w.out);
+        let mut none = Watch::new(None);
+        none.event(auth);
+        none.status(b"wpa_state=SCANNING\n");
+        assert!(none.miss.is_none(), "no file: nothing kept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ADDENDUM 13: the driver's own join (moal's host_mlme=0, the supplicant's connect command) has no authentication
+    /// of the supplicant's: its attempt starts at `trying`, and its steps carry their times from there.
+    #[test]
+    fn a_join_the_driver_makes_itself_starts_at_trying() {
+        let mut w = Watch::new(None);
+        w.event("Trying to associate with 02:11:22:33:44:55 (SSID='Example' freq=2437 MHz)");
+        assert!(w.step.is_some_and(|(_, s)| s == "the association"), "a step from here");
+        w.event("Associated with 02:11:22:33:44:55");
+        w.event("CTRL-EVENT-CONNECTED - Connection to 02:11:22:33:44:55 completed [id=0 id_str=]");
+        assert_eq!(w.out[0], "trying freq=2437");
+        assert!(w.out[1].starts_with("associated (+") && w.out[2].starts_with("connected (+"), "{:?}", w.out);
+        w.event("Trying to associate with 02:11:22:33:44:55 (SSID='Example' freq=2437 MHz)");
+        w.status(b"wpa_state=DISCONNECTED\n");
+        assert!(w.out[3].starts_with("no answer to the association (+"), "{:?}", w.out);
     }
 }
