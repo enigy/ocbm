@@ -5,8 +5,11 @@
 # starts and on which interface, the configuration it writes (0600, the name in hex, the key as given), the state it
 # publishes, the channel it keeps, the mismatch line, the scans around a CarPlay start (none while the phone joins the
 # AP, the AP's channel and a look a minute once the session runs), the first look and the adapter's own session's
-# (ADDENDUM 9), its waits (no supplicant, one interface, an AP on the station's interface, the seam's wlan lock), and
-# its clean stop. Under every POSIX shell found (sh, dash), and BusyBox's by tools/busybox_suites.sh.
+# (ADDENDUM 9), the hotspot's kept address, the supplicant's monitor, the channel plan in place (SET_NETWORK), the
+# retry of a held-back network, no pause or restart over a join, the station's own address, a start whose pid file
+# comes after its socket (ADDENDUM 11), its waits (no supplicant, one interface, an AP on the station's interface, the
+# seam's wlan lock), and its clean stop. Under every POSIX shell found (sh, dash), and BusyBox's by
+# tools/busybox_suites.sh.
 #
 #   tools/wifi_sta_test.sh
 set -u

@@ -827,7 +827,16 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
   at power-up, the phone and the hotspot on a 20 MHz 2.4 GHz channel shared three ways, the restart. A USB host's AP
   keeps its own channel when the station is not on the hotspot. That bench's second fault (no join for six minutes after
   the AP went down, the hotspot on the air) is not explained by the code: the keeper now logs the supplicant's state,
-  each look's result and a join's events, keeps its own scans (no driver scheduled scan) and looks every 30 s; (6) M3
+  each look's result and a join's events, keeps its own scans (no driver scheduled scan) and looks every 30 s. The bench
+  of 25 Nov (ADDENDUM 10, on d897dba): the AP followed to 2.4 GHz channel 6 at power-up (proven); a supplicant start was
+  taken for a failure (fixed, 451eecb, with a test); the iPhone's hotspot hides its name whenever its hotspot screen is
+  closed, so the looks heard nothing (built 25 Nov, ADDENDUM 11: every look probes for the hotspot by name and knows it
+  by its kept address, `/etc/ocbm/wifi_link_bssid`; not benched); and the joins fail: the driver's authentication
+  unanswered, or answered about 2.4 s late and no association, then TEMP-DISABLED (OPEN, the blocker). For it the
+  supplicant's joins are now logged as they happen with each step's time (its monitor), nothing of the keeper's cuts a
+  join under way (SET_NETWORK in place of RECONFIGURE, no pause or restart over one), a look that hears the hotspot
+  clears the supplicant's back-off, and the station's own address is compared with its last start's; the candidates
+  and the line that tells each are in docs/wireless/01_BT_AND_RADIO.md, "A join that fails"; (6) M3
   (the set-up network) is built, not
   benched: whether the stock hostapd takes `ap_isolate=1` (it refuses an unknown key, and then no set-up network is
   offered), and what the set-up AP raised 20 s into a boot with no host yet costs a head unit that connects later; its

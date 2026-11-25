@@ -522,8 +522,8 @@ also joins the phone's Personal Hotspot as a station, so a head unit on that hot
   copy in `/tmp/bin`, and waits without one. It speaks to the supplicant's control socket
   (`/var/run/wpa_supplicant/<if>`) with `ocbmd wpa`, not wpa_cli, which the adapter no longer carries (24 Nov 2026:
   about 68 KB of flash); by hand over the console the same: `ocbmd wpa sta0 status` (or `scan`, `scan_results`,
-  `list_networks`, `enable_network 0`: wpa_cli's commands, the reply printed as wpa_cli prints it; `-p DIR` before the
-  interface for another control directory). OCBM's own is built by
+  `list_networks`, `select_network 0`: wpa_cli's commands, the reply printed as wpa_cli prints it; `-p DIR` before the
+  interface for another control directory), and `ocbmd wpa sta0 events 60` (below). OCBM's own is built by
   `tools/build_wpa_supplicant.sh` (wpa_supplicant 2.11 and libnl 3.12.0, static, nl80211 with WEXT as the fallback,
   WPA2-PSK only) from release archives a checkout fetches once into `scratchpad/wpa/dl`, each checked against a SHA-256
   pinned in the script, and the image places it when built (its licences as NOTICE files beside the payload).
@@ -533,7 +533,11 @@ also joins the phone's Personal Hotspot as a station, so a head unit on that hot
   with the address and netmask from its DHCP hook (`wifi_sta_dhcp.sh`: no default route, never the AP's or NCM's
   subnet), publishes `/tmp/wifi_link_state` for ocbmd and the AP layer (`iface=`, `state=`, `channel=`, then the last
   look's `seen=<channel> <uptime>` and, below, `elsewhere=`) and keeps the hotspot's last channel, joined or heard, in
-  `/etc/ocbm/wifi_link_channel`. Driver load for it: the verb `wifi_sta_up`, under the wlan lock; while that lock is
+  `/etc/ocbm/wifi_link_channel`, its address in `/etc/ocbm/wifi_link_bssid` (below) and the station's own address at
+  its last start in `/etc/ocbm/wifi_link_sta` (said once a start: `the station's own address: the one it had at its last
+  start`, or `new since its last start (a new device to the phone)`; the supplicant uses the interface's own address,
+  2.11's `mac_addr` default, and the keeper sets none). Each is written 0600 when it changes and never logged.
+  Driver load for it: the verb `wifi_sta_up`, under the wlan lock; while that lock is
   held (the boot preload loading the driver) it looks for its interface every 0.2 s instead of queueing behind it, 15 s
   at most, and waits for its supplicant's socket rather than a fixed second. A supplicant that does not start, or does
   not stay, is started again no sooner than 30 s after its last start and said once until it runs. With no supplicant or
@@ -551,12 +555,91 @@ also joins the phone's Personal Hotspot as a station, so a head unit on that hot
   (the evening bench: an authentication on 2437 beside the AP on 36, then the driver's `bss_start Fails`); a *look* over
   the channels an AP may use (no radar channel) each 60 s, or each 20 s while the adapter's own session has no host (its
   video parked), the first at once when its AP is not where the hotspot was last heard. With no AP up: every channel,
-  and a look each 30 s (a wired session too). A look is `ocbmd wpa <if> find` (ccpa/ocbmd/src/wpa.rs): a scan, where it
-  heard the hotspot (from the BSS table, entries it did not hear left out) and the join the supplicant starts on it,
-  followed to its end; the keeper says the channel and dBm when they change, and the join's events (names and numeric
-  codes, never a name or an address) when they change. The supplicant scans for itself (`disable_scan_offload=1`):
-  wpa_supplicant 2.11 hands its scans to the driver's scheduled scan after three that found nothing
-  (`wpa_supplicant_req_sched_scan`), and nothing on this radio has shown that the driver reports them.
+  and a look each 30 s (a wired session too). A look is `ocbmd wpa <if> find` (ccpa/ocbmd/src/wpa.rs): first the
+  supplicant's own results (a sighting from its scan of the last 4 s, or a join under way: then no scan of ours, so a
+  look never meets the join the supplicant starts on its own results), else a scan of the look's channels that probes
+  for the hotspot by name (next item); where it heard the hotspot, from the BSS table (entries it did not hear, or on
+  other channels, left out). The keeper says the channel and dBm when they change. The supplicant scans for itself
+  (`disable_scan_offload=1`): wpa_supplicant 2.11 hands its scans to the driver's scheduled scan after three that found
+  nothing (`wpa_supplicant_req_sched_scan`), and nothing on this radio has shown that the driver reports them. What it
+  scans and joins on changes in place (ADDENDUM 11): its network's `scan_freq` and `freq_list` through SET_NETWORK,
+  which leaves a join under way alone (a RECONFIGURE deauthenticates first); the adapter's own session's start pause
+  (DISCONNECT) and the restart after 300 s not joined wait for a join under way to end.
+- **The hotspot with its name hidden** (ADDENDUM 10 and 11 of the hand-off plan, 25 Nov 2026). An iPhone's Personal
+  Hotspot leaves its name out of its beacons whenever the phone's hotspot screen is not open (locked, or another screen
+  in front), also while a client is joined: a scan that names nothing lists it as a strong entry with an empty name,
+  and only a probe that carries its name gets an answer with the name. The supplicant's own scans carry it
+  (`scan_ssid=1`); so does every look now: `SCAN freq=<list> ssid <name in hex> ssid ` (wpa_supplicant 2.11's grammar,
+  ctrl_iface.c `wpas_ctrl_scan`: the name, then the wildcard; a driver that takes one name per scan keeps the first). A
+  look also knows the hotspot by its address, kept in `/etc/ocbm/wifi_link_bssid` at each join (STATUS `bssid=`) and
+  when a look hears it by name: an entry with its name hidden (empty, or zeros) and that address, on the look's
+  channels, is the hotspot (find's `seen 6 -39 hidden`; the keeper's `the hotspot heard on channel 6 (-39 dBm, its name
+  hidden: known by its address)`). Heard by name under another address, with the kept one not heard in the same look,
+  the new address is kept; a new set-up (MGMT_WIFI_LINK, ocbmd `wifi::store`), `OCBM_WIFI_RESET` and the go-back to
+  stock remove it. The owner, 25 Nov 2026: an iPhone's hotspot address does not change; other phones and hotspot
+  devices are not known.
+  - **For owners:** the adapter remembers your hotspot's address so it can find and join it while the name is hidden
+    (on an iPhone: whenever the Personal Hotspot screen is not open). This relies on the hotspot keeping one address, as
+    an iPhone does. A phone or hotspot that changes its address has to be visible by name (its hotspot screen open) for
+    the adapter to find it again; the adapter then remembers the new address. Setting the Wi-Fi link up again forgets
+    the old one.
+  - **No `bssid=` or `bssid_hint=` in the supplicant's network** (decided 25 Nov from the 2.11 source). With `ssid=`
+    set, `bssid=` only narrows the choice to that address: the name check stays (events.c `wpa_scan_res_ok` relaxes it
+    only for a network with no name), so it adds nothing for a hidden hotspot and would lock out an owner whose hotspot
+    came back under another address. A network with `bssid=` and no name would match the hidden beacon, but its
+    authentication and association carry the entry's empty name (sme.c takes the BSS's `ssid`), which no hotspot takes.
+    `bssid_hint=` serves only a driver that picks the BSS itself (wpa_supplicant.c, the connect command's
+    `bssid_hint`); this driver takes the supplicant's own SME (moal's `HostMlme` lines). So the supplicant joins by
+    name, from the answer to its named probe, and the kept address serves the looks: `seen=`, `elsewhere=`, the AP's
+    head start, and the retry below.
+  - **Held back after failed joins:** 2.11 disables the network for a while after 4 failed attempts in a row
+    (`wpas_connection_failed`: 10 s, then 20, 30, 60 from the 4th, 90 from the 6th, 120 from the 11th, 300 from the
+    51st; `ssid-temp-disabled auth_failures=N duration=D reason=CONN_FAILED`). A look that hears the hotspot then sends
+    SELECT_NETWORK, which clears that and has it try at once (ENABLE_NETWORK leaves an enabled network's back-off as
+    it is), said once in 5 minutes: `the hotspot heard while the supplicant held it back after failed joins: it tries
+    again now`. Not while the station is paused for a CarPlay start.
+- **Its joins, as they happen** (ADDENDUM 11). Beside each supplicant the keeper runs a monitor of its control socket,
+  `ocbmd wpa <if> events 0` (ATTACH and LEVEL 2: this build has no debug output, and its MSG_DEBUG `wpa_msg` lines, the
+  SME's own 5 s timers among them, are all there is beyond the events), into the box log: `[wifi_sta] [up N]
+  supplicant: <event>`, names and numeric codes only, never a name or an address. A join's steps carry the time since
+  its authentication began (`authenticating freq=2437`, `trying freq=2437 (+2412 ms)`, `associated (+2450 ms)`,
+  `connected (+2610 ms)`); a step that ends with no event of its own is said from STATUS (`no answer to the
+  authentication (+2405 ms, now SCANNING)`: 2.11 says nothing when the driver ends one, sme.c
+  `sme_event_auth_timed_out`). Within a minute each line comes once, then one line with the repeats (`again in the
+  last 60 s: authenticating freq=2437 x5, no answer to the authentication x5`); the hotspot not found after a scan is
+  left out (the looks say that). It ends with its supplicant (TERMINATING, or no PONG after 10 s of silence) and
+  starts again with the next. By hand, `ocbmd wpa sta0 events 60` prints the same for 60 s.
+- **A join that fails: what tells the causes apart** (the bench of 25 Nov: the driver's `HostMlme sta0 send auth to
+  bssid` with no answer, 4 times of 7, or an auth received about 2.4 s later and then no association; the network
+  TEMP-DISABLED). From the 2.11 source and the stock moal driver's own messages (its strings in the factory image); the
+  monitor's lines and dmesg together:
+
+  - *The phone does not answer* (its hidden-hotspot policy, a client limit, the phone busy elsewhere):
+    `authenticating` then `no answer to the authentication (+N ms ...)`, N the driver's wait each time; dmesg
+    `wlan: HostMlme auth timeout` and no `Received auth frame`; with the hotspot screen open the same adapter joins.
+  - *The driver's wait ended before the answer came:* dmesg `wlan: HostMlme auth timeout` before `HostMlme sta0:
+    Received auth frame type = 0x..`, then `HostMlme sta0: Drop auth frame, auth_flag=..`; the monitor's `no answer
+    to the authentication (+N ms ...)` shorter than the answer's 2.4 s.
+  - *The answer came after the supplicant had left AUTHENTICATING* (sme.c `sme_event_auth` passes it by, unsaid in
+    this build): dmesg `Received auth frame` with no `Drop` after it, and no `trying` from the monitor; its `no answer
+    ...` came first.
+  - *The answer taken, the association not answered:* `trying freq=2437 (+N ms)`, then `no answer to the association
+    (+N ms ...)` or `no answer to the association in 5 s`, or `assoc-reject status_code=N` (with `timeout`); dmesg
+    `bss_start Fails`, `Failed to connect`.
+  - *The phone refused:* `auth-reject auth_type=0 auth_transaction=2 status_code=N` or `assoc-reject status_code=N`
+    (17: too many clients).
+  - *The key:* `associated` then `the key handshake timed out` or `4-way handshake failed (the key?)`.
+  - *The radio away from the channel when the answer came* (the AP on another channel; Bluetooth during the adapter's
+    own session): failures only with an AP up (`[radio_ap_up]` lines) or with the session's Bluetooth busy (btd's
+    lines at the same uptime); dmesg `HostMlme sta0: Set remain on Channel: with status=N`.
+  - *The driver refused the step:* `the driver refused the authentication`; dmesg `pending auth on going`, `Fail to
+    send packet status=N`, `Fail to configure remain on channel`.
+  - *Ours* (a pause, a channel change, a restart over a join): none now, a join under way is waited for; the keeper's
+    lines beside it say what it did (`CarPlay is starting`, `not joined for 300 s`).
+  - *A new device to the phone at each start:* `the station's own address: new since its last start`.
+  - *The back-off stretching the retries:* `ssid-temp-disabled ... duration=D`, and the look's `... held it back
+    after failed joins: it tries again now`.
+
 - **The listener and the advert stay on the station's side.** The listener takes connections from the station's
   interface only (SO_BINDTODEVICE: under Linux's weak-host model the station's address alone would also answer on the
   AP's or USB's network). The mDNS socket is bound to the group, 224.0.0.251:5353, so no unicast datagram for carplayd's

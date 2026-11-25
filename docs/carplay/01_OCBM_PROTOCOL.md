@@ -648,6 +648,14 @@ once on the hotspot's channel when it is heard elsewhere (ADDENDUM 9). MGMT_INFO
 `/script/wifi_sta.sh`, and the Wi-Fi link section of docs/wireless/01_BT_AND_RADIO.md have the rest; the hand-off notes
 of 24 Nov hold the contract with Carlink.
 
+The hotspot with its name hidden (ADDENDUM 11, 25 Nov 2026; not benched). An iPhone's Personal Hotspot hides its name
+whenever the phone's hotspot screen is not open, which in a car is nearly always. The adapter looks for the hotspot by
+its name (a probe a hidden hotspot answers) and also by its address, which it remembers from each join and from each
+time it hears the hotspot by name. In plain words, for owners: the adapter remembers your hotspot's address so it can
+find and join it while the name is hidden. This relies on the hotspot keeping one address, as an iPhone does. A phone
+or hotspot that changes its address has to be visible by name (its hotspot screen open) for the adapter to find it
+again; the adapter then remembers the new address. Setting the Wi-Fi link up again forgets the old address.
+
 First set-up with no USB (M3, `src/setup.rs`, not benched): an adapter NEVER USED (no link, no host's HELLO ever taken
 on it, no bonded phone, no kept host config, no update record) offers, 20 s after ocbmd's start if no host has spoken
 and for 10 minutes, a set-up network `CarLink-Setup-xxxx` (public WPA2 passphrase `carlinksetup`, client isolation)

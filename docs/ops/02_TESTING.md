@@ -378,11 +378,16 @@ the host's arrival and the first frame, the PSK count is a lower bound: `PSK mis
 `/etc/ocbm/wifi_selfstart_off` too): no CarPlay session without a host (M2 off) on an adapter with the link set up.
 `/tmp/bench_wifi_link_if` holding an interface name: ocbmd's listener binds that interface's address instead of the
 station's (never the AP's subnet), e.g. a wired bench over NCM. A bench supplicant goes in `/tmp/bin` (`wpa_supplicant`;
-no wpa_cli is needed or shipped). The supplicant by hand, over the console: `ocbmd wpa sta0 status`, `ocbmd wpa sta0
-scan`, `ocbmd wpa sta0 scan_results`, `ocbmd wpa sta0 list_networks`, `ocbmd wpa sta0 enable_network 0` (in place of
-`ocbm-wpa_cli -p /var/run/wpa_supplicant -i sta0 <cmd>`; the first word goes in capitals, the rest as typed, so any
-wpa_cli command spelled as its control command works, e.g. `status-verbose`; exit 1 and a line on stderr when no
-supplicant answers). What to look for: `[wifi_sta]` and `[ocbmd] wifi:` lines in the box log, MGMT_INFO's `wifi_link`.
+no wpa_cli is needed or shipped; a debug build there is the one way to the supplicant's own log, the shipped one has
+none). The supplicant by hand, over the console: `ocbmd wpa sta0 status`, `ocbmd wpa sta0 scan`, `ocbmd wpa sta0
+scan_results`, `ocbmd wpa sta0 list_networks` (`[TEMP-DISABLED]`: held back after failed joins), `ocbmd wpa sta0
+select_network 0` (tries again now; `enable_network 0` does not clear a back-off) (in place of `ocbm-wpa_cli -p
+/var/run/wpa_supplicant -i sta0 <cmd>`; the first word goes in capitals, the rest as typed, so any wpa_cli command
+spelled as its control command works, e.g. `status-verbose`; exit 1 and a line on stderr when no supplicant answers),
+and `ocbmd wpa sta0 events 60`: its join events for 60 s, as the keeper's monitor logs them all along (below). What to
+look for: `[wifi_sta]` and `[ocbmd] wifi:` lines in the box log, MGMT_INFO's `wifi_link`; and for a join, dmesg's
+`HostMlme` lines (the IW416's driver: `send auth to bssid`, `Received auth frame`, `Drop auth frame`, `HostMlme auth
+timeout`, `bss_start Fails`, `Connected to bssid ... successfully`).
 A link's end lines (`wifi: link N reader ended: ...`, `... writer ended: ...`) say who closed it (`the host closed the
 link` after the host's FIN, `the box closed the link (...)` after the box's own shutdown), the uptime, both ways'
 records, bytes and how long ago the last went, and the socket's own view: `tcp state 8` (close-wait: the host's FIN came
@@ -395,17 +400,26 @@ The AP on the hotspot's channel at power-up (ADDENDUM 9, 24 Nov 2026; 2.4 GHz is
 `[wifi_sta]` lines say what it scans when that changes (`the adapter's own session starting, no AP yet: scans and joins
 on the hotspot's channel N only`, `CarPlay is starting: no scans until it runs (40 s at most)`, `scans and joins on the
 AP's channel N only; a look over the channels an AP may use every 20 s` (60 s with a host), `scans every channel (no AP
-up); ...`), each look whose result changed (`the hotspot heard on channel N (D dBm)`, `the hotspot not heard (channels
-...)`), a join's events (`supplicant: trying freq=2437, assoc-reject status_code=1, ssid-temp-disabled ...`: names and
-codes only) and the supplicant's state (`supplicant: SCANNING`, one line in 10 s at most). radio_ap_up.sh says
+up); ...`), each look whose result changed (`the hotspot heard on channel N (D dBm)`, with `, its name hidden: known
+by its address` when the hotspot's beacon hid its name, `the hotspot not heard (channels ...)`), the supplicant's state
+(`supplicant: SCANNING`, one line in 10 s at most) and, from its monitor (ADDENDUM 11), each join as it happens with
+its steps' times (`supplicant: authenticating freq=2437`, `trying freq=2437 (+N ms)`, `associated (+N ms)`, `connected
+(+N ms)`; `no answer to the authentication (+N ms, now SCANNING)` for a step that ended unsaid; `auth-reject ...
+status_code=N`, `assoc-reject status_code=N`, `ssid-temp-disabled auth_failures=N duration=D reason=CONN_FAILED`;
+repeats in one `again in the last 60 s: ...` line a minute: names and codes only). docs/wireless/01_BT_AND_RADIO.md, "A
+join that fails", says which line tells which cause. radio_ap_up.sh says
 `STA mode, the adapter's own session: channel N, heard there by the station's look (waited M ms for the station)` (or
 `the hotspot's last (not heard now)`, `the station joined the hotspot there`, `the hotspot not heard and no last
 channel`) and `STA mode: the AP follows the station to channel 6 (hw_mode=g, 20 MHz)`; ocbmd, when the adapter's own
 session with no host starts again on the hotspot's channel, `wifi: the hotspot is heard on channel N, the AP runs on
-M: ... starts again on N (once)`. By hand: `ocbmd wpa sta0 find 2412-2462,5180-5240,5745-5825` (one frequency, or none for every
-channel) prints `seen <channel> <dBm>` per sighting (or `seen 0`) and the join's `event` lines; `/tmp/wifi_link_state`
-holds the last look's `seen=<channel> <uptime>` and, while two looks in a row heard the hotspot on another channel than
-the AP's, `elsewhere=`; `/tmp/wifi_self_parked` is there while the adapter's own session has no host.
+M: ... starts again on N (once)`. By hand: `ocbmd wpa sta0 find 2412-2462,5180-5240,5745-5825 /etc/ocbm/wifi_link_bssid`
+(one frequency, or none for every channel; the kept address's file, or none to look by name alone) prints `seen
+<channel> <dBm>` per sighting, `hidden` after one known by the kept address alone, or `seen 0`; it scans only when the
+supplicant's own results of the last 4 s did not hear the hotspot and no join is under way. `/tmp/wifi_link_state` holds
+the last look's `seen=<channel> <uptime>` and, while two looks in a row heard the hotspot on another channel than the
+AP's, `elsewhere=`; `/tmp/wifi_self_parked` is there while the adapter's own session has no host.
+`/etc/ocbm/wifi_link_bssid` and `/etc/ocbm/wifi_link_sta` hold the hotspot's and the station's addresses (0600; read
+them by hand, never paste them anywhere public).
 The set-up network (M3): off with `/tmp/bench_wifi_setup_off` or `/etc/ocbm/bench_wifi_setup_off` (the owner's
 `/etc/ocbm/wifi_setup_off` too); offered only on an adapter never used, so a bench adapter needs `OCBM_WIFI_RESET` on a
 stick first (it removes the link and `/etc/ocbm/host_seen` and leaves `/etc/ocbm/wifi_setup_once`, in any mode, an
