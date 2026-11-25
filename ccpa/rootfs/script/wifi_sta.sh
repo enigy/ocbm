@@ -207,9 +207,10 @@ on_channel() {
   [ "$_of" != 0 ] && [ "$conf_freq" != "$_of" ] && ! in_join && { write_conf "$_of"; cli reconfigure >/dev/null; }
   [ "$paused" = 1 ] && { cli reconnect >/dev/null; paused=0; }
 }
-# A look over $1's frequencies: seen_ch (0 none) and seen_at; said when the result changes, the join events too.
+# A look over $1's frequencies ($2 quick: no join followed): seen_ch (0 none) and seen_at; said when the result
+# changes, the join's events too.
 find_now() {
-  _fo=$(ocbmd wpa -p "$CTRL" "$IF" find "$1" 2>/dev/null) || {
+  _fo=$(ocbmd wpa -p "$CTRL" "$IF" find "$1" ${2:+quick} 2>/dev/null) || {
     [ "$find_down" = 1 ] || log "a look got no answer from the supplicant"; find_down=1; return 1; }
   find_down=0; _fc=0; _fl=""; _fe=""
   while read -r _f1 _f2 _f3; do
@@ -230,13 +231,13 @@ EOF
   last_events=$_fe
 }
 # The first look at a supplicant's start: the hotspot's last channel alone (a fraction of a second where it was last
-# time), then the channels an AP may use. Published at once: the AP of the adapter's own session waits for it. The
-# supplicant's state read again after it: a join the look's scan started is not cut by a configuration change.
+# time), then the channels an AP may use; quick (no join followed) and published at once: the AP of the adapter's own
+# session waits for it. The supplicant's state read again after it: a join it started is not cut by a reconfigure.
 first_look() {
   looked=1; last_find=$now; seen_ch=""
   _lc=""; read -r _lc 2>/dev/null <"$CHANNEL_MEMO"
-  ap_may_use "$_lc" && find_now "$(freq_of "$_lc")"
-  [ "${seen_ch:-0}" = 0 ] && find_now "$AP_FREQS"
+  ap_may_use "$_lc" && find_now "$(freq_of "$_lc")" quick
+  [ "${seen_ch:-0}" = 0 ] && find_now "$AP_FREQS" quick
   no_look; publish joining 0
   wstate=$(cli status | sed -n 's/^wpa_state=//p')
 }

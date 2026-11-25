@@ -21,12 +21,13 @@
 //! `enable_network 0`, `disconnect`, `reconnect`, `reconfigure`). Where wpa_cli spells one otherwise (`status verbose`
 //! is its `STATUS-VERBOSE`), the control command itself is typed (`status-verbose`).
 //!
-//! `find [FREQS]` (ADDENDUM 9): where the hotspot is now, for the keeper's looks. A monitor of the supplicant's events
-//! for its few seconds (ATTACH), a scan of FREQS (SCAN's `freq=` list: `2437`, or ranges `2412-2462,5180-5240`; none:
-//! every channel) or the one under way, awaited (at most 10 s), then the network's name (GET_NETWORK 0 ssid) matched in
-//! the BSS table (`BSS RANGE=` pages: id, freq, level, age, ssid), what the look did not hear left out. Prints `seen
-//! <channel> <dBm>` per match, the strongest first, or `seen 0`; then, when the supplicant tried to join on the scan,
-//! `event ...` lines: event names and numeric codes only ([`mask`]). Nothing it prints comes from a BSSID or an SSID.
+//! `find [FREQS] [quick]` (ADDENDUM 9): where the hotspot is now, for the keeper's looks. A monitor of the
+//! supplicant's events for its few seconds (ATTACH), a scan of FREQS (SCAN's `freq=` list: `2437`, or ranges
+//! `2412-2462,5180-5240`; none: every channel) or the one under way, awaited (at most 10 s), then the network's name
+//! (GET_NETWORK 0 ssid) matched in the BSS table (`BSS RANGE=` pages: id, freq, level, age, ssid), what the look did
+//! not hear left out. Prints `seen <channel> <dBm>` per match, the strongest first, or `seen 0`; then, when the
+//! supplicant tried to join on the scan (not followed with `quick`), `event ...` lines: event names and numeric codes
+//! only ([`mask`]). Nothing it prints comes from a BSSID or an SSID.
 //!
 //! Exit status: 0 a reply came, whatever it says (as wpa_cli), or `find`'s scan ended; 1 no supplicant answered on
 //! `DIR/IFACE` within 10 s, the socket failed, or `find`'s scan failed or did not end (said on stderr); 2 usage.
@@ -76,8 +77,11 @@ pub fn cli(args: &[String]) -> Option<i32> {
     if words.is_empty() {
         return Some(usage());
     }
-    if words[0] == "find" && words.len() <= 2 {
-        return Some(match find(Path::new(dir), iface, words.get(1).map(String::as_str), Path::new(CLIENT_DIR)) {
+    if words[0] == "find" && words.len() <= 3 {
+        // `quick`: no join followed after the scan (the keeper's first look, which an AP's start may wait for).
+        let quick = words[1..].iter().any(|w| w == "quick");
+        let freqs = words[1..].iter().find(|w| *w != "quick").map(String::as_str);
+        return Some(match find(Path::new(dir), iface, freqs, quick, Path::new(CLIENT_DIR)) {
             Ok(f) => {
                 let _ = std::io::stdout().write_all(render(&f).as_bytes());
                 0
@@ -248,13 +252,13 @@ fn render(f: &Found) -> String {
     o
 }
 
-fn find(dir: &Path, iface: &str, freqs: Option<&str>, client_dir: &Path) -> std::io::Result<Found> {
+fn find(dir: &Path, iface: &str, freqs: Option<&str>, quick: bool, client_dir: &Path) -> std::io::Result<Found> {
     let t0 = Instant::now();
     let mut c = Conn::open(dir, iface, client_dir)?;
     if !c.ask("ATTACH", REPLY_WAIT)?.starts_with(b"OK") {
         return Err(other("the supplicant took no monitor"));
     }
-    let found = look(&mut c, freqs, t0);
+    let found = look(&mut c, freqs, quick, t0);
     let _ = c.ask("DETACH", Duration::from_secs(1));
     found
 }
@@ -266,7 +270,7 @@ fn join_end(e: &str) -> bool {
         .any(|p| e.strip_prefix("CTRL-EVENT-").is_some_and(|r| r.starts_with(p)))
 }
 
-fn look(c: &mut Conn, freqs: Option<&str>, t0: Instant) -> std::io::Result<Found> {
+fn look(c: &mut Conn, freqs: Option<&str>, quick: bool, t0: Instant) -> std::io::Result<Found> {
     let ssid = conf_ssid(&c.ask("GET_NETWORK 0 ssid", REPLY_WAIT)?).ok_or_else(|| other("no network 0"))?;
     let r = c.ask(&freqs.map_or("SCAN".to_string(), |f| format!("SCAN freq={f}")), REPLY_WAIT)?;
     // FAIL-BUSY: a scan under way (its end is awaited instead) or a join (its outcome, then the table it has).
@@ -291,8 +295,8 @@ fn look(c: &mut Conn, freqs: Option<&str>, t0: Instant) -> std::io::Result<Found
     let mut seen = sightings(c, &ssid, t0.elapsed().as_secs() + 2)?;
     seen.sort_by(|a, b| b.1.cmp(&a.1));
     // A join the supplicant starts on these results (it tries at once), followed to its outcome: CONNECTED, or quiet
-    // after a failure. None tried within 300 ms: no wait.
-    let watch_end = Instant::now() + JOIN_WATCH;
+    // after a failure. None tried within 300 ms, or `quick`: no wait.
+    let watch_end = Instant::now() + if quick { Duration::ZERO } else { JOIN_WATCH };
     let tried = c.events.iter().any(|e| e.starts_with("Trying to associate"));
     let mut quiet = if tried { JOIN_QUIET } else { Duration::from_millis(300) };
     while let Some(e) = c.event((Instant::now() + quiet).min(watch_end))? {
@@ -691,7 +695,7 @@ mod tests {
         ];
         let sup = finder(&dir, false, vec![p1, p2], join);
         let t = Instant::now();
-        let f = find(&dir, "sta0", Some("2412-2462,5180-5240,5745-5825"), &dir).unwrap();
+        let f = find(&dir, "sta0", Some("2412-2462,5180-5240,5745-5825"), false, &dir).unwrap();
         let asked = sup.join().unwrap();
         assert_eq!(f.seen, vec![(6, -40), (36, -80)], "heard in this look only, the strongest first");
         assert_eq!(f.events, vec![
@@ -711,13 +715,29 @@ mod tests {
     }
 
     #[test]
+    fn a_quick_find_reports_what_it_heard_and_follows_no_join() {
+        let dir = scratch("quick");
+        let mut p = entry(3, 2437, -45, 0, NAME_TXT);
+        p.truncate(p.len() - 5);
+        p.push_str("####\n");
+        let join = vec!["<3>Trying to associate with 02:11:22:33:44:55 (SSID='x' freq=2437 MHz)".to_string()];
+        let sup = finder(&dir, false, vec![p], join);
+        let t = Instant::now();
+        let f = find(&dir, "sta0", Some("2437"), true, &dir).unwrap();
+        sup.join().unwrap();
+        assert_eq!(f, Found { seen: vec![(6, -45)], events: vec![] }, "heard on 6; the join not waited for");
+        assert!(t.elapsed() < Duration::from_millis(900));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn find_on_a_busy_supplicant_reads_the_scan_under_way_and_says_seen_0_when_the_network_is_not_heard() {
         let dir = scratch("busy");
         let mut p = entry(1, 2412, -70, 0, "Other");
         p.truncate(p.len() - 5);
         p.push_str("####\n");
         let sup = finder(&dir, true, vec![p], vec![]);
-        let f = find(&dir, "sta0", None, &dir).unwrap();
+        let f = find(&dir, "sta0", None, true, &dir).unwrap();
         let asked = sup.join().unwrap();
         assert_eq!(f, Found::default());
         assert_eq!(render(&f), "seen 0\n");

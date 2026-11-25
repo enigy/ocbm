@@ -115,8 +115,8 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   check 'grep -qx "disable_scan_offload=1" "$R/tmp/wpa_sta.conf"' "  the supplicant's own scans, never the driver's scheduled one"
   check 'grep -qx "state=joining" "$R/tmp/wifi_link_state" && grep -qx "iface=sta0" "$R/tmp/wifi_link_state"' "joining, published for ocbmd"
   n=0; while [ "$n" -lt 30 ] && ! grep -qx "seen=0 100" "$R/tmp/wifi_link_state"; do n=$((n + 1)); sleep 0.1; done
-  check 'grep -q "^wpa sta0 find 2412-2462,5180-5240,5745-5825$" "$R/calls" && [ "$(sed -n 4p "$R/tmp/wifi_link_state")" = "seen=0 100" ]' \
-    "the first look (no last channel kept): the channels an AP may use; heard nowhere, seen=0 as the 4th line"
+  check 'grep -q "^wpa sta0 find 2412-2462,5180-5240,5745-5825 quick$" "$R/calls" && [ "$(sed -n 4p "$R/tmp/wifi_link_state")" = "seen=0 100" ]' \
+    "the first look (no last channel kept, quick): the channels an AP may use; heard nowhere, seen=0 as the 4th line"
   check 'grep -q "the hotspot not heard (channels 2412-2462,5180-5240,5745-5825)" "$R/tmp/box.log"' "  said"
   # Joined on the AP's channel.
   printf 'wpa_state=COMPLETED\nfreq=5180\n' > "$R/wpa_status"
@@ -157,7 +157,7 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   check '[ "$looks" = 1 ]' "  no look before FIND_EVERY has passed (a session a host holds: its video on the AP's channel)"
   uptime_at "$R" 170
   n=0; while [ "$n" -lt 30 ] && [ "$(grep -c "^wpa sta0 find" "$R/calls")" = "$looks" ]; do n=$((n + 1)); sleep 0.1; done
-  check '[ "$(grep -c "^wpa sta0 find 2412-2462,5180-5240,5745-5825$" "$R/calls")" = 2 ] && ! grep -q "^wpa sta0 scan" "$R/calls"' \
+  check '[ "$(grep -c "^wpa sta0 find 2412-2462,5180-5240,5745-5825$" "$R/calls")" = 1 ] && ! grep -q "^wpa sta0 scan" "$R/calls"' \
     "  and a look over the channels an AP may use once FIND_EVERY has passed"
   # The AP gone: every channel again.
   rm -f "$R/hostapd.running"
@@ -208,7 +208,7 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
     "$sh" "$KEEPER" >/dev/null 2>&1 &
   BG=$!
   n=0; while [ "$n" -lt 30 ] && ! grep -qx "	freq_list=2437" "$R/tmp/wpa_sta.conf" 2>/dev/null; do n=$((n + 1)); sleep 0.1; done
-  check '[ "$(grep -c "^wpa sta0 find" "$R/calls")" = 1 ] && grep -q "^wpa sta0 find 2437$" "$R/calls" && [ "$(sed -n 4p "$R/tmp/wifi_link_state")" = "seen=6 100" ]' \
+  check '[ "$(grep -c "^wpa sta0 find" "$R/calls")" = 1 ] && grep -q "^wpa sta0 find 2437 quick$" "$R/calls" && [ "$(sed -n 4p "$R/tmp/wifi_link_state")" = "seen=6 100" ]' \
     "the first look on the hotspot's last channel (2437) alone heard it: seen=6, no second look"
   check 'grep -q "the hotspot heard on channel 6 (-40 dBm)" "$R/tmp/box.log" && [ "$(grep -c "supplicant: trying freq=2437, assoc-reject status_code=1" "$R/tmp/box.log")" = 1 ]' \
     "  said, with the join's events (names and codes only)"
@@ -248,8 +248,8 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   n=0; while [ "$n" -lt 30 ] && ! grep -qx "seen=0 100" "$R/tmp/wifi_link_state" 2>/dev/null; do n=$((n + 1)); sleep 0.1; done
   check 'grep -qx "initial_freq_list=2437" "$R/tmp/wpa_sta.conf" && ! grep -q -e "scan_freq" -e "	freq_list" "$R/tmp/wpa_sta.conf"' \
     "the supplicant's first scan on the hotspot's last channel alone (initial_freq_list=2437), every channel after"
-  check '[ "$(grep "^wpa sta0 find" "$R/calls" | tr "\n" "|")" = "wpa sta0 find 2437|wpa sta0 find 2412-2462,5180-5240,5745-5825|" ]' \
-    "  the first look: its last channel, then the channels an AP may use"
+  check '[ "$(grep "^wpa sta0 find" "$R/calls" | tr "\n" "|")" = "wpa sta0 find 2437 quick|wpa sta0 find 2412-2462,5180-5240,5745-5825 quick|" ]' \
+    "  the first look: its last channel, then the channels an AP may use, quick (no join waited for)"
   kill "$BG"; wait "$BG" 2>/dev/null; BG=""
 
   # A USB host's start (a host present, no parked mark), the last channel kept: no look before or during its start.

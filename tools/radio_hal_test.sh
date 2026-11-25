@@ -1145,7 +1145,10 @@ case_follow() {
   printf 'iface=sta0\nstate=joining\nchannel=0\n' > "$R/tmp/wifi_link_state"; hal wifi_ap_on
   check 'last_ap | grep -q "iface=wlan0 .* follow=0$"' "the station not on the hotspot: 0 (the AP layer keeps its own channel, and says so)"
   hal wifi_ap_off; rm -f "$R/tmp/wifi_link_state"; hal wifi_ap_on
-  check 'last_ap | grep -q "iface=wlan0 .* follow=$"' "no keeper state yet: no channel to follow"
+  check 'last_ap | grep -q "iface=wlan0 .* follow=0$"' \
+    "no keeper state yet (ADDENDUM 9: the keeper starting): not on the hotspot, 0 (the AP layer decides, and says so)"
+  printf 'iface=\nstate=unsupported\nchannel=0\nseen=0 9\n' > "$R/tmp/wifi_link_state"; hal wifi_ap_off; hal wifi_ap_on
+  check 'last_ap | grep -q "iface=wlan0 .* follow=$"' "no station on this unit: no channel to follow"
   hal wifi_ap_off
   echo "wlan0 CarLink-a1b2 192.168.43.1 36 0" > "$R/tmp/.radio_ap_prepared"
   printf 'iface=sta0\nstate=joined\nchannel=44\n' > "$R/tmp/wifi_link_state"; hal wifi_ap_on
