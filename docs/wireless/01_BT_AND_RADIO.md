@@ -608,7 +608,10 @@ also joins the phone's Personal Hotspot as a station, so a head unit on that hot
   `sme_event_auth_timed_out`). Within a minute each line comes once, then one line with the repeats (`again in the
   last 60 s: authenticating freq=2437 x5, no answer to the authentication x5`); the hotspot not found after a scan is
   left out (the looks say that). It ends with its supplicant (TERMINATING, or no PONG after 10 s of silence) and
-  starts again with the next. By hand, `ocbmd wpa sta0 events 60` prints the same for 60 s.
+  starts again with the next. By hand, `ocbmd wpa sta0 events 60` prints the same for 60 s. Being an `ocbmd` process
+  that lives all along, `pidof ocbmd` counts it: ocbm_boot.sh's failover watchdog (`pgrep -f /usr/sbin/ocbmd`, as the
+  respawn wrapper), the supervisor's L2 check (the full path) and the trial self-test (an ` wpa ` command line left
+  out) look for the daemon without it; the supervisor's `pkill -x ocbmd` ends it, and the keeper starts it again.
 - **A join that fails: what tells the causes apart** (the bench of 25 Nov: the driver's `HostMlme sta0 send auth to
   bssid` with no answer, 4 times of 7, or an auth received about 2.4 s later and then no association; the network
   TEMP-DISABLED). From the 2.11 source and the stock moal driver's own messages (its strings in the factory image); the
