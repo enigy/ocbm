@@ -24,7 +24,8 @@
 #     session's set-up never meet one; but the adapter's own session with no AP yet and the hotspot heard: scans and
 #     joins on that channel alone, so the station may join before the AP comes;
 #   - with the AP up: scans and joins on its channel only (scan_freq, freq_list), and a look over the channels an AP
-#     may use each FIND_EVERY s (PARKED_FIND s, the first at once, while the adapter's own session has no host);
+#     may use each FIND_EVERY s (PARKED_FIND s while the adapter's own session has no host, the first at once when
+#     its AP is not where the hotspot was last heard);
 #   - no AP up: every channel, and a look each IDLE_FIND s.
 # A look is `ocbmd wpa ... find` (ccpa/ocbmd/src/wpa.rs): where the hotspot is heard, and the supplicant's join events
 # (names and codes only), said when they change. Its result is the state's seen= line; two looks in a row that heard

@@ -549,14 +549,14 @@ also joins the phone's Personal Hotspot as a station, so a head unit on that hot
   is never held up by a look. With the AP up the station scans AND joins on the AP's channel only (`scan_freq`,
   `freq_list`): one radio cannot join elsewhere while the AP runs, and each try off it took the radio from the phone
   (the evening bench: an authentication on 2437 beside the AP on 36, then the driver's `bss_start Fails`); a *look* over
-  the channels an AP may use (no radar channel) each 60 s, or each 20 s and the first at once while the adapter's own
-  session has no host (its video parked). With no AP up: every channel, and a look each 30 s (a wired session too). A
-  look is `ocbmd wpa <if> find` (ccpa/ocbmd/src/wpa.rs): a scan, where it heard the hotspot (from the BSS table, entries
-  it did not hear left out) and the join the supplicant starts on it, followed to its end; the keeper says the channel
-  and dBm when they change, and the join's events (names and numeric codes, never a name or an address) when they
-  change. The supplicant scans for itself (`disable_scan_offload=1`): wpa_supplicant 2.11 hands its scans to the
-  driver's scheduled scan after three that found nothing (`wpa_supplicant_req_sched_scan`), and nothing on this radio
-  has shown that the driver reports them.
+  the channels an AP may use (no radar channel) each 60 s, or each 20 s while the adapter's own session has no host (its
+  video parked), the first at once when its AP is not where the hotspot was last heard. With no AP up: every channel,
+  and a look each 30 s (a wired session too). A look is `ocbmd wpa <if> find` (ccpa/ocbmd/src/wpa.rs): a scan, where it
+  heard the hotspot (from the BSS table, entries it did not hear left out) and the join the supplicant starts on it,
+  followed to its end; the keeper says the channel and dBm when they change, and the join's events (names and numeric
+  codes, never a name or an address) when they change. The supplicant scans for itself (`disable_scan_offload=1`):
+  wpa_supplicant 2.11 hands its scans to the driver's scheduled scan after three that found nothing
+  (`wpa_supplicant_req_sched_scan`), and nothing on this radio has shown that the driver reports them.
 - **The listener and the advert stay on the station's side.** The listener takes connections from the station's
   interface only (SO_BINDTODEVICE: under Linux's weak-host model the station's address alone would also answer on the
   AP's or USB's network). The mDNS socket is bound to the group, 224.0.0.251:5353, so no unicast datagram for carplayd's
