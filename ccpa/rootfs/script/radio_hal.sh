@@ -105,31 +105,15 @@ pid_live() { [ -n "$1" ] && kill -0 "$1" 2>/dev/null; }
 # 0: written; 1: not, which the caller logs where it matters. Nothing here stops a bring-up.
 write_empty() { { true >"$1"; } 2>/dev/null; }
 
-# Single-flight per subsystem. mkdir is the portable atomic test-and-set on busybox (no flock
-# dependency). A concurrent second bring-up must not run - the supervisor can manufacture
-# overlapping edges (a respawn synthesizes a host-present edge), and stacking two insmod/rmmod
-# sequences on one module is the driver-wedge class this guards against.
-#
-# A lock MUST be reclaimable. An earlier version had no staleness handling and no trap: a killed
-# invocation (an ssh session timing out mid-bring-up is enough) left the directory behind and
-# every later call refused to run, so wireless could never come up again until reboot. A lock is
-# an optimisation against stacking, never a way to permanently disable a radio.
-# RECLAIM ON LIVENESS, NOT ON AGE. The first version aged locks out after 2 minutes, which is
-# SHORTER THAN A LEGITIMATE bt_on: against a present-but-wedged controller the convergence poll
-# calls a `timeout 5` probe up to 30 times per attempt, across 4 attempts, so a genuine bring-up
-# can hold the lock for many minutes. A concurrent caller would then declare the LIVE holder
-# stale, delete its lock, and start a second attach against the same UART - which is exactly the
-# OP_H5_SYNC collision the lock exists to prevent, manufactured by the lock itself.
-#
-# So the holder records its PID and reclaim requires the holder to be GONE. The age check stays
-# only as a backstop for a PID that died and was recycled onto an unrelated process, and it is
-# now generous enough that it can never fire against a working bring-up.
-# THE WAIT, LOOKED AT EVERY 0.2 s (20 Nov 2026). A host that comes while the boot preload holds both locks waits here
-# for each (its wifi_ap_on for wlan, its bt_on for bt), and a look every 0.5 s put up to half a second between the
-# preload letting go and the host's bring-up going on. Between looks only the sleep forks (the shell's own test sees
-# the lock go; the pid is read with `read`), so five looks a second cost no more than the two of before, which forked
-# cat and mkdir each time. Still 30 s at most, and a lock is still reclaimed only when its holder is gone. Since 2.7.1
-# every 0.05 s by default (round 4's page_trim, below).
+# Single-flight per subsystem: mkdir, busybox's atomic test-and-set. A second bring-up must not stack on a first (the
+# supervisor can manufacture overlapping edges; two insmod/rmmod sequences on one module wedge the driver).
+# RECLAIMABLE, ON LIVENESS, NOT ON AGE. A lock a killed call left must not disable a radio until reboot, and a genuine
+# bt_on against a wedged controller holds it for minutes (a `timeout 5` probe up to 30 times an attempt, 4 attempts):
+# the first version's 2-minute age-out declared that LIVE holder stale and started a second attach on the same UART,
+# the OP_H5_SYNC collision the lock exists to prevent. So the holder records its PID and reclaim needs it GONE; a
+# generous age check only backs up a PID recycled onto another process.
+# THE WAIT (20 Nov 2026): a host that comes while the boot preload holds a lock waits here, looking every 0.2 s (only
+# the sleep forks), 30 s at most; since 2.7.1 every 0.05 s by default (round 4's page_trim, below).
 lock_take() {  # $1 = subsystem
   _lk="/tmp/.radio_lock_$1"; _n=0
   # Round 4, item 6 (page_trim, on by default since 2.7.1): a look every 0.05 s while it waits (20 a round, 600 in all:
@@ -469,19 +453,10 @@ hci_rt() {
   if command -v chrt >/dev/null 2>&1; then chrt -f 1 hciconfig "$@"; else hciconfig "$@"; fi
 }
 
-# Confirmed variant - used for DECISIONS, never inside a poll loop.
-#
-# MEASURED on an RTL8822CS: a healthy, attached controller intermittently times out a name read
-# - about one attempt in four, with the next attempts a second later succeeding. So the probe is
-# not a clean oracle, and the two questions we ask it deserve DIFFERENT bars:
-#
-#   "did my attach succeed?"        -> strict. One real round-trip, poll until it answers.
-#   "is this radio already up?"     -> reluctant. A false negative here does not merely misreport;
-#                                      it sends us into rmmod + GPIO reset + re-attach against a
-#                                      working chip, which during a live session drops the phone.
-#
-# Hence: be strict to declare success, reluctant to destroy. Five spaced attempts cost up to a
-# few tens of seconds in the rare all-miss case, and only on the decision path.
+# Confirmed variant - used for DECISIONS, never inside a poll loop. MEASURED on an RTL8822CS: a healthy, attached
+# controller times out about one name read in four. "Did my attach succeed?" is strict (poll until it answers); "is this
+# radio already up?" is reluctant, since a false negative sends us into rmmod + GPIO reset + re-attach against a working
+# chip, which drops a live session's phone. Five spaced attempts, on the decision path only.
 bt_responsive_confirmed() {  # $1 = hci dev
   _t=0
   while [ "$_t" -lt 5 ]; do
@@ -591,6 +566,21 @@ wlan_driver_up() {
   return $_wdr
 }
 
+# Bench only (ADDENDUM 13 of the Wi-Fi link plan): words added to one module's insmod, from /tmp/bench_sta_modparam or,
+# for a cold boot (the preload loads the driver), /etc/ocbm/bench_sta_modparam: one line, the module's name, then its
+# NAME=VALUE words (the IW416's `moal host_mlme=0`). The file names the module, so this script names none; anything
+# but plain words is refused, said. A module already loaded takes it at its next load (the next power-up). Sets _mpx.
+mod_extra() {
+  _mpx=""
+  for _mpf in /tmp/bench_sta_modparam /etc/ocbm/bench_sta_modparam; do
+    [ -e "$_mpf" ] || continue
+    _mpm=""; _mpw=""; read -r _mpm _mpw 2>/dev/null <"$_mpf"
+    [ "$_mpm" = "$1" ] || return 0
+    case "$_mpw" in ''|*[!A-Za-z0-9_=.,\ -]*) log "[bench] sta_modparam ($_mpf): refused, not plain NAME=VALUE words" ;;
+      *) _mpx=$_mpw; log "[bench] sta_modparam ($_mpf): $1 loads with $_mpx" ;; esac
+    return 0
+  done
+}
 wlan_driver_load() {
   ko_unpack || log "driver tarball ${RADIO_KO_TARBALL:-<none>} did not unpack"
   log "wlan driver: $RADIO_WLAN_INSMOD"
@@ -608,7 +598,8 @@ wlan_driver_load() {
     else
       boot_mark wlan_start   # the boot line: the first module this boot loads (the first stamp stands)
       _wdl_loaded=1
-      $_cmd 2>&1 | sed "s|^|$LOGP   |"
+      mod_extra "$_mod"
+      $_cmd $_mpx 2>&1 | sed "s|^|$LOGP   |"
     fi
     IFS=';'
   done

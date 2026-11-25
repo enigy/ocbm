@@ -46,6 +46,7 @@ cat > "$S/insmod" <<'EOF'
 R=$STUB_R
 m=${1##*/}; m=${m%.ko}
 echo "insmod $m start" >> "$R/calls"
+shift; echo "loaded $m with: $*" >> "$R/calls"
 case "$m" in
   moal) : > "$R/state/moal.loading"; sleep "${WLAN_SECS:-0.6}"
         mkdir -p "$R/sys/class/net/sta0/wireless"; echo 02:00:00:00:00:01 > "$R/sys/class/net/sta0/address"
@@ -1157,11 +1158,36 @@ case_follow() {
   hal wifi_ap_off
 }
 
+case_modparam() {
+  # ---- ADDENDUM 13 (25 Nov 2026), bench only: words for one module's insmod, the module named by the file -----------
+  echo "== $SH: the bench's sta_modparam: words added to the named module's insmod at its load"
+  unit
+  WLAN_SECS=0.3 FW_SECS=0.3 hal bt_on
+  check 'called "loaded moal with: mod_para=nxp/wifi_mod_para.conf" && ! called "loaded moal with: mod_para=nxp/wifi_mod_para.conf "' \
+    "no file: the unit's own load line, as before"
+  unit; echo "moal host_mlme=0" > "$R/etc/ocbm/bench_sta_modparam"
+  WLAN_SECS=0.3 FW_SECS=0.3 hal bt_on
+  check 'called "loaded moal with: mod_para=nxp/wifi_mod_para.conf host_mlme=0" && called "loaded mlan with: " && ! called "loaded mlan with: host_mlme"' \
+    "on flash (a cold boot's: the preload loads the driver): moal loads with host_mlme=0, mlan as it was"
+  check 'said bt_on "[bench] sta_modparam ($R/etc/ocbm/bench_sta_modparam): moal loads with host_mlme=0"' "  said"
+  unit; echo "moal host_mlme=0" > "$R/etc/ocbm/bench_sta_modparam"; echo off > "$R/tmp/bench_sta_modparam"
+  WLAN_SECS=0.3 FW_SECS=0.3 hal bt_on
+  check '! called "host_mlme" && ! said bt_on "sta_modparam"' "  \"off\" in /tmp over the flash file: none"
+  unit; echo 'moal host_mlme=0;reboot' > "$R/tmp/bench_sta_modparam"
+  WLAN_SECS=0.3 FW_SECS=0.3 hal bt_on
+  check '! called "reboot" && ! called "host_mlme" && said bt_on "sta_modparam ($R/tmp/bench_sta_modparam): refused, not plain NAME=VALUE words"' \
+    "  anything but plain words: refused, said, the load as it was"
+  unit; echo 'mlan drvdbg=0x237 ps_mode=2' > "$R/tmp/bench_sta_modparam"
+  WLAN_SECS=0.3 FW_SECS=0.3 hal bt_on
+  check 'called "loaded mlan with: drvdbg=0x237 ps_mode=2" && called "loaded moal with: mod_para=nxp/wifi_mod_para.conf" && ! called "loaded moal with: mod_para=nxp/wifi_mod_para.conf "' \
+    "  the module the file names, and that one only"
+}
+
 . "$HERE/test_shells.sh"
 for SH in ${SHELLS:-$(distinct_shells sh dash)}; do
   command -v "$SH" >/dev/null 2>&1 || { echo "== $SH: not installed, skipped"; continue; }
   R="$T/$(basename "$SH").root"
-  for c in ${RH_ONLY:-kept order switches fallback host handover review gpio line unpack locks boot round4 fwpush follow}; do "case_$c"; done
+  for c in ${RH_ONLY:-kept order switches fallback host handover review gpio line unpack locks boot round4 fwpush follow modparam}; do "case_$c"; done
   reap
 done
 [ "$fails" -eq 0 ] && echo "radio_hal_test: all passed ($passes checks)" || { echo "radio_hal_test: $fails failed"; exit 1; }
