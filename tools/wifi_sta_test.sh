@@ -330,6 +330,6 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   printf 'iface=\nstate=unsupported\nchannel=0\n' > "$R/tmp/wifi_link_state"
   check '[ "$(fch)" = "[]" ]' "  no station on this unit: nothing"
   rm -f "$R/tmp/wifi_link_state"
-  check '[ "$(fch)" = "[]" ]' "  no keeper state yet: nothing"
+  check '[ "$(fch)" = "[0]" ]' "  a link and no keeper state yet (the keeper starting): not on the hotspot, 0"
 done
 [ "$fails" -eq 0 ] && echo "wifi_sta_test: all passed" || { echo "wifi_sta_test: $fails FAILED"; exit 1; }

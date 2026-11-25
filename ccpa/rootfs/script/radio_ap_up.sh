@@ -342,19 +342,49 @@ ap_enabled_seen() {
   case "$_ae_out" in *AP-ENABLED*) return 0 ;; esac
   return 1
 }
-# ---- STA mode: the AP on the station's channel (ADDENDUM 6, 24 Nov 2026) --------------------------------------------
-# One radio. The bench's AP on 36 beside the station on the hotspot's 149 was never joined. RADIO_AP_CHANNEL is the
-# seam's ("" no link, 0 not joined: the own channel, as before). ap_may_use: the US domain hostapd.conf asks for
+# ---- STA mode: the AP on the hotspot's channel (ADDENDUM 6 and 9, 24 Nov 2026) ---------------------------------------
+# One radio: the AP, the station and the head unit on one channel, the hotspot's. RADIO_AP_CHANNEL is the seam's: the
+# station's channel, 0 not on the hotspot, "" no link. ap_may_use: the US domain hostapd.conf asks for
 # (country_code=US), no DFS: 1-11, 36-48, 149-165. ht40_side: its pair's side (_hs); none on 165 and 14.
 ap_may_use() { case "$1" in [1-9]|1[01]|36|40|44|48|149|153|157|161|165) return 0 ;; esac; return 1; }
 ht40_side() { _hs=""; case "$1" in [1-7]|36|44|149|157) _hs=+ ;; [89]|1[0-3]|40|48|153|161) _hs=- ;; esac; }
 say() { echo "$L $*"; echo "$L $*" 2>/dev/null >>"$AP_BOXLOG"; }   # the box log too
+# The adapter's own session with no host (M2: ocbmd's mark AP_PARKED), the station not on the hotspot: the AP waits up
+# to HEAD_START tenths of a second for the keeper's first look (its state's 4th line, seen=<ch> <up s>) while the
+# keeper lives, then takes the channel the look heard the hotspot on, else the hotspot's last (wifi_link_channel), else
+# its own. No other start waits (a USB host's never). Sets _fc.
+AP_PARKED=/tmp/wifi_self_parked; STA_ST=/tmp/wifi_link_state; STA_KEPT=/etc/ocbm/wifi_link_channel
+STA_LOCK=/tmp/.wifi_sta_lock/pid; HEAD_START=${HEAD_START:-40}
+ap_head() {
+  _hn=0; _hw=""
+  while :; do
+    _a=""; _b=""; _c=""; _d=""; _k=""
+    { read -r _a; read -r _b; read -r _c; read -r _d; } 2>/dev/null <"$1$STA_ST"
+    [ "$_b" = state=joined ] && { _fc=${_c#channel=}; _hw="the station joined the hotspot there"; break; }
+    case $_d in seen=*) break ;; esac
+    read -r _k 2>/dev/null <"$1$STA_LOCK"
+    [ "$_hn" -lt "$HEAD_START" ] && [ -e "$1$AP_PARKED" ] && [ -n "$_k" ] && kill -0 "$_k" 2>/dev/null || break
+    _hn=$((_hn + 1)); sleep 0.1
+  done
+  if [ -z "$_hw" ]; then
+    _d=${_d#seen=}; _d=${_d%% *}
+    case $_d in
+      [1-9]*) _fc=$_d; _hw="heard there by the station's look" ;;
+      *) _k=""; read -r _k 2>/dev/null <"$1$STA_KEPT"
+         ap_may_use "$_k" && { _fc=$_k; _hw="the hotspot's last (not heard now)"; } ;;
+    esac
+  fi
+  say "STA mode, the adapter's own session: ${_hw:+channel $_fc, }${_hw:-the hotspot not heard and no last channel}" \
+      "(waited $((_hn * 100)) ms for the station)"
+}
 # hostapd's configuration (_hrun) under root $1: AP_SESSION (tmpfs, 0600: hostapd.conf with the station's channel, band
-# and HT40 side) when it follows, else hostapd.conf, never written for it. Sets ch; _own: the AP's own.
+# and HT40 side; 20 MHz and no VHT at 2.4 GHz, as the factory file's own 2.4 GHz line) when it follows, else
+# hostapd.conf, never written for it. Sets ch; _own: the AP's own.
 AP_SESSION=/tmp/hostapd_session.conf
 ap_follow() {
   _hrun="$1/etc/hostapd.conf"; _own=$ch; _fc=${RADIO_AP_CHANNEL:-}
   rm -f "$1$AP_SESSION"
+  [ "$_fc" = 0 ] && [ -e "$1$AP_PARKED" ] && ap_head "$1"
   case "$_fc" in
     ''|"$ch") return 0 ;;
     0) say "STA mode: the station is not on the hotspot - the AP keeps its own channel $ch"; return 0 ;;
@@ -364,11 +394,13 @@ ap_follow() {
     case "$_fc" in 5[2-9]|6[0-4]|1[0-3][0-9]|14[0-4]) _w="a radar (DFS) channel" ;; esac
     say "STA mode: the station is on channel $_fc, $_w - the AP keeps its own channel $ch"; return 0
   fi
-  _hm=a; [ "$_fc" -le 14 ] && _hm=g; ht40_side "$_fc"
-  if ( umask 077; sed -e "s/^channel=.*/channel=$_fc/; s/^hw_mode=.*/hw_mode=$_hm/; /^vht_oper_c/d" \
-         -e "/^ht_capab=/s/\[HT40[-+]\]/${_hs:+[HT40$_hs]}/" "$_hrun" > "$1$AP_SESSION.new" ) \
-     && mv -f "$1$AP_SESSION.new" "$1$AP_SESSION"; then
-    say "STA mode: the AP follows the station to channel $_fc (hw_mode=$_hm${_hs:+, HT40$_hs})"
+  _hm=a; _vd='/^vht_oper_c/d'; _sg='[SHORT-GI-40]'; ht40_side "$_fc"
+  [ "$_fc" -le 14 ] && { _hm=g; _vd='/^vht_/d; /^ieee80211ac=/d'; _sg=""; _hs=""; }
+  _bw="HT40$_hs"; [ -n "$_hs" ] || _bw="20 MHz"
+  if ( umask 077; sed -e "s/^channel=.*/channel=$_fc/; s/^hw_mode=.*/hw_mode=$_hm/; $_vd" \
+         -e "/^ht_capab=/s/\[HT40[-+]\]/${_hs:+[HT40$_hs]}/" -e "/^ht_capab=/s/\[SHORT-GI-40\]/$_sg/" \
+         "$_hrun" > "$1$AP_SESSION.new" ) && mv -f "$1$AP_SESSION.new" "$1$AP_SESSION"; then
+    say "STA mode: the AP follows the station to channel $_fc (hw_mode=$_hm, $_bw)"
     ch=$_fc; _hrun="$1$AP_SESSION"
   else
     rm -f "$1$AP_SESSION.new"; say "STA mode: channel $_fc not written - the AP keeps its own channel $ch"

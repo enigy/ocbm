@@ -432,13 +432,14 @@ ap_iface() {
   wlan_iface
 }
 # The station's channel for the AP (ADDENDUM 6; radio_ap_up.sh's RADIO_AP_CHANNEL), from the keeper's state (iface=,
-# state=, channel=, in that order): joined, its channel; joining, 0; no link or no state, "". No fork. Sets _fch.
+# state=, channel=, in that order): joined, its channel; not yet, or no state yet, 0; no station, or no link, "". No
+# fork. Sets _fch.
 WIFI_LINK_STATE=/tmp/wifi_link_state
 sta_channel() {
   _fch=""; _sts=""; _stc=""
   [ -f "$WIFI_LINK_FILE" ] || return 0
   { read -r _sti; read -r _sts; read -r _stc; } 2>/dev/null <"$WIFI_LINK_STATE"
-  case $_sts in state=joined) _fch=${_stc#channel=} ;; state=joining) _fch=0 ;; esac
+  case $_sts in state=joined) _fch=${_stc#channel=} ;; state=unsupported) ;; *) _fch=0 ;; esac
 }
 
 hci_dev() {

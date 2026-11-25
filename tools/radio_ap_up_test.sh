@@ -366,24 +366,73 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   }
   SC="$F/tmp/hostapd_session.conf"
   others() { grep -v -e '^channel=' -e '^hw_mode=' -e '^ht_capab=' "$1"; }
-  while read -r fc hm hs; do
+  # 5 GHz: HT40 on its pair's side; 2.4 GHz (ADDENDUM 9: the truck's hotspot, Maximize Compatibility): 20 MHz, the
+  # factory file's own 2.4 GHz line ([SHORT-GI-20] alone).
+  while read -r fc hm hs gi; do   # "." for none
+    [ "$hs" = . ] && hs=""; [ "${gi:-.}" = . ] && gi=""
     mkf; r=$(fol "$fc"); d="HT40$hs"; [ -n "$hs" ] || d="no HT40 (20 MHz)"
-    check '[ "$r" = "$fc $SC" ] && grep -qx "channel=$fc" "$SC" && grep -qx "hw_mode=$hm" "$SC" && grep -qxF "ht_capab=[SHORT-GI-20][SHORT-GI-40]${hs:+[HT40$hs]}" "$SC"' \
+    check '[ "$r" = "$fc $SC" ] && grep -qx "channel=$fc" "$SC" && grep -qx "hw_mode=$hm" "$SC" && grep -qxF "ht_capab=[SHORT-GI-20]${gi:+[SHORT-GI-40]}${hs:+[HT40$hs]}" "$SC"' \
       "the station on $fc: the AP follows, hw_mode=$hm, $d"
     check 'cmp -s "$F/etc/hostapd.conf" "$F.ref" && [ -z "$(find "$F/etc" -type f -newer "$F.mark")" ] && [ "$(others "$SC")" = "$(others "$F.ref")" ]' \
       "  hostapd.conf on flash untouched; the session's every other line as it has it, the passphrase too"
   done <<'EOF'
-149 a +
-153 a -
-157 a +
-161 a -
-165 a
-40 a -
-44 a +
-48 a -
-6 g +
-11 g -
+149 a + 40
+153 a - 40
+157 a + 40
+161 a - 40
+165 a . 40
+40 a - 40
+44 a + 40
+48 a - 40
+1 g . .
+6 g . .
+11 g . .
 EOF
+  mkf; r=$(fol 6)
+  check 'grep -q "the AP follows the station to channel 6 (hw_mode=g, 20 MHz)" "$F/tmp/box.log"' "  a 2.4 GHz follow says 20 MHz"
+  mkf; printf 'ieee80211ac=1\nvht_capab=[SHORT-GI-80]\nvht_oper_chwidth=1\nvht_oper_centr_freq_seg0_idx=42\n' >> "$F/etc/hostapd.conf"
+  r=$(fol 11)
+  check '! grep -q -e "^ieee80211ac=" -e "^vht_" "$SC" && grep -qx "#ieee80211ac=1" "$SC" && grep -qx "ieee80211ac=1" "$F/etc/hostapd.conf"' \
+    "  no VHT at 2.4 GHz (the flash file keeps its lines; a commented one stays commented)"
+
+  # ADDENDUM 9: the adapter's own session with no host (ocbmd's parked mark), the station not on the hotspot: the AP
+  # waits for the station's first look (HEAD_START), then takes the channel it heard, else the hotspot's last, else its
+  # own. Any other start (a USB host's) never waits.
+  echo "== $sh: STA mode, the adapter's own session: the AP waits for the station's look, then the hotspot's channel"
+  park() {  # $1 the keeper's pid (a live one when not given)
+    mkf; mkdir -p "$F/etc/ocbm" "$F/tmp/.wifi_sta_lock"; : > "$F/tmp/wifi_self_parked"; echo "${1:-$$}" > "$F/tmp/.wifi_sta_lock/pid"
+  }
+  st() { { echo iface=sta0; echo "state=$1"; echo "channel=$2"; [ -z "${3:-}" ] || echo "$3"; } > "$F/tmp/wifi_link_state"; }
+  last_ch() { echo "$1" > "$F/etc/ocbm/wifi_link_channel"; }
+  pfol() {  # $1 RADIO_AP_CHANNEL, $2 HEAD_START: "ch _hrun"
+    env RADIO_AP_CHANNEL="$1" HEAD_START="$2" RADIO_AP_UP_FUNCS=1 AP_BOXLOG="$F/tmp/box.log" OCBM_TEST_PATH="${OCBM_TEST_PATH:-}" \
+      "$sh" -c '. "$1"; ch=36; ap_follow "$2" > "$2.out" 2>&1; echo "$ch $_hrun"' sh "$AP" "$F"
+  }
+  logged() { grep -q "$1" "$F/tmp/box.log"; }
+  park; st joining 0 "seen=6 12"; last_ch 149; r=$(pfol 0 40)
+  check '[ "$r" = "6 $SC" ] && grep -qx "channel=6" "$SC" && grep -qx "hw_mode=g" "$SC" && logged "own session: channel 6, heard there by the station.s look (waited 0 ms"' \
+    "the look heard the hotspot on 6: the AP takes 6 at once, 2.4 GHz (not the last channel, 149)"
+  park; st joining 0 "seen=0 12"; last_ch 11; r=$(pfol 0 40)
+  check '[ "$r" = "11 $SC" ] && logged "own session: channel 11, the hotspot.s last (not heard now)"' \
+    "the look heard nothing: the hotspot's last channel, 11"
+  park; st joining 0 "seen=0 12"; last_ch 100; r=$(pfol 0 40)
+  check '[ "$r" = "36 $F/etc/hostapd.conf" ] && logged "the hotspot not heard and no last channel" && logged "not on the hotspot - the AP keeps its own channel 36"' \
+    "  a last channel no AP may use (100): the AP's own, 36"
+  park; last_ch 6; ( sleep 0.6; st joining 0 "seen=1 13" ) & r=$(pfol 0 40); wait
+  check '[ "$r" = "1 $SC" ] && logged "channel 1, heard there by the station.s look (waited [4-9]00 ms"' \
+    "no look yet: the AP waits for it (0.6 s), then takes what it heard (1)"
+  park; last_ch 6; st joining 0; ( sleep 0.3; st joined 11 "seen=11 13" ) & r=$(pfol 0 40); wait
+  check '[ "$r" = "11 $SC" ] && logged "channel 11, the station joined the hotspot there"' "  the station joins meanwhile: its channel"
+  park; last_ch 6; r=$(pfol 0 5)
+  check '[ "$r" = "6 $SC" ] && logged "channel 6, the hotspot.s last (not heard now) (waited 500 ms"' \
+    "no look within HEAD_START (0.5 s here): the hotspot's last"
+  park "$(sh -c 'echo $$')"; last_ch 6; r=$(pfol 0 40)
+  check '[ "$r" = "6 $SC" ] && logged "(waited 0 ms"' "  no keeper running: no wait"
+  park; rm -f "$F/tmp/wifi_self_parked"; last_ch 6; t0=$(date +%s); r=$(pfol 0 40)
+  check '[ "$r" = "36 $F/etc/hostapd.conf" ] && ! logged "own session" && [ $(( $(date +%s) - t0 )) -le 1 ]' \
+    "not the adapter's own session (a USB host's start, say): no wait, its own channel, as before"
+  park; st joined 149; last_ch 6; r=$(pfol 149 40)
+  check '[ "$r" = "149 $SC" ] && ! logged "own session"' "the station on the hotspot when the seam asked: followed, no look waited for"
   mkf; r=$(fol 149)
   check '[ "$(ls -l "$SC" | cut -c1-10)" = "-rw-------" ] && [ ! -e "$SC.new" ]' "the session's configuration is 0600 (the AP's passphrase is in it)"
   check 'grep -q "the AP follows the station to channel 149 (hw_mode=a, HT40+)" "$F/tmp/box.log" && grep -q "follows the station to channel 149" "$F.out"' \
@@ -433,6 +482,10 @@ EOF
     "  the session's configuration first, then hostapd.conf; the session's gone; in the box log too"
   check '[ $((t1 - t0)) -le 5 ]' "  within a few seconds, not the converge step's 12 s bound"
   ended; rm -f "$S/refuse" "$S/hostapd.confs"
+  : > "$S/hostapd.confs"; FOLLOW=6; start_ap "$sh"; unset FOLLOW
+  check '[ "$(cat "$R.rc")" = 0 ] && grep -q "AP up: ssid=[^ ]* ip=192.168.43.1 ch=6 if=sta0 dhcp=yes" "$R.out" && grep -qx "hw_mode=g" "$R/tmp/hostapd_session.conf" && grep -qx "ht_capab=" "$R/tmp/hostapd_session.conf"' \
+    "the station on 6 (2.4 GHz, the truck's hotspot): the AP up on 6, hw_mode=g, 20 MHz"
+  ended; rm -f "$S/hostapd.confs"
 
   # do_wifi_ap_off itself, its commands stood in for (the second review, item 5): the AP's server seen gone before it
   # returns, so that a teardown which killed and went on (2.6.1's) fails here.
