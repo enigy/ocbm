@@ -6,10 +6,10 @@
 //! wpa_supplicant 2.11's UNIX control interface, as its own client library and server do it (`src/common/wpa_ctrl.c`
 //! `wpa_ctrl_open2` / `wpa_ctrl_request`, `wpa_supplicant/ctrl_iface_unix.c`): a datagram socket at `DIR/IFACE`, DIR
 //! being the configuration's `ctrl_interface` (the keeper writes `/var/run/wpa_supplicant`, the default here). The
-//! client binds a socket of its own, which the supplicant answers with `sendto` to the address it came from, connects to
-//! `DIR/IFACE` and sends the request text; one datagram comes back: `OK\n`, `FAIL\n`, `UNKNOWN COMMAND\n` or the
-//! command's text, at most 4096 B. A datagram that begins with `<` or `IFNAME=` is an event for an attached monitor, not
-//! the reply, and is passed by. wpa_ctrl waits 10 s for the reply, and so does this.
+//! client binds a socket of its own, which the supplicant answers with `sendto` to the address it came from,
+//! connects to `DIR/IFACE` and sends the request text; one datagram comes back: `OK\n`, `FAIL\n`, `UNKNOWN COMMAND\n`
+//! or the command's text, at most 4096 B. A datagram that begins with `<` or `IFNAME=` is an event for an attached
+//! monitor, not the reply, and is passed by. wpa_ctrl waits 10 s for the reply, and so does this.
 //!
 //! The client's socket (ADDENDUM 9, 24 Nov 2026: one `/tmp/ocbmd_wpa_<pid>` was found left behind, a request killed
 //! mid-way): on Linux an abstract name, `\0ocbmd_wpa_<pid>`, which is no file, so nothing is left whatever ends the run
@@ -29,9 +29,9 @@
 //! `event ...` lines: event names and numeric codes only ([`mask`]). Nothing it prints comes from a BSSID or an SSID.
 //!
 //! Exit status: 0 a reply came, whatever it says (as wpa_cli), or `find`'s scan ended; 1 no supplicant answered on
-//! `DIR/IFACE` within 10 s, the socket failed, or `find`'s scan failed or did not end (said on stderr); 2 usage. Nothing
-//! goes to stdout but the reply. Run before ocbmd's single-instance lock, as `jffs2-extract` is: it never touches the
-//! accessory, the daemon's files or its sockets.
+//! `DIR/IFACE` within 10 s, the socket failed, or `find`'s scan failed or did not end (said on stderr); 2 usage.
+//! Nothing goes to stdout but the reply. Run before ocbmd's single-instance lock, as `jffs2-extract` is: it never
+//! touches the accessory, the daemon's files or its sockets.
 
 use std::io::{Error, ErrorKind, Write};
 use std::os::unix::net::UnixDatagram;
@@ -106,7 +106,7 @@ pub fn cli(args: &[String]) -> Option<i32> {
 }
 
 fn usage() -> i32 {
-    eprintln!("usage: ocbmd wpa [-p CTRL_DIR] IFACE COMMAND [ARG...]   e.g. ocbmd wpa sta0 status; ... sta0 find [FREQS]");
+    eprintln!("usage: ocbmd wpa [-p CTRL_DIR] IFACE COMMAND [ARG...]   e.g. ocbmd wpa sta0 status; sta0 find [FREQS]");
     2
 }
 
@@ -227,7 +227,7 @@ fn ask(dir: &Path, iface: &str, req: &str, client_dir: &Path, wait: Duration) ->
     Conn::open(dir, iface, client_dir)?.ask(req, wait)
 }
 
-// ---- find ------------------------------------------------------------------------------------------------------------
+// ---- find -----------------------------------------------------------------------------------------------------------
 
 /// `find`'s result: the network's sightings in the look as (channel, dBm), the strongest first, and the masked events.
 #[derive(Debug, Default, PartialEq)]
@@ -261,9 +261,9 @@ fn find(dir: &Path, iface: &str, freqs: Option<&str>, client_dir: &Path) -> std:
 
 /// A join's end, for a look that found the supplicant joining (FAIL-BUSY) and for the watch after a scan.
 fn join_end(e: &str) -> bool {
-    ["CTRL-EVENT-CONNECTED", "CTRL-EVENT-DISCONNECTED", "CTRL-EVENT-ASSOC-REJECT", "CTRL-EVENT-AUTH-REJECT", "CTRL-EVENT-SSID-TEMP-DISABLED"]
+    ["CONNECTED", "DISCONNECTED", "ASSOC-REJECT", "AUTH-REJECT", "SSID-TEMP-DISABLED"]
         .iter()
-        .any(|p| e.starts_with(p))
+        .any(|p| e.strip_prefix("CTRL-EVENT-").is_some_and(|r| r.starts_with(p)))
 }
 
 fn look(c: &mut Conn, freqs: Option<&str>, t0: Instant) -> std::io::Result<Found> {
@@ -319,7 +319,8 @@ fn sightings(c: &mut Conn, ssid: &[u8], fresh: u64) -> std::io::Result<Vec<(u32,
     let mut seen = Vec::new();
     let mut from = 0u64;
     for _ in 0..16 {
-        let page = String::from_utf8_lossy(&c.ask(&format!("BSS RANGE={from}- MASK={BSS_MASK}"), REPLY_WAIT)?).into_owned();
+        let page = c.ask(&format!("BSS RANGE={from}- MASK={BSS_MASK}"), REPLY_WAIT)?;
+        let page = String::from_utf8_lossy(&page);
         let (mut id, mut freq, mut level, mut age, mut name) = (None, 0u32, 0i32, u64::MAX, None);
         let mut last = false;
         let mut next = None;
@@ -435,13 +436,18 @@ fn mask(e: &str) -> Option<String> {
     }
     if e.starts_with("Trying to associate") {
         // The last `freq=`: the event's own, after the quoted SSID.
-        let f: String = e.rsplit_once("freq=").map(|(_, r)| r.chars().take_while(char::is_ascii_digit).collect()).unwrap_or_default();
+        let digits = |r: &str| r.chars().take_while(char::is_ascii_digit).collect::<String>();
+        let f = e.rsplit_once("freq=").map(|(_, r)| digits(r)).unwrap_or_default();
         return Some(if f.is_empty() { "trying".into() } else { format!("trying freq={f}") });
     }
-    [("Associated with", "associated"), ("Authentication with", "authentication timed out"), ("WPA: 4-Way Handshake failed", "4-way handshake failed (the key?)")]
-        .iter()
-        .find(|(p, _)| e.starts_with(p))
-        .map(|(_, w)| w.to_string())
+    [
+        ("Associated with", "associated"),
+        ("Authentication with", "authentication timed out"),
+        ("WPA: 4-Way Handshake failed", "4-way handshake failed (the key?)"),
+    ]
+    .iter()
+    .find(|(p, _)| e.starts_with(p))
+    .map(|(_, w)| w.to_string())
 }
 
 /// `s` without its quoted parts (`"..."` and `'...'`, a backslash escaping the next character inside one).
@@ -542,7 +548,8 @@ mod tests {
         assert_eq!(cli(&words(&["ocbmd", "wpa", "-p", "/nonexistent"])), Some(2));
         let none = words(&["ocbmd", "wpa", "-p", "/nonexistent", "sta0", "status"]);
         assert_eq!(cli(&none), Some(1), "nothing answers there");
-        assert_eq!(cli(&words(&["ocbmd", "wpa", "-p", "/nonexistent", "sta0", "find"])), Some(1), "find: nothing answers");
+        let find = words(&["ocbmd", "wpa", "-p", "/nonexistent", "sta0", "find"]);
+        assert_eq!(cli(&find), Some(1), "find: nothing answers");
     }
 
     // The hotspot of these tests: a made-up name with an apostrophe from outside ASCII, as phones name theirs.
@@ -560,7 +567,8 @@ mod tests {
         assert_eq!(conf_ssid(b"\"a \"quoted\" one\"").unwrap(), b"a \"quoted\" one", "its quoted form, as it is");
         assert_eq!(conf_ssid(b"FAIL\n"), None);
         assert_eq!(conf_ssid(b"abc"), None);
-        assert_eq!([chan_of(2412), chan_of(2437), chan_of(2462), chan_of(2484), chan_of(5180), chan_of(5745)], [1, 6, 11, 14, 36, 149]);
+        let chans = [2412, 2437, 2462, 2484, 5180, 5745].map(chan_of);
+        assert_eq!(chans, [1, 6, 11, 14, 36, 149]);
         assert_eq!(chan_of(5955), 0, "6 GHz: never this radio's");
     }
 
@@ -568,19 +576,34 @@ mod tests {
     fn events_keep_their_names_and_codes_and_lose_every_name_and_address() {
         let cases = [
             ("CTRL-EVENT-ASSOC-REJECT bssid=02:11:22:33:44:55 status_code=1", Some("assoc-reject status_code=1")),
-            ("CTRL-EVENT-AUTH-REJECT 02:11:22:33:44:55 auth_type=0 auth_transaction=2 status_code=17", Some("auth-reject auth_type=0 auth_transaction=2 status_code=17")),
-            ("CTRL-EVENT-DISCONNECTED bssid=02:11:22:33:44:55 reason=3 locally_generated=1", Some("disconnected reason=3 locally_generated=1")),
+            (
+                "CTRL-EVENT-AUTH-REJECT 02:11:22:33:44:55 auth_type=0 auth_transaction=2 status_code=17",
+                Some("auth-reject auth_type=0 auth_transaction=2 status_code=17"),
+            ),
+            (
+                "CTRL-EVENT-DISCONNECTED bssid=02:11:22:33:44:55 reason=3 locally_generated=1",
+                Some("disconnected reason=3 locally_generated=1"),
+            ),
             ("CTRL-EVENT-CONNECTED - Connection to 02:11:22:33:44:55 completed [id=0 id_str=]", Some("connected")),
-            ("CTRL-EVENT-SSID-TEMP-DISABLED id=0 ssid=\"reason=SECRET_NAME \\\" status_code=9\" auth_failures=2 duration=20 reason=CONN_FAILED", Some("ssid-temp-disabled auth_failures=2 duration=20 reason=CONN_FAILED")),
+            (
+                concat!(
+                    "CTRL-EVENT-SSID-TEMP-DISABLED id=0 ssid=\"reason=SECRET_NAME \\\" status_code=9\" ",
+                    "auth_failures=2 duration=20 reason=CONN_FAILED"
+                ),
+                Some("ssid-temp-disabled auth_failures=2 duration=20 reason=CONN_FAILED"),
+            ),
             ("CTRL-EVENT-SSID-REENABLED id=0 ssid=\"Example\"", Some("ssid-reenabled")),
             ("CTRL-EVENT-NETWORK-NOT-FOUND ", Some("network-not-found")),
             ("CTRL-EVENT-SCAN-FAILED ret=-16 retry=1", Some("scan-failed ret=-16")),
-            ("CTRL-EVENT-CHANNEL-SWITCH freq=2437 ht_enabled=1 ch_offset=0 ch_width=20 MHz cf1=2437 cf2=0", Some("channel-switch freq=2437 ch_width=20")),
+            (
+                "CTRL-EVENT-CHANNEL-SWITCH freq=2437 ht_enabled=1 ch_offset=0 ch_width=20 MHz cf1=2437 cf2=0",
+                Some("channel-switch freq=2437 ch_width=20"),
+            ),
             ("Trying to associate with 02:11:22:33:44:55 (SSID='freq=1234 X' freq=2437 MHz)", Some("trying freq=2437")),
             ("Trying to associate with SSID 'Example'", Some("trying")),
             ("Associated with 02:11:22:33:44:55", Some("associated")),
             ("Authentication with 02:11:22:33:44:55 timed out.", Some("authentication timed out")),
-            ("WPA: 4-Way Handshake failed - pre-shared key may be incorrect", Some("4-way handshake failed (the key?)")),
+            ("WPA: 4-Way Handshake failed - pre-shared key may be wrong", Some("4-way handshake failed (the key?)")),
             ("CTRL-EVENT-SCAN-RESULTS ", None),
             ("CTRL-EVENT-BSS-ADDED 3 02:11:22:33:44:55", None),
             ("WPA: Key negotiation completed with 02:11:22:33:44:55 [PTK=CCMP GTK=CCMP]", None),
@@ -653,14 +676,18 @@ mod tests {
         let dir = scratch("find");
         // Two pages (the first cut where the reply buffer ended): another network, the hotspot heard now on 6 and
         // seen minutes ago on 149, another network named alike in part, then the table's last entry.
-        let p1 = entry(4, 2412, -70, 0, "Other") + &entry(7, 2437, -40, 1, NAME_TXT) + &entry(9, 5745, -55, 300, NAME_TXT);
+        let p1 = entry(4, 2412, -70, 0, "Other") + &entry(7, 2437, -40, 1, NAME_TXT);
+        let p1 = p1 + &entry(9, 5745, -55, 300, NAME_TXT);
         let mut p2 = entry(10, 2462, -60, 0, "Example") + &entry(12, 5180, -80, 0, NAME_TXT);
         p2.truncate(p2.len() - 5);
         p2.push_str("####\n");
         let join = vec![
-            "<3>Trying to associate with 02:11:22:33:44:55 (SSID='Example\\xe2\\x80\\x99s Hotspot' freq=2437 MHz)".to_string(),
+            format!("<3>Trying to associate with 02:11:22:33:44:55 (SSID='{NAME_TXT}' freq=2437 MHz)"),
             "<3>CTRL-EVENT-ASSOC-REJECT bssid=02:11:22:33:44:55 status_code=1".to_string(),
-            "<3>CTRL-EVENT-SSID-TEMP-DISABLED id=0 ssid=\"Example\\xe2\\x80\\x99s Hotspot\" auth_failures=1 duration=10 reason=CONN_FAILED".to_string(),
+            format!(
+                "<3>CTRL-EVENT-SSID-TEMP-DISABLED id=0 ssid=\"{NAME_TXT}\" {}",
+                "auth_failures=1 duration=10 reason=CONN_FAILED"
+            ),
         ];
         let sup = finder(&dir, false, vec![p1, p2], join);
         let t = Instant::now();
@@ -673,7 +700,8 @@ mod tests {
             "ssid-temp-disabled auth_failures=1 duration=10 reason=CONN_FAILED".to_string(),
         ]);
         assert_eq!(asked[..3], ["ATTACH", "GET_NETWORK 0 ssid", "SCAN freq=2412-2462,5180-5240,5745-5825"]);
-        assert_eq!(asked[3..], ["BSS RANGE=0- MASK=0x21285", "BSS RANGE=10- MASK=0x21285", "DETACH"], "the next page from the id after the cut");
+        let pages = ["BSS RANGE=0- MASK=0x21285", "BSS RANGE=10- MASK=0x21285", "DETACH"];
+        assert_eq!(asked[3..], pages, "the next page from the id after the cut");
         assert!(t.elapsed() < Duration::from_secs(3), "the join followed until quiet, not to the 4 s bound");
         let out = render(&f);
         assert_eq!(out.lines().next(), Some("seen 6 -40"));
