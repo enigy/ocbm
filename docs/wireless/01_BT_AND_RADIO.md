@@ -654,16 +654,16 @@ also joins the phone's Personal Hotspot as a station, so a head unit on that hot
     alike on 2412 and 2437, and so did the client-only driver mode (`drv_mode=1`). Nothing the driver sends differs by
     band (ADDENDUM 15). What fails is the station's unicast exchange: the authentication in the stay, the firmware-built
     association after one answered in time (0xfffc, also with the bench's late copy), the firmware's own join (0xfffa);
-    its broadcast probes and their answers work (its directed scans found the hidden hotspot), and so does the AP. Every
-    in-time answer at 2.4 GHz came with a channel event (24 Nov: the AP on 36 and the stay to 2437; case a: hostapd
-    starting on 6 during the stay; otherwise the stay's own end), and the same channel with the AP running joined at
-    5 GHz (36) but not at 2.4 GHz (6). Ranked (ADDENDUM 18): a 2.4 GHz-only hold of the station's unicast frames in the
-    combo firmware, let go by a channel change, Bluetooth's coexistence arbiter being the chip's one 2.4-only part (its
-    static set-up, not its traffic: the controller was idle in btd's armed state, page and inquiry scan off, nothing
-    paging); the firmware's antenna choice; the module's own calibration file, shipped and never loaded; the station's
-    802.11d domain, sent band 0 then band 1 so that the last is the 5 GHz one (but 802.11d is off, and the firmware's
-    join re-sends the 2.4 GHz one before it joins). The stay alone is not it: the association fails with no stay.
-    docs/ops/02_TESTING.md has the no-flash steps that split these.
+    its broadcast probes and their answers work (its directed scans found the hidden hotspot), and so does the AP. The
+    in-time answers at 2.4 GHz whose moment is known came with a channel event (24 Nov: the AP on 36 and the stay to
+    2437; case a: hostapd starting on 6 during the stay; otherwise the stay's own end; two have no known event), and the
+    same channel with the AP running joined at 5 GHz (36) but not at 2.4 GHz (6). Ranked (ADDENDUM 18): a 2.4 GHz-only
+    hold of the station's unicast frames in the combo firmware, let go by a channel change, Bluetooth's coexistence
+    arbiter being the chip's one 2.4-only part (its static set-up, not its traffic: the controller was idle in btd's
+    armed state, page and inquiry scan off, nothing paging); the firmware's antenna choice; the module's own calibration
+    file, shipped and never loaded; the station's 802.11d domain, sent band 0 then band 1 so that the last is the 5 GHz
+    one (but 802.11d is off, and the firmware's join re-sends the 2.4 GHz one before it joins). The stay alone is not
+    it: the association fails with no stay. docs/ops/02_TESTING.md has the no-flash steps that split these.
   - *What the host can set there* (ADDENDUM 18, read in the factory moal and mlan): no coexistence parameter or conf key
     (the driver's robust coex is one TLV, 0x021b, an external Bluetooth-request pin; the firmware's event 0x76 only
     tunes aggregation windows and scan times); `antcfg` (1 or 2 an antenna, 0xffff diversity), 0 in the stock file so
