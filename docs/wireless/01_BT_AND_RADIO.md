@@ -648,17 +648,32 @@ also joins the phone's Personal Hotspot as a station, so a head unit on that hot
     (`WiFi Reset due to auth timeout cnt 5`, `Start to process hanging`, with `auto_fw_reload` the firmware loaded
     again), but only on its data path; the command path this firmware uses returns before the count. A second count
     does reset the radio: five deauthentications received while connected (`WiFi Reset due to EAPOL timeout cnt 5`).
-  - *INFERRED, not shown by any code read:* why the answer comes only as the stay ends. Every sample lands 10-20 ms
-    after the expiry, and the one answered in time (ADDENDUM 12, case a, at +1842 ms) came as hostapd started the uAP
-    on the same channel. **It is 2.4 GHz only**: the control of 25 Nov 18:10 (the same build and boot, the hotspot moved
-    to 149) authenticated in 7 ms and joined in 39 ms, three seconds after an unanswered attempt on 2437; the 24 Nov
-    joins were at 5 GHz but one. Nothing the driver sends differs by band (the stay, the command's fields, the
-    receive mask: read for ADDENDUM 15), so the cause is the firmware's or the air's. Ranked: Bluetooth's share of 2.4
-    GHz on this combo chip (`hciconfig hci0 down` closes only the host's side: a link or page scan the controller
-    holds goes on), or the phone's own; a stay on channel 6 (a P2P social channel) kept as a listen; less likely the
-    rates or power (the AP's frames take the same command and table and reach the phone). The firmware's own
-    association after an answer in time also went unanswered once (0xfffc). The firmware's coexistence changes print
-    `EVENT: BT coex wlan param update` and `coex_scan=.. coex_win=.. tx_win=.. rx_win=..` with MEVENT (0x20).
+  - *Why the answer comes only as the stay ends* (INFERRED; ADDENDA 12 to 18 of the hand-off plan). **It is 2.4 GHz
+    only, and neither the phone, the AP beside the station nor the driver's mode**: the control of 25 Nov 18:10 (the
+    hotspot moved to 149) authenticated in 7 ms and joined in 39 ms; a second network on ordinary access points failed
+    alike on 2412 and 2437, and so did the client-only driver mode (`drv_mode=1`). Nothing the driver sends differs by
+    band (ADDENDUM 15). What fails is the station's unicast exchange: the authentication in the stay, the firmware-built
+    association after one answered in time (0xfffc, also with the bench's late copy), the firmware's own join (0xfffa);
+    its broadcast probes and their answers work (its directed scans found the hidden hotspot), and so does the AP. Every
+    in-time answer at 2.4 GHz came with a channel event (24 Nov: the AP on 36 and the stay to 2437; case a: hostapd
+    starting on 6 during the stay; otherwise the stay's own end), and the same channel with the AP running joined at
+    5 GHz (36) but not at 2.4 GHz (6). Ranked (ADDENDUM 18): a 2.4 GHz-only hold of the station's unicast frames in the
+    combo firmware, let go by a channel change, Bluetooth's coexistence arbiter being the chip's one 2.4-only part (its
+    static set-up, not its traffic: the controller was idle in btd's armed state, page and inquiry scan off, nothing
+    paging); the firmware's antenna choice; the module's own calibration file, shipped and never loaded; the station's
+    802.11d domain, sent band 0 then band 1 so that the last is the 5 GHz one (but 802.11d is off, and the firmware's
+    join re-sends the 2.4 GHz one before it joins). The stay alone is not it: the association fails with no stay.
+    docs/ops/02_TESTING.md has the no-flash steps that split these.
+  - *What the host can set there* (ADDENDUM 18, read in the factory moal and mlan): no coexistence parameter or conf key
+    (the driver's robust coex is one TLV, 0x021b, an external Bluetooth-request pin; the firmware's event 0x76 only
+    tunes aggregation windows and scan times); `antcfg` (1 or 2 an antenna, 0xffff diversity), 0 in the stock file so
+    the firmware's own default runs, read and set at run time in `/proc/mwlan/adapter0/config`; `cal_data_cfg` (none in
+    the stock file, though `nxp/WlanCalData_ext.conf` is there) and `init_hostcmd_cfg` (raw host commands as sta0 is
+    added), files the loader finds by a plain name in /lib/firmware, either ending the driver's load when it cannot be
+    read; the power table's 2.4 GHz rows (CCK 16 dBm on 1-14); the firmware's OTP region, WW and not forced, so the
+    driver writes US over it (`FW country code WW does not match with US`; channels 1-11 active either way). Worth a
+    grep in any dmesg with MEVENT: `EVENT: BT coex wlan param update` (and `coex_scan=..`), `EVENT: Antenna Diversity`,
+    `EVENT: Stop Tx`, `EVENT: TX_DATA_PAUSE`, `EVENT: MULTI_CHAN_INFO`, `EVENT: FW Debug Info`.
   - *Seen in dmesg* (the driver's default mask, `drvdbg` 0x207, shows MMSG and MERROR lines): `send auth to bssid`,
     mlan's `Auth received from`, `pending auth on going`, `Fail to configure remain on channel`, `HostMlme sta0: Set
     remain on Channel: with status=N`, `Fail to send packet status=N`, `bss_start Fails`, `WiFi Reset due to ...`,

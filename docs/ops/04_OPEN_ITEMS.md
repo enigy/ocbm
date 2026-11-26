@@ -845,8 +845,13 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
   (ADDENDUM 13's guard against moal's fifth-miss reset, which ADDENDUM 15 found to be the driver's data path only: not
   this firmware's); the station joining before the AP; the driver's debug mask; and (ADDENDUM 15) `sta_modparam` into
   a copy of moal's parameter file and `sta_drvpatch`, a driver copy with named bytes: the answer after the stay taken,
-  no stay, or the firmware's own join (`host_mlme=0` alone is overridden by the card). OPEN: whether Bluetooth's share
-  of 2.4 GHz is the cause (the phone's Bluetooth off for one attempt), and which copy gives a join; (6) M3
+  no stay, or the firmware's own join (`host_mlme=0` alone is overridden by the card). Benched 25 Nov evening (ADDENDA
+  16 and 17): the late copy took the answer and the association then went unanswered; the firmware's own join went
+  unanswered (never tried at 5 GHz); not the phone's Bluetooth, not the iPhone (a second network on ordinary access
+  points fails alike), not the AP-plus-station driver mode. OPEN (ADDENDUM 18, read in the factory driver; nothing
+  built): a 2.4 GHz-only hold of the station's unicast frames in the combo firmware that a channel change lets go,
+  Bluetooth's coexistence set-up the suspect; else the antenna, or the module's calibration file that stock never loads;
+  the no-flash steps that split them are in docs/ops/02_TESTING.md; (6) M3
   (the set-up network) is built, not
   benched: whether the stock hostapd takes `ap_isolate=1` (it refuses an unknown key, and then no set-up network is
   offered), and what the set-up AP raised 20 s into a boot with no host yet costs a head unit that connects later; its

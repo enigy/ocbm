@@ -442,6 +442,8 @@ load (a power-up).
   taken: dmesg `FW_REMAIN_ON_CHANNEL_EXPIRED` with no `HostMlme auth timeout` after it, then `auth success`); nostay,
   the same with ` 377435:1a:ea` (no `Remain on Channel` before `send auth`; only with the AP on the hotspot's
   channel); fwmlme `echo "moal $M 615439:01:00" > ...` with `moal host_mlme=0` in `sta_modparam`.
+  A fourth byte on the late line, ` 347935:0a:ea`, lets the scans go on while an unanswered authentication stays pending
+  (else `scan-failed ret=-11`); the next authentication then goes without a stay (ADDENDUM 18).
 - `sta_drvdbg` (off; set: 0x237, or the mask written): the radio driver's debug mask, through
   `/proc/mwlan/adapter0/sta0/debug` (moal's and mlan's) else moal's parameter; again when the file changes. Line
   `[wifi_sta] ... [bench] sta_drvdbg (<file>): the radio driver's debug mask 0x237 through <path> (its parameter: 567)`;
@@ -464,6 +466,35 @@ load (a power-up).
   this firmware's authentications go by command, so the guard guards nothing here; `off` for the join benches. Still
   look in dmesg every bench: `WiFi Reset due to`, `Start to process hanging`, `WIFI auto_fw_reload: fw_reload=1`, `FW
   Reload successfully.` (now expected only from `EAPOL timeout`, five deauthentications while connected).
+The station's 2.4 GHz fault, the no-flash steps (ADDENDUM 18; the why in docs/wireless/01_BT_AND_RADIO.md, "Why the
+answer comes only as the stay ends"): one change each, F the network's frequency, each command one line.
+- The channel change (no reboot): the three commands below make the network's scan end at 5 GHz, so the stay changes
+  channel. `trying freq=F (+N ms)` with N under 100 = the parked channel held the frame (then `connected`, or
+  `no answer to the association`); `+~2400` = not the channel. The keeper writes scan_freq back only when its plan
+  changes.
+  `ocbmd wpa sta0 set_network 0 scan_freq F 5180`
+  `ocbmd wpa sta0 reassociate`
+  `ocbmd wpa sta0 events 60`
+- No Bluetooth firmware (a power cut, no USB host until the attempts are logged):
+  `touch /script/radio_preload_off /etc/ocbm/bench_wifi_selfstart_off`; the keeper then loads the Wi-Fi driver alone
+  (`wifi_sta_up: station interface sta0 up`, no `fw_loader_linux` before the attempts). A join = Bluetooth's arbitration
+  holds the station; `+~2400` = Bluetooth is out. Remove both files after, and power-cut again.
+- The antenna (no reboot): `grep antcfg /proc/mwlan/adapter0/config`, then
+  `echo "antcfg=1" > /proc/mwlan/adapter0/config` (and 2) and `ocbmd wpa sta0 reassociate` each time; back to the value
+  read (`antcfg=0xffff <ms>` for diversity) or a power cut. `Could not set Antenna Diversity!!` = refused.
+- The firmware's join at 5 GHz (the fwmlme lines above, the network on 5 GHz):
+  `wlan: Connected to bssid ... successfully` = it works, so its 2.4 GHz `0xfffa` counts; `0xfffa` there too = it never
+  works on this firmware.
+- Load-time reads (one power-up): the two lines below into `/lib/firmware/bench_coex_get.conf` (a robust coex GET and
+  its GPIO TLV), `moal drvdbg=0x20237 init_hostcmd_cfg=bench_coex_get.conf` in `sta_modparam`, `sta_drvdbg` 0x237 to
+  bring the mask down once the supplicant runs; within a minute `dmesg`: `OTP region: ...`,
+  `OTP Region (BG): chan=N flags=0x..`, and the `CMD_RESP` hexdump after the ROBUSTCOEX line (in `1b 02 03 00 E G P`,
+  E=01 is an external Bluetooth-request pin obeyed). A file that cannot be read ends the driver's load.
+  `printf 'coex_get={\ne0 00 0c 00 00 00 00 00 00 00 00 00\n}\n' > /lib/firmware/bench_coex_get.conf`
+  `printf 'coex_gpio={\ne0 00 13 00 00 00 00 00 00 00 00 00 1b 02 03 00 00 00 00\n}\n' >> /lib/firmware/bench_coex_get.conf`
+- The module's calibration file: `cp /lib/firmware/nxp/WlanCalData_ext.conf /lib/firmware/WlanCalData_ext.conf` and
+  `moal cal_data_cfg=WlanCalData_ext.conf` in `sta_modparam`; dmesg `cal_data_cfg=WlanCalData_ext.conf`, no
+  `CFG data cmd resp failed`; no Wi-Fi that boot = refused (the USB console still works).
 The set-up network (M3): off with `/tmp/bench_wifi_setup_off` or `/etc/ocbm/bench_wifi_setup_off` (the owner's
 `/etc/ocbm/wifi_setup_off` too); offered only on an adapter never used, so a bench adapter needs `OCBM_WIFI_RESET` on a
 stick first (it removes the link and `/etc/ocbm/host_seen` and leaves `/etc/ocbm/wifi_setup_once`, in any mode, an
