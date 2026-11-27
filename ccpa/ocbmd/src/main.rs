@@ -3654,11 +3654,12 @@ impl Daemon {
             wifi::Provision::Clear => Ok((prov, None)),
         });
         let stored = net.and_then(|(prov, n)| {
+            // A v2 over the link stored: a band changed while a link exists goes on trial (wifi::next_conf).
             let c = match &prov {
-                wifi::Provision::Set(c) => Some(c),
+                wifi::Provision::Set(c) => Some(wifi::next_conf(wifi::read_link_conf(wifi::LINK_FILE).as_ref(), c.key.clone(), c.band)),
                 wifi::Provision::Clear => None,
             };
-            wifi::store(c, wifi::LINK_FILE).map(|()| (prov, n)).map_err(|e| {
+            wifi::store(c.as_ref(), wifi::LINK_FILE).map(|()| (prov, n)).map_err(|e| {
                 eprintln!("[ocbmd] wifi: MGMT_WIFI_LINK could not be stored ({e})");
                 wifi::Refusal::Bad("not stored")
             })
@@ -4545,6 +4546,11 @@ impl Daemon {
             eprintln!("[ocbmd] wifi: link {} sent no HELLO in {} s; closed", l.id, wifi::HELLO_WITHIN.as_secs());
             l.close();
         }
+        // A band change on trial whose time is up with no Wi-Fi host on the new band: back to the band before. Never with
+        // a set-up still to apply (the file holds a newer one).
+        if self.wifi.on && self.wifi.pending.is_none() && self.wifi.trial.is_some_and(|t| now.saturating_duration_since(t) >= wifi::BAND_TRIAL) {
+            self.band_back(now);
+        }
         // Mode `ap`: the AP is the head unit's network (wifi::ApKeep).
         if let Some(band) = self.wifi.conf.as_ref().map(|c| c.band).filter(|_| self.wifi.on) {
             if let Some(verb) = self.wifi.apk.tick(now, band, setup::ap_up()) {
@@ -4562,7 +4568,8 @@ impl Daemon {
     /// Apply the link as stored: start or stop taking Wi-Fi hosts, hand the listener a new key; and when the request
     /// came over a Wi-Fi link that the change cuts (a new key, a new band or a link that came, the link removed), close
     /// that link: its host reconnects. The listener takes the AP's address, and a link that came or a new band restarts
-    /// the AP on the band at once (wifi::ApKeep).
+    /// the AP on the band at once (wifi::ApKeep). A band change on trial starts its wifi::BAND_TRIAL now (a band that
+    /// moved again starts it afresh); the band before asked again, or the link removed, ends it.
     fn wifi_apply(&mut self, came: Option<Via>, before: Option<wifi::LinkConf>, now: Instant, direct_io: bool) {
         let conf = wifi::read_link_conf(wifi::LINK_FILE);
         let key_changed = before.as_ref().map(|c| &c.key) != conf.as_ref().map(|c| &c.key);
@@ -4632,6 +4639,34 @@ impl Daemon {
                 }
             }
         }
+        // The band's trial, where this start takes Wi-Fi hosts (a USB-only start on a serializing driver takes none: its
+        // next start gives the trial its whole time, wifi::Side::resume_trial).
+        self.wifi.trial = match conf.as_ref().and_then(|c| c.band_prev.map(|p| (c.band, p))) {
+            Some((b, prev)) if self.wifi.on && (moved || self.wifi.trial.is_none()) => {
+                eprintln!(
+                    "[ocbmd] wifi: mode ap: the band moved to {} GHz: on trial, back to {} GHz in {} s unless a Wi-Fi host \
+                     links on {} GHz",
+                    b.name(),
+                    prev.name(),
+                    wifi::BAND_TRIAL.as_secs(),
+                    b.name()
+                );
+                Some(now)
+            }
+            Some(_) if self.wifi.on => self.wifi.trial,
+            Some((b, _)) => {
+                if moved {
+                    eprintln!("[ocbmd] wifi: mode ap: the band moved to {} GHz: on trial from ocbmd's next start (this one takes no Wi-Fi host)", b.name());
+                }
+                None
+            }
+            None => {
+                if self.wifi.trial.is_some() {
+                    eprintln!("[ocbmd] wifi: mode ap: the band's trial ends ({})", if conf.is_some() { "the band before asked again" } else { "the link removed" });
+                }
+                None
+            }
+        };
         // M3: one set-up a window: it ends now, its link with it.
         if std::mem::take(&mut self.setup.linked) {
             self.setup_end("done");
@@ -4644,6 +4679,66 @@ impl Daemon {
                 }
             }
         }
+    }
+
+    /// The link as this process holds it, when the file still holds the same (a stick's OCBM_WIFI_RESET, say, removes it
+    /// under ocbmd): what the trial may rewrite. None otherwise, said.
+    fn link_unchanged(&self, what: &str) -> Option<wifi::LinkConf> {
+        let c = self.wifi.conf.clone()?;
+        if wifi::read_link_conf(wifi::LINK_FILE).as_ref() != Some(&c) {
+            eprintln!("[ocbmd] wifi: mode ap: {what}: the link file changed under this start; left as it is");
+            return None;
+        }
+        Some(c)
+    }
+
+    /// The band's trial is up (wifi::BAND_TRIAL) with no Wi-Fi host on the new band: back to the band before, on flash
+    /// first, one line said; the AP moves to it by wifi::ApKeep's rule for an AP of another band, once no phone's CarPlay
+    /// session uses it (`back`), so a phone projecting over USB, or the adapter's own session, is not cut for it. A file
+    /// that could not be written is tried again after another trial's time.
+    fn band_back(&mut self, now: Instant) {
+        self.wifi.trial = None;
+        let Some(c) = self.link_unchanged("the band's trial is up") else { return };
+        let Some(prev) = c.band_prev else { return };
+        let back = wifi::LinkConf { key: c.key.clone(), band: prev, band_prev: None };
+        match wifi::store(Some(&back), wifi::LINK_FILE) {
+            Ok(()) => {
+                eprintln!(
+                    "[ocbmd] wifi: mode ap: no Wi-Fi host linked on {} GHz within {} s of the band's change: back to {} GHz \
+                     (the AP moves once no phone's CarPlay session uses it)",
+                    c.band.name(),
+                    wifi::BAND_TRIAL.as_secs(),
+                    prev.name()
+                );
+                self.wifi.conf = Some(back);
+                self.wifi.apk.back = true;
+            }
+            Err(e) => {
+                eprintln!("[ocbmd] wifi: mode ap: back to {} GHz not stored ({e}); tried again in {} s", prev.name(), wifi::BAND_TRIAL.as_secs());
+                self.wifi.trial = Some(now);
+            }
+        }
+    }
+
+    /// A Wi-Fi host completed the OCBW handshake (the loop's, for each link the listener hands over): a band change on
+    /// trial is kept when the AP runs the new band (wifi::ap_runs: a handshake on the band before, the AP not moved yet,
+    /// keeps nothing), the band before forgotten, said once. Never with a set-up still to apply.
+    fn wifi_band_heard(&mut self) {
+        if self.wifi.pending.is_some() || !self.wifi.conf.as_ref().is_some_and(|c| c.band_prev.is_some() && wifi::ap_runs(c.band)) {
+            return;
+        }
+        let Some(c) = self.link_unchanged("a Wi-Fi host linked") else { return };
+        let kept = wifi::LinkConf { band_prev: None, ..c.clone() };
+        if let Err(e) = wifi::store(Some(&kept), wifi::LINK_FILE) {
+            eprintln!("[ocbmd] wifi: mode ap: the kept band not stored ({e}); kept for this start");
+        }
+        eprintln!(
+            "[ocbmd] wifi: mode ap: a Wi-Fi host linked on {} GHz: the band is kept ({} GHz forgotten)",
+            kept.band.name(),
+            c.band_prev.map_or("?", wifi::Band::name)
+        );
+        self.wifi.conf = Some(kept);
+        self.wifi.trial = None;
     }
 }
 
@@ -5392,6 +5487,9 @@ fn main() {
     let mut wifi_side = wifi::Side::off();
     wifi_side.conf = link_conf.clone();
     wifi_side.usb_direct = usb_reader_only;
+    if wifi_mode {
+        wifi_side.resume_trial(Instant::now()); // a band change on trial from before this start: its whole time again
+    }
     let acc_out = if wifi_mode {
         // Nobody holds the box yet: the output goes to the sink until a host takes it (Daemon::admit).
         wifi_side.usb_out = (acc_io == AccIo::Relay).then_some(to_host);
@@ -5900,6 +5998,7 @@ fn main() {
             }
         }
         for a in links_new {
+            d.wifi_band_heard(); // a completed handshake: a band on trial is kept if the AP runs it
             let (id, peer) = (a.id, wifi::peer_short(&a.peer));
             match wifi::start_link(a) {
                 Ok(l) => {
@@ -8075,7 +8174,7 @@ mod tests {
         let _l = wifi_file_lock();
         ap_named();
         let mut d = td();
-        let kept = wifi::LinkConf { key: ocbm_link::LinkKey([0x61; 32]), band: wifi::Band::G5 };
+        let kept = wifi::LinkConf { key: ocbm_link::LinkKey([0x61; 32]), band: wifi::Band::G5, band_prev: None };
         wifi::store(Some(&kept), wifi::LINK_FILE).unwrap();
         let before = std::fs::read(wifi::LINK_FILE).unwrap();
         for body in [v1(0x62, "Example Hotspot", &"ab".repeat(32)), v1(0x62, "", ""), vec![p::MGMT_WIFI_LINK, 1]] {
@@ -8093,7 +8192,7 @@ mod tests {
         let _l = wifi_file_lock();
         ap_named();
         let mut d = td_wifi();
-        let first = wifi::LinkConf { key: ocbm_link::LinkKey([0x31; 32]), band: wifi::Band::G24 };
+        let first = wifi::LinkConf { key: ocbm_link::LinkKey([0x31; 32]), band: wifi::Band::G24, band_prev: None };
         wifi::store(Some(&first), wifi::LINK_FILE).unwrap();
         d.wifi.conf = Some(first);
         let (l, _o, mut host) = wifi::test_link(9);
@@ -8160,6 +8259,126 @@ mod tests {
         d.wifi.stop();
         let _ = std::fs::remove_file(wifi::LINK_FILE);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The AP layer's mark the band's trial reads (wifi::AP_LINK_MARK, "<band asked> <channel run>"), set or removed;
+    /// held under wifi_file_lock.
+    fn ap_mark(m: Option<&str>) {
+        match m {
+            Some(t) => std::fs::write(wifi::AP_LINK_MARK, t).unwrap(),
+            None => {
+                let _ = std::fs::remove_file(wifi::AP_LINK_MARK);
+            }
+        }
+    }
+
+    /// A v2 (`key`, `band`) stored over USB and applied, as the loop applies it half a second after the ACK; the apply's
+    /// time.
+    fn v2_applied(d: &mut Daemon, key: u8, band: u8) -> Instant {
+        d.handle_mgmt(&v2(key, band));
+        let (at, came, before) = d.wifi.pending.take().expect("stored");
+        d.wifi_apply(came, before, at, false);
+        at
+    }
+
+    /// The owner's rule of 27 Nov 2026: a band changed while a link exists is on trial (MGMT_INFO's band_pending), and
+    /// with no Wi-Fi host on the new band within BAND_TRIAL the box goes back to the band before by itself: on flash, the
+    /// key kept, the AP moved by ApKeep's rule for an AP of another band (`back`: not while a phone's CarPlay uses it).
+    #[test]
+    fn a_band_change_with_no_wifi_host_on_the_new_band_goes_back_by_itself() {
+        let _l = wifi_file_lock();
+        let _ = std::fs::remove_file(wifi::LINK_FILE);
+        ap_named();
+        ap_mark(None);
+        let mut d = td();
+        v2_applied(&mut d, 0x71, 0x02);
+        assert!(d.wifi.trial.is_none() && d.wifi.info().ends_with(",\"band_pending\":false}"), "a first set-up: nothing to undo");
+        let at = v2_applied(&mut d, 0x71, 0x05);
+        let c = wifi::read_link_conf(wifi::LINK_FILE).unwrap();
+        assert_eq!((c.band, c.band_prev), (wifi::Band::G5, Some(wifi::Band::G24)), "on flash: 5 GHz on trial, 2.4 kept");
+        assert_eq!(d.wifi.trial, Some(at), "its time runs from the apply");
+        assert!(d.wifi.apk.restart, "the AP moves to 5 GHz at once, as for any change asked");
+        let info = d.wifi.info();
+        assert!(info.contains("\"ap_band\":\"5\"") && info.ends_with(",\"band_pending\":true}"), "{info}");
+        d.wifi_tick(at + wifi::BAND_TRIAL - Duration::from_secs(1), false); // (ApKeep's look raises: no AP on the host)
+        assert_eq!(wifi::read_link_conf(wifi::LINK_FILE).unwrap().band, wifi::Band::G5, "not before its time");
+        d.wifi_tick(at + wifi::BAND_TRIAL, false); // (ApKeep's next look is 2 s on: `back` left for it)
+        let c = wifi::read_link_conf(wifi::LINK_FILE).unwrap();
+        assert_eq!((c.band, c.band_prev, c.key.0), (wifi::Band::G24, None, [0x71; 32]), "back to 2.4 GHz on flash, the key kept");
+        assert!(d.wifi.trial.is_none() && d.wifi.apk.back, "done once; the AP to move by the rule for another band's AP");
+        let info = d.wifi.info();
+        assert!(info.contains("\"ap_band\":\"2.4\"") && info.ends_with(",\"band_pending\":false}"), "{info}");
+        d.wifi.stop();
+        let _ = std::fs::remove_file(wifi::LINK_FILE);
+        let _ = std::fs::remove_dir_all(wifi::AP_ROOT);
+    }
+
+    /// A Wi-Fi host's completed handshake keeps the band on trial, but only while the AP runs it (its mark): one made on
+    /// the band before, the AP not moved yet, keeps nothing; the bench lever's interface is not the AP (not testable
+    /// here: its file is a fixed path). Kept, the band before is forgotten on flash and nothing goes back.
+    #[test]
+    fn a_wifi_host_on_the_new_band_keeps_it_and_one_on_the_band_before_does_not() {
+        let _l = wifi_file_lock();
+        let _ = std::fs::remove_file(wifi::LINK_FILE);
+        ap_named();
+        let mut d = td();
+        v2_applied(&mut d, 0x72, 0x02);
+        let at = v2_applied(&mut d, 0x72, 0x05);
+        ap_mark(Some("2.4 6\n"));
+        d.wifi_band_heard();
+        assert_eq!(wifi::read_link_conf(wifi::LINK_FILE).unwrap().band_prev, Some(wifi::Band::G24), "the AP still on 2.4: nothing kept");
+        ap_mark(Some("5 36\n"));
+        d.handle_mgmt(&v2(0x72, 0x05)); // the same v2 again, its apply not yet due
+        d.wifi_band_heard();
+        assert!(d.wifi.trial.is_some(), "a set-up still to apply: nothing kept meanwhile");
+        let (pat, came, before) = d.wifi.pending.take().unwrap();
+        d.wifi_apply(came, before, pat, false);
+        assert_eq!(d.wifi.trial, Some(at), "the same band again: the trial's time as it was");
+        d.wifi_band_heard();
+        let c = wifi::read_link_conf(wifi::LINK_FILE).unwrap();
+        assert_eq!((c.band, c.band_prev), (wifi::Band::G5, None), "the AP on 5 GHz: kept, 2.4 forgotten on flash");
+        assert!(d.wifi.trial.is_none() && d.wifi.info().ends_with(",\"band_pending\":false}"));
+        d.wifi_tick(at + wifi::BAND_TRIAL, false);
+        assert_eq!(wifi::read_link_conf(wifi::LINK_FILE).unwrap().band, wifi::Band::G5, "nothing goes back");
+        // Kept, then 2.4 GHz again: on trial back to 5. The band before asked again by the host ends that trial.
+        v2_applied(&mut d, 0x72, 0x02);
+        assert_eq!(wifi::read_link_conf(wifi::LINK_FILE).unwrap().band_prev, Some(wifi::Band::G5));
+        v2_applied(&mut d, 0x72, 0x05);
+        assert!(d.wifi.trial.is_none() && wifi::read_link_conf(wifi::LINK_FILE).unwrap().band_prev.is_none(), "back by the host: no trial");
+        d.wifi.stop();
+        ap_mark(None);
+        let _ = std::fs::remove_file(wifi::LINK_FILE);
+        let _ = std::fs::remove_dir_all(wifi::AP_ROOT);
+    }
+
+    /// The trial survives a restart and a power cut in the link file (band_prev), and each start gives it the whole time
+    /// again (wifi::Side::resume_trial). A link file changed under ocbmd (a stick's OCBM_WIFI_RESET removed it) is never
+    /// written back by the trial; the link removed ends it.
+    #[test]
+    fn a_trial_kept_from_before_a_start_runs_again_and_a_file_removed_under_ocbmd_stays_removed() {
+        let _l = wifi_file_lock();
+        ap_named();
+        let on_trial = wifi::LinkConf { key: ocbm_link::LinkKey([0x73; 32]), band: wifi::Band::G5, band_prev: Some(wifi::Band::G24) };
+        wifi::store(Some(&on_trial), wifi::LINK_FILE).unwrap();
+        let (conf, retired) = wifi::start_link_conf(wifi::LINK_FILE);
+        assert_eq!((conf.as_ref(), retired), (Some(&on_trial), false), "the trial on flash, as the next start reads it");
+        let mut d = td_wifi();
+        d.wifi.conf = conf;
+        let t0 = Instant::now();
+        d.wifi.resume_trial(t0);
+        assert_eq!(d.wifi.trial, Some(t0), "the whole time again from this start");
+        let _ = std::fs::remove_file(wifi::LINK_FILE); // OCBM_WIFI_RESET on a stick, ocbmd still running
+        d.wifi_tick(t0 + wifi::BAND_TRIAL, false);
+        assert!(!std::path::Path::new(wifi::LINK_FILE).exists(), "not written back");
+        assert!(d.wifi.trial.is_none(), "and not tried again");
+        wifi::store(Some(&on_trial), wifi::LINK_FILE).unwrap();
+        d.wifi.trial = Some(t0);
+        d.handle_mgmt(&[p::MGMT_WIFI_LINK]);
+        let (at, came, before) = d.wifi.pending.take().unwrap();
+        d.wifi_apply(came, before, at, false);
+        assert!(d.wifi.trial.is_none() && d.wifi.conf.is_none(), "the link removed: no trial");
+        let _ = std::fs::remove_file(wifi::LINK_FILE);
+        let _ = std::fs::remove_dir_all(wifi::AP_ROOT);
     }
 
     #[test]
@@ -8379,7 +8598,7 @@ mod tests {
         let mut d = td();
         subscribe(&mut d, b"cfg: a\n");
         assert!(!std::path::Path::new(SESSION_CFG_FILE).exists(), "no link: the config stays ephemeral, as in 2.7.1");
-        d.wifi.conf = Some(wifi::LinkConf { key: ocbm_link::LinkKey([1; 32]), band: wifi::Band::G24 });
+        d.wifi.conf = Some(wifi::LinkConf { key: ocbm_link::LinkKey([1; 32]), band: wifi::Band::G24, band_prev: None });
         subscribe(&mut d, b"cfg: b\n");
         assert_eq!(std::fs::read(SESSION_CFG_FILE).unwrap(), b"cfg: b\n");
         let _ = std::fs::remove_file(SESSION_CFG_FILE);
@@ -8538,11 +8757,18 @@ mod tests {
     #[test]
     fn on_a_serializing_driver_no_listener_runs_beside_the_loops_own_reads_of_the_device() {
         let _l = wifi_file_lock();
-        let c = wifi::LinkConf { key: ocbm_link::LinkKey([0x51; 32]), band: wifi::Band::G24 };
+        let c = wifi::LinkConf { key: ocbm_link::LinkKey([0x51; 32]), band: wifi::Band::G24, band_prev: None };
         wifi::store(Some(&c), wifi::LINK_FILE).unwrap();
         let mut d = td();
         d.wifi_apply(Some(Via::Usb), None, Instant::now(), true);
         assert!(!d.wifi.on && d.wifi.listener.is_none() && d.wifi.restart_when_idle, "the listener waits for the next start");
+        // A band change on trial set up so: no trial in this start (it takes no Wi-Fi host); the next start's.
+        let on_trial = wifi::LinkConf { band: wifi::Band::G5, band_prev: Some(wifi::Band::G24), ..c.clone() };
+        wifi::store(Some(&on_trial), wifi::LINK_FILE).unwrap();
+        let mut d = td();
+        d.wifi_apply(Some(Via::Usb), Some(c.clone()), Instant::now(), true);
+        assert!(d.wifi.trial.is_none() && d.wifi.info().ends_with(",\"band_pending\":true}"), "on flash, not run here");
+        wifi::store(Some(&c), wifi::LINK_FILE).unwrap();
         let mut d = td();
         d.wifi.usb_direct = true;
         d.wifi_apply(Some(Via::Wifi(1 << 40)), None, Instant::now(), true);

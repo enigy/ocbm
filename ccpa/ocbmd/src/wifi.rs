@@ -10,6 +10,9 @@
 //!
 //! - the AP is up from power-up and between phone sessions ([`ApKeep`]), on the band the link keeps; v2's ACK carries
 //!   the AP's name and passphrase ([`ap_network`]);
+//! - a band changed while a link exists is ON TRIAL ([`BAND_TRIAL`], the owner's decision of 27 Nov 2026): the link
+//!   file keeps the band before (`band_prev=`) until a Wi-Fi host completes the OCBW handshake while the AP runs the
+//!   new band ([`ap_runs`]), and with none in time the box goes back to it by itself (main.rs `Daemon::band_back`);
 //! - [`start_listener`]'s thread listens on the AP'S OWN ADDRESS on the AP's interface only, port 7020, as the radio
 //!   seam publishes them, never on 0.0.0.0 or another interface. Handshakes run on threads of their own, at most
 //!   [`MAX_HANDSHAKES`] at once and one per peer address, each within `ocbm_link::HANDSHAKE_TIMEOUT`, so a stranger on
@@ -76,9 +79,9 @@ const WLAN_STATE: &str = "/tmp/.radio_wlan_state";
 const WLAN_STATE: &str = "/tmp/ocbmd_selftest_no_such_radio_wlan_state";
 /// Mode `ap`: the band the running AP was started for, and its channel (radio_ap_up.sh: "<band> <channel>").
 #[cfg(not(test))]
-const AP_LINK_MARK: &str = "/tmp/.radio_ap_link";
+pub(crate) const AP_LINK_MARK: &str = "/tmp/.radio_ap_link";
 #[cfg(test)]
-const AP_LINK_MARK: &str = "/tmp/ocbmd_selftest_no_such_radio_ap_link";
+pub(crate) const AP_LINK_MARK: &str = "/tmp/ocbmd_selftest_radio_ap_link";
 /// An AP bring-up or teardown under way: the seam's wlan lock, the AP layer's own.
 #[cfg(not(test))]
 const AP_BUSY: [&str; 2] = ["/tmp/.radio_lock_wlan", "/tmp/.radio_ap_lock"];
@@ -99,6 +102,14 @@ pub const MAX_CANDIDATES: usize = 4;
 pub const HOLD_SILENCE: Duration = Duration::from_secs(10);
 /// An authenticated link that sends no HELLO within this long is closed.
 pub const HELLO_WITHIN: Duration = Duration::from_secs(5);
+/// A band changed while a link exists is on trial this long from the change's apply (half a second after its ACK), or
+/// from ocbmd's start when the trial was kept from before it (a power cut, or ocbmd started again: no clock survives a
+/// power cut, so every start gives the new band the whole time): no Wi-Fi host completing the OCBW handshake on the new
+/// band by then takes the AP back to the band before. Room for the AP's restart (seconds), the head unit to see its
+/// network go and join it again on the new band (Android's scans while it has no network: tens of seconds, INFERRED)
+/// and Carlink's next link (a search every few seconds), with margin; short enough that a head unit that sees no 5 GHz
+/// network has the adapter back on 2.4 GHz within a drive's first minutes.
+pub const BAND_TRIAL: Duration = Duration::from_secs(180);
 
 /// The subnets the bench's interface lever must never name: the box's own AP's and NCM's (box-common `net`).
 fn reserved_subnet(ip: Ipv4Addr) -> bool {
@@ -143,6 +154,14 @@ impl Band {
             _ => None,
         }
     }
+
+    /// `channel` is one of this band's: 1-14 at 2.4 GHz, 32 and up at 5 GHz.
+    fn holds(self, channel: u32) -> bool {
+        match self {
+            Band::G24 => (1..=14).contains(&channel),
+            Band::G5 => (32..=196).contains(&channel),
+        }
+    }
 }
 
 /// What [`LINK_FILE`] holds: a link in mode `ap`, the only mode since 27 Nov 2026.
@@ -151,15 +170,46 @@ pub struct LinkConf {
     pub key: LinkKey,
     /// The band of the adapter's AP, which the head unit joins (v2's last byte).
     pub band: Band,
+    /// A band change on trial ([`BAND_TRIAL`]): the band before it, the last one a Wi-Fi host linked on or set up
+    /// first, to go back to. None: nothing to undo (a first set-up, a band kept, or one gone back).
+    pub band_prev: Option<Band>,
 }
 
-/// [`LINK_FILE`]'s text: `key=` (64 hex), `mode=ap` and `band=` (radio_hal.sh's `link_ap` reads the same lines).
+/// [`LINK_FILE`]'s text: `key=` (64 hex), `mode=ap` and `band=` (radio_hal.sh's `link_ap` reads the same lines), and
+/// `band_prev=` while a band change is on trial (the shell reads none of it).
 pub fn link_file_text(c: &LinkConf) -> String {
+    let prev = c.band_prev.map(|b| format!("band_prev={}\n", b.name())).unwrap_or_default();
     format!(
-        "# OCBM Wi-Fi link (MGMT_WIFI_LINK). Secret: never into a log, a backup or a stick.\nkey={}\nmode=ap\nband={}\n",
+        "# OCBM Wi-Fi link (MGMT_WIFI_LINK). Secret: never into a log, a backup or a stick.\nkey={}\nmode=ap\nband={}\n{prev}",
         c.key.to_hex(),
         c.band.name()
     )
+}
+
+/// The link a v2 sets up (`key`, `band`) over the one stored (`now`): a band changed while a link exists goes on trial
+/// with the band it had (the one before the trial already running, if one is: the last band a host linked on); the
+/// band before asked again ends the trial; the same band keeps whatever trial runs. A first set-up has nothing to undo.
+pub fn next_conf(now: Option<&LinkConf>, key: LinkKey, band: Band) -> LinkConf {
+    let band_prev = match now {
+        None => None,
+        Some(c) if c.band == band => c.band_prev,
+        Some(c) if c.band_prev == Some(band) => None,
+        Some(c) => Some(c.band_prev.unwrap_or(c.band)),
+    };
+    LinkConf { key, band, band_prev }
+}
+
+/// The AP layer's mark (`<band asked> <channel run>`, radio_ap_up.sh) says the AP runs `band`: started for it, and on
+/// one of its channels (an AP whose channel hostapd refused runs its own, perhaps of the other band: not this one).
+pub fn on_band(mark: &str, band: Band) -> bool {
+    let mut w = mark.split_whitespace();
+    w.next().and_then(Band::named) == Some(band) && w.next().and_then(|c| c.parse().ok()).is_some_and(|c| band.holds(c))
+}
+
+/// A Wi-Fi host that completes the OCBW handshake now does it on `band`: the AP runs it ([`on_band`]) and the listener
+/// is the AP's (not the bench lever's interface).
+pub fn ap_runs(band: Band) -> bool {
+    bench_iface().is_none() && on_band(&std::fs::read_to_string(AP_LINK_MARK).unwrap_or_default(), band)
 }
 
 /// The file says mode `ap` (a `mode=ap` line). One that does not is of the retired hotspot mode: a hotspot's
@@ -168,22 +218,24 @@ fn mode_ap(text: &str) -> bool {
     text.lines().any(|l| l.strip_prefix("mode=").is_some_and(|v| v.trim() == "ap"))
 }
 
-/// The file's text read back: mode `ap`, a `key=` line of 64 hex digits, its `band=` (2.4 unless 5). Anything else is
-/// no link.
+/// The file's text read back: mode `ap`, a `key=` line of 64 hex digits, its `band=` (2.4 unless 5), and `band_prev=`
+/// (2.4 or 5, and not the band itself; else none). Anything else is no link.
 pub fn parse_link_file(text: &str) -> Option<LinkConf> {
     if !mode_ap(text) {
         return None;
     }
     let mut key = None;
-    let mut band = Band::G24;
+    let (mut band, mut prev) = (Band::G24, None);
     for l in text.lines() {
         if let Some(v) = l.strip_prefix("key=") {
             key = LinkKey::from_hex(v);
         } else if let Some(v) = l.strip_prefix("band=") {
             band = Band::named(v).unwrap_or(Band::G24);
+        } else if let Some(v) = l.strip_prefix("band_prev=") {
+            prev = Band::named(v);
         }
     }
-    Some(LinkConf { key: key?, band })
+    Some(LinkConf { key: key?, band, band_prev: prev.filter(|p| *p != band) })
 }
 
 /// The link as stored, or None (no file, one of the retired hotspot mode, or no valid key: then the link is off, and
@@ -234,7 +286,8 @@ fn remove_beside(path: &str) {
 pub enum Provision {
     /// Remove the link: the box is a USB-only box again.
     Clear,
-    /// Version 2: the link key, mode `ap` on this band.
+    /// Version 2: the link key, mode `ap` on this band (`band_prev` none: [`next_conf`] decides it against the link
+    /// stored).
     Set(LinkConf),
 }
 
@@ -272,7 +325,7 @@ pub fn parse_provision(body: &[u8]) -> Result<Provision, Refusal> {
         Some(2) => {
             let key: [u8; 32] = body.get(1..33).filter(|_| body.len() == 34).and_then(|k| k.try_into().ok()).ok_or(Refusal::Bad("a v2 that is not 35 B"))?;
             let band = Band::from_wire(body[33]).ok_or(Refusal::Bad("a v2 with an unknown band"))?;
-            Ok(Provision::Set(LinkConf { key: LinkKey(key), band }))
+            Ok(Provision::Set(LinkConf { key: LinkKey(key), band, band_prev: None }))
         }
         Some(_) => Err(Refusal::Bad("an unknown version")),
     }
@@ -1074,8 +1127,10 @@ pub fn sink() -> File {
 
 /// The `"wifi_link"` object of MGMT_INFO in mode `ap` (ADDENDUM 24 item 9): `state` off (the AP not serving: no
 /// address to listen on), up (the listener on the AP), linked (a Wi-Fi host holds the box); `ap_band` the link's;
-/// `ap_channel` the channel the AP runs on, the band's once it has moved. No name, no key, no address.
-pub fn ap_info_json(band: Band, linked: bool, listening: bool, ap_ch: u32) -> String {
+/// `ap_channel` the channel the AP runs on, the band's once it has moved; `band_pending` (27 Nov 2026) true while a band
+/// change is on trial: with no Wi-Fi host on `ap_band` within [`BAND_TRIAL`] the adapter goes back to the other band by
+/// itself. No name, no key, no address.
+pub fn ap_info_json(band: Band, linked: bool, listening: bool, ap_ch: u32, pending: bool) -> String {
     let state = if linked {
         "linked"
     } else if listening {
@@ -1083,7 +1138,10 @@ pub fn ap_info_json(band: Band, linked: bool, listening: bool, ap_ch: u32) -> St
     } else {
         "off"
     };
-    format!("{{\"mode\":\"ap\",\"state\":\"{state}\",\"ap_band\":\"{}\",\"ap_channel\":{ap_ch}}}", band.name())
+    format!(
+        "{{\"mode\":\"ap\",\"state\":\"{state}\",\"ap_band\":\"{}\",\"ap_channel\":{ap_ch},\"band_pending\":{pending}}}",
+        band.name()
+    )
 }
 
 /// The `"wifi_link"` object of MGMT_INFO with no link (`mode` off), as round 1 sent it: `channel` was the retired
@@ -1139,6 +1197,8 @@ pub struct Side {
     pub conf: Option<LinkConf>,
     /// Mode `ap`: the AP kept up for the head unit.
     pub apk: ApKeep,
+    /// A band change on trial (the link's `band_prev`): when this start's [`BAND_TRIAL`] began. None: none runs here.
+    pub trial: Option<Instant>,
 }
 
 impl Side {
@@ -1171,6 +1231,23 @@ impl Side {
             restart_when_idle: false,
             conf: None,
             apk: ApKeep::default(),
+            trial: None,
+        }
+    }
+
+    /// At ocbmd's start: a band change kept on trial from before this start (the link file's `band_prev`) gets the
+    /// whole [`BAND_TRIAL`] again from `now` (no clock survives a power cut), said once.
+    pub fn resume_trial(&mut self, now: Instant) {
+        if let Some((band, prev)) = self.conf.as_ref().and_then(|c| c.band_prev.map(|p| (c.band, p))) {
+            self.trial = Some(now);
+            eprintln!(
+                "[ocbmd] wifi: mode ap: the band's change to {} GHz is still on trial: back to {} GHz in {} s unless a \
+                 Wi-Fi host links on {} GHz",
+                band.name(),
+                prev.name(),
+                BAND_TRIAL.as_secs(),
+                band.name()
+            );
         }
     }
 
@@ -1214,7 +1291,7 @@ impl Side {
         let listening = self.shared.as_ref().is_some_and(|s| s.bound().is_some());
         let linked = matches!(self.via, Some(Via::Wifi(_)));
         match self.conf.as_ref() {
-            Some(c) => ap_info_json(c.band, linked, listening, ap),
+            Some(c) => ap_info_json(c.band, linked, listening, ap, c.band_prev.is_some()),
             None => off_info_json(ap),
         }
     }
@@ -1227,13 +1304,17 @@ impl Side {
 /// (radio_hal.sh); this keeps it there, a look every [`AP_LOOK`] while a link is set up (never otherwise):
 /// raised when no hostapd runs, restarted on the band at once when the mode or the band changed ([`ApKeep::restart`]:
 /// the phone's CarPlay drops and comes back), and restarted when it runs a configuration started for another band (or
-/// none) while no phone's CarPlay session uses it, a few times a start at most. Never over an AP bring-up or teardown
-/// under way, or a set-up network.
+/// none) while no phone's CarPlay session uses it, a few times a start at most; the band's going back after a trial
+/// ([`ApKeep::back`]) takes the same rule, outside that count. Never over an AP bring-up or teardown under way, or a
+/// set-up network.
 #[derive(Default)]
 pub struct ApKeep {
     next: Option<Instant>,
     /// The mode or the band changed: the AP restarts on the band at the next look.
     pub restart: bool,
+    /// The band went back after its trial (main.rs `Daemon::band_back`): the AP restarts on it once no phone's CarPlay
+    /// session uses it, whatever the fixes made this start; cleared once asked, or once the AP runs the band.
+    pub back: bool,
     /// The last raise or restart asked of the seam.
     last: Option<Instant>,
     /// Restarts for a configuration of another band, this start ([`AP_FIXES`] at most).
@@ -1285,9 +1366,19 @@ impl ApKeep {
         let mark = std::fs::read_to_string(AP_LINK_MARK).unwrap_or_default();
         let carplay = box_common::flags::owner() == box_common::flags::ProjectionOwner::WirelessCp;
         let running = !busy && crate::running_procs(&["hostapd"])[0]; // the set-up network's counts too
-        let act = ap_decide(busy, running, self.restart, mark.split_whitespace().next(), band, carplay);
+        self.step(now, band, busy, running, &mark, carplay)
+    }
+
+    /// The look's decision on what it read (`mark`: the AP layer's, `carplay`: a phone's CarPlay session on the AP),
+    /// and its pace: the verb to ask of the seam, if any, said in the box log.
+    fn step(&mut self, now: Instant, band: Band, busy: bool, running: bool, mark: &str, carplay: bool) -> Option<&'static str> {
+        let started_for = mark.split_whitespace().next();
+        let act = ap_decide(busy, running, self.restart, started_for, band, carplay);
         if running {
             self.raises = 0;
+            if started_for == Some(band.name()) {
+                self.back = false; // the AP runs the band gone back to: nothing left to do for it
+            }
         }
         let gap = if act == ApAct::Raise { AP_GAP * (1 << self.raises.saturating_sub(1).min(4)) } else { AP_GAP };
         let due = self.last.is_none_or(|t| now.duration_since(t) >= gap);
@@ -1296,19 +1387,20 @@ impl ApKeep {
                 self.raises += 1;
                 "wifi_ap_on"
             }
-            ApAct::Restart if self.restart || (due && self.fixes < AP_FIXES) => {
-                self.fixes += u32::from(!self.restart);
+            ApAct::Restart if self.restart || (due && (self.back || self.fixes < AP_FIXES)) => {
+                self.fixes += u32::from(!self.restart && !self.back);
                 "wifi_ap_restart"
             }
             _ => return None,
         };
-        let why = match (act, self.restart) {
-            (ApAct::Raise, _) => "no AP up",
-            (_, true) => "the mode or the band changed",
+        let why = match (act, self.restart, self.back) {
+            (ApAct::Raise, _, _) => "no AP up",
+            (_, true, _) => "the mode or the band changed",
+            (_, _, true) => "the band went back after its trial, no CarPlay on the AP",
             _ => "an AP of another band, no CarPlay on it",
         };
         eprintln!("[ocbmd] wifi: mode ap: {why}: {verb} on {} GHz", band.name());
-        self.restart = false;
+        (self.restart, self.back) = (false, false);
         self.last = Some(now);
         Some(verb)
     }
@@ -1404,7 +1496,7 @@ mod tests {
     #[test]
     fn v2_is_mode_ap_on_its_band_and_v1_is_retired() {
         let v2_24 = unhex("0e02111111111111111111111111111111111111111111111111111111111111111102");
-        let want = |band| Ok(Provision::Set(LinkConf { key: LinkKey([0x11; 32]), band }));
+        let want = |band| Ok(Provision::Set(LinkConf { key: LinkKey([0x11; 32]), band, band_prev: None }));
         assert_eq!((v2_24.len(), parse_provision(&v2_24[1..])), (35, want(Band::G24)), "B's vector, 2.4 GHz");
         let mut v2_5 = v2_24.clone();
         v2_5[34] = 0x05;
@@ -1425,7 +1517,7 @@ mod tests {
 
     #[test]
     fn the_link_file_holds_mode_ap_and_its_band() {
-        let c = LinkConf { key: LinkKey([7; 32]), band: Band::G5 };
+        let c = LinkConf { key: LinkKey([7; 32]), band: Band::G5, band_prev: None };
         let t = link_file_text(&c);
         assert!(t.ends_with(&format!("\nkey={}\nmode=ap\nband=5\n", "07".repeat(32))), "{t}");
         assert_eq!(parse_link_file(&t), Some(c.clone()));
@@ -1437,6 +1529,66 @@ mod tests {
         assert_eq!(parse_link_file(&format!("{k}ssid_hex=6e6574\npsk=\n")), None, "the retired hotspot mode's: no link");
         assert_eq!(parse_link_file(&k), None, "the bench's key alone (v1): no link");
         assert_eq!(parse_link_file("key=short\nmode=ap\n"), None, "no valid key");
+    }
+
+    /// The owner's rule of 27 Nov 2026: a band changed while a link exists goes on trial with the band it had; a first
+    /// set-up has nothing to undo; the same band again keeps the trial as it is (a new key too); the band before asked
+    /// again ends it; a band that moves again keeps the band before the trial (the last one a host linked on).
+    #[test]
+    fn a_band_change_goes_on_trial_and_the_band_before_ends_it() {
+        let (k1, k2) = (LinkKey([1; 32]), LinkKey([2; 32]));
+        let c = |band, band_prev| LinkConf { key: LinkKey([1; 32]), band, band_prev };
+        assert_eq!(next_conf(None, k1.clone(), Band::G5), c(Band::G5, None), "a first set-up: nothing to undo");
+        let set = c(Band::G24, None);
+        assert_eq!(next_conf(Some(&set), k1.clone(), Band::G24), set, "the same band: nothing moves");
+        let trial = next_conf(Some(&set), k1.clone(), Band::G5);
+        assert_eq!(trial, c(Band::G5, Some(Band::G24)), "2.4 -> 5: on trial, 2.4 kept to go back to");
+        assert_eq!(next_conf(Some(&trial), k1.clone(), Band::G5), trial, "5 again: the trial as it is");
+        assert_eq!(next_conf(Some(&trial), k2.clone(), Band::G5).band_prev, Some(Band::G24), "a new key, the same band");
+        assert_eq!(next_conf(Some(&trial), k1.clone(), Band::G24), set, "back to 2.4 by the host: no trial");
+        let kept = c(Band::G5, None);
+        assert_eq!(next_conf(Some(&kept), k1, Band::G24), c(Band::G24, Some(Band::G5)), "5 kept, then 2.4: on trial back to 5");
+    }
+
+    #[test]
+    fn the_link_file_keeps_the_band_on_trial() {
+        let c = LinkConf { key: LinkKey([7; 32]), band: Band::G5, band_prev: Some(Band::G24) };
+        let t = link_file_text(&c);
+        assert!(t.ends_with("\nmode=ap\nband=5\nband_prev=2.4\n"), "{t}");
+        assert_eq!(parse_link_file(&t), Some(c.clone()), "kept across a restart and a power cut: the file");
+        let none = LinkConf { band_prev: None, ..c.clone() };
+        assert!(!link_file_text(&none).contains("band_prev"), "no trial: no line");
+        let k = format!("key={}\nmode=ap\n", "07".repeat(32));
+        for (lines, want) in [("band=5\nband_prev=5\n", None), ("band=5\nband_prev=24\n", None), ("band=2.4\nband_prev=5\n", Some(Band::G5))] {
+            assert_eq!(parse_link_file(&format!("{k}{lines}")).and_then(|c| c.band_prev), want, "{lines:?}");
+        }
+    }
+
+    /// The AP layer's mark `<band asked> <channel run>`: a handshake counts for a band on trial only while the AP was
+    /// started for that band and runs one of its channels.
+    #[test]
+    fn the_ap_layers_mark_says_whether_the_ap_runs_the_band() {
+        assert!(on_band("5 36", Band::G5) && on_band("5 149\n", Band::G5) && on_band("2.4 6", Band::G24));
+        assert!(!on_band("2.4 6", Band::G5), "the band before, the AP not moved yet");
+        assert!(!on_band("2.4 36", Band::G24), "6 refused: its own 36, not 2.4 GHz");
+        assert!(!on_band("5 6", Band::G5) && !on_band("", Band::G5) && !on_band("5", Band::G5) && !on_band("5 x", Band::G5));
+    }
+
+    /// The band gone back after its trial: the AP restarts on it once no phone's CarPlay session uses it (the rule for
+    /// an AP of another band), whatever restarts of that kind this start made, and only once.
+    #[test]
+    fn the_band_gone_back_restarts_the_ap_once_no_carplay_uses_it() {
+        let t = Instant::now();
+        let mut k = ApKeep { fixes: AP_FIXES, back: true, ..ApKeep::default() };
+        assert_eq!(k.step(t, Band::G24, false, true, "5 36", true), None, "a phone's CarPlay on the AP: it waits");
+        assert!(k.back, "  still to do");
+        assert_eq!(k.step(t + AP_LOOK, Band::G24, false, true, "5 36", false), Some("wifi_ap_restart"), "no CarPlay: restarted");
+        assert!(!k.back && k.fixes == AP_FIXES, "asked once, and no fix counted");
+        let mut k = ApKeep { back: true, ..ApKeep::default() };
+        assert_eq!(k.step(t, Band::G24, false, true, "2.4 6", false), None, "the AP on the band already: nothing");
+        assert!(!k.back);
+        let mut k = ApKeep { fixes: AP_FIXES, ..ApKeep::default() };
+        assert_eq!(k.step(t, Band::G24, false, true, "5 36", false), None, "another band with the fixes spent: as before");
     }
 
     /// A link file of the retired hotspot mode (a hotspot's, or the key alone) at ocbmd's start: removed, with what that
@@ -1457,7 +1609,7 @@ mod tests {
         }
         std::fs::write(&path, format!("{k}mode=ap\nband=5\n")).unwrap();
         std::fs::write(beside("_channel"), "x\n").unwrap();
-        assert_eq!(start_link_conf(&path), (Some(LinkConf { key: LinkKey([0x0a; 32]), band: Band::G5 }), false));
+        assert_eq!(start_link_conf(&path), (Some(LinkConf { key: LinkKey([0x0a; 32]), band: Band::G5, band_prev: None }), false));
         assert!(std::path::Path::new(&path).exists() && std::path::Path::new(&beside("_channel")).exists(), "mode ap: kept");
         std::fs::write(&path, "key=short\nmode=ap\n").unwrap();
         assert_eq!(start_link_conf(&path), (None, false), "mode ap with no valid key: off, the file left as it is");
@@ -1527,11 +1679,14 @@ mod tests {
         assert_eq!(ap_bind(&moved, |_| Some(Ipv4Addr::new(10, 0, 0, 1))).map(|(a, _)| a.ip().octets()), Some([10, 0, 0, 1]), "/etc/wifi_ip's");
     }
 
+    /// Mode `ap`'s object: mode, state, band, channel and (27 Nov 2026) whether a band change is on trial, the last key.
     #[test]
-    fn mgmt_info_in_mode_ap_says_mode_state_band_and_channel_only() {
-        assert_eq!(ap_info_json(Band::G24, false, false, 36), "{\"mode\":\"ap\",\"state\":\"off\",\"ap_band\":\"2.4\",\"ap_channel\":36}");
-        assert_eq!(ap_info_json(Band::G24, false, true, 6), "{\"mode\":\"ap\",\"state\":\"up\",\"ap_band\":\"2.4\",\"ap_channel\":6}");
-        assert_eq!(ap_info_json(Band::G5, true, true, 36), "{\"mode\":\"ap\",\"state\":\"linked\",\"ap_band\":\"5\",\"ap_channel\":36}");
+    fn mgmt_info_in_mode_ap_says_mode_state_band_channel_and_a_trial_only() {
+        let j = |b, linked, listening, ch, pending| ap_info_json(b, linked, listening, ch, pending);
+        assert_eq!(j(Band::G24, false, false, 36, false), "{\"mode\":\"ap\",\"state\":\"off\",\"ap_band\":\"2.4\",\"ap_channel\":36,\"band_pending\":false}");
+        assert_eq!(j(Band::G24, false, true, 6, false), "{\"mode\":\"ap\",\"state\":\"up\",\"ap_band\":\"2.4\",\"ap_channel\":6,\"band_pending\":false}");
+        assert_eq!(j(Band::G5, true, true, 36, false), "{\"mode\":\"ap\",\"state\":\"linked\",\"ap_band\":\"5\",\"ap_channel\":36,\"band_pending\":false}");
+        assert_eq!(j(Band::G5, false, true, 6, true), "{\"mode\":\"ap\",\"state\":\"up\",\"ap_band\":\"5\",\"ap_channel\":6,\"band_pending\":true}", "5 GHz on trial, the AP not moved yet");
     }
 
     /// Mode `ap`'s look: raise, restart at once for a change, restart for another band's AP only with no CarPlay on
@@ -1568,7 +1723,7 @@ mod tests {
     fn the_link_file_is_stored_0600_and_removed() {
         use std::os::unix::fs::PermissionsExt;
         let path = format!("/tmp/ocbmd_selftest_wifi_store_{}", std::process::id());
-        let c = LinkConf { key: LinkKey([9; 32]), band: Band::G24 };
+        let c = LinkConf { key: LinkKey([9; 32]), band: Band::G24, band_prev: None };
         let kept = format!("{path}_bssid"); // the retired hotspot mode's kept address: any store takes it
         std::fs::write(&kept, "02:11:22:33:44:55\n").unwrap();
         store(Some(&c), &path).unwrap();
