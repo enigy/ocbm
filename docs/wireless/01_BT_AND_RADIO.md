@@ -499,28 +499,62 @@ because BT attach waits for WLAN on this part, Bluetooth with it. Both forms now
 
 ## The Wi-Fi link in mode `ap`: the head unit on the adapter's own AP (branch `wifi-link`, 27 Nov 2026; not benched)
 
-ADDENDUM 24 of the hand-off plan, the owner's decision: the IW416 cannot join a 2.4 GHz network as a client (below,
-ADDENDA 14-23), so the head unit joins the AP the phone's CarPlay already uses. `/etc/ocbm/wifi_link` then holds
-`key=`, `mode=ap` and `band=2.4|5` (MGMT_WIFI_LINK version 2, docs/carplay/01_OCBM_PROTOCOL.md); no `ssid_hex=`, so
-nothing of the station below runs (no keeper, no supplicant).
-- **The seam** (`radio_hal.sh`, `link_ap`: the shell's own read of the file, no fork): the AP takes the uAP interface
-  (`ap_iface`: the wireless interface that is not `sta*`, `wlan0` on the IW416, as in STA mode; the 2.4 GHz CarPlay AP
-  of the 24-25 Nov benches ran there), and `sta0` stays idle. `wifi_ap_on` hands the AP layer the band
-  (`RADIO_AP_BAND`), and with an AP up returns 2 at once. `wifi_ap_off` leaves the AP up and says so (`mode ap: the AP
-  stays up (the head unit's network)`): a session's teardown ends the phone's session and powers Bluetooth down as
-  before, but the AP is the head unit's network. `wifi_ap_restart` (new verb, ocbmd's) takes it down and up again.
+ADDENDUM 24 of the hand-off plan, the owner's decision: the IW416 cannot join a 2.4 GHz network as a client (the RETIRED
+section below, ADDENDA 14-23), so the head unit joins the AP the phone's CarPlay already uses, and the adapter is never
+a client. `/etc/ocbm/wifi_link` holds `key=`, `mode=ap`, `band=2.4|5` (MGMT_WIFI_LINK version 2,
+docs/carplay/01_OCBM_PROTOCOL.md) and, while a band change is on trial, `band_prev=` (below). A file without `mode=ap`
+(the retired hotspot mode's) is no link: ocbmd removes it at its start, and the seam reads it as none.
+- **Interfaces, from the unit's own driver configuration.** The IW416's stock `wifi_mod_para.conf` (2025.10.15.1127,
+  read from the 18 Oct backup) says `drv_mode=3`, `sta_name=sta`, `uap_name=wlan`: one moal load makes `sta0`, the STA
+  BSS, and `wlan0`, the uAP BSS. The AP of 2.7.1 takes the first wireless interface by name, `sta0`, which hostapd
+  switches to the AP role, and leaves `wlan0` idle; with no link it still does. In mode `ap` `radio_hal.sh` (`ap_iface`,
+  `sta_bss_iface`) gives the AP the wireless interface NOT named `sta*` while one named `sta*` is beside it: the uAP,
+  `wlan0` (the 2.4 GHz CarPlay AP of the 24-25 Nov benches ran there); `sta0` stays idle, nothing runs on it. A driver
+  that makes one interface gives the AP that one; that is known 1 s after its first interface appears (`pair_settle`: a
+  driver's interfaces come from one probe) and marked for the boot (`/tmp/.radio_one_iface`), so no later start waits
+  again. An adapter with no link forks nothing for any of this (the shell's own test of the link file first).
+- **Never `/usr/sbin/wpa_supplicant`.** The vendor dispatcher's gate (`test -e /usr/sbin/wpa_supplicant &&
+  supportStaMode=1`) switches moal to `wifi_mod_para_p2psta.conf` (`drv_mode=5`, `wfd_name=wlan`: no uAP BSS at all),
+  and `radio_detect.sh` follows that gate on every unit, set up or not. OCBM places none (pinned in
+  tools/ocbm_installer_test.sh), and since 27 Nov 2026 no supplicant at all: the hotspot mode's
+  `/usr/sbin/ocbm-wpa_supplicant` is retired (`ccpa/installer/retired.list`).
+- **The seam** (`radio_hal.sh`, `link_ap`: the shell's own read of the file, no fork): `wifi_ap_on` hands the AP layer
+  the band (`RADIO_AP_BAND`), and with an AP up returns 2 at once. `wifi_ap_off` leaves the AP up and says so (`mode ap:
+  the AP stays up (the head unit's network)`): a session's teardown ends the phone's session and powers Bluetooth down
+  as before, but the AP is the head unit's network. `wifi_ap_restart` (ocbmd's verb) takes it down and up again. A
+  teardown of mode `ap`'s AP (forced, or once the link is removed: the band's mark says so) downs the interface the AP
+  ran on, `hostapd.conf`'s `interface=` (the uAP, or the first interface for an AP raised before the link was set up),
+  never the first interface by name blindly, which left the uAP up with the AP's address once the link was removed.
 - **The band** (`radio_ap_up.sh` `ap_band_conf`, through `/tmp/hostapd_session.conf`; `hostapd.conf` on flash never
   written for it): 2.4 GHz = channel 6, `hw_mode=g`, 20 MHz (no HT40, no `[SHORT-GI-40]`, no VHT line); 5 GHz =
   `hostapd.conf`'s own channel when it is a non-DFS 5 GHz one (36 on the factory file), else 36 and its HT40 side. A
-  refused channel falls back to the AP's own, as in STA mode. `/tmp/.radio_ap_link` says which band the running AP was
-  started for (`2.4 6`; after a refusal `2.4 36`), and goes with it. The set-up network runs on channel 6 too.
-- **Up from power-up and between sessions** (ocbmd `src/wifi.rs` `ApKeep`, a look every 2 s in mode `ap` only): no
-  hostapd running, the AP is raised (`wifi_ap_on`, 15 s apart at most); a changed mode or band restarts it at once (the
-  phone's CarPlay drops and comes back); an AP started for another band (or before mode `ap`) is restarted only while
-  no phone's CarPlay session uses it (`/tmp/projection_owner`), three times a start at most. Never over an AP bring-up
-  or teardown under way (the wlan lock, the AP layer's lock) or a set-up network. Leaving mode `ap` with no host's
-  session up takes the AP down; with one, its teardown does. The radio inhibit (`CT_RADIO off`), `wireless: false` and
-  a wired session's yield take Bluetooth and the phone's session down, never this AP.
+  refused channel falls back to the AP's own. `/tmp/.radio_ap_link` says which band the running AP was started for and
+  the channel it runs (`2.4 6`; after a refusal `2.4 36`), and goes with it; an AP started with no band removes an
+  earlier mode-ap AP's mark and session configuration. btd's 0x5703 tells the phone the channel the AP runs (the session
+  configuration's while it is there). The set-up network runs on channel 6 too.
+- **Up from power-up and between sessions** (ocbmd `src/wifi.rs` `ApKeep`, a look every 2 s while a link is set up): no
+  hostapd running, the AP is raised (`wifi_ap_on`, 15 s apart at most); a link set up or a band changed restarts it at
+  once (the phone's CarPlay drops and comes back); an AP started for another band (or before mode `ap`) is restarted
+  only while no phone's CarPlay session uses it (`/tmp/projection_owner`), three times a start at most. Never over an AP
+  bring-up or teardown under way (the wlan lock, the AP layer's lock) or a set-up network. The link removed with no
+  host's session up takes the AP down; with one, its teardown does. The radio inhibit (`CT_RADIO off`), `wireless:
+  false` and a wired session's yield take Bluetooth and the phone's session down, never this AP.
+- **A band change on trial** (the owner's decision of 27 Nov 2026; ocbmd `wifi::BAND_TRIAL`, 180 s). A v2 that changes
+  the band of an existing link keeps the band before in the link file (`band_prev=`, written with the new band in one
+  rename); a first set-up has nothing to undo, the same band again keeps the trial as it is, and the band before asked
+  again ends it. The trial's time runs from the change's apply, and from each ocbmd start while the file keeps it (no
+  clock survives a power cut: a start gives the new band the whole time again; a USB-only start on a serializing driver
+  runs no Wi-Fi side and so no trial). A Wi-Fi host that completes the OCBW handshake while the AP runs the new band
+  (its mark started for that band and on one of its channels, the listener on the AP, not the bench lever's interface)
+  keeps it: `band_prev=` goes (`wifi: mode ap: a Wi-Fi host linked on 5 GHz: the band is kept (2.4 GHz forgotten)`). A
+  handshake on the band before, the AP not moved yet, keeps nothing. No such host in time: the link file goes back to
+  the band before and one line says so (`wifi: mode ap: no Wi-Fi host linked on 5 GHz within 180 s of the band's change:
+  back to 2.4 GHz (the AP moves once no phone's CarPlay session uses it)`); the AP then moves by the rule for an AP of
+  another band, outside its three a start (`the band went back after its trial, no CarPlay on the AP: wifi_ap_restart on
+  2.4 GHz`), so a phone projecting meanwhile (over USB, or the adapter's own session) is not cut for it. A link file
+  changed under ocbmd (a stick's `OCBM_WIFI_RESET`) is never written back. MGMT_INFO's `wifi_link` says
+  `"band_pending":true` while the trial runs. A USB host holding the box keeps Wi-Fi hosts out, so a change made over
+  USB is kept only once Carlink links over Wi-Fi within the time.
 - **What it costs (inferred, not measured):** the AP beacons whenever the adapter has power, `CarLink-xxxx` visible to
   anyone near the car, and udhcpd runs all the while (its lease file written every 60 s, `auto_time`). A phone that
   knows the AP from CarPlay may stay on it after a session ends (seen on 1 Aug with an AP left beaconing). Its power
@@ -532,127 +566,34 @@ nothing of the station below runs (no keeper, no supplicant).
   not on (the head unit and the phone each talk to the adapter only, but an unknown hostapd key refuses the whole
   configuration: unbenched).
 
-## The Wi-Fi link's station beside the AP (branch `wifi-link`, 24 Nov 2026; not benched)
+## RETIRED 27 Nov 2026: the Wi-Fi link's hotspot mode (the adapter as a station on the phone's hotspot, 24-27 Nov)
 
-With a hotspot set up (an `ssid_hex=` line in `/etc/ocbm/wifi_link`, written by ocbmd for `MGMT_WIFI_LINK`) the adapter
-also joins the phone's Personal Hotspot as a station, so a head unit on that hotspot reaches ocbmd over TCP
-(docs/carplay/01_OCBM_PROTOCOL.md, "The Wi-Fi link"). Without the line nothing below runs.
-
-- **Interfaces, from the unit's own driver configuration.** The IW416's stock `wifi_mod_para.conf` (2025.10.15.1127, read
-  from the 18 Oct backup) says `drv_mode=3`, `sta_name=sta`, `uap_name=wlan`: one moal load makes `sta0`, the STA BSS,
-  and `wlan0`, the uAP BSS. The AP of 2.7.1 takes the first wireless interface by name, `sta0`, which hostapd switches to
-  the AP role, and leaves `wlan0` idle. In STA mode `radio_hal.sh` (`sta_mode`, `sta_iface`, `ap_iface`) gives the AP the
-  wireless interface that is NOT named `sta*` and the station `sta*`: each BSS in its own role, and the layout the
-  vendor's own STA mode uses (its supplicant on `sta0`). A unit whose driver makes one interface has no station beside
-  its AP; the AP keeps it. That is known 1 s after the driver's first interface appears (`sta_settle`: a driver's
-  interfaces come from one probe) and marked for the boot (`/tmp/.radio_one_iface`), so no path waits for a station
-  again, `wifi_sta_up` answers 3 at once, and the keeper publishes `state=unsupported` (MGMT_INFO `wifi_link` state
-  `"unsupported"`). An adapter with no link forks nothing for any of this (`sta_mode` tests the file first). The AP's
-  teardown never downs the station's interface. That the IW416 firmware runs the two together on one channel is
-  inferred, not measured.
-- **Never `/usr/sbin/wpa_supplicant`.** The vendor dispatcher's gate (`test -e /usr/sbin/wpa_supplicant &&
-  supportStaMode=1`) switches moal to `wifi_mod_para_p2psta.conf` (`drv_mode=5`, `wfd_name=wlan`: no uAP BSS at all), and
-  `radio_detect.sh` follows that gate on every unit, set up or not. The stock image ships no supplicant (the factory
-  survey of 27 Oct), so the keeper takes OCBM's own `/usr/sbin/ocbm-wpa_supplicant`, a unit's own stock copy, or a bench
-  copy in `/tmp/bin`, and waits without one. It speaks to the supplicant's control socket
-  (`/var/run/wpa_supplicant/<if>`) with `ocbmd wpa`, not wpa_cli, which the adapter no longer carries (24 Nov 2026:
-  about 68 KB of flash); by hand over the console the same: `ocbmd wpa sta0 status` (or `scan`, `scan_results`,
-  `list_networks`, `select_network 0`: wpa_cli's commands, the reply printed as wpa_cli prints it; `-p DIR` before the
-  interface for another control directory), and `ocbmd wpa sta0 events 60` (below). OCBM's own is built by
-  `tools/build_wpa_supplicant.sh` (wpa_supplicant 2.11 and libnl 3.12.0, static, nl80211 with WEXT as the fallback,
-  WPA2-PSK only) from release archives a checkout fetches once into `scratchpad/wpa/dl`, each checked against a SHA-256
-  pinned in the script, and the image places it when built (its licences as NOTICE files beside the payload).
-- **WPA3-only hotspots are not supported in this version** (WPA2 and WPA2/WPA3 mixed are): the box receives the
-  hotspot key as its PBKDF2 hash, which serves WPA2-PSK only, and the supplicant is built without SAE.
-- **The keeper** (`/script/wifi_sta.sh`, started by `ocbm_boot.sh`): from power-up it keeps the station on the hotspot,
-  with the address and netmask from its DHCP hook (`wifi_sta_dhcp.sh`: no default route, never the AP's or NCM's
-  subnet), publishes `/tmp/wifi_link_state` for ocbmd and the AP layer (`iface=`, `state=`, `channel=`, then the last
-  look's `seen=<channel> <uptime>` and, below, `elsewhere=`) and keeps the hotspot's last channel, joined or heard, in
-  `/etc/ocbm/wifi_link_channel`, its address in `/etc/ocbm/wifi_link_bssid` (below) and the station's own address at
-  its last start in `/etc/ocbm/wifi_link_sta` (said once a start: `the station's own address: the one it had at its last
-  start`, or `new since its last start (a new device to the phone)`; the supplicant uses the interface's own address,
-  2.11's `mac_addr` default, and the keeper sets none). Each is written 0600 when it changes and never logged.
-  Driver load for it: the verb `wifi_sta_up`, under the wlan lock; while that lock is
-  held (the boot preload loading the driver) it looks for its interface every 0.2 s instead of queueing behind it, 15 s
-  at most, and waits for its supplicant's socket rather than a fixed second. A supplicant that does not start, or does
-  not stay, is started again no sooner than 30 s after its last start and said once until it runs. With no supplicant or
-  no station it publishes `seen=0`, so no AP start waits for a look that cannot come.
-- **Scans on the one radio** (ADDENDUM 9 of the hand-off plan, 24 Nov 2026, for the looks). None while joined. Not
-  joined: at each supplicant start with no AP up, and no host but the adapter's own session (M2), the *first look*: the
-  hotspot's last channel alone (the supplicant's own first scan too, `initial_freq_list`; a fraction of a second where
-  it was last time), then the channels an AP may use; its result is published at once. With a session starting (the AP
-  up, or `/tmp/host_present` 1: M2's own session pages the bonded phones over Bluetooth before any AP) and not
-  established (`/tmp/session_healthy` not 1, 40 s at most) no scan at all, so the page, the phone's join of the AP and
-  the session's set-up never meet one; the one exception is the adapter's own session before its AP comes, when the
-  first look heard the hotspot: scans and joins on that channel alone, so the station may join first. A USB host's start
-  is never held up by a look. With the AP up the station scans AND joins on the AP's channel only (`scan_freq`,
-  `freq_list`): one radio cannot join elsewhere while the AP runs, and each try off it took the radio from the phone
-  (the evening bench: an authentication on 2437 beside the AP on 36, then the driver's `bss_start Fails`); a *look* over
-  the channels an AP may use (no radar channel) each 60 s, or each 20 s while the adapter's own session has no host (its
-  video parked), the first at once when its AP is not where the hotspot was last heard. With no AP up: every channel,
-  and a look each 30 s (a wired session too). A look is `ocbmd wpa <if> find` (ccpa/ocbmd/src/wpa.rs): first the
-  supplicant's own results (a sighting from its scan of the last 4 s, or a join under way: then no scan of ours, so a
-  look never meets the join the supplicant starts on its own results), else a scan of the look's channels that probes
-  for the hotspot by name (next item); where it heard the hotspot, from the BSS table (entries it did not hear, or on
-  other channels, left out). The keeper says the channel and dBm when they change. The supplicant scans for itself
-  (`disable_scan_offload=1`): wpa_supplicant 2.11 hands its scans to the driver's scheduled scan after three that found
-  nothing (`wpa_supplicant_req_sched_scan`), and nothing on this radio has shown that the driver reports them. What it
-  scans and joins on changes in place (ADDENDUM 11): its network's `scan_freq` and `freq_list` through SET_NETWORK,
-  which leaves a join under way alone (a RECONFIGURE deauthenticates first); the adapter's own session's start pause
-  (DISCONNECT) and the restart after 300 s not joined wait for a join under way to end.
-- **The hotspot with its name hidden** (ADDENDUM 10 and 11 of the hand-off plan, 25 Nov 2026). An iPhone's Personal
-  Hotspot leaves its name out of its beacons whenever the phone's hotspot screen is not open (locked, or another screen
-  in front), also while a client is joined: a scan that names nothing lists it as a strong entry with an empty name,
-  and only a probe that carries its name gets an answer with the name. The supplicant's own scans carry it
-  (`scan_ssid=1`); so does every look now: `SCAN freq=<list> ssid <name in hex> ssid ` (wpa_supplicant 2.11's grammar,
-  ctrl_iface.c `wpas_ctrl_scan`: the name, then the wildcard; a driver that takes one name per scan keeps the first). A
-  look also knows the hotspot by its address, kept in `/etc/ocbm/wifi_link_bssid` at each join (STATUS `bssid=`) and
-  when a look hears it by name: an entry with its name hidden (empty, or zeros) and that address, on the look's
-  channels, is the hotspot (find's `seen 6 -39 hidden`; the keeper's `the hotspot heard on channel 6 (-39 dBm, its name
-  hidden: known by its address)`). Heard by name under another address, with the kept one not heard in the same look,
-  the new address is kept; a new set-up (MGMT_WIFI_LINK, ocbmd `wifi::store`), `OCBM_WIFI_RESET` and the go-back to
-  stock remove it. The owner, 25 Nov 2026: an iPhone's hotspot address does not change; other phones and hotspot
-  devices are not known.
-  - **For owners:** the adapter remembers your hotspot's address so it can find and join it while the name is hidden
-    (on an iPhone: whenever the Personal Hotspot screen is not open). This relies on the hotspot keeping one address, as
-    an iPhone does. A phone or hotspot that changes its address has to be visible by name (its hotspot screen open) for
-    the adapter to find it again; the adapter then remembers the new address. Setting the Wi-Fi link up again forgets
-    the old one.
-  - **No `bssid=` or `bssid_hint=` in the supplicant's network** (decided 25 Nov from the 2.11 source). With `ssid=`
-    set, `bssid=` only narrows the choice to that address: the name check stays (events.c `wpa_scan_res_ok` relaxes it
-    only for a network with no name), so it adds nothing for a hidden hotspot and would lock out an owner whose hotspot
-    came back under another address. A network with `bssid=` and no name would match the hidden beacon, but its
-    authentication and association carry the entry's empty name (sme.c takes the BSS's `ssid`), which no hotspot takes.
-    `bssid_hint=` serves only a driver that picks the BSS itself (wpa_supplicant.c, the connect command's
-    `bssid_hint`); this driver takes the supplicant's own SME (moal's `HostMlme` lines). So the supplicant joins by
-    name, from the answer to its named probe, and the kept address serves the looks: `seen=`, `elsewhere=`, the AP's
-    head start, and the retry below.
-  - **Held back after failed joins:** 2.11 disables the network for a while after 4 failed attempts in a row
-    (`wpas_connection_failed`: 10 s, then 20, 30, 60 from the 4th, 90 from the 6th, 120 from the 11th, 300 from the
-    51st; `ssid-temp-disabled auth_failures=N duration=D reason=CONN_FAILED`). A look that hears the hotspot then sends
-    SELECT_NETWORK, which clears that and has it try at once (ENABLE_NETWORK leaves an enabled network's back-off as
-    it is), said once in 5 minutes: `the hotspot heard while the supplicant held it back after failed joins: it tries
-    again now`. Not while the station is paused for a CarPlay start.
-- **Its joins, as they happen** (ADDENDUM 11). Beside each supplicant the keeper runs a monitor of its control socket,
-  `ocbmd wpa <if> events 0 /tmp/wifi_sta_misses` (the file: its count of unanswered authentications, ADDENDUM 13,
-  below) (ATTACH and LEVEL 2: this build has no debug output, and its MSG_DEBUG `wpa_msg` lines, the
-  SME's own 5 s timers among them, are all there is beyond the events), into the box log: `[wifi_sta] [up N]
-  supplicant: <event>`, names and numeric codes only, never a name or an address. A join's steps carry the time since
-  its authentication began (`authenticating freq=2437`, `trying freq=2437 (+2412 ms)`, `associated (+2450 ms)`,
-  `connected (+2610 ms)`); a step that ends with no event of its own is said from STATUS (`no answer to the
-  authentication (+2405 ms, now SCANNING)`: 2.11 says nothing when the driver ends one, sme.c
-  `sme_event_auth_timed_out`). Within a minute each line comes once, then one line with the repeats (`again in the
-  last 60 s: authenticating freq=2437 x5, no answer to the authentication x5`); the hotspot not found after a scan is
-  left out (the looks say that). It ends with its supplicant (TERMINATING, or no PONG after 10 s of silence) and
-  starts again with the next. By hand, `ocbmd wpa sta0 events 60` prints the same for 60 s. Being an `ocbmd` process
-  that lives all along, `pidof ocbmd` counts it: ocbm_boot.sh's failover watchdog (`pgrep -f /usr/sbin/ocbmd`, as the
-  respawn wrapper), the supervisor's L2 check (the full path) and the trial self-test (an ` wpa ` command line left
-  out) look for the daemon without it; the supervisor's `pkill -x ocbmd` ends it, and the keeper starts it again.
-- **The authentication's 2.4 s: what the stock driver does** (ADDENDUM 12 and 13 of the hand-off plan, 25 Nov 2026).
-  The bench of 557b6b9: with no AP up, the driver's `wlan: HostMlme sta0 send auth to bssid ...`, then `wlan: HostMlme
-  Auth received from ...` 2.41 s later every time, about 20 ms after the monitor's `no answer to the authentication
-  (+2406 ms, now SCANNING)`. FOUND by disassembling the factory image's moal.ko (`iw416_ko.tar.gz`, driver
-  `MXM5X--437.p20`; its symbols, relocations and strings; nothing run):
+The Wi-Fi link was first built for the phone's Personal Hotspot (MGMT_WIFI_LINK version 1): the adapter joined it as a
+station beside its own AP, on one radio, and the head unit reached ocbmd there. The benches of 24-27 Nov (ADDENDA 6 to
+23 of the hand-off plan) found that the IW416 joins no 2.4 GHz network as a client, with three firmwares and on a radio
+capture, while the owner's head unit is 2.4 GHz only; two-band operation (the AP at 2.4, the station at 5 GHz, the
+driver's DRCS mode) lost 33 to 58% of the station's pings. The owner retired the mode on 27 Nov 2026 for mode `ap`
+(above). Removed then: the station keeper (`/script/wifi_sta.sh`) and its DHCP hook (`wifi_sta_dhcp.sh`), the bundled
+supplicant (`/usr/sbin/ocbm-wpa_supplicant`, wpa_supplicant 2.11 and libnl, 545,712 B; its build script) and ocbmd's
+client for it (`ocbmd wpa`), the seam's station verb and channel (`wifi_sta_up`, `sta_channel`), the AP's following
+of the hotspot's channel and its head start for the station (`radio_ap_up.sh` `ap_follow`, `ap_head`, `ap_join`), the
+adapter's own session's restart on the hotspot's channel, and the bench's station switches (`sta_modparam`,
+`sta_drvpatch`, `sta_drvdbg`, `sta_join_wait`, `sta_join_first`, `sta_ap_hold`, `sta_miss_guard`). An update retires
+the three files at its commit; ocbmd refuses a version 1 (status 2) and removes a link file of that mode at its start
+with what the mode kept beside it (`/etc/ocbm/wifi_link_channel`, `_bssid`, `_sta`). Their full description is in git:
+this document and docs/ops/02_TESTING.md at d100800 (branch `wifi-link`). What the benches and the stock driver's code
+showed, kept as findings:
+- **The channel, one radio** (24 Nov, the first bench): with the station on the hotspot's 149 and the AP on
+  `hostapd.conf`'s 36 the phone never joined the AP (4 CarPlay starts of 4); with a session on 36 the phone's hotspot
+  followed the phone's own link to 36 and the station joined beside the AP. An AP and a station share one channel.
+- **An iPhone's Personal Hotspot hides its name** whenever the phone's hotspot screen is not open, also while a client
+  is joined: a scan that names nothing lists a strong entry with an empty name, and only a probe carrying the name is
+  answered with it (25 Nov).
+- **The authentication's 2.4 s: what the stock driver does** (ADDENDUM 12 and 13 of the hand-off plan, 25 Nov 2026). The
+  bench of 557b6b9: with no AP up, the driver's `wlan: HostMlme sta0 send auth to bssid ...`, then `wlan: HostMlme Auth
+  received from ...` 2.41 s later every time, about 20 ms after the keeper's monitor said `no answer to the
+  authentication (+2406 ms, now SCANNING)`. FOUND by disassembling the factory image's moal.ko (`iw416_ko.tar.gz`,
+  driver `MXM5X--437.p20`; its symbols, relocations and strings; nothing run):
   - *Host MLME.* moal's `host_mlme` parameter is on by default (1) and the stock `wifi_mod_para.conf` leaves it. With it
     `woal_register_cfg80211` gives cfg80211 the `auth` and `assoc` operations and takes `connect` and `disconnect` away,
     so wpa_supplicant 2.11 runs its own SME (driver_nl80211_capa.c: the wiphy lists AUTHENTICATE): an
@@ -661,7 +602,7 @@ also joins the phone's Personal Hotspot as a station, so a head unit on that hot
     **The card forces it** (ADDENDUM 15): woal_add_card, right after the command line and then the conf block were
     read (the block's `host_mlme=0` prints `host_mlme=disable`), takes the IW416's card table and, its
     `host_mlme_required` byte being 1, sets host MLME again. No parameter, conf line or /proc knob turns it off; only a
-    driver copy with that byte changed (the bench's `sta_drvpatch`, below).
+    driver copy with that byte changed (the bench's former `sta_drvpatch`).
   - *The wait is a remain-on-channel.* `woal_cfg80211_authenticate` asks the firmware to stay on the network's channel
     for 2400 ms (the literal in its call to `woal_cfg80211_remain_on_channel_cfg`; 20 MHz, the channel's band, asked
     whenever no authentication is pending, whatever else runs on that channel), marks the authentication pending, and
@@ -698,7 +639,8 @@ also joins the phone's Personal Hotspot as a station, so a head unit on that hot
     armed state, page and inquiry scan off, nothing paging); the firmware's antenna choice; the module's own calibration
     file, shipped and never loaded; the station's 802.11d domain, sent band 0 then band 1 so that the last is the 5 GHz
     one (but 802.11d is off, and the firmware's join re-sends the 2.4 GHz one before it joins). The stay alone is not
-    it: the association fails with no stay. docs/ops/02_TESTING.md has the no-flash steps that split these.
+    it: the association fails with no stay. docs/ops/02_TESTING.md at d100800 has the no-flash steps that would split
+    these.
   - *What the host can set there* (ADDENDUM 18, read in the factory moal and mlan): no coexistence parameter or conf key
     (the driver's robust coex is one TLV, 0x021b, an external Bluetooth-request pin; the firmware's event 0x76 only
     tunes aggregation windows and scan times); `antcfg` (1 or 2 an antenna, 0xffff diversity), 0 in the stock file so
@@ -712,112 +654,18 @@ also joins the phone's Personal Hotspot as a station, so a head unit on that hot
   - *Seen in dmesg* (the driver's default mask, `drvdbg` 0x207, shows MMSG and MERROR lines): `send auth to bssid`,
     mlan's `Auth received from`, `pending auth on going`, `Fail to configure remain on channel`, `HostMlme sta0: Set
     remain on Channel: with status=N`, `Fail to send packet status=N`, `bss_start Fails`, `WiFi Reset due to ...`,
-    `Start to process hanging`. With the bench's `sta_drvdbg` (0x237: MCMND 0x10 and MEVENT 0x20 added) also
-    `FW_REMAIN_ON_CHANNEL_EXPIRED cookie = ...` and `wlan: HostMlme auth timeout` (MEVENT), `HostMlme sta0: Received
-    auth frame type = 0x0` (MEVENT), `Remain on Channel: chan=6, offset=.. width=..` and `wlan: HostMlme sta0 auth
-    success` (MCMND). The mask is moal's `drvdbg`, writable at run time: `echo "drvdbg=0x237" >
+    `Start to process hanging`. With the debug mask 0x237 (MCMND 0x10 and MEVENT 0x20 added; the former `sta_drvdbg`)
+    also `FW_REMAIN_ON_CHANNEL_EXPIRED cookie = ...` and `wlan: HostMlme auth timeout` (MEVENT), `HostMlme sta0:
+    Received auth frame type = 0x0` (MEVENT), `Remain on Channel: chan=6, offset=.. width=..` and `wlan: HostMlme sta0
+    auth success` (MCMND). The mask is moal's `drvdbg`, writable at run time: `echo "drvdbg=0x237" >
     /proc/mwlan/adapter0/sta0/debug` sets moal's and its mlan's, `/sys/module/moal/parameters/drvdbg` moal's alone.
-- **What the keeper and the AP layer do about it** (ADDENDUM 13, built 25 Nov on 557b6b9; not benched):
-  - *The AP of the adapter's own session waits for a join under way* (`radio_ap_up.sh` `ap_join`): once the first look
-    heard the hotspot, from the supplicant's STATUS every 0.2 s (`ocbmd wpa`), 6 s at most (the authentication alone
-    takes 2.4 s): joined, the AP takes its channel; still under way at the bound, the AP starts beside it (said). With
-    the bench's `sta_join_first` it waits instead for the station to be on the hotspot, up to that many seconds (10),
-    its retries included. A USB host's AP never waits.
-  - *No join begins in hostapd's start.* Not joined at the end of that wait, the AP layer stops the supplicant
-    (DISCONNECT, never over a join under way) and writes `/tmp/.radio_ap_start` (its pid) until its start is over; the
-    keeper takes that as its own pause (`the AP is starting: no scans and no joins until it is up`) and its start rules
-    put the station back (the session running, 40 s at most; at once if no AP came).
-  - *No fifth miss while the AP runs.* The monitor keeps the count of authentications in a row with no answer in
-    `/tmp/wifi_sta_misses` (one more for each that ended unanswered or on the SME's 5 s timer, none again after any
-    answer: the association tried, a refusal, a join; a refusal by the driver sent no frame and does not count); at 3
-    the keeper tries no join while an AP is up (`3 authentications in a row unanswered: no joins while the AP runs`),
-    and goes on when the AP is down. The file lasts the boot. **Its premise does not hold on this firmware**
-    (ADDENDUM 15, above: no reset from failed authentications; the line no longer says it, 27 Nov); the guard now only
-    holds joins back while the AP runs (`off` in `bench_sta_miss_guard` for the bench; whether to keep it is the
-    owner's).
-  - *The quick retry the plan asked for is 2.11's own:* its first three retries come 0.1 to 1 s after each failure, and
-    the bench's case b shows them failing alike. Not built.
-  - *Firmware MLME* (ADDENDUM 15: the bench's `sta_drvpatch` with the card's `host_mlme_required` byte changed, and
-    `moal host_mlme=0` in `/etc/ocbm/bench_sta_modparam`, then a power-up; `host_mlme=0` alone is overridden by the
-    card): moal keeps `connect` (`woal_cfg80211_connect`: the firmware's own join, no remain-on-channel, no
-    host-built frame, no counter), and 2.11 then connects with NL80211_CMD_CONNECT by itself (`trying freq=..` with no
-    `authenticating` before it; dmesg `wlan: Connected to bssid ... successfully`, or `can't find targe AP` when moal's
-    own scan table lacks the hidden hotspot by name). Its cost is the AP's side: moal tests the same flag in its uAP
-    start, its beacon filter, its management frame registration and transmit and its station add and delete, and
-    without it says the AP's SME is the firmware's (`WIPHY_FLAG_HAVE_AP_SME`): so, INFERRED from those, the phone's
-    authentication and association of the AP move into the firmware and hostapd learns of stations from the driver.
-    Stock never ran so; not benched. The same one insmod at the boot preload (from the copies the two files make): no
-    reload, nothing on a USB host's time to picture from the load itself. Changing it at run time would need the driver
-    unloaded and loaded again (the AP and the station down for the driver's load, 3.8 s in the 24 Nov boot log beside
-    the Bluetooth firmware's push, and Bluetooth's side under that unknown): not built.
-  - *The bench's driver copies* (ADDENDUM 15; radio_hal.sh, off unless the file is there). `sta_modparam` puts its words
-    for a module whose insmod names a parameter file (moal's `mod_para=`) into a copy of that file at `/tmp/fw`, inside
-    its block after the file's own lines, and points the kernel firmware loader's path
-    (`/sys/module/firmware_class/parameters/path`) there: moal reads the command line first and the block after it, so
-    only there does a word the block names win. `sta_drvpatch` (`<module> <sha256> OFFSET:OLD:NEW...`) loads the module
-    from a copy with those bytes changed, only when its file has that sha256 and the copy differs by exactly those
-    bytes. The lines for moal 437.p20 (docs/ops/02_TESTING.md): *late*, the stay's expiry no longer ends a pending
-    authentication and a new one is not refused for it, so the answer that reaches the driver 10 ms after the stay is
-    taken; *nostay*, no stay at all, the frame going as the AP's own do (only with the AP on the hotspot's channel);
-    *fwmlme*, the card's byte, for the firmware's own join above.
-  - *The rest of the candidates, and their lines* (the monitor's beside dmesg): the answer taken and the association not
-    answered (`trying freq=2437 (+N ms)` then `no answer to the association ...`, `assoc-reject status_code=N`; dmesg
-    `bss_start Fails`, `Failed to connect`); the phone refusing (`auth-reject ... status_code=N`, 17: too many
-    clients); the key (`associated` then `the key handshake timed out` or `4-way handshake failed (the key?)`); the
-    driver refusing the step (`the driver refused the authentication`; dmesg `pending auth on going`, `Fail to
-    configure remain on channel`, `bssid not found in scan list`: moal's own scan table lacks the network); a new
-    device to the phone at each start (`the station's own address: new since its last start`); the back-off
-    (`ssid-temp-disabled ... duration=D`, the look's `... it tries again now`).
-
-- **The listener and the advert stay on the station's side.** The listener takes connections from the station's
-  interface only (SO_BINDTODEVICE: under Linux's weak-host model the station's address alone would also answer on the
-  AP's or USB's network). The mDNS socket is bound to the group, 224.0.0.251:5353, so no unicast datagram for carplayd's
-  mdns-sd (its sockets: 0.0.0.0:5353, SO_REUSEPORT) can land in it.
-- **Channels: the AP follows the hotspot** (ADDENDUM 6 of the hand-off plan, 24 Nov 2026; not benched). One radio, so
-  one channel for the adapter's AP, its station and the head unit: the hotspot's. On the first bench (24 Nov, dev
-  adapter) the station held the hotspot on 149 and the AP came up on `hostapd.conf`'s 36: the phone never joined the AP
-  (4 CarPlay starts of 4, cut by btd's 90 s watchdog). With a session running on 36 the phone's hotspot was on 36 too
-  (it follows the phone's own link) and the station joined beside the AP there. So at each AP start in STA mode the seam
-  (`radio_hal.sh` `sta_channel`) hands the AP layer the channel the station is associated on, from the keeper's
-  `/tmp/wifi_link_state` (no fork), and `radio_ap_up.sh` (`ap_follow`) starts hostapd there from a per-session
-  configuration, `/tmp/hostapd_session.conf` (tmpfs, 0600): `hostapd.conf` with that `channel=`, its band's `hw_mode`
-  and the HT40 side of its 40 MHz pair, any VHT centre left out. `hostapd.conf` on flash is never written for it; the
-  per-session file goes at the AP's teardown and at the next start. btd's 0x5703 (the channel the phone is told) and
-  MGMT_INFO's `ap_channel` read it while it is there, `hostapd.conf` otherwise. With no link nothing of this runs.
-  - **Where an AP may start:** the US domain the unit's `hostapd.conf` asks for (`country_code=US` in the factory file
-    of 28 Oct and the dev adapter's of 21 Oct: 802.11n, HT40+ on 36, VHT off) without radar detection: 1-11, 36-48
-    (U-NII-1), 149-165 (U-NII-3). Never 52-144 (DFS), nor any other. HT40 on its pair's side: 36/40, 44/48, 149/153,
-    157/161 (HT40+ on the lower channel, HT40- on the upper), 1-7 HT40+ and 8-11 HT40- at 2.4 GHz; 165 and 14 have no
-    pair, 20 MHz there. In STA mode `/etc/wifi_use_24G` gives way: the AP goes to the station's band.
-  - **At power-up, the adapter's own session** (ADDENDUM 9, the evening bench of 24 Nov on b860672): M2's AP came up at
-    about 10 s on `hostapd.conf`'s 36 before the keeper had published anything (its supplicant started at 10.0 s, its
-    first word was a second later), so the station never joined the hotspot on 2.4 GHz channel 6 and no Wi-Fi host could
-    reach the adapter in the 180 s the session ran. Now, while the adapter's own session runs with no host
-    (`/tmp/wifi_self_parked`, ocbmd's) and the station is not on the hotspot, `radio_ap_up.sh` (`ap_head`) waits up to
-    4 s, while the keeper runs, for its first look, and starts the AP on the channel the look heard the hotspot on, else
-    on the hotspot's last channel (`/etc/ocbm/wifi_link_channel`, where an AP may), else on its own; said in one line
-    with the wait. Where the look heard it, it also waits for a join under way (ADDENDUM 13, above: 6 s at most) and
-    holds the station still through hostapd's start: `STA mode, the adapter's own session: channel 6, heard there by
-    the station's look (waited 300 ms for the station, then 2400 ms for its join, held still while hostapd starts)`.
-    Any other start (a USB host's) waits for nothing and keeps its own channel when the station is not on the hotspot,
-    as before.
-  - **2.4 GHz** (the owner's head unit needs the hotspot's Maximize Compatibility, so 1-11 is the product's normal
-    case): the session's configuration is `hw_mode=g`, 20 MHz (`ht_capab=[SHORT-GI-20]`, the factory file's own 2.4 GHz
-    line: no 20/40 coexistence scan at hostapd's start, nothing on the channel next to the hotspot's) and no VHT line.
-    The phone is told the channel in the 0x5703 as at 5 GHz (a channel number, from which iOS takes the band).
-  - **Heard elsewhere while the AP runs:** two looks in a row that heard the hotspot on another channel an AP may use
-    (the keeper's `elsewhere=`): the adapter's own session with no host attached starts again, once (ocbmd's re-arm: the
-    phone leaves CarPlay and comes back, about a cold start), and its next AP takes that channel. A session a host is
-    attached to is never moved.
-  - **Not associated, or on a channel no AP may use** (a radar one): the AP keeps its own channel, as before, and the
-    box log says why; the station stays joined, so MGMT_INFO shows `joined` with the two channels and Carlink its line.
-    A followed channel hostapd refuses (it exits in its start-up: a domain with no AP there, say) costs one try: the AP
-    then starts on its own channel, also said.
-  - **During a session a host holds nothing moves.** The station joining after the AP is up finds the hotspot on the
-    AP's channel (the phone's hotspot follows the phone's link, as benched). A station on another channel while the AP
-    runs (it came up before the station joined) is said once by the keeper and reported in MGMT_INFO; the next AP start
-    follows. What the radio does meanwhile (refuse the association, move the uAP, time-share the two channels) is for
-    the bench.
+- **What did not answer it** (ADDENDA 15 to 23, benches 25-27 Nov): a driver copy that took the late answer (the
+  association then went unanswered), the firmware's own join (`host_mlme` off through a patched card byte: unanswered;
+  never tried at 5 GHz), a second network on ordinary access points (it failed alike), the client-only driver mode
+  (`drv_mode=1`), firmwares 16.92.21.p137.2 and p164 (the same fault), and two-band operation (the AP on 2.4 GHz channel
+  6 with the station on 5 GHz 44 through moal's `cfg80211_drcs=1`: both up, the station's link losing 33-58% of its
+  pings, averaging 2-3 s round trips; with DRCS off hostapd refused, `Beacon set failed: -16`). On DFS channel 116 the
+  station joined and the AP did not run.
 
 ## Between host sessions: armed (Bluetooth powered, invisible)
 

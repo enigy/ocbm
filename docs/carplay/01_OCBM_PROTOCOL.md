@@ -379,7 +379,7 @@ explicitly requests `CONSOLE`. New modes are pure additions — no rewrite.
 | `0x0025` | TUNNEL | box→host: route A's tunnels to the phone's proxy (`setProxyParameters`), so the video the phone hands off is fetched over the phone's network (box seam `:9006`; `[u32 BE "TUNL"][u32 BE len][op][id][data]`, the metadata seam's shape). Ops `TUNNEL_OPEN 0x01` (host→box `[port u16 BE][the proxyUrl's host]`), `TUNNEL_DATA 0x02` (both ways), `TUNNEL_CLOSE 0x03` (both ways; box→host carries the reason), `TUNNEL_OPENED 0x04`. Host→box rides INPUT as `INPUT_TUNNEL 0x0B` `[op][id][data ≤ 16 KiB]`. The bytes are the host's TLS 1.3 PSK session with the proxy, so ocbmd read-gates this seam on its own queue and never drops a frame; carplayd connects a tunnel only to the phone's own address or a link-local one on its link (`receiver::tunnel`), never elsewhere on the box's network. Always on since OCBM 2.0; see "Route A" below (2026-11-11) | route A |
 | `0x0030` | INPUT | host→box: **binary `INPUT_*` sub-frames** — `INPUT_TOUCH 0x01` (normalized u16 coords) / `INPUT_KEYFRAME 0x02` / `INPUT_MEDIA_BTN 0x03` (Consumer-Control HID uid 2) / `INPUT_COMMAND 0x04` / `INPUT_NAV 0x05` (D-Pad HID uid 3, `NAV_*`) / `INPUT_KEYFRAME_ALT 0x06` (re-IDRs the ALT/cluster stream **specifically**; a bare `INPUT_KEYFRAME` only re-IDRs main) / `INPUT_KNOB 0x07` (Knob HID uid 4) / `INPUT_TELEPHONY 0x08` (Telephony HID). `INPUT_COMMAND`'s payload is the `CMD_*` set — `CMD_REQUEST_UI 0x01`, `CMD_REQUEST_SIRI 0x02` *(deprecated, iOS ignores it)*, `CMD_SIRI_DOWN 0x03` / `CMD_SIRI_UP 0x04`, `CMD_NAV_START 0x05` / `CMD_NAV_STOP 0x06` / `CMD_NAV_CARD 0x07` / `CMD_NAV_APP 0x0A`, `CMD_LIMITED_UI_ON 0x08` / `CMD_LIMITED_UI_OFF 0x09`, `CMD_NAV_APPEARANCE 0x0B`, `CMD_NAV_ZOOM_IN 0x0C` / `CMD_NAV_ZOOM_OUT 0x0D`, `CMD_UI_APPEARANCE 0x0E` / `CMD_MAP_APPEARANCE 0x0F` / `CMD_NIGHT_MODE 0x10`, `CMD_VIEW_AREA 0x11` (`[cmd][index]` → `updateViewArea` for the MAIN display, refused if `/info` never declared the index; 2026-09-07), `CMD_REQUEST_UI_URL 0x12` (`[cmd][url…]`, UTF-8, no terminator, 1..=255 bytes → `requestUI{url}` on the MAIN screen, e.g. `maps:` / `nowplaying:`; empty, over-long or non-UTF-8 is refused with a log line; 2026-10-25, for the Carlink3 split-screen pane). ocbmd relays every sub-frame opaquely to carplayd; carplayd taps the iPhone HID devices for touch/media/nav/knob/telephony, dispatches `INPUT_COMMAND` as an AirPlay `/command`, and turns `INPUT_KEYFRAME` / `INPUT_KEYFRAME_ALT` into a `forceKeyFrame` on the event channel (main / `VideoStream.Alt1`). Constants are authoritative in `crates/ocbm-proto/src/lib.rs` | all |
 | `0x0031` | MIC | host→box: mic-uplink PCM (S16LE at the CT_UPLINK-negotiated rate/ch); ocbmd relays to carplayd's mic-ingest seam → RTP uplink to the iPhone | projection |
-| `0x0040` | MGMT | box management, request/response (the app's "CCPA" tab): host→box `MGMT_GET_INFO 0x01` / `MGMT_REBOOT 0x02` / `MGMT_FORGET_ALL 0x03` / `MGMT_FORGET_DEVICE 0x04` / `MGMT_RESTART_WIRELESS 0x05` / `MGMT_ENTER_NCM 0x06` (added 2026-09-03: box arms the persistent `/script/ncm_only` flag, drops any `/script/ocbm_trial` dead-man, ACKs, reboots into NCM maintenance mode; sticky — return over ssh with `rm /script/ncm_only; reboot`. Bench: `ocbm-host ncm`); `MGMT_INSTALL_CONFIRM 0x0A` / `MGMT_GO_STOCK 0x0B` (added 2026-10-28 for the one-file install, advertised as `CAP_INSTALL 0x100`; `MGMT_INFO` carries `"install":"trial"\|"confirmed"\|"final"\|"none"`. CONFIRM moves `/script/ocbm_mode` from `trial` to `confirmed`, and when that session ends, or at the next start if the power was cut first, the box removes the Carlinkit stack for good (`ccpa/installer/ocbm_finish.sh`), so only an app that shows the user "Go back to stock" for the rest of the session may send it. GO_STOCK, while stock is still kept, ACKs and runs `ocbm_revert.sh`, which restarts the box on stock firmware; status 1 in `final` or on a box without the one-file install. Bench: `ocbm-host install [vid pid] info\|confirm\|stock`); `MGMT_SET_POLICY 0x07` / `MGMT_CONNECT_DEVICE 0x08` (`CAP_PHONE_POLICY 0x40`); `MGMT_SWITCH_DEVICE 0x0D` `[ascii MAC]` (added 2026-11-01, `CAP_PHONE_SWITCH 0x400`: the device screen's Connect while another phone projects. With another phone's WIRELESS session live, btd ends it through the arbiter-preempt go-quiet teardown, pages the named phone, and for 45 s refuses every other phone so the dropped one cannot re-dial in first; idle or already that phone, it is a connect. Never ends a wired session. `MGMT_ACK` 1 = not a MAC, not bonded, or btd unreachable); `MGMT_WIFI_LINK 0x0E` `[1][link key 32][ssid_len][ssid][psk_len][psk]`, `[2][link key 32][band]` (mode `ap`, 27 Nov 2026: its ACK 0 carries the AP's name and passphrase) or no body (added 24 Nov 2026, `CAP_WIFI_LINK 0x800`: set up or remove the Wi-Fi link, below; ACK 0 = stored, applied half a second later beside the session that asked); box→host `MGMT_INFO 0x81` (with `"wifi_link":{"state","channel","ap_channel"}` since 24 Nov 2026, `"mode"` first since 27 Nov) / `MGMT_ACK 0x82` | all |
+| `0x0040` | MGMT | box management, request/response (the app's "CCPA" tab): host→box `MGMT_GET_INFO 0x01` / `MGMT_REBOOT 0x02` / `MGMT_FORGET_ALL 0x03` / `MGMT_FORGET_DEVICE 0x04` / `MGMT_RESTART_WIRELESS 0x05` / `MGMT_ENTER_NCM 0x06` (added 2026-09-03: box arms the persistent `/script/ncm_only` flag, drops any `/script/ocbm_trial` dead-man, ACKs, reboots into NCM maintenance mode; sticky — return over ssh with `rm /script/ncm_only; reboot`. Bench: `ocbm-host ncm`); `MGMT_INSTALL_CONFIRM 0x0A` / `MGMT_GO_STOCK 0x0B` (added 2026-10-28 for the one-file install, advertised as `CAP_INSTALL 0x100`; `MGMT_INFO` carries `"install":"trial"\|"confirmed"\|"final"\|"none"`. CONFIRM moves `/script/ocbm_mode` from `trial` to `confirmed`, and when that session ends, or at the next start if the power was cut first, the box removes the Carlinkit stack for good (`ccpa/installer/ocbm_finish.sh`), so only an app that shows the user "Go back to stock" for the rest of the session may send it. GO_STOCK, while stock is still kept, ACKs and runs `ocbm_revert.sh`, which restarts the box on stock firmware; status 1 in `final` or on a box without the one-file install. Bench: `ocbm-host install [vid pid] info\|confirm\|stock`); `MGMT_SET_POLICY 0x07` / `MGMT_CONNECT_DEVICE 0x08` (`CAP_PHONE_POLICY 0x40`); `MGMT_SWITCH_DEVICE 0x0D` `[ascii MAC]` (added 2026-11-01, `CAP_PHONE_SWITCH 0x400`: the device screen's Connect while another phone projects. With another phone's WIRELESS session live, btd ends it through the arbiter-preempt go-quiet teardown, pages the named phone, and for 45 s refuses every other phone so the dropped one cannot re-dial in first; idle or already that phone, it is a connect. Never ends a wired session. `MGMT_ACK` 1 = not a MAC, not bonded, or btd unreachable); `MGMT_WIFI_LINK 0x0E` `[2][link key 32][band]` (mode `ap`, 27 Nov 2026: its ACK 0 carries the AP's name and passphrase) or no body (added 24 Nov 2026, `CAP_WIFI_LINK 0x800`: set up or remove the Wi-Fi link, below; ACK 0 = stored, applied half a second later beside the session that asked; version 1, the retired hotspot mode, ACK 2); box→host `MGMT_INFO 0x81` (with `"wifi_link":{"mode","state","ap_band","ap_channel","band_pending"}` in mode `ap`, `{"mode":"off","state","channel","ap_channel"}` with no link) / `MGMT_ACK 0x82` | all |
 | `0x0042` | LOG | **box→host only:** the box's own logs, streamed live. Payload = one or more back-to-back entries, `[source u8][flags u8][seq u16 LE][unix_ms u64 LE][len u16 LE][text]`, packed up to a 4096 B payload per frame. Off until the host sends `CT_LOG_CTL`. See below | all |
 | `0xF000–0xFFFF` | reserved: **experimental / vendor** | — | — |
 
@@ -621,54 +621,50 @@ transfer leaves neither a half-written binary nor a stale non-executable one. `m
 exec bits (e.g. `0o755`), which fixes the long-standing "deploy dropped the +x bit → unbootable
 rcS" gotcha. This is the incremental, always-available cousin of the `FIRMWARE_UPDATE` mode below.
 
-## The Wi-Fi link: the same stream over TCP (branch `wifi-link`, 24 Nov 2026; not benched)
+## The Wi-Fi link: the same stream over TCP on the adapter's own AP (branch `wifi-link`, 24-27 Nov 2026; not benched)
 
-The OCBM byte stream can also ride TCP on the phone's Personal Hotspot, beside or instead of USB, behind OCBW v1
-(`crates/ocbm-link`, its header is the spec): a pre-shared-key handshake (HMAC-SHA256 proofs, the host first),
-HKDF-SHA256 direction keys, ChaCha20-Poly1305 records, an empty record as the keepalive after 1 s of silence, and a dead
-link after 3 s with nothing received. The 32-byte link key is made by the host and handed over once with
-`MGMT_WIFI_LINK`, over whatever session it has. The box listens on its station interface's address only (port 7020),
-advertises `_ocbm._tcp` there (TXT `id` = an HMAC of the key), takes one host at a time over either transport (the first
-it takes holds the box against Wi-Fi hosts until it leaves or is silent for 10 s; a USB host's frame always takes it at
+The OCBM byte stream can also ride TCP, beside or instead of USB, behind OCBW v1 (`crates/ocbm-link`, its header is
+the spec): a pre-shared-key handshake (HMAC-SHA256 proofs, the host first), HKDF-SHA256 direction keys,
+ChaCha20-Poly1305 records, an empty record as the keepalive after 1 s of silence, and a dead link after 3 s with
+nothing received. The 32-byte link key is made by the host and handed over once with `MGMT_WIFI_LINK`, over whatever
+session it has.
+
+Mode `ap` (ADDENDUM 24 of the hand-off plan, 27 Nov 2026), the one mode: the head unit joins the ADAPTER'S OWN access
+point, the one the phone's CarPlay uses (the IW416 cannot be a 2.4 GHz client, ADDENDA 14-23). Set up with
+`MGMT_WIFI_LINK` version 2, `[0x0E][2][link key 32][band]`, 35 B exactly, band `0x02` = 2.4 GHz (channel 6, 20 MHz) or
+`0x05` = 5 GHz (the AP's own non-DFS channel, 36 on the factory file); its `MGMT_ACK` status 0 carries the AP the head
+unit joins, `[0x82][0x0E][0][ssid_len][ssid][pass_len][pass]` (the adapter's name and the AP's WPA2 passphrase: never in
+MGMT_INFO or a log); status 1 = malformed, or the AP not nameable yet (try again in a moment). A box without mode `ap`
+refuses v2 (status 1). The box listens on the AP's own address on the AP's interface only (`wlan0`, the uAP on the
+IW416), port 7020, and advertises `_ocbm._tcp` there (TXT `id` = an HMAC of the key); the head unit finds it at the
+network's DHCP server address (udhcpd hands no router). It takes one host at a time over either transport (the first it
+takes holds the box against Wi-Fi hosts until it leaves or is silent for 10 s; a USB host's frame always takes it at
 once, from a Wi-Fi holder too, and no USB frame is ever dropped; where the accessory driver serializes reads and writes,
-USB is read on a thread whose read is issued afresh every 10 s and after any failed read, ADDENDUM 7), and with no
-link set up behaves as 2.7.1. With a link set
-up the adapter also starts its CarPlay session at power-up with no host, video parked, and a host attaches to it at
-SUBSCRIBE (M2). At that attach, and when the same host comes back over a running session (its link lost within the
-heartbeat grace), the box sends one live `CT_PROJ_MODE` (no `F_REPLAY`) right after its replayed one, and replays on
-CH_METADATA what the phone said on the metadata seam meanwhile, kept in Wi-Fi mode only (`src/meta.rs`: the latest
-now-playing, route guidance, maneuver, lane, call, location and vehicle-status records, the corner mask and the
-artwork; not the command plists or route A's `dataStream` requests), as the seam's own records and at a record
-boundary of the channel's stream; a host takes them as the phone's, and one it already had changes nothing. One radio
-serves the hotspot and the adapter's own AP, so with a link set up the AP starts on the channel the station holds the
-hotspot on, never a radar channel (ADDENDUM 6), 20 MHz at 2.4 GHz; the adapter's own session with no host first waits
-up to 4 s for the station's look at power-up and takes the channel it heard, else the hotspot's last, and starts again
-once on the hotspot's channel when it is heard elsewhere (ADDENDUM 9). MGMT_INFO's `wifi_link` gives the hotspot's
-`channel` beside the `ap_channel` the AP runs on. ocbmd `src/wifi.rs` and `src/mdns.rs`,
-`/script/wifi_sta.sh`, and the Wi-Fi link section of docs/wireless/01_BT_AND_RADIO.md have the rest; the hand-off notes
-of 24 Nov hold the contract with Carlink.
+USB is read on a thread whose read is issued afresh every 10 s and after any failed read, ADDENDUM 7), and with no link
+set up behaves as 2.7.1. The AP is up from power-up and between phone sessions; a set-up, a new key or a new band
+restarts it on the band at once (the phone's CarPlay drops and comes back, and a Wi-Fi host's link closes after the
+ACK). A band changed while a link exists is ON TRIAL (the owner's decision of 27 Nov 2026): unless a Wi-Fi host
+completes the OCBW handshake on the new band within 180 s of the change's apply (or of the box's next start, which gives
+it the whole time again), the box goes back to the band before by itself (docs/wireless/01_BT_AND_RADIO.md, "A band
+change on trial"). MGMT_INFO's `wifi_link` is
+`{"mode":"ap","state":"off"|"up"|"linked","ap_band":"2.4"|"5","ap_channel":N,"band_pending":false|true}` (`band_pending`
+true while a change is on trial); with no link `{"mode":"off","state":"off","channel":0,"ap_channel":N}`.
 
-Mode `ap` (ADDENDUM 24 of the hand-off plan, 27 Nov 2026; not benched): the head unit joins the ADAPTER'S OWN access
-point, the one the phone's CarPlay uses; no hotspot, no station, no supplicant (the IW416 cannot be a 2.4 GHz client,
-ADDENDA 14-23). Set up with `MGMT_WIFI_LINK` version 2, `[0x0E][2][link key 32][band]`, 35 B exactly, band `0x02` =
-2.4 GHz (channel 6, 20 MHz) or `0x05` = 5 GHz (the AP's own non-DFS channel, 36 on the factory file); its `MGMT_ACK`
-status 0 carries the AP the head unit joins, `[0x82][0x0E][0][ssid_len][ssid][pass_len][pass]` (the adapter's name and
-the AP's WPA2 passphrase: never in MGMT_INFO or a log). A box without mode `ap` refuses v2 (status 1); v1 is unchanged,
-its key-only form included. The box listens on the AP's own address on the AP's interface only (`wlan0`, the uAP on the
-IW416), port 7020, and advertises `_ocbm._tcp` there; the head unit finds it at the network's DHCP server address
-(udhcpd hands no router). The AP is up from power-up and between phone sessions; a changed key, mode or band restarts
-it on the band at once (the phone's CarPlay drops and comes back, and a Wi-Fi host's link closes after the ACK).
-MGMT_INFO's `wifi_link` is then `{"mode":"ap","state":"off"|"up"|"linked","ap_band":"2.4"|"5","ap_channel":N}`; with no
-link, or in the hotspot mode, it is the object above with `"mode":"off"` or `"mode":"hotspot"` first. The set-up network
-(below) runs on 2.4 GHz channel 6 for head units that see no 5 GHz network.
+With a link set up the adapter also starts its CarPlay session at power-up with no host, video parked, and a host
+attaches to it at SUBSCRIBE (M2). At that attach, and when the same host comes back over a running session (its link
+lost within the heartbeat grace), the box sends one live `CT_PROJ_MODE` (no `F_REPLAY`) right after its replayed one,
+and replays on CH_METADATA what the phone said on the metadata seam meanwhile, kept in Wi-Fi mode only (`src/meta.rs`:
+the latest now-playing, route guidance, maneuver, lane, call, location and vehicle-status records, the corner mask and
+the artwork; not the command plists or route A's `dataStream` requests), as the seam's own records and at a record
+boundary of the channel's stream; a host takes them as the phone's, and one it already had changes nothing. ocbmd
+`src/wifi.rs`, `src/mdns.rs` and `src/meta.rs`, and the mode-ap section of docs/wireless/01_BT_AND_RADIO.md, have the
+rest; the hand-off notes of 24-27 Nov hold the contract with Carlink.
 
-The hotspot with its name hidden (ADDENDUM 11, 25 Nov 2026; not benched). An iPhone's Personal Hotspot hides its name
-whenever the phone's hotspot screen is not open, which in a car is nearly always. The adapter looks for the hotspot by
-its name (a probe a hidden hotspot answers) and also by its address, which it remembers from each join and from each
-time it hears the hotspot by name. In plain words, for owners: the adapter remembers your hotspot's address so it can
-find and join it while the name is hidden. This relies on the hotspot keeping one address, as an iPhone does. A phone
-or hotspot that changes its address has to be visible by name (its hotspot screen open) for the adapter to find it
-again; the adapter then remembers the new address. Setting the Wi-Fi link up again forgets the old address.
+RETIRED (27 Nov 2026): the hotspot mode, `MGMT_WIFI_LINK` version 1
+`[1][link key 32][ssid_len][ssid][psk_len][psk]`, the adapter as a client of the phone's Personal Hotspot with its own
+station keeper and supplicant (24-27 Nov, never released). A box since then refuses every version 1 with `MGMT_ACK`
+status 2 and stores nothing, and removes a link file of that mode at its start: the adapter comes up with no link.
+docs/wireless/01_BT_AND_RADIO.md, "RETIRED 27 Nov 2026", has what the benches found.
 
 First set-up with no USB (M3, `src/setup.rs`, not benched): an adapter NEVER USED (no link, no host's HELLO ever taken
 on it, no bonded phone, no kept host config, no update record) offers, 20 s after ocbmd's start if no host has spoken

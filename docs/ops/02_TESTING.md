@@ -372,7 +372,7 @@ that never reached CarPlay, a wired preempt), so a second session's line counts 
 session's carplayd's. The phantom's pages count as absent. When ocbmd rotated `box.log` (it empties it at its cap) between
 the host's arrival and the first frame, the PSK count is a lower bound: `PSK mismatches >=N (box.log cut)`.
 
-### Wi-Fi link switches (branch `wifi-link`, 24 Nov 2026)
+### Wi-Fi link switches (branch `wifi-link`, 24-27 Nov 2026)
 
 Mode `ap` (ADDENDUM 24, 27 Nov 2026; not benched): set up from Carlink (MGMT_WIFI_LINK v2); the link file then has
 `mode=ap` and `band=`. What to look for in the box log: `[ocbmd] wifi: mode ap: no AP up: wifi_ap_on on 2.4 GHz` soon
@@ -380,130 +380,37 @@ after power-up (or `the mode or the band changed: wifi_ap_restart on ...`), `[ra
 (hw_mode=g, 20 MHz)`, `AP up: ... ch=6 if=wlan0`, `[ocbmd] wifi: listening on 192.168.43.1:7020 (OCBW v1, the AP's
 address, from wlan0 only)`, `[ocbmd] mdns: advertising CarLink-xxxx._ocbm._tcp.local at 192.168.43.1:7020`, and at each
 session's end `[radio_hal] ... mode ap: the AP stays up (the head unit's network)`. `cat /tmp/.radio_ap_link` (`2.4 6`),
-`ps | grep -c "[h]ostapd"` (1, between sessions too), no `wifi_sta` line and no supplicant process. MGMT_INFO:
-`"wifi_link":{"mode":"ap","state":"up",...}`, `linked` while Carlink holds the box over Wi-Fi.
+`ps | grep -c "[h]ostapd"` (1, between sessions too), and no station, supplicant or keeper at all (the hotspot mode is
+retired). MGMT_INFO: `"wifi_link":{"mode":"ap","state":"up",...,"band_pending":false}`, `linked` while Carlink holds the
+box over Wi-Fi. A v1 (an older Carlink's hotspot set-up) is answered `MGMT_ACK` status 2 with `[ocbmd] wifi: refused a
+MGMT_WIFI_LINK v1 (the hotspot mode is retired ...)`; an adapter that held a hotspot link says once at its start
+`[ocbmd] wifi: /etc/ocbm/wifi_link held a link of the retired hotspot mode (MGMT_WIFI_LINK v1): removed, ...`.
+
+A band change on trial (27 Nov 2026, `wifi::BAND_TRIAL` 180 s; docs/wireless/01_BT_AND_RADIO.md, "A band change on
+trial"): after a v2 with the other band, `[ocbmd] wifi: mode ap: the band moved to 5 GHz: on trial, back to 2.4 GHz in
+180 s unless a Wi-Fi host links on 5 GHz`, `band_prev=2.4` in the link file (read it by hand, never paste it anywhere:
+the key is in it) and `"band_pending":true` in MGMT_INFO. Then either `a Wi-Fi host linked on 5 GHz: the band is kept
+(2.4 GHz forgotten)` (a handshake while `/tmp/.radio_ap_link` says `5 ...`), or, 180 s on with none, `no Wi-Fi host
+linked on 5 GHz within 180 s of the band's change: back to 2.4 GHz (...)` and, once no phone's CarPlay session uses the
+AP, `mode ap: the band went back after its trial, no CarPlay on the AP: wifi_ap_restart on 2.4 GHz`. A start (a power
+cut) with the trial on flash says `the band's change to 5 GHz is still on trial: back to 2.4 GHz in 180 s ...`.
 
 `/tmp/bench_wifi_selfstart_off` or `/etc/ocbm/bench_wifi_selfstart_off` (set unless "off"; the owner's
 `/etc/ocbm/wifi_selfstart_off` too): no CarPlay session without a host (M2 off) on an adapter with the link set up.
 `/tmp/bench_wifi_link_if` holding an interface name: ocbmd's listener binds that interface's address instead of the
-station's (never the AP's subnet), e.g. a wired bench over NCM. A bench supplicant goes in `/tmp/bin` (`wpa_supplicant`;
-no wpa_cli is needed or shipped; a debug build there is the one way to the supplicant's own log, the shipped one has
-none). The supplicant by hand, over the console: `ocbmd wpa sta0 status`, `ocbmd wpa sta0 scan`, `ocbmd wpa sta0
-scan_results`, `ocbmd wpa sta0 list_networks` (`[TEMP-DISABLED]`: held back after failed joins), `ocbmd wpa sta0
-select_network 0` (tries again now; `enable_network 0` does not clear a back-off) (in place of `ocbm-wpa_cli -p
-/var/run/wpa_supplicant -i sta0 <cmd>`; the first word goes in capitals, the rest as typed, so any wpa_cli command
-spelled as its control command works, e.g. `status-verbose`; exit 1 and a line on stderr when no supplicant answers),
-and `ocbmd wpa sta0 events 60`: its join events for 60 s, as the keeper's monitor logs them all along (below). What to
-look for: `[wifi_sta]` and `[ocbmd] wifi:` lines in the box log, MGMT_INFO's `wifi_link`; and for a join, dmesg's
-`HostMlme` lines (the IW416's driver: `send auth to bssid`, `Received auth frame`, `Drop auth frame`, `HostMlme auth
-timeout`, `bss_start Fails`, `Connected to bssid ... successfully`).
-A link's end lines (`wifi: link N reader ended: ...`, `... writer ended: ...`) say who closed it (`the host closed the
-link` after the host's FIN, `the box closed the link (...)` after the box's own shutdown), the uptime, both ways'
-records, bytes and how long ago the last went, and the socket's own view: `tcp state 8` (close-wait: the host's FIN came
-first), `4`/`5` (fin-wait: the box shut first), `7` (a reset), then `unacked`, `retrans`, `rtt`, `data in`/`out` and
-`acked ... ms ago`, `queued` B; while a Wi-Fi host holds the box the same counters come every 30 s beside the health
-line (`wifi: link N at uptime ...`). At an attach, and at the same host's return: `session: <why>: the session's
-metadata replayed (N B: nowPlaying x2, location, ...)` (or `... goes at the end of the record under way`, or `no
-metadata of the session's kept to replay`) and `projection mode -> host: 2 (live: ...)`.
-The AP on the hotspot's channel at power-up (ADDENDUM 9, 24 Nov 2026; 2.4 GHz is the truck's case): the keeper's
-`[wifi_sta]` lines say what it scans when that changes (`the adapter's own session starting, no AP yet: scans and joins
-on the hotspot's channel N only`, `CarPlay is starting: no scans until it runs (40 s at most)`, `scans and joins on the
-AP's channel N only; a look over the channels an AP may use every 20 s` (60 s with a host), `scans every channel (no AP
-up); ...`), each look whose result changed (`the hotspot heard on channel N (D dBm)`, with `, its name hidden: known
-by its address` when the hotspot's beacon hid its name, `the hotspot not heard (channels ...)`), the supplicant's state
-(`supplicant: SCANNING`, one line in 10 s at most) and, from its monitor (ADDENDUM 11), each join as it happens with
-its steps' times (`supplicant: authenticating freq=2437`, `trying freq=2437 (+N ms)`, `associated (+N ms)`, `connected
-(+N ms)`; `no answer to the authentication (+N ms, now SCANNING)` for a step that ended unsaid; `auth-reject ...
-status_code=N`, `assoc-reject status_code=N`, `ssid-temp-disabled auth_failures=N duration=D reason=CONN_FAILED`;
-repeats in one `again in the last 60 s: ...` line a minute: names and codes only). docs/wireless/01_BT_AND_RADIO.md,
-"The authentication's 2.4 s", says what the driver does and which line tells which cause. radio_ap_up.sh says
-`STA mode, the adapter's own session: channel N, heard there by the station's look (waited M ms for the station)` (or
-`the hotspot's last (not heard now)`, `the station joined the hotspot there`, `the hotspot not heard and no last
-channel`) and `STA mode: the AP follows the station to channel 6 (hw_mode=g, 20 MHz)`; ocbmd, when the adapter's own
-session with no host starts again on the hotspot's channel, `wifi: the hotspot is heard on channel N, the AP runs on
-M: ... starts again on N (once)`. By hand: `ocbmd wpa sta0 find 2412-2462,5180-5240,5745-5825 /etc/ocbm/wifi_link_bssid`
-(one frequency, or none for every channel; the kept address's file, or none to look by name alone) prints `seen
-<channel> <dBm>` per sighting, `hidden` after one known by the kept address alone, or `seen 0`; it scans only when the
-supplicant's own results of the last 4 s did not hear the hotspot and no join is under way. `/tmp/wifi_link_state` holds
-the last look's `seen=<channel> <uptime>` and, while two looks in a row heard the hotspot on another channel than the
-AP's, `elsewhere=`; `/tmp/wifi_self_parked` is there while the adapter's own session has no host.
-`/etc/ocbm/wifi_link_bssid` and `/etc/ocbm/wifi_link_sta` hold the hotspot's and the station's addresses (0600; read
-them by hand, never paste them anywhere public).
-The station's joins (ADDENDUM 13 and 15, 25 Nov 2026; docs/wireless/01_BT_AND_RADIO.md, "The authentication's 2.4
-s"): seven switches, each `/tmp/bench_<name>` or, for a cold boot, `/etc/ocbm/bench_<name>`, `/tmp` read first; `off`
-is off; an empty file or `on` is the default value; a number sets it. Read where they act, so a `/tmp` file takes
-effect at the next join, AP start or keeper pass, except `sta_modparam` and `sta_drvpatch`, which act at the driver's
-load (a power-up).
-- `sta_modparam` (none): one line, a module's name and its `NAME=VALUE` words, for that module at the driver's load
-  (ADDENDUM 15): a module whose insmod names a parameter file (moal's `mod_para=nxp/wifi_mod_para.conf`) reads them
-  from a copy of it at `/tmp/fw`, inside its block after the file's own lines, the kernel firmware loader's path
-  pointed there; any other module on its insmod line. Line `[radio_hal] ... [bench] sta_modparam (<file>): moal reads
-  host_mlme=0 from /tmp/fw/nxp/wifi_mod_para.conf, in its block` (or `... loads with ...` on the line), and `[bench]
-  moal: <the line run>`. moal's `host_mlme=0` alone changes nothing: the IW416's card forces host MLME (with
-  `sta_drvpatch`'s fwmlme line it is the firmware's own join, the AP's SME in the firmware too: unbenched). Back:
-  remove the file (or `off` in `/tmp` before the power-up) and power up again.
-- `sta_drvpatch` (none): `<module> <sha256> OFFSET:OLD:NEW...` (decimal offset, hex bytes): the module loads from
-  `/tmp/<name>.bench.ko`, a copy with those bytes changed, only when its file has that sha256 and the copy differs by
-  exactly those bytes (`cmp -l`); else as it is (`... refused, ...`). Line `[bench] sta_drvpatch (<file>): moal loads
-  from /tmp/moal.bench.ko, these bytes changed: ...`. For moal 437.p20 (sha256
-  `a5a893b863709fa2c575e9361ff10101f638fbf07a004f8b2fc6dc0e9da5524d`; set `M=` to it in the shell, each command one
-  line): late `echo "moal $M 128851:0a:ea 376935:0a:ea" > /etc/ocbm/bench_sta_drvpatch` (the answer after the stay
-  taken: dmesg `FW_REMAIN_ON_CHANNEL_EXPIRED` with no `HostMlme auth timeout` after it, then `auth success`); nostay,
-  the same with ` 377435:1a:ea` (no `Remain on Channel` before `send auth`; only with the AP on the hotspot's
-  channel); fwmlme `echo "moal $M 615439:01:00" > ...` with `moal host_mlme=0` in `sta_modparam`.
-  A fourth byte on the late line, ` 347935:0a:ea`, lets the scans go on while an unanswered authentication stays pending
-  (else `scan-failed ret=-11`); the next authentication then goes without a stay (ADDENDUM 18).
-- `sta_drvdbg` (off; set: 0x237, or the mask written): the radio driver's debug mask, through
-  `/proc/mwlan/adapter0/sta0/debug` (moal's and mlan's) else moal's parameter; again when the file changes. Line
-  `[wifi_sta] ... [bench] sta_drvdbg (<file>): the radio driver's debug mask 0x237 through <path> (its parameter: 567)`;
-  then dmesg holds `FW_REMAIN_ON_CHANNEL_EXPIRED cookie = ...`, `wlan: HostMlme auth timeout`, `HostMlme sta0: Received
-  auth frame type = 0x0`, `Remain on Channel: chan=6, ...`, `wlan: HostMlme sta0 auth success`. The mask lasts until
-  the next power-up; `0x207` puts the default back. MEVENT (0x20) also prints the firmware's events, a few more
-  lines while a phone streams.
-- `sta_join_wait` (6 s; `off`: no wait): how long the AP of the adapter's own session waits for a join under way once
-  the first look heard the hotspot. Line `[radio_ap_up] STA mode, the adapter's own session: channel N, ... (waited M ms
-  for the station, then J ms for its join[, held still while hostapd starts | , a join still under way: the AP starts
-  beside it])`, or `channel N, the station joined the hotspot there (...)`.
-- `sta_join_first` (off; set: 10 s, or the seconds): that AP waits instead until the station is on the hotspot, its
-  retries included, up to that long (the station first, then the AP on its channel). Same line.
-- `sta_ap_hold` (on; `off`: not): not joined at the end of the wait, the station held still while hostapd starts (the
-  AP layer's DISCONNECT and `/tmp/.radio_ap_start`). Line `held still while hostapd starts` above, and the keeper's
-  `the AP is starting: no scans and no joins until it is up`.
-- `sta_miss_guard` (3; `off`: none): after that many unanswered authentications in a row (the monitor's count,
-  `/tmp/wifi_sta_misses`), no join is tried while an AP is up. Line `N authentications in a row unanswered: no joins
-  while the AP runs` (until 27 Nov with the disproven reset in it). ADDENDUM 15: that reset is the data path's only, and
-  this firmware's authentications go by command, so the guard guards nothing here; `off` for the join benches. Still
-  look in dmesg every bench: `WiFi Reset due to`, `Start to process hanging`, `WIFI auto_fw_reload: fw_reload=1`, `FW
-  Reload successfully.` (now expected only from `EAPOL timeout`, five deauthentications while connected).
-The station's 2.4 GHz fault, the no-flash steps (ADDENDUM 18; the why in docs/wireless/01_BT_AND_RADIO.md, "Why the
-answer comes only as the stay ends"): one change each, F the network's frequency, each command one line.
-- The channel change (no reboot): the three commands below make the network's scan end at 5 GHz, so the stay changes
-  channel. `trying freq=F (+N ms)` with N under 100 = the parked channel held the frame (then `connected`, or
-  `no answer to the association`); `+~2400` = not the channel. The keeper writes scan_freq back only when its plan
-  changes.
-  `ocbmd wpa sta0 set_network 0 scan_freq F 5180`
-  `ocbmd wpa sta0 reassociate`
-  `ocbmd wpa sta0 events 60`
-- No Bluetooth firmware (a power cut, no USB host until the attempts are logged):
-  `touch /script/radio_preload_off /etc/ocbm/bench_wifi_selfstart_off`; the keeper then loads the Wi-Fi driver alone
-  (`wifi_sta_up: station interface sta0 up`, no `fw_loader_linux` before the attempts). A join = Bluetooth's arbitration
-  holds the station; `+~2400` = Bluetooth is out. Remove both files after, and power-cut again.
-- The antenna (no reboot): `grep antcfg /proc/mwlan/adapter0/config`, then
-  `echo "antcfg=1" > /proc/mwlan/adapter0/config` (and 2) and `ocbmd wpa sta0 reassociate` each time; back to the value
-  read (`antcfg=0xffff <ms>` for diversity) or a power cut. `Could not set Antenna Diversity!!` = refused.
-- The firmware's join at 5 GHz (the fwmlme lines above, the network on 5 GHz):
-  `wlan: Connected to bssid ... successfully` = it works, so its 2.4 GHz `0xfffa` counts; `0xfffa` there too = it never
-  works on this firmware.
-- Load-time reads (one power-up): the two lines below into `/lib/firmware/bench_coex_get.conf` (a robust coex GET and
-  its GPIO TLV), `moal drvdbg=0x20237 init_hostcmd_cfg=bench_coex_get.conf` in `sta_modparam`, `sta_drvdbg` 0x237 to
-  bring the mask down once the supplicant runs; within a minute `dmesg`: `OTP region: ...`,
-  `OTP Region (BG): chan=N flags=0x..`, and the `CMD_RESP` hexdump after the ROBUSTCOEX line (in `1b 02 03 00 E G P`,
-  E=01 is an external Bluetooth-request pin obeyed). A file that cannot be read ends the driver's load.
-  `printf 'coex_get={\ne0 00 0c 00 00 00 00 00 00 00 00 00\n}\n' > /lib/firmware/bench_coex_get.conf`
-  `printf 'coex_gpio={\ne0 00 13 00 00 00 00 00 00 00 00 00 1b 02 03 00 00 00 00\n}\n' >> /lib/firmware/bench_coex_get.conf`
-- The module's calibration file: `cp /lib/firmware/nxp/WlanCalData_ext.conf /lib/firmware/WlanCalData_ext.conf` and
-  `moal cal_data_cfg=WlanCalData_ext.conf` in `sta_modparam`; dmesg `cal_data_cfg=WlanCalData_ext.conf`, no
-  `CFG data cmd resp failed`; no Wi-Fi that boot = refused (the USB console still works).
+AP's (never the AP's or NCM's subnet), e.g. a wired bench; a handshake there keeps no band on trial. A link's end lines
+(`wifi: link N reader ended: ...`, `... writer ended: ...`) say who closed it (`the host closed the link` after the
+host's FIN, `the box closed the link (...)` after the box's own shutdown), the uptime, both ways' records, bytes and
+how long ago the last went, and the socket's own view: `tcp state 8` (close-wait: the host's FIN came first), `4`/`5`
+(fin-wait: the box shut first), `7` (a reset), then `unacked`, `retrans`, `rtt`, `data in`/`out` and `acked ... ms ago`,
+`queued` B; while a Wi-Fi host holds the box the same counters come every 30 s beside the health line (`wifi: link N at
+uptime ...`). At an attach, and at the same host's return: `session: <why>: the session's metadata replayed (N B:
+nowPlaying x2, location, ...)` (or `... goes at the end of the record under way`, or `no metadata of the session's kept
+to replay`) and `projection mode -> host: 2 (live: ...)`.
+The hotspot mode's station switches (`sta_modparam`, `sta_drvpatch`, `sta_drvdbg`, `sta_join_wait`, `sta_join_first`,
+`sta_ap_hold`, `sta_miss_guard`), its `ocbmd wpa` commands and the 2.4 GHz fault's no-flash steps were removed with the
+mode on 27 Nov 2026 (in git: this document at d100800); an adapter may still hold `/etc/ocbm/bench_sta_*` files, which
+nothing reads now.
 The set-up network (M3): off with `/tmp/bench_wifi_setup_off` or `/etc/ocbm/bench_wifi_setup_off` (the owner's
 `/etc/ocbm/wifi_setup_off` too); offered only on an adapter never used, so a bench adapter needs `OCBM_WIFI_RESET` on a
 stick first (it removes the link and `/etc/ocbm/host_seen` and leaves `/etc/ocbm/wifi_setup_once`, in any mode, an

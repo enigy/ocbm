@@ -805,75 +805,38 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
 
 ### Wireless transport — the RCS DataStream and the BT→WiFi path
 
-- **The Wi-Fi link (branch `wifi-link`, 24 Nov 2026): built and unit-tested, NOT benched.** Open: (1) no WPA supplicant
-  on the stock image: one must be bundled as `/usr/sbin/ocbm-wpa_supplicant` (never `/usr/sbin/wpa_supplicant`, which
-  flips the IW416 driver mode on every unit) or pushed to `/tmp/bin` for the bench; a build needs downloaded sources
-  (wpa_supplicant 2.11, libnl 3.12.0; `tools/build_wpa_supplicant.sh` checks them against the SHA-256 pinned 24 Nov).
-  Built and bundled 24 Nov (545,712 B, no debug output). Its wpa_cli (96,340 B) was dropped the same day, when the
-  update package stood at need_kb 3,895 of a final adapter's `final_kb` 3,900: `ocbmd wpa` speaks to the control
-  socket instead (ccpa/ocbmd/src/wpa.rs), and `retired.list` takes the copy a bench package placed. Every byte on flash
-  still counts; (2) the AP on `wlan0` (uAP BSS)
-  beside the station on `sta0` is inferred from the stock driver configuration, not measured; (3) the AP on the
-  hotspot's channel (ADDENDUM 6, 24 Nov: at its start in STA mode the AP follows the station, never to a radar channel,
-  from `/tmp/hostapd_session.conf`; docs/wireless/01_BT_AND_RADIO.md, "Channels") is built, not benched: whether the
-  phone joins the AP on 149 while the station holds the hotspot there, whether hostapd and the vendor driver take an AP
-  on 149-165 at all (the US domain applied, or 149-165 no-IR: then the AP falls back to its own channel, and the first
-  bench's failure stays) and HT40+ there, and what the radio does when the station joins another channel during a
-  session; (4) WPA3-only hotspots are not supported in this version (WPA2 and mixed are; the box
-  gets the PBKDF2 hash, the supplicant has no SAE); (5) M2's self-started session: the phone's audio goes nowhere while no host is attached (60 s / 180 s holds);
-  at power-up its AP waits up to 4 s for the station's first look and starts on the channel that heard the hotspot, else
-  on its last channel (ADDENDUM 9, 24 Nov, after the evening bench's AP on 36 beside a hotspot on 2.4 GHz 6), 20 MHz at
-  2.4 GHz; heard elsewhere twice while it runs with no host, it starts again once there. Not benched: the look's timing
-  at power-up, the phone and the hotspot on a 20 MHz 2.4 GHz channel shared three ways, the restart. A USB host's AP
-  keeps its own channel when the station is not on the hotspot. That bench's second fault (no join for six minutes after
-  the AP went down, the hotspot on the air) is not explained by the code: the keeper now logs the supplicant's state,
-  each look's result and a join's events, keeps its own scans (no driver scheduled scan) and looks every 30 s. The bench
-  of 25 Nov (ADDENDUM 10, on d897dba): the AP followed to 2.4 GHz channel 6 at power-up (proven); a supplicant start was
-  taken for a failure (fixed, 451eecb, with a test); the iPhone's hotspot hides its name whenever its hotspot screen is
-  closed, so the looks heard nothing (built 25 Nov, ADDENDUM 11: every look probes for the hotspot by name and knows it
-  by its kept address, `/etc/ocbm/wifi_link_bssid`; not benched); and the joins fail: the driver's authentication
-  unanswered, or answered about 2.4 s late and no association, then TEMP-DISABLED (OPEN, the blocker). For it the
-  supplicant's joins are now logged as they happen with each step's time (its monitor), nothing of the keeper's cuts a
-  join under way (SET_NETWORK in place of RECONFIGURE, no pause or restart over one), a look that hears the hotspot
-  clears the supplicant's back-off, and the station's own address is compared with its last start's. The bench of
-  557b6b9 (ADDENDUM 12) and the stock driver's code (ADDENDUM 13, docs/wireless/01_BT_AND_RADIO.md, "The
-  authentication's 2.4 s"): the 2.4 s is moal's host-MLME remain-on-channel, fixed in its code; the phone's answer
-  reaches the host just after it ends and is passed by; why the frame or its answer waits for that end is not shown,
-  and it is 2.4 GHz only (the 25 Nov control on 149: 7 ms, joined; nothing the driver sends differs by band,
-  ADDENDUM 15). Built, not benched: the AP of the adapter's own session waits for a join under way (6 s) and holds the
-  station still through hostapd's start; no join while an AP is up after 3 unanswered authentications in a row
-  (ADDENDUM 13's guard against moal's fifth-miss reset, which ADDENDUM 15 found to be the driver's data path only: not
-  this firmware's); the station joining before the AP; the driver's debug mask; and (ADDENDUM 15) `sta_modparam` into
-  a copy of moal's parameter file and `sta_drvpatch`, a driver copy with named bytes: the answer after the stay taken,
-  no stay, or the firmware's own join (`host_mlme=0` alone is overridden by the card). Benched 25 Nov evening (ADDENDA
-  16 and 17): the late copy took the answer and the association then went unanswered; the firmware's own join went
-  unanswered (never tried at 5 GHz); not the phone's Bluetooth, not the iPhone (a second network on ordinary access
-  points fails alike), not the AP-plus-station driver mode. OPEN (ADDENDUM 18, read in the factory driver; nothing
-  built): a 2.4 GHz-only hold of the station's unicast frames in the combo firmware that a channel change lets go,
-  Bluetooth's coexistence set-up the suspect; else the antenna, or the module's calibration file that stock never loads;
-  the no-flash steps that split them are in docs/ops/02_TESTING.md; (6) M3
-  (the set-up network) is built, not
-  benched: whether the stock hostapd takes `ap_isolate=1` (it refuses an unknown key, and then no set-up network is
-  offered), and what the set-up AP raised 20 s into a boot with no host yet costs a head unit that connects later; its
-  set-up code (24 Nov, ADDENDUM 5) is built, not benched: UNMEASURED whether a phone's Bluetooth list (and the car's)
-  shows the adapter's changed name `CarLink code NNNN` in reasonable time, and whether it lists a controller in inquiry
-  scan alone (no page scan, chosen so nothing can connect or bond to the code's name) by its EIR name; the code needs
-  btd's armed state, so an adapter whose Bluetooth is not armed (the preload or the arm switched off, an arm that
-  failed) shows none and the driver cannot confirm (the set-up then fails safe); the build needs a few KB more on flash
-  (the figure in the hand-off notes); (7)
-  on a serializing USB driver (AccIo::Direct, the truck's) a USB host's frame restarts ocbmd for one plain USB start,
-  which ends a self-started (M2) session: the phone's session starts again under that host, so M2's attach is not kept
-  for USB hosts there (the loop cannot write the device while a reader thread waits in acc_read; interrupting that
-  reader is the one route, untried for writes). Wi-Fi hosts attach as on other units. Benched 24 Nov (ADDENDUM 7):
-  after Wi-Fi hosts, a USB host got no answer and no log line for 7 minutes; the reader's one read, parked since
-  ocbmd's start, never completed. Now its read is issued afresh, the device opened again, every 10 s (a signal ends
-  it: EINTR) and a second after a failed read. Not benched: that this module completes the fresh read, and that its
-  wait takes the signal; (8) mode `ap` (ADDENDUM 24, 27 Nov 2026: the head unit on the adapter's own AP, no station,
-  MGMT_WIFI_LINK v2; docs/wireless/01_BT_AND_RADIO.md, "The Wi-Fi link in mode ap") is built and unit-tested, NOT
-  benched: CarPlay and a head unit together on the uAP at 2.4 GHz channel 6 HT20 (the video over one channel twice),
-  the AP up from power-up and between sessions (its draw, a phone that stays on it after its session), the head unit's
-  join with the password Carlink shows, a band change while a phone projects, and the set-up network on channel 6. The
-  update package needs 3,880 KB with the supplicant, which mode `ap` does not use (3,504 KB without it).
+- **The Wi-Fi link (branch `wifi-link`, 24-27 Nov 2026): built and unit-tested, NOT benched.** Since 27 Nov one mode:
+  the head unit joins the adapter's own AP (mode `ap`, MGMT_WIFI_LINK v2; docs/wireless/01_BT_AND_RADIO.md, "The Wi-Fi
+  link in mode ap"). Open: (1) CarPlay and a head unit together on the uAP at 2.4 GHz channel 6 HT20 (the video over
+  one channel twice), the AP up from power-up and between sessions (its draw, a phone that stays on it after its
+  session), the head unit's join with the password Carlink shows, a band change while a phone projects, and the set-up
+  network on channel 6; (2) the band's trial (27 Nov: a band changed while a link exists goes back to the band before
+  after 180 s with no Wi-Fi host on the new one): whether 180 s covers a head unit's rejoin and Carlink's next link, the
+  AP's move once no phone's CarPlay session uses it, and a change made over USB (kept only once Carlink links over
+  Wi-Fi in the time, a USB holder keeping Wi-Fi hosts out); (3) M2's self-started session: the phone's audio goes
+  nowhere while no host is attached (60 s / 180 s holds); (4) M3 (the set-up network) is built, not benched: whether the
+  stock hostapd takes `ap_isolate=1` (it refuses an unknown key, and then no set-up network is offered), and what the
+  set-up AP raised 20 s into a boot with no host yet costs a head unit that connects later; its set-up code (24 Nov,
+  ADDENDUM 5) is built, not benched: UNMEASURED whether a phone's Bluetooth list (and the car's) shows the adapter's
+  changed name `CarLink code NNNN` in reasonable time, and whether it lists a controller in inquiry scan alone (no page
+  scan, chosen so nothing can connect or bond to the code's name) by its EIR name; the code needs btd's armed state, so
+  an adapter whose Bluetooth is not armed (the preload or the arm switched off, an arm that failed) shows none and the
+  driver cannot confirm (the set-up then fails safe); (5) on a serializing USB driver (AccIo::Direct, the truck's) a USB
+  host's frame restarts ocbmd for one plain USB start, which ends a self-started (M2) session: the phone's session
+  starts again under that host, so M2's attach is not kept for USB hosts there (the loop cannot write the device while a
+  reader thread waits in acc_read; interrupting that reader is the one route, untried for writes). Wi-Fi hosts attach as
+  on other units. Benched 24 Nov (ADDENDUM 7): after Wi-Fi hosts, a USB host got no answer and no log line for 7
+  minutes; the reader's one read, parked since ocbmd's start, never completed. Now its read is issued afresh, the device
+  opened again, every 10 s (a signal ends it: EINTR) and a second after a failed read. Not benched: that this module
+  completes the fresh read, and that its wait takes the signal. The update package (27 Nov, round 2) needs 3,447 KB of
+  a final adapter's 3,900 (round 1: 3,880, of which 376 KB the supplicant).
+- **RETIRED 27 Nov 2026: the Wi-Fi link's hotspot mode** (the adapter as a station on the phone's hotspot, its keeper
+  and its bundled wpa_supplicant 2.11; docs/wireless/01_BT_AND_RADIO.md, "RETIRED 27 Nov 2026"). Closed with it: the
+  supplicant's bundling and its flash (545,712 B, 376 KB of an update's room), the AP beside a station and on the
+  hotspot's channel, WPA3-only hotspots, the hidden hotspot's address, and the station's 2.4 GHz fault (the
+  authentication answered only as the driver's 2.4 s remain-on-channel ends, the association then unanswered: not
+  fixed from the host on three firmwares, ADDENDA 10-23, ranked causes in the radio document). A newer driver (the
+  plan's option 2) was judged a no-go on 27 Nov.
 
 - **An inbound RCS `'sync'` obliges a `'rply'`; the box logs and does not send one — BLOCKED, not
   merely unstarted.** `_controlServer_sendResponseInternal` writes `messageType = 0` while the
