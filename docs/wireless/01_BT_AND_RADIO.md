@@ -497,6 +497,41 @@ because BT attach waits for WLAN on this part, Bluetooth with it. Both forms now
 
 ---
 
+## The Wi-Fi link in mode `ap`: the head unit on the adapter's own AP (branch `wifi-link`, 27 Nov 2026; not benched)
+
+ADDENDUM 24 of the hand-off plan, the owner's decision: the IW416 cannot join a 2.4 GHz network as a client (below,
+ADDENDA 14-23), so the head unit joins the AP the phone's CarPlay already uses. `/etc/ocbm/wifi_link` then holds
+`key=`, `mode=ap` and `band=2.4|5` (MGMT_WIFI_LINK version 2, docs/carplay/01_OCBM_PROTOCOL.md); no `ssid_hex=`, so
+nothing of the station below runs (no keeper, no supplicant).
+- **The seam** (`radio_hal.sh`, `link_ap`: the shell's own read of the file, no fork): the AP takes the uAP interface
+  (`ap_iface`: the wireless interface that is not `sta*`, `wlan0` on the IW416, as in STA mode; the 2.4 GHz CarPlay AP
+  of the 24-25 Nov benches ran there), and `sta0` stays idle. `wifi_ap_on` hands the AP layer the band
+  (`RADIO_AP_BAND`), and with an AP up returns 2 at once. `wifi_ap_off` leaves the AP up and says so (`mode ap: the AP
+  stays up (the head unit's network)`): a session's teardown ends the phone's session and powers Bluetooth down as
+  before, but the AP is the head unit's network. `wifi_ap_restart` (new verb, ocbmd's) takes it down and up again.
+- **The band** (`radio_ap_up.sh` `ap_band_conf`, through `/tmp/hostapd_session.conf`; `hostapd.conf` on flash never
+  written for it): 2.4 GHz = channel 6, `hw_mode=g`, 20 MHz (no HT40, no `[SHORT-GI-40]`, no VHT line); 5 GHz =
+  `hostapd.conf`'s own channel when it is a non-DFS 5 GHz one (36 on the factory file), else 36 and its HT40 side. A
+  refused channel falls back to the AP's own, as in STA mode. `/tmp/.radio_ap_link` says which band the running AP was
+  started for (`2.4 6`; after a refusal `2.4 36`), and goes with it. The set-up network runs on channel 6 too.
+- **Up from power-up and between sessions** (ocbmd `src/wifi.rs` `ApKeep`, a look every 2 s in mode `ap` only): no
+  hostapd running, the AP is raised (`wifi_ap_on`, 15 s apart at most); a changed mode or band restarts it at once (the
+  phone's CarPlay drops and comes back); an AP started for another band (or before mode `ap`) is restarted only while
+  no phone's CarPlay session uses it (`/tmp/projection_owner`), three times a start at most. Never over an AP bring-up
+  or teardown under way (the wlan lock, the AP layer's lock) or a set-up network. Leaving mode `ap` with no host's
+  session up takes the AP down; with one, its teardown does. The radio inhibit (`CT_RADIO off`), `wireless: false` and
+  a wired session's yield take Bluetooth and the phone's session down, never this AP.
+- **What it costs (inferred, not measured):** the AP beacons whenever the adapter has power, `CarLink-xxxx` visible to
+  anyone near the car, and udhcpd runs all the while (its lease file written every 60 s, `auto_time`). A phone that
+  knows the AP from CarPlay may stay on it after a session ends (seen on 1 Aug with an AP left beaconing). Its power
+  draw on an always-on outlet is unmeasured.
+- **Other clients on the AP:** the head unit takes a lease from the same pool (192.168.43.100-200, per address, ten
+  days) beside the phones; udhcpd hands no router, so the head unit has no default route there. carplayd dials only the
+  phone btd names, by its `_carplay-ctrl` record's id, and the head unit advertises none; the AP watch's `sta_assoc` and
+  `dhcp_ack` timeline marks can be the head unit's when it joins during a session's first minute. Client isolation is
+  not on (the head unit and the phone each talk to the adapter only, but an unknown hostapd key refuses the whole
+  configuration: unbenched).
+
 ## The Wi-Fi link's station beside the AP (branch `wifi-link`, 24 Nov 2026; not benched)
 
 With a hotspot set up (an `ssid_hex=` line in `/etc/ocbm/wifi_link`, written by ocbmd for `MGMT_WIFI_LINK`) the adapter
@@ -695,12 +730,11 @@ also joins the phone's Personal Hotspot as a station, so a head unit on that hot
   - *No fifth miss while the AP runs.* The monitor keeps the count of authentications in a row with no answer in
     `/tmp/wifi_sta_misses` (one more for each that ended unanswered or on the SME's 5 s timer, none again after any
     answer: the association tried, a refusal, a join; a refusal by the driver sent no frame and does not count); at 3
-    the keeper tries no join while an AP is up (`3 authentications in a row unanswered: no joins while the AP runs (the
-    driver resets the radio at 5)`), and goes on when the AP is down, where a reset drops no phone. The file lasts the
-    boot, as the driver's count does (a reset the driver made with no AP up is not seen: the count stays high, so it
-    errs toward holding). **Its premise does not hold on this firmware** (ADDENDUM 15, above: no reset from failed
-    authentications), and the line's parenthesis repeats it; the guard now only holds joins back while the AP runs
-    (`off` in `bench_sta_miss_guard` for the bench; whether to keep it is the owner's).
+    the keeper tries no join while an AP is up (`3 authentications in a row unanswered: no joins while the AP runs`),
+    and goes on when the AP is down. The file lasts the boot. **Its premise does not hold on this firmware**
+    (ADDENDUM 15, above: no reset from failed authentications; the line no longer says it, 27 Nov); the guard now only
+    holds joins back while the AP runs (`off` in `bench_sta_miss_guard` for the bench; whether to keep it is the
+    owner's).
   - *The quick retry the plan asked for is 2.11's own:* its first three retries come 0.1 to 1 s after each failure, and
     the bench's case b shows them failing alike. Not built.
   - *Firmware MLME* (ADDENDUM 15: the bench's `sta_drvpatch` with the card's `host_mlme_required` byte changed, and

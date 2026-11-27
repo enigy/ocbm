@@ -374,6 +374,15 @@ the host's arrival and the first frame, the PSK count is a lower bound: `PSK mis
 
 ### Wi-Fi link switches (branch `wifi-link`, 24 Nov 2026)
 
+Mode `ap` (ADDENDUM 24, 27 Nov 2026; not benched): set up from Carlink (MGMT_WIFI_LINK v2); the link file then has
+`mode=ap` and `band=`. What to look for in the box log: `[ocbmd] wifi: mode ap: no AP up: wifi_ap_on on 2.4 GHz` soon
+after power-up (or `the mode or the band changed: wifi_ap_restart on ...`), `[radio_ap_up] mode ap: 2.4 GHz, channel 6
+(hw_mode=g, 20 MHz)`, `AP up: ... ch=6 if=wlan0`, `[ocbmd] wifi: listening on 192.168.43.1:7020 (OCBW v1, the AP's
+address, from wlan0 only)`, `[ocbmd] mdns: advertising CarLink-xxxx._ocbm._tcp.local at 192.168.43.1:7020`, and at each
+session's end `[radio_hal] ... mode ap: the AP stays up (the head unit's network)`. `cat /tmp/.radio_ap_link` (`2.4 6`),
+`ps | grep -c "[h]ostapd"` (1, between sessions too), no `wifi_sta` line and no supplicant process. MGMT_INFO:
+`"wifi_link":{"mode":"ap","state":"up",...}`, `linked` while Carlink holds the box over Wi-Fi.
+
 `/tmp/bench_wifi_selfstart_off` or `/etc/ocbm/bench_wifi_selfstart_off` (set unless "off"; the owner's
 `/etc/ocbm/wifi_selfstart_off` too): no CarPlay session without a host (M2 off) on an adapter with the link set up.
 `/tmp/bench_wifi_link_if` holding an interface name: ocbmd's listener binds that interface's address instead of the
@@ -462,7 +471,7 @@ load (a power-up).
   `the AP is starting: no scans and no joins until it is up`.
 - `sta_miss_guard` (3; `off`: none): after that many unanswered authentications in a row (the monitor's count,
   `/tmp/wifi_sta_misses`), no join is tried while an AP is up. Line `N authentications in a row unanswered: no joins
-  while the AP runs (the driver resets the radio at 5)`. ADDENDUM 15: that reset is the driver's data path only, and
+  while the AP runs` (until 27 Nov with the disproven reset in it). ADDENDUM 15: that reset is the data path's only, and
   this firmware's authentications go by command, so the guard guards nothing here; `off` for the join benches. Still
   look in dmesg every bench: `WiFi Reset due to`, `Start to process hanging`, `WIFI auto_fw_reload: fw_reload=1`, `FW
   Reload successfully.` (now expected only from `EAPOL timeout`, five deauthentications while connected).

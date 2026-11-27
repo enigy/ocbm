@@ -868,7 +868,12 @@ canonical control, box-autonomous page-on-boot) are **not** open items and are n
   after Wi-Fi hosts, a USB host got no answer and no log line for 7 minutes; the reader's one read, parked since
   ocbmd's start, never completed. Now its read is issued afresh, the device opened again, every 10 s (a signal ends
   it: EINTR) and a second after a failed read. Not benched: that this module completes the fresh read, and that its
-  wait takes the signal.
+  wait takes the signal; (8) mode `ap` (ADDENDUM 24, 27 Nov 2026: the head unit on the adapter's own AP, no station,
+  MGMT_WIFI_LINK v2; docs/wireless/01_BT_AND_RADIO.md, "The Wi-Fi link in mode ap") is built and unit-tested, NOT
+  benched: CarPlay and a head unit together on the uAP at 2.4 GHz channel 6 HT20 (the video over one channel twice),
+  the AP up from power-up and between sessions (its draw, a phone that stays on it after its session), the head unit's
+  join with the password Carlink shows, a band change while a phone projects, and the set-up network on channel 6. The
+  update package needs 3,880 KB with the supplicant, which mode `ap` does not use (3,504 KB without it).
 
 - **An inbound RCS `'sync'` obliges a `'rply'`; the box logs and does not send one — BLOCKED, not
   merely unstarted.** `_controlServer_sendResponseInternal` writes `messageType = 0` while the
