@@ -30,6 +30,10 @@
 //! IP_MULTICAST_ALL to 0 so it hears only the groups it joined itself (by default a Linux socket hears a group joined
 //! by ANY socket on ANY interface, the AP's included). A query from outside the station's subnet is not answered. So
 //! nothing of `_ocbm._tcp` reaches the phone on the box's own AP.
+//!
+//! MODE `ap` (ADDENDUM 24): the listener's address is the AP's own, so the same advert runs on the AP's interface and
+//! subnet, where the head unit is (its first way to the box is the DHCP server's address; this is the second). The
+//! phone on that AP hears it too: `id` says nothing about the key.
 
 use crate::wifi::Shared;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
@@ -272,7 +276,7 @@ fn run(shared: &Shared) {
                 let mask = crate::wifi::mask_of(a.addr).unwrap_or(Ipv4Addr::new(255, 255, 255, 0));
                 match open_socket(a.addr) {
                     Ok(s) => {
-                        eprintln!("[ocbmd] mdns: advertising {}.{SERVICE} at {}:{} on the station's link", a.name, a.addr, a.port);
+                        eprintln!("[ocbmd] mdns: advertising {}.{SERVICE} at {}:{}", a.name, a.addr, a.port);
                         // Announce twice, a second apart (RFC 6762 §8.3).
                         let _ = s.send_to(&response(&a, false, None), dest);
                         std::thread::sleep(Duration::from_secs(1));

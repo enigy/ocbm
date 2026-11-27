@@ -375,6 +375,10 @@ pub const MGMT_SWITCH_DEVICE: u8 = 0x0D;
 /// session carries on, a Wi-Fi session's link is closed when the key or the hotspot changed (or the link was
 /// removed), and its host reconnects. Status 1 = malformed, not storable, or the file could not be written: nothing
 /// changed. Only on a box with CAP_WIFI_LINK.
+/// Version 2 (Wi-Fi link plan, ADDENDUM 24: mode `ap`, the head unit joins the adapter's own AP; no hotspot, no
+/// station): [MGMT_WIFI_LINK][ver 2][link key 32 B][band u8], 35 B exactly, band 0x02 = 2.4 GHz, 0x05 = 5 GHz. Its
+/// MGMT_ACK status 0 carries the AP the head unit joins: [MGMT_ACK][0x0E][0][ssid_len u8][ssid][pass_len u8][pass]
+/// (the AP's name and WPA2 passphrase; never in MGMT_INFO). A changed key, band or mode restarts the AP on the band.
 pub const MGMT_WIFI_LINK: u8 = 0x0E;
                                             //   Box->host:
 pub const MGMT_INFO: u8 = 0x81; // [MGMT_INFO][utf8 JSON] — identity + health + bonded-device snapshot

@@ -1,6 +1,7 @@
 //! M3: the set-up network. An adapter with no Wi-Fi link that no host has spoken to since power-up offers, 20 s after
 //! ocbmd's start and for 10 minutes, a set-up network from its own AP (`CarLink-Setup-xxxx`, a public WPA2 passphrase,
-//! client isolation: `radio_hal.sh setup_ap_on`), and listens on 192.168.43.1:7021 for the OCBS v1 exchange
+//! client isolation, 2.4 GHz channel 6 for head units that see no 5 GHz: `radio_hal.sh setup_ap_on`), and listens on
+//! 192.168.43.1:7021 for the OCBS v1 exchange
 //! (`ocbm_link::setup_box_handshake`: P-256 ECDH, then OCBW records). One client at a time: the handshake within 5 s in
 //! all, its first record within 3 s, then 180 s in all to MGMT_WIFI_LINK (the driver compares the set-up code first,
 //! below). Over that session the box takes CT_HELLO and MGMT_WIFI_LINK and nothing else, answered on the set-up link
@@ -78,7 +79,7 @@ pub(crate) const CLOSED_FOR_BOOT: &str = "/tmp/ocbmd_setup_closed";
 pub(crate) const CLOSED_FOR_BOOT: &str = "/tmp/ocbmd_selftest_setup_closed";
 
 /// A set-up network is up, or on its way up, by radio_hal.sh's files.
-fn ap_up() -> bool {
+pub(crate) fn ap_up() -> bool {
     std::path::Path::new(AP_MARK).exists() || std::path::Path::new(AP_CONF).exists()
 }
 
@@ -265,8 +266,8 @@ impl Setup {
 }
 
 /// A radio_hal.sh verb, fire and forget (ocbmd ignores SIGCHLD: nothing may wait on the child); the box log has its
-/// lines, and `setup_ap_on` leaves [`AP_MARK`] when the AP is up.
-fn hal(verb: &str) {
+/// lines, and `setup_ap_on` leaves [`AP_MARK`] when the AP is up. Mode `ap`'s AP verbs too (wifi::ApKeep).
+pub(crate) fn hal(verb: &str) {
     if !std::path::Path::new(HAL).exists() {
         return;
     }

@@ -23,6 +23,11 @@
 //!   box from a Wi-Fi holder at once (its link closes), and no USB frame is ever dropped.
 //!
 //! The mDNS advert for the hotspot is `mdns.rs`.
+//!
+//! MODE `ap` (ADDENDUM 24 of the Wi-Fi link plan, MGMT_WIFI_LINK v2): the head unit joins the ADAPTER'S OWN AP, the one
+//! the phone's CarPlay uses. No station, no supplicant, no hotspot: the listener (and the advert) take the AP's own
+//! address on the AP's interface, as the radio seam publishes them; the AP is up from power-up and between phone
+//! sessions ([`ApKeep`]), on the band the link keeps; v2's ACK carries the AP's name and passphrase ([`ap_network`]).
 
 use ocbm_link::{LinkKey, Session};
 use std::fs::File;
@@ -74,6 +79,26 @@ pub const HOSTAPD_CONF: &str = "/etc/hostapd.conf";
 pub const AP_SESSION_CONF: &str = "/tmp/hostapd_session.conf";
 #[cfg(test)]
 pub const AP_SESSION_CONF: &str = "/tmp/ocbmd_selftest_no_such_hostapd_session.conf";
+/// Mode `ap`: the radio seam's word on the AP once it serves (`result=ok`, `ap_iface=`, `ap_ip=`; gone with the AP).
+#[cfg(not(test))]
+const WLAN_STATE: &str = "/tmp/.radio_wlan_state";
+#[cfg(test)]
+const WLAN_STATE: &str = "/tmp/ocbmd_selftest_no_such_radio_wlan_state";
+/// Mode `ap`: the band the running AP was started for, and its channel (radio_ap_up.sh: "<band> <channel>").
+#[cfg(not(test))]
+const AP_LINK_MARK: &str = "/tmp/.radio_ap_link";
+#[cfg(test)]
+const AP_LINK_MARK: &str = "/tmp/ocbmd_selftest_no_such_radio_ap_link";
+/// An AP bring-up or teardown under way: the seam's wlan lock, the AP layer's own.
+#[cfg(not(test))]
+const AP_BUSY: [&str; 2] = ["/tmp/.radio_lock_wlan", "/tmp/.radio_ap_lock"];
+#[cfg(test)]
+const AP_BUSY: [&str; 2] = ["/tmp/ocbmd_selftest_no_such_lock_wlan", "/tmp/ocbmd_selftest_no_such_ap_lock"];
+/// The root the AP's files are read under for v2's ACK ([`ap_network`]): "" on the adapter.
+#[cfg(not(test))]
+pub const AP_ROOT: &str = "";
+#[cfg(test)]
+pub const AP_ROOT: &str = "/tmp/ocbmd_selftest_aproot";
 
 /// Handshakes under way at once, all peers together.
 pub const MAX_HANDSHAKES: usize = 4;
@@ -93,34 +118,69 @@ fn reserved_subnet(ip: Ipv4Addr) -> bool {
 
 // ---- the link file ------------------------------------------------------------------------------------------------
 
+/// The band of the adapter's own AP in mode `ap`: v2's last byte, the link file's `band=`, MGMT_INFO's `ap_band`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Band {
+    /// 2.4 GHz: channel 6, 20 MHz (many head units, the owner's included, see only 2.4 GHz).
+    G24,
+    /// 5 GHz: hostapd.conf's own channel when it is a non-DFS 5 GHz one (36 on the factory file), else 36.
+    G5,
+}
+
+impl Band {
+    /// v2's byte: 0x02 or 0x05.
+    pub fn from_wire(b: u8) -> Option<Band> {
+        match b {
+            0x02 => Some(Band::G24),
+            0x05 => Some(Band::G5),
+            _ => None,
+        }
+    }
+
+    /// "2.4" or "5", as the link file, the AP layer's mark and MGMT_INFO say it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Band::G24 => "2.4",
+            Band::G5 => "5",
+        }
+    }
+}
+
 /// What [`LINK_FILE`] holds.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LinkConf {
     pub key: LinkKey,
-    /// The hotspot's name; empty: the key only, no hotspot (the bench's interface lever).
+    /// The hotspot's name; empty: the key only, no hotspot (the bench's interface lever), or mode `ap`.
     pub ssid: String,
     /// 64 hex digits (the PBKDF2 hash), or the passphrase, or empty (an open network).
     pub psk: String,
+    /// Mode `ap` (v2): the head unit joins the adapter's own AP, on this band; no hotspot. None: v1 (a hotspot, or
+    /// the key only).
+    pub ap: Option<Band>,
 }
 
 /// [`LINK_FILE`]'s text: `key=` (64 hex), and with a hotspot `ssid_hex=` (the name's bytes in hex, as the station
 /// keeper hands them to wpa_supplicant: no quoting, and no hexdump needed on the adapter) and `psk=` (as received:
-/// 64 hex digits, or a passphrase [`parse_provision`] checked, or empty).
+/// 64 hex digits, or a passphrase [`parse_provision`] checked, or empty); in mode `ap`, `mode=ap` and `band=`.
 pub fn link_file_text(c: &LinkConf) -> String {
     let mut t = format!(
         "# OCBM Wi-Fi link (MGMT_WIFI_LINK). Secret: never into a log, a backup or a stick.\nkey={}\n",
         c.key.to_hex()
     );
-    if !c.ssid.is_empty() {
+    if let Some(b) = c.ap {
+        t.push_str(&format!("mode=ap\nband={}\n", b.name()));
+    } else if !c.ssid.is_empty() {
         t.push_str(&format!("ssid_hex={}\npsk={}\n", ocbm_link::hex(c.ssid.as_bytes()), c.psk));
     }
     t
 }
 
-/// The file's text read back: the `key=` line must be 64 hex digits; `ssid_hex=` and `psk=` are optional.
+/// The file's text read back: the `key=` line must be 64 hex digits; `ssid_hex=` and `psk=` are optional; `mode=ap`
+/// is mode `ap` on its `band=` (2.4 unless 5), with no hotspot whatever else the file holds.
 pub fn parse_link_file(text: &str) -> Option<LinkConf> {
     let mut key = None;
     let (mut ssid, mut psk) = (String::new(), String::new());
+    let (mut ap, mut band) = (false, Band::G24);
     for l in text.lines() {
         if let Some(v) = l.strip_prefix("key=") {
             key = LinkKey::from_hex(v);
@@ -130,9 +190,16 @@ pub fn parse_link_file(text: &str) -> Option<LinkConf> {
             ssid = bytes.and_then(|b| String::from_utf8(b).ok()).filter(|_| v.len() % 2 == 0)?;
         } else if let Some(v) = l.strip_prefix("psk=") {
             psk = v.to_string();
+        } else if let Some(v) = l.strip_prefix("mode=") {
+            ap = v.trim() == "ap";
+        } else if let Some(v) = l.strip_prefix("band=") {
+            band = if v.trim() == "5" { Band::G5 } else { Band::G24 };
         }
     }
-    Some(LinkConf { key: key?, ssid, psk })
+    if ap {
+        (ssid, psk) = (String::new(), String::new());
+    }
+    Some(LinkConf { key: key?, ssid, psk, ap: ap.then_some(band) })
 }
 
 /// The link as stored, or None (no file, or no valid key: then the link is off, and the line says why once).
@@ -164,10 +231,19 @@ fn psk_storable(psk: &str) -> bool {
 }
 
 /// `MGMT_WIFI_LINK`'s body (after the verb): empty = [`Provision::Clear`], else
-/// `[ver 1][key 32][ssid_len u8][ssid][psk_len u8][psk]`. Refuses anything the file or the supplicant could not hold.
+/// `[ver 1][key 32][ssid_len u8][ssid][psk_len u8][psk]`, or v2, mode `ap`: `[ver 2][key 32][band u8]` (35 B with the
+/// verb; band 0x02 or 0x05). Refuses anything the file or the supplicant could not hold.
 pub fn parse_provision(body: &[u8]) -> Result<Provision, &'static str> {
     if body.is_empty() {
         return Ok(Provision::Clear);
+    }
+    if body[0] == 2 {
+        if body.len() != 34 {
+            return Err("a v2 that is not 35 B");
+        }
+        let key: [u8; 32] = body[1..33].try_into().map_err(|_| "a v2 that is not 35 B")?;
+        let band = Band::from_wire(body[33]).ok_or("a v2 with an unknown band")?;
+        return Ok(Provision::Set(LinkConf { key: LinkKey(key), ssid: String::new(), psk: String::new(), ap: Some(band) }));
     }
     if body[0] != 1 {
         return Err("an unknown version");
@@ -191,7 +267,60 @@ pub fn parse_provision(body: &[u8]) -> Result<Provision, &'static str> {
     if ssid.is_empty() && !psk.is_empty() {
         return Err("a psk without an ssid");
     }
-    Ok(Provision::Set(LinkConf { key: LinkKey(key), ssid: ssid.to_string(), psk: psk.to_string() }))
+    Ok(Provision::Set(LinkConf { key: LinkKey(key), ssid: ssid.to_string(), psk: psk.to_string(), ap: None }))
+}
+
+// ---- mode `ap`: the AP the head unit joins ---------------------------------------------------------------------------
+
+/// A WPA passphrase radio_ap_up.sh's `ap_passphrase` would keep: 8..=63 printable ASCII, and none of the defaults it
+/// counts as missing (stock's 12345678, an older OCBM's "carplay" + the AP interface's 4 hex: any 4 hex here).
+fn ap_psk_good(p: &str) -> bool {
+    let known = p == "12345678" || p.strip_prefix("carplay").is_some_and(|s| s.is_empty() || (s.len() == 4 && s.bytes().all(|b| b.is_ascii_hexdigit())));
+    (8..=63).contains(&p.len()) && p.bytes().all(|b| (b' '..=b'~').contains(&b)) && !known
+}
+
+/// The AP the head unit joins in mode `ap`, for v2's ACK: the adapter's name, which the AP takes as its ssid
+/// (`/etc/carplay_ident`, radio_hal.sh's box_name, decided once), and the AP's WPA2 passphrase as radio_ap_up.sh keeps
+/// it: hostapd.conf's when good; else, as its ap_passphrase would choose at the AP's next configuration, the one OCBM
+/// kept (`/etc/ocbm/wifi_psk`), or a new random one, kept there for it first. Err (v2 refused,
+/// nothing stored): no decided name yet, or the AP layer writing its configuration this very moment.
+pub fn ap_network(root: &str) -> Result<(String, String), &'static str> {
+    let read = |f: &str| std::fs::read_to_string(format!("{root}/{f}")).unwrap_or_default();
+    let name = read("etc/carplay_ident").lines().next().unwrap_or("").trim().to_string();
+    if !name.starts_with("CarLink-") || name.len() > 32 || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+        return Err("no name decided yet");
+    }
+    if let Some(p) = read("etc/hostapd.conf").lines().find_map(|l| l.strip_prefix("wpa_passphrase=")).filter(|p| ap_psk_good(p)) {
+        return Ok((name, p.to_string()));
+    }
+    if std::path::Path::new(&format!("{root}/tmp/.radio_ap_lock")).exists() {
+        return Err("the AP layer is writing");
+    }
+    // As ap_passphrase reads it, `tr -cd ' -~' | head -c 63`. Not /etc/wifi_password, its next: a new one kept in
+    // wifi_psk comes first for it.
+    let kept: String = read("etc/ocbm/wifi_psk").chars().filter(|c| (' '..='~').contains(c)).take(63).collect();
+    if ap_psk_good(&kept) {
+        return Ok((name, kept));
+    }
+    let p = ocbm_link::hex(&ocbm_link::random32().map_err(|_| "no randomness")?)[..20].to_string();
+    write_0600(&format!("{root}/etc/ocbm/wifi_psk"), &format!("{p}\n")).map_err(|_| "not kept")?;
+    Ok((name, p))
+}
+
+/// `text` into `path`, 0600, through a synced temporary and a rename; the temporary goes on failure.
+fn write_0600(path: &str, text: &str) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let tmp = format!("{path}.tmp");
+    let written = (|| {
+        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
 }
 
 /// Carry a provision out on flash: [`LINK_FILE`] written 0600 through a synced temporary and a rename, or removed.
@@ -204,21 +333,10 @@ pub fn store(p: &Provision, path: &str) -> std::io::Result<()> {
             _ => Ok(()),
         },
         Provision::Set(c) => {
-            use std::os::unix::fs::OpenOptionsExt;
             if let Some(dir) = std::path::Path::new(path).parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
-            let tmp = format!("{path}.tmp");
-            let written = (|| {
-                let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
-                f.write_all(link_file_text(c).as_bytes())?;
-                f.sync_all()
-            })();
-            if let Err(e) = written {
-                let _ = std::fs::remove_file(&tmp);
-                return Err(e);
-            }
-            std::fs::rename(&tmp, path)
+            write_0600(path, &link_file_text(c))
         }
     };
     if done.is_ok() {
@@ -390,9 +508,26 @@ fn bench_iface() -> Option<String> {
     (!v.is_empty() && v != "off").then(|| v.to_string())
 }
 
+/// Mode `ap`: the AP's own address on the AP's interface, port 7020, from the radio seam's word on the AP (`state`:
+/// `result=ok`, `ap_iface=`, `ap_ip=`), and only while that interface holds that address (`addr_of`); never loopback,
+/// 0.0.0.0 or NCM's subnet (ADDENDUM 24 item 2: the AP side, reversed from the hotspot mode's rule).
+pub fn ap_bind(state: &str, addr_of: impl Fn(&str) -> Option<Ipv4Addr>) -> Option<(SocketAddrV4, String)> {
+    let get = |k: &str| state.lines().find_map(|l| l.strip_prefix(k)).map(str::trim);
+    let (iface, ip): (&str, Ipv4Addr) = (get("ap_iface=")?, get("ap_ip=")?.parse().ok()?);
+    let o = ip.octets();
+    if get("result=")? != "ok" || iface.is_empty() || ip.is_loopback() || ip.is_unspecified() || o[..3] == [192, 168, 50] {
+        return None;
+    }
+    (addr_of(iface)? == ip).then(|| (SocketAddrV4::new(ip, ocbm_link::PORT), iface.to_string()))
+}
+
 /// Where the listener should be now: the station's address (or the bench lever's interface's), port 7020, and that
-/// interface; None while there is none, or when it lies on the AP's or NCM's subnet.
-pub fn listen_addr(sta: Option<&Sta>) -> Option<(SocketAddrV4, String)> {
+/// interface; None while there is none, or when it lies on the AP's or NCM's subnet. In mode `ap` ([`ap_bind`]) the
+/// AP's, unless the bench lever names an interface.
+pub fn listen_addr(sta: Option<&Sta>, ap: bool) -> Option<(SocketAddrV4, String)> {
+    if ap && bench_iface().is_none() {
+        return ap_bind(&std::fs::read_to_string(WLAN_STATE).unwrap_or_default(), |i| iface_v4(i).map(|(ip, _)| ip));
+    }
     let iface = bench_iface().or_else(|| sta.filter(|s| s.joined).map(|s| s.iface.clone()))?;
     let (ip, _) = iface_v4(&iface)?;
     if reserved_subnet(ip) || ip.is_loopback() || ip.is_unspecified() {
@@ -429,6 +564,8 @@ pub struct Shared {
     pub bound: Mutex<Option<SocketAddrV4>>,
     /// Set to end the listener and the advert for good (the link was removed).
     pub stop: AtomicBool,
+    /// Mode `ap`: the listener takes the AP's address ([`listen_addr`]); it follows a change within its look (1 s).
+    pub ap: AtomicBool,
     /// While `crate::mono_ms()` is below this, a host holds the box ([`HOLD_SILENCE`] after its last frame): a new
     /// connection is closed before the box's hello, which Carlink reads as "busy", not as a wrong key (notes, 3b).
     pub busy_until_ms: AtomicU64,
@@ -444,6 +581,7 @@ impl Shared {
             key: Mutex::new(key),
             bound: Mutex::new(None),
             stop: AtomicBool::new(false),
+            ap: AtomicBool::new(false),
             busy_until_ms: AtomicU64::new(0),
             next_id: AtomicU64::new(1),
             handshakes: AtomicUsize::new(0),
@@ -476,7 +614,7 @@ pub struct Authed {
 /// Where the listener binds.
 #[cfg_attr(not(test), allow(dead_code))]
 pub enum Bind {
-    /// The station's address as it comes and goes ([`listen_addr`]).
+    /// The station's address as it comes and goes, or the AP's in mode `ap` ([`listen_addr`]).
     Station,
     /// A fixed address (the tests: loopback, port 0).
     Fixed(SocketAddr),
@@ -544,16 +682,19 @@ fn listen_loop(shared: Arc<Shared>, fixed: Option<TcpListener>, tx: mpsc::Sender
     while !shared.stop.load(Ordering::Acquire) {
         if !fixed_mode && last_look.elapsed() >= Duration::from_secs(1) {
             last_look = Instant::now();
-            let want = listen_addr(read_sta(STA_STATE).as_ref());
+            let ap = shared.ap.load(Ordering::Acquire);
+            let sta = if ap { None } else { read_sta(STA_STATE) };
+            let want = listen_addr(sta.as_ref(), ap);
             if cur.as_ref().map(|(w, _)| w) != want.as_ref() {
                 if let Some(((a, _), _)) = cur.take() {
-                    eprintln!("[ocbmd] wifi: listener on {a} closed (the station's address went or changed)");
+                    eprintln!("[ocbmd] wifi: listener on {a} closed (its address went or changed)");
                 }
                 *shared.bound.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 if let Some((a, i)) = want {
                     match TcpListener::bind(a).and_then(|l| only_on(&l, &i).map(|()| l)) {
                         Ok(l) => {
-                            eprintln!("[ocbmd] wifi: listening on {a} (OCBW v1, the station's address, from {i} only)");
+                            let w = if ap { "the AP's" } else { "the station's" };
+                            eprintln!("[ocbmd] wifi: listening on {a} (OCBW v1, {w} address, from {i} only)");
                             *shared.bound.lock().unwrap_or_else(|e| e.into_inner()) = Some(a);
                             cur = Some(((a, i), l));
                         }
@@ -1030,7 +1171,21 @@ pub fn sink() -> File {
     std::fs::OpenOptions::new().write(true).open("/dev/null").expect("/dev/null")
 }
 
-/// The `"wifi_link"` object of MGMT_INFO: no name, no key, no address.
+/// The `"wifi_link"` object of MGMT_INFO in mode `ap` (ADDENDUM 24 item 9): `state` off (the AP not serving: no
+/// address to listen on), up (the listener on the AP), linked (a Wi-Fi host holds the box); `ap_band` the link's;
+/// `ap_channel` the channel the AP runs on, the band's once it has moved. No name, no key, no address.
+pub fn ap_info_json(band: Band, linked: bool, listening: bool, ap_ch: u32) -> String {
+    let state = if linked {
+        "linked"
+    } else if listening {
+        "up"
+    } else {
+        "off"
+    };
+    format!("{{\"mode\":\"ap\",\"state\":\"{state}\",\"ap_band\":\"{}\",\"ap_channel\":{ap_ch}}}", band.name())
+}
+
+/// The `"wifi_link"` object of MGMT_INFO with no link (`mode` off) or in the hotspot mode: no name, no key, no address.
 pub fn info_json(set_up: bool, linked: bool, sta: Option<&Sta>, listening: bool, ap_ch: u32) -> String {
     let (state, channel) = if !set_up {
         ("off", 0)
@@ -1043,7 +1198,8 @@ pub fn info_json(set_up: bool, linked: bool, sta: Option<&Sta>, listening: bool,
     } else {
         ("joining", 0)
     };
-    format!("{{\"state\":\"{state}\",\"channel\":{channel},\"ap_channel\":{ap_ch}}}")
+    let mode = if set_up { "hotspot" } else { "off" };
+    format!("{{\"mode\":\"{mode}\",\"state\":\"{state}\",\"channel\":{channel},\"ap_channel\":{ap_ch}}}")
 }
 
 /// True once, if [`USB_ONCE_FLAG`] was set; removes it.
@@ -1091,6 +1247,8 @@ pub struct Side {
     pub restart_when_idle: bool,
     /// The link as stored.
     pub conf: Option<LinkConf>,
+    /// Mode `ap`: the AP kept up for the head unit.
+    pub apk: ApKeep,
 }
 
 impl Side {
@@ -1122,12 +1280,14 @@ impl Side {
             pending: None,
             restart_when_idle: false,
             conf: None,
+            apk: ApKeep::default(),
         }
     }
 
     /// Start taking Wi-Fi hosts with `conf`'s key: the listener and the advert.
     pub fn start(&mut self, conf: &LinkConf) -> std::io::Result<()> {
         let shared = Shared::new(Some(conf.key.clone()));
+        shared.ap.store(conf.ap.is_some(), Ordering::Release);
         let l = start_listener(shared.clone(), Bind::Station)?;
         crate::mdns::start(shared.clone());
         self.shared = Some(shared);
@@ -1161,10 +1321,107 @@ impl Side {
 
     /// MGMT_INFO's `"wifi_link"` object.
     pub fn info(&self) -> String {
-        let sta = read_sta(STA_STATE);
         let ap = ap_channel(&ap_conf_text(AP_SESSION_CONF, HOSTAPD_CONF));
         let listening = self.shared.as_ref().is_some_and(|s| s.bound().is_some());
-        info_json(self.conf.is_some(), matches!(self.via, Some(Via::Wifi(_))), sta.as_ref(), listening, ap)
+        let linked = matches!(self.via, Some(Via::Wifi(_)));
+        match self.conf.as_ref().and_then(|c| c.ap) {
+            Some(b) => ap_info_json(b, linked, listening, ap),
+            None => info_json(self.conf.is_some(), linked, read_sta(STA_STATE).as_ref(), listening, ap),
+        }
+    }
+}
+
+// ---- mode `ap`: the AP kept up ---------------------------------------------------------------------------------------
+
+/// Mode `ap`: the AP is the head unit's network, up from power-up and between phone sessions (ADDENDUM 24 item 5).
+/// The supervisor brings it up for a session as before, and in this mode the seam's teardown leaves it up
+/// (radio_hal.sh); this keeps it there, a look every [`AP_LOOK`] while the link is in mode `ap` (never otherwise):
+/// raised when no hostapd runs, restarted on the band at once when the mode or the band changed ([`ApKeep::restart`]:
+/// the phone's CarPlay drops and comes back), and restarted when it runs a configuration started for another band (or
+/// none) while no phone's CarPlay session uses it, a few times a start at most. Never over an AP bring-up or teardown
+/// under way, or a set-up network.
+#[derive(Default)]
+pub struct ApKeep {
+    next: Option<Instant>,
+    /// The mode or the band changed: the AP restarts on the band at the next look.
+    pub restart: bool,
+    /// The last raise or restart asked of the seam.
+    last: Option<Instant>,
+    /// Restarts for a configuration of another band, this start ([`AP_FIXES`] at most).
+    fixes: u32,
+    /// Raises since an AP was last seen running: each waits twice the last (from [`AP_GAP`], 4 min at most), so a
+    /// unit whose AP never comes up is not asked every 15 s for good.
+    raises: u32,
+}
+
+/// Mode `ap`'s look, and the least gap between two of its raises or restarts (a seam verb takes a few seconds; one that
+/// fails is not asked again at once), and the restarts for another band's configuration a start may make.
+pub const AP_LOOK: Duration = Duration::from_secs(2);
+const AP_GAP: Duration = Duration::from_secs(15);
+const AP_FIXES: u32 = 3;
+
+/// What mode `ap`'s look asks of the seam.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ApAct {
+    Wait,
+    /// `radio_hal.sh wifi_ap_on`: no AP runs.
+    Raise,
+    /// `radio_hal.sh wifi_ap_restart`: down and up again on the band.
+    Restart,
+}
+
+/// The look's decision: an AP bring-up or teardown under way or a set-up network (`busy`) waits; no hostapd: raise;
+/// a change asked for a restart: restart; the AP started for another band (`started_for`, the AP layer's mark; None:
+/// not started in mode `ap`) and no phone's CarPlay session on it: restart.
+pub fn ap_decide(busy: bool, running: bool, asked: bool, started_for: Option<&str>, band: Band, carplay: bool) -> ApAct {
+    if busy {
+        ApAct::Wait
+    } else if !running {
+        ApAct::Raise
+    } else if asked || (started_for != Some(band.name()) && !carplay) {
+        ApAct::Restart
+    } else {
+        ApAct::Wait
+    }
+}
+
+impl ApKeep {
+    /// One look, for the link's `band` at `now`; the seam's verb it asks for, if any (the caller runs it).
+    pub fn tick(&mut self, now: Instant, band: Band, set_up_ap: bool) -> Option<&'static str> {
+        if self.next.is_some_and(|t| now < t) {
+            return None;
+        }
+        self.next = Some(now + AP_LOOK);
+        let busy = set_up_ap || AP_BUSY.iter().any(|p| std::path::Path::new(p).exists());
+        let mark = std::fs::read_to_string(AP_LINK_MARK).unwrap_or_default();
+        let carplay = box_common::flags::owner() == box_common::flags::ProjectionOwner::WirelessCp;
+        let running = !busy && crate::running_procs(&["hostapd"])[0]; // the set-up network's counts too
+        let act = ap_decide(busy, running, self.restart, mark.split_whitespace().next(), band, carplay);
+        if running {
+            self.raises = 0;
+        }
+        let gap = if act == ApAct::Raise { AP_GAP * (1 << self.raises.saturating_sub(1).min(4)) } else { AP_GAP };
+        let due = self.last.is_none_or(|t| now.duration_since(t) >= gap);
+        let verb = match act {
+            ApAct::Raise if due => {
+                self.raises += 1;
+                "wifi_ap_on"
+            }
+            ApAct::Restart if self.restart || (due && self.fixes < AP_FIXES) => {
+                self.fixes += u32::from(!self.restart);
+                "wifi_ap_restart"
+            }
+            _ => return None,
+        };
+        let why = match (act, self.restart) {
+            (ApAct::Raise, _) => "no AP up",
+            (_, true) => "the mode or the band changed",
+            _ => "an AP of another band, no CarPlay on it",
+        };
+        eprintln!("[ocbmd] wifi: mode ap: {why}: {verb} on {} GHz", band.name());
+        self.restart = false;
+        self.last = Some(now);
+        Some(verb)
     }
 }
 
@@ -1228,7 +1485,7 @@ mod tests {
     fn provision_bodies_parse_and_refuse() {
         assert_eq!(parse_provision(&[]), Ok(Provision::Clear));
         let hash = "ab".repeat(32);
-        let want = LinkConf { key: LinkKey([3; 32]), ssid: "Example Hotspot".into(), psk: hash.clone() };
+        let want = LinkConf { key: LinkKey([3; 32]), ssid: "Example Hotspot".into(), psk: hash.clone(), ap: None };
         assert_eq!(parse_provision(&body([3; 32], "Example Hotspot", &hash)), Ok(Provision::Set(want.clone())));
         // The file it writes reads back the same.
         assert_eq!(parse_link_file(&link_file_text(&want)), Some(want));
@@ -1250,11 +1507,145 @@ mod tests {
         assert!(parse_provision(&body([3; 32], "net", &hash)[..40]).is_err());
     }
 
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len() / 2).map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap()).collect()
+    }
+
+    /// ADDENDUM 24, agent B's wire proposal as adopted (notes/carlink.md, notes/ocbm.md): v2 is mode `ap` on a band,
+    /// 35 B with the verb exactly; v1's key-only form keeps its meaning.
+    #[test]
+    fn v2_is_mode_ap_on_its_band_and_v1_is_as_before() {
+        let v2_24 = unhex("0e02111111111111111111111111111111111111111111111111111111111111111102");
+        let want = |ap| Ok(Provision::Set(LinkConf { key: LinkKey([0x11; 32]), ssid: String::new(), psk: String::new(), ap }));
+        assert_eq!((v2_24.len(), parse_provision(&v2_24[1..])), (35, want(Some(Band::G24))), "B's vector, 2.4 GHz");
+        let mut v2_5 = v2_24.clone();
+        v2_5[34] = 0x05;
+        assert_eq!(parse_provision(&v2_5[1..]), want(Some(Band::G5)), "B's vector, 5 GHz");
+        for bad in [0x00, 0x03, 0x24, 0xff] {
+            v2_5[34] = bad;
+            assert!(parse_provision(&v2_5[1..]).is_err(), "band {bad:#04x}");
+        }
+        assert!(parse_provision(&v2_24[1..34]).is_err(), "34 B");
+        assert!(parse_provision(&[&v2_24[1..], &[0][..]].concat()).is_err(), "36 B");
+        assert!(parse_provision(&[2]).is_err());
+        assert_eq!(parse_provision(&body([0x11; 32], "", "")), want(None), "v1's key only: no mode ap");
+        assert!(parse_provision(&[3]).is_err(), "another version");
+    }
+
+    #[test]
+    fn the_link_file_holds_mode_ap_and_its_band() {
+        let c = LinkConf { key: LinkKey([7; 32]), ssid: String::new(), psk: String::new(), ap: Some(Band::G5) };
+        let t = link_file_text(&c);
+        assert!(t.contains("\nmode=ap\nband=5\n") && !t.contains("ssid_hex"), "{t}");
+        assert_eq!(parse_link_file(&t), Some(c.clone()));
+        let k = format!("key={}\n", "07".repeat(32));
+        assert_eq!(parse_link_file(&format!("{k}mode=ap\n")).and_then(|c| c.ap), Some(Band::G24), "no band: 2.4 GHz");
+        let both = parse_link_file(&format!("{k}mode=ap\nband=2.4\nssid_hex=6e6574\npsk=x\n")).unwrap();
+        assert_eq!((both.ap, both.ssid.as_str(), both.psk.as_str()), (Some(Band::G24), "", ""), "mode ap: no hotspot");
+        assert_eq!(parse_link_file(&format!("{k}ssid_hex=6e6574\npsk=\n")).and_then(|c| c.ap), None, "v1: hotspot");
+    }
+
+    fn ap_root(tag: &str) -> String {
+        let r = format!("/tmp/ocbmd_selftest_apnet_{tag}_{}", std::process::id());
+        let _ = std::fs::remove_dir_all(&r);
+        std::fs::create_dir_all(format!("{r}/etc/ocbm")).unwrap();
+        std::fs::create_dir_all(format!("{r}/tmp")).unwrap();
+        r
+    }
+
+    /// v2's ACK names the AP as the AP layer runs it (radio_ap_up.sh's ap_passphrase), or the v2 is refused.
+    #[test]
+    fn ap_network_is_the_ap_the_ap_layer_keeps() {
+        use std::os::unix::fs::PermissionsExt;
+        let r = ap_root("net");
+        let put = |f: &str, t: &str| std::fs::write(format!("{r}/{f}"), t).unwrap();
+        put("etc/hostapd.conf", "interface=wlan0\nssid=CarLink-0000\nwpa_passphrase=example-pass\nchannel=36\n");
+        assert!(ap_network(&r).is_err(), "no name decided yet");
+        put("etc/carplay_ident", "ccpa-fe01\n");
+        assert!(ap_network(&r).is_err(), "an older OCBM's name is derived again: not this one");
+        put("etc/carplay_ident", "CarLink-0000\n");
+        assert_eq!(ap_network(&r), Ok(("CarLink-0000".into(), "example-pass".into())), "hostapd.conf's, a good one");
+        // Defaults ap_passphrase counts as missing: the one OCBM kept, which it takes first.
+        put("etc/ocbm/wifi_psk", "0f3a9c41d27e88b05c6e\n");
+        for known in ["12345678", "carplayfd6c", "carplay", "seven77"] {
+            put("etc/hostapd.conf", &format!("ssid=CarLink-0000\nwpa_passphrase={known}\n"));
+            assert_eq!(ap_network(&r).map(|n| n.1), Ok("0f3a9c41d27e88b05c6e".into()), "{known}: the kept one");
+        }
+        // Nothing good: a new one, kept for the AP layer (0600), which takes the kept one before /etc/wifi_password;
+        // unless that layer is writing right now.
+        put("etc/ocbm/wifi_psk", "12345678\n");
+        put("etc/wifi_password", "a stock owner's\n");
+        put("tmp/.radio_ap_lock", "");
+        assert!(ap_network(&r).is_err(), "the AP layer configuring: refused, try again");
+        let _ = std::fs::remove_file(format!("{r}/tmp/.radio_ap_lock"));
+        let (_, p) = ap_network(&r).unwrap();
+        assert!(p.len() == 20 && p.bytes().all(|b| b.is_ascii_hexdigit()), "{p}");
+        assert_eq!(std::fs::read_to_string(format!("{r}/etc/ocbm/wifi_psk")).unwrap(), format!("{p}\n"));
+        assert_eq!(std::fs::metadata(format!("{r}/etc/ocbm/wifi_psk")).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(ap_network(&r).map(|n| n.1), Ok(p), "the same one again");
+        let _ = std::fs::remove_dir_all(&r);
+    }
+
+    /// Mode `ap`'s listener: the seam's AP on its interface, and nothing else.
+    #[test]
+    fn mode_ap_listens_on_the_aps_address_on_its_interface_only() {
+        let at = |want: &'static str| move |i: &str| (i == want).then(|| Ipv4Addr::new(192, 168, 43, 1));
+        let ok = "result=ok\nbackend=mapped\nap_iface=wlan0\nap_ip=192.168.43.1\nwlan_mac=02:00:00:00:00:01\n";
+        let want = Some((SocketAddrV4::new(Ipv4Addr::new(192, 168, 43, 1), ocbm_link::PORT), "wlan0".to_string()));
+        assert_eq!(ap_bind(ok, at("wlan0")), want, "the AP's own address, from wlan0 only");
+        assert_eq!(ap_bind(ok, at("sta0")), None, "the interface does not hold it (yet)");
+        assert_eq!(ap_bind(&ok.replace("result=ok", "result=fail"), at("wlan0")), None, "an AP that did not start");
+        assert_eq!(ap_bind("", at("wlan0")), None, "no AP (its state goes with it)");
+        let ncm = ok.replace("192.168.43.1", "192.168.50.2");
+        assert_eq!(ap_bind(&ncm, |_| Some(Ipv4Addr::new(192, 168, 50, 2))), None, "never NCM's subnet");
+        let any = ok.replace("192.168.43.1", "0.0.0.0");
+        assert_eq!(ap_bind(&any, |_| Some(Ipv4Addr::UNSPECIFIED)), None, "never 0.0.0.0");
+        let moved = ok.replace("192.168.43.1", "10.0.0.1");
+        assert_eq!(ap_bind(&moved, |_| Some(Ipv4Addr::new(10, 0, 0, 1))).map(|(a, _)| a.ip().octets()), Some([10, 0, 0, 1]), "/etc/wifi_ip's");
+    }
+
+    #[test]
+    fn mgmt_info_in_mode_ap_says_mode_state_band_and_channel_only() {
+        assert_eq!(ap_info_json(Band::G24, false, false, 36), "{\"mode\":\"ap\",\"state\":\"off\",\"ap_band\":\"2.4\",\"ap_channel\":36}");
+        assert_eq!(ap_info_json(Band::G24, false, true, 6), "{\"mode\":\"ap\",\"state\":\"up\",\"ap_band\":\"2.4\",\"ap_channel\":6}");
+        assert_eq!(ap_info_json(Band::G5, true, true, 36), "{\"mode\":\"ap\",\"state\":\"linked\",\"ap_band\":\"5\",\"ap_channel\":36}");
+    }
+
+    /// Mode `ap`'s look: raise, restart at once for a change, restart for another band's AP only with no CarPlay on
+    /// it, and never over a bring-up under way.
+    #[test]
+    fn mode_aps_look_keeps_the_ap_up_on_its_band() {
+        use ApAct::*;
+        let d = |busy, running, asked, mark, carplay| ap_decide(busy, running, asked, mark, Band::G24, carplay);
+        assert_eq!(d(true, false, true, None, false), Wait, "a bring-up or teardown under way, or a set-up network");
+        assert_eq!(d(false, false, false, None, true), Raise, "no AP: raised, whatever runs");
+        assert_eq!(d(false, true, true, Some("2.4"), true), Restart, "a change: at once, CarPlay or not");
+        assert_eq!(d(false, true, false, Some("2.4"), false), Wait, "the band's AP");
+        assert_eq!(d(false, true, false, Some("5"), false), Restart, "another band's, no CarPlay on it");
+        assert_eq!(d(false, true, false, None, false), Restart, "one not started in mode ap");
+        assert_eq!(d(false, true, false, None, true), Wait, "  but not under a phone's CarPlay");
+        // The keeper's pace (no AP runs on the test host): a look each 2 s, a raise each 15 s at most.
+        let mut k = ApKeep::default();
+        let t = Instant::now();
+        assert_eq!(k.tick(t, Band::G24, false), Some("wifi_ap_on"));
+        assert_eq!(k.tick(t + Duration::from_secs(1), Band::G24, false), None, "the next look is 2 s on");
+        assert_eq!(k.tick(t + Duration::from_secs(3), Band::G24, false), None, "a raise not again within 15 s");
+        assert_eq!(k.tick(t + Duration::from_secs(9), Band::G24, true), None, "a set-up network up: wait");
+        k.restart = true;
+        assert_eq!(k.tick(t + Duration::from_secs(17), Band::G24, false), Some("wifi_ap_on"), "no AP: a raise takes the band");
+        assert!(!k.restart, "asked once");
+        // No AP comes up: each raise waits twice the last (15, 30, 60 s ... 4 min).
+        assert_eq!(k.tick(t + Duration::from_secs(40), Band::G24, false), None, "the third raise 30 s after the second");
+        assert_eq!(k.tick(t + Duration::from_secs(48), Band::G24, false), Some("wifi_ap_on"));
+        assert_eq!(k.tick(t + Duration::from_secs(100), Band::G24, false), None, "then 60 s");
+        assert_eq!(k.tick(t + Duration::from_secs(108), Band::G24, false), Some("wifi_ap_on"));
+    }
+
     #[test]
     fn the_link_file_is_stored_0600_and_removed() {
         use std::os::unix::fs::PermissionsExt;
         let path = format!("/tmp/ocbmd_selftest_wifi_store_{}", std::process::id());
-        let c = LinkConf { key: LinkKey([9; 32]), ssid: "net".into(), psk: "cd".repeat(32) };
+        let c = LinkConf { key: LinkKey([9; 32]), ssid: "net".into(), psk: "cd".repeat(32), ap: None };
         let kept = format!("{path}_bssid"); // the keeper's kept hotspot address: a new set-up clears it
         std::fs::write(&kept, "02:11:22:33:44:55\n").unwrap();
         store(&Provision::Set(c.clone()), &path).unwrap();
@@ -1297,18 +1688,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         // The hotspot on a radar channel and the AP on its own: joined, the two channels differ (Carlink's line).
         let dfs = Sta { iface: "sta0".into(), joined: true, channel: 100, none: false };
-        assert_eq!(info_json(true, false, Some(&dfs), true, 36), "{\"state\":\"joined\",\"channel\":100,\"ap_channel\":36}");
+        assert_eq!(info_json(true, false, Some(&dfs), true, 36), "{\"mode\":\"hotspot\",\"state\":\"joined\",\"channel\":100,\"ap_channel\":36}");
     }
 
     #[test]
     fn mgmt_info_names_states_and_channels_only() {
         let joined = Sta { iface: "sta0".into(), joined: true, channel: 36, none: false };
         let none = Sta { none: true, ..Sta::default() };
-        assert_eq!(info_json(true, false, Some(&none), false, 36), "{\"state\":\"unsupported\",\"channel\":0,\"ap_channel\":36}");
-        assert_eq!(info_json(false, false, None, false, 36), "{\"state\":\"off\",\"channel\":0,\"ap_channel\":36}");
-        assert_eq!(info_json(true, false, None, false, 36), "{\"state\":\"joining\",\"channel\":0,\"ap_channel\":36}");
-        assert_eq!(info_json(true, false, Some(&joined), false, 36), "{\"state\":\"joined\",\"channel\":36,\"ap_channel\":36}");
-        assert_eq!(info_json(true, true, Some(&joined), true, 44), "{\"state\":\"linked\",\"channel\":36,\"ap_channel\":44}");
+        assert_eq!(info_json(true, false, Some(&none), false, 36), "{\"mode\":\"hotspot\",\"state\":\"unsupported\",\"channel\":0,\"ap_channel\":36}");
+        assert_eq!(info_json(false, false, None, false, 36), "{\"mode\":\"off\",\"state\":\"off\",\"channel\":0,\"ap_channel\":36}");
+        assert_eq!(info_json(true, false, None, false, 36), "{\"mode\":\"hotspot\",\"state\":\"joining\",\"channel\":0,\"ap_channel\":36}");
+        assert_eq!(info_json(true, false, Some(&joined), false, 36), "{\"mode\":\"hotspot\",\"state\":\"joined\",\"channel\":36,\"ap_channel\":36}");
+        assert_eq!(info_json(true, true, Some(&joined), true, 44), "{\"mode\":\"hotspot\",\"state\":\"linked\",\"channel\":36,\"ap_channel\":44}");
     }
 
     #[test]
