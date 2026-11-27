@@ -641,9 +641,9 @@ network's DHCP server address (udhcpd hands no router). It takes one host at a t
 takes holds the box against Wi-Fi hosts until it leaves or is silent for 10 s; a USB host's frame always takes it at
 once, from a Wi-Fi holder too, and no USB frame is ever dropped; where the accessory driver serializes reads and writes,
 USB is read on a thread whose read is issued afresh every 10 s and after any failed read, ADDENDUM 7), and with no link
-set up behaves as 2.7.1. The AP is up from power-up and between phone sessions; a set-up, a new key or a new band
-restarts it on the band at once (the phone's CarPlay drops and comes back, and a Wi-Fi host's link closes after the
-ACK). A band changed while a link exists is ON TRIAL (the owner's decision of 27 Nov 2026): unless a Wi-Fi host
+set up behaves as 2.7.1. The AP is up from power-up and between phone sessions; a first set-up or a new band restarts
+it on the band at once (the phone's CarPlay drops and comes back), and a new key or band closes a Wi-Fi host's link
+after the ACK. A band changed while a link exists is ON TRIAL (the owner's decision of 27 Nov 2026): unless a Wi-Fi host
 completes the OCBW handshake on the new band within 180 s of the change's apply (or of the box's next start, which gives
 it the whole time again), the box goes back to the band before by itself (docs/wireless/01_BT_AND_RADIO.md, "A band
 change on trial"). MGMT_INFO's `wifi_link` is

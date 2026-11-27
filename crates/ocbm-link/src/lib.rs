@@ -366,8 +366,8 @@ pub fn host_handshake<S: Read + Write>(s: &mut S, key: &LinkKey, host_nonce: [u8
 // An adapter with no link key offers a time-limited set-up network from its own AP (SSID [`SETUP_SSID_PREFIX`] + its
 // four hex digits, WPA2 passphrase [`SETUP_PASSPHRASE`], public on purpose). A host on it agrees keys with the box by an
 // unauthenticated P-256 ECDH, so nothing it then sends (the link key, the AP's name and passphrase in the answer) is
-// readable from the air; trust is first-come within the window (the adapter has no screen for a code). After the 70-byte
-// exchange the session
+// readable from the air; trust is first-come within the window (the adapter has no screen for a code). After the
+// 70-byte exchange the session
 // is OCBW v1's record layer, the plain OCBM stream inside:
 //
 // ```text

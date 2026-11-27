@@ -279,8 +279,8 @@ fn wait_for_ap_at(lock: &std::path::Path, max: std::time::Duration, abort: &dyn 
 
 // ---- On-target AP glue: fill AccessoryWiFiConfig from the box's live hostapd.conf --------------
 
-/// The configuration the AP runs from where it followed the station's channel (radio_ap_up.sh, ADDENDUM 6 of the
-/// Wi-Fi link plan): hostapd.conf with that channel, band and HT40 side, in tmpfs, there only while that AP is.
+/// The configuration the AP runs from where it took the Wi-Fi link's band (radio_ap_up.sh, mode ap, ADDENDUM 24 of
+/// the Wi-Fi link plan): hostapd.conf with that channel, band and HT40 side, in tmpfs, there only while that AP is.
 const AP_SESSION_CONF: &str = "/tmp/hostapd_session.conf";
 
 /// The file the running AP's configuration is read from: `session` while it is there, else `/etc/hostapd.conf`. The
@@ -444,7 +444,7 @@ mod tests {
         assert_eq!(cfg.passphrase.as_deref(), Some("a/b&c\\d#e\"f'g h "), "a CRLF file: only the line end goes");
     }
 
-    /// ADDENDUM 6: the 0x5703 describes the AP that runs, its per-session configuration where it followed the station.
+    /// The 0x5703 describes the AP that runs: its per-session configuration where it took mode ap's band (ADDENDUM 24).
     #[test]
     fn the_0x5703_reads_the_configuration_the_ap_runs_from() {
         let dir = std::env::temp_dir().join(format!("ap_session_{}", std::process::id()));
@@ -455,7 +455,7 @@ mod tests {
         assert_eq!(ap_conf_path(s), "/etc/hostapd.conf", "no session configuration: the flash file");
         let conf = "interface=wlan0\nssid=CarLink-0a1b\nwpa=3\nwpa_passphrase=a made-up key\nhw_mode=a\nchannel=149\n";
         std::fs::write(&session, conf).unwrap();
-        assert_eq!(ap_conf_path(s), s, "the AP followed the station: its session's configuration");
+        assert_eq!(ap_conf_path(s), s, "the AP on mode ap's band: its session's configuration");
         let cfg = parse_hostapd_conf(&std::fs::read_to_string(&session).unwrap(), s).unwrap();
         assert_eq!((cfg.ssid.as_str(), cfg.channel), ("CarLink-0a1b", Some(149)));
         let _ = std::fs::remove_dir_all(&dir);
