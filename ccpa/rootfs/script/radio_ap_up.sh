@@ -31,7 +31,7 @@
 # USAGE  RADIO_WLAN_IF=<iface> sh radio_ap_up.sh [AP|PREP]
 #        AP (the default) brings the AP up. PREP writes its configuration only, raising nothing, and the stamp a
 #        later AP start trusts (radio_hal.sh wifi_ap_prep, the armed state between host sessions).
-#        RADIO_AP_CHANNEL: STA mode's station channel, for the AP to follow (ap_follow).
+#        RADIO_AP_CHANNEL: STA mode's station channel, for the AP to follow (ap_follow). RADIO_AP_BAND: mode ap's.
 # EXIT   0 AP converged (PREP: configured)   1 failed to converge
 ########################
 set -u
@@ -415,8 +415,20 @@ ap_join() {  # $1 root, $2 the station's interface
 }
 # hostapd's configuration (_hrun) under root $1: AP_SESSION (tmpfs, 0600: hostapd.conf with the station's channel, band
 # and HT40 side; 20 MHz and no VHT at 2.4 GHz, as the factory file's own 2.4 GHz line) when it follows, else
-# hostapd.conf, never written for it. Sets ch; _own: the AP's own.
+# hostapd.conf, never written for it. Sets ch; _own: the AP's own. ap_session writes it for channel $2: 0 written (ch,
+# _hrun then name it; _hm, _bw what it is).
 AP_SESSION=/tmp/hostapd_session.conf
+ap_session() {
+  _hm=a; _vd='/^vht_oper_c/d'; _sg='[SHORT-GI-40]'; ht40_side "$2"
+  [ "$2" -le 14 ] && { _hm=g; _vd='/^vht_/d; /^ieee80211ac=/d'; _sg=""; _hs=""; }
+  _bw="HT40$_hs"; [ -n "$_hs" ] || _bw="20 MHz"
+  if ( umask 077; sed -e "s/^channel=.*/channel=$2/; s/^hw_mode=.*/hw_mode=$_hm/; $_vd" \
+         -e "/^ht_capab=/s/\[HT40[-+]\]/${_hs:+[HT40$_hs]}/" -e "/^ht_capab=/s/\[SHORT-GI-40\]/$_sg/" \
+         "$_hrun" > "$1$AP_SESSION.new" ) && mv -f "$1$AP_SESSION.new" "$1$AP_SESSION"; then
+    ch=$2; _hrun="$1$AP_SESSION"; return 0
+  fi
+  rm -f "$1$AP_SESSION.new"; return 1
+}
 ap_follow() {
   _hrun="$1/etc/hostapd.conf"; _own=$ch; _fc=${RADIO_AP_CHANNEL:-}
   rm -f "$1$AP_SESSION"
@@ -430,17 +442,19 @@ ap_follow() {
     case "$_fc" in 5[2-9]|6[0-4]|1[0-3][0-9]|14[0-4]) _w="a radar (DFS) channel" ;; esac
     say "STA mode: the station is on channel $_fc, $_w - the AP keeps its own channel $ch"; return 0
   fi
-  _hm=a; _vd='/^vht_oper_c/d'; _sg='[SHORT-GI-40]'; ht40_side "$_fc"
-  [ "$_fc" -le 14 ] && { _hm=g; _vd='/^vht_/d; /^ieee80211ac=/d'; _sg=""; _hs=""; }
-  _bw="HT40$_hs"; [ -n "$_hs" ] || _bw="20 MHz"
-  if ( umask 077; sed -e "s/^channel=.*/channel=$_fc/; s/^hw_mode=.*/hw_mode=$_hm/; $_vd" \
-         -e "/^ht_capab=/s/\[HT40[-+]\]/${_hs:+[HT40$_hs]}/" -e "/^ht_capab=/s/\[SHORT-GI-40\]/$_sg/" \
-         "$_hrun" > "$1$AP_SESSION.new" ) && mv -f "$1$AP_SESSION.new" "$1$AP_SESSION"; then
-    say "STA mode: the AP follows the station to channel $_fc (hw_mode=$_hm, $_bw)"
-    ch=$_fc; _hrun="$1$AP_SESSION"
-  else
-    rm -f "$1$AP_SESSION.new"; say "STA mode: channel $_fc not written - the AP keeps its own channel $ch"
-  fi
+  if ap_session "$1" "$_fc"; then say "STA mode: the AP follows the station to channel $_fc (hw_mode=$_hm, $_bw)"
+  else say "STA mode: channel $_fc not written - the AP keeps its own channel $ch"; fi
+}
+# Mode ap (ADDENDUM 24, docs/wireless/01_BT_AND_RADIO.md): RADIO_AP_BAND 2.4 = channel 6, 20 MHz; 5 = the AP's own
+# non-DFS 5 GHz channel, else 36. AP_LINK: the band the running AP was started for, and its channel (ocbmd's).
+AP_LINK=/tmp/.radio_ap_link
+ap_band_conf() {
+  _hrun="$1/etc/hostapd.conf"; _own=$ch; _mw="mode ap"; _fc=6; rm -f "$1$AP_SESSION"
+  [ "$RADIO_AP_BAND" = 5 ] && { _fc=36; [ "$ch" -gt 14 ] && ap_may_use "$ch" && _fc=$ch; }
+  if [ "$_fc" -gt 14 ] && [ "$_fc" = "$ch" ]; then _bw="its own"
+  elif ap_session "$1" "$_fc"; then _bw="hw_mode=$_hm, $_bw"
+  else _bw="not written: its own"; fi
+  say "mode ap: $RADIO_AP_BAND GHz, channel $ch ($_bw)"
 }
 [ "${RADIO_AP_UP_FUNCS:-}" = 1 ] && return 0
 
@@ -530,9 +544,10 @@ test -e "$AP_ROOT/tmp/bin/hostapd" || cp "$AP_ROOT/usr/sbin/hostapd" "$AP_ROOT/t
 # This start's own line, before the launch: the converge step waits for an AP-ENABLED after it (ap_enabled_seen).
 _ae_mark="[radio] hostapd starting on $IF"
 echo "$_ae_mark" 2>/dev/null >> "$AP_BOXLOG" || _ae_mark=""
-_launched=0; _hapd=""; _dhcpd=""; _hrun="$AP_ROOT/etc/hostapd.conf"
+_launched=0; _hapd=""; _dhcpd=""; _hrun="$AP_ROOT/etc/hostapd.conf"; _mw="STA mode"
 if ! pidof hostapd >/dev/null 2>&1; then
-  ap_follow "$AP_ROOT"
+  [ -e "$AP_ROOT$AP_LINK" ] && rm -f "$AP_ROOT$AP_LINK"   # the shell's test first: no fork with no link
+  if [ -n "${RADIO_AP_BAND:-}" ]; then ap_band_conf "$AP_ROOT"; else ap_follow "$AP_ROOT"; fi
   setsid hostapd "$_hrun" </dev/null >>"$AP_BOXLOG" 2>&1 &
   _hapd=$!
   tl_stamp ap_start
@@ -624,7 +639,7 @@ ap_converge() {
 ap_converge
 # Refused there (a domain with no AP on it, say): the AP's own channel, as before.
 if hapd_refused; then
-  say "STA mode: hostapd did not start on channel $ch - the AP takes its own channel $_own"
+  say "$_mw: hostapd did not start on channel $ch - the AP takes its own channel $_own"
   rm -f "$_hrun"; ch=$_own; _hrun="$AP_ROOT/etc/hostapd.conf"
   [ -n "$_ae_mark" ] && echo "$_ae_mark" 2>/dev/null >> "$AP_BOXLOG"
   setsid hostapd "$_hrun" </dev/null >>"$AP_BOXLOG" 2>&1 &
@@ -645,6 +660,7 @@ if ! ap_serving || { [ "$_launched" = 1 ] && hapd_exited; }; then
          tail -3 "$AP_ROOT/tmp/radio_ap_dhcp.log" 2>/dev/null | sed "s|^|$L     |" | tee -a "$AP_BOXLOG"; }
   exit 1
 fi
+[ "$_launched" = 1 ] && [ -n "${RADIO_AP_BAND:-}" ] && echo "$RADIO_AP_BAND $ch" 2>/dev/null >"$AP_ROOT$AP_LINK"
 if [ -n "$_ae_ms" ]; then
   echo "$L AP up: ssid=$NAME ip=$WLANIP ch=$ch if=$IF dhcp=yes (AP-ENABLED ${_ae_ms} ms after it was serving)"
 elif [ "$_launched" = 1 ]; then

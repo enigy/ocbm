@@ -143,10 +143,11 @@ cat > "$S/ps" <<EOF
 EOF
 chmod 755 "$S"/*
 # radio_ap_up.sh (PREP when $2 says so) under shell $1 on adapter $R, OLD_DHCP passed on, and FOLLOW as the seam's
-# RADIO_AP_CHANNEL when set (STA mode); its output in $R.out and its status in $R.rc. The servers and hostapd it leaves
+# RADIO_AP_CHANNEL when set (STA mode), BAND as its RADIO_AP_BAND (mode ap); its output in $R.out and its status in
+# $R.rc. The servers and hostapd it leaves
 # running are this run's to end (ended).
 start_ap() {
-  env ${FOLLOW+"RADIO_AP_CHANNEL=$FOLLOW"} \
+  env ${FOLLOW+"RADIO_AP_CHANNEL=$FOLLOW"} ${BAND+"RADIO_AP_BAND=$BAND"} \
     OCBM_TEST_PATH="$S:$PSPATH${SED_SHIM:+:$SED_SHIM}" AP_ROOT="$R" AP_PROC="$R/proc" AP_BOXLOG="$R/tmp/box.log" \
     AP_DHCP_MATCH="$MATCH" RADIO_WLAN_IF=sta0 OLD_DHCP="${OLD_DHCP:-}" "$1" "$AP" ${2:-} > "$R.out" 2>&1
   echo $? > "$R.rc"
@@ -548,6 +549,48 @@ EOF
   : > "$S/hostapd.confs"; FOLLOW=6; start_ap "$sh"; unset FOLLOW
   check '[ "$(cat "$R.rc")" = 0 ] && grep -q "AP up: ssid=[^ ]* ip=192.168.43.1 ch=6 if=sta0 dhcp=yes" "$R.out" && grep -qx "hw_mode=g" "$R/tmp/hostapd_session.conf" && grep -qx "ht_capab=" "$R/tmp/hostapd_session.conf"' \
     "the station on 6 (2.4 GHz, the truck's hotspot): the AP up on 6, hw_mode=g, 20 MHz"
+  ended; rm -f "$S/hostapd.confs"
+
+  # ---- mode ap: the head unit joins this AP, on the link's band (ADDENDUM 24, 27 Nov 2026) -------------------------
+  echo "== $sh: mode ap: the AP on the link's band (2.4 GHz: 6, 20 MHz), never DFS, hostapd.conf untouched"
+  bnd() {  # $1 RADIO_AP_BAND, $2 the AP's own channel: "ch _hrun"
+    env RADIO_AP_BAND="$1" RADIO_AP_UP_FUNCS=1 AP_BOXLOG="$F/tmp/box.log" OCBM_TEST_PATH="${OCBM_TEST_PATH:-}" \
+      "$sh" -c '. "$1"; ch=$3; ap_band_conf "$2" > "$2.out" 2>&1; echo "$ch $_hrun"' sh "$AP" "$F" "$2"
+  }
+  mkf; r=$(bnd 2.4 36)
+  check '[ "$r" = "6 $SC" ] && grep -qx "channel=6" "$SC" && grep -qx "hw_mode=g" "$SC" && grep -qxF "ht_capab=[SHORT-GI-20]" "$SC" && grep -q "mode ap: 2.4 GHz, channel 6 (hw_mode=g, 20 MHz)" "$F/tmp/box.log"' \
+    "2.4 GHz: channel 6, hw_mode=g, 20 MHz (no HT40, no SHORT-GI-40), said"
+  check 'cmp -s "$F/etc/hostapd.conf" "$F.ref" && [ -z "$(find "$F/etc" -type f -newer "$F.mark")" ] && [ "$(others "$SC")" = "$(others "$F.ref")" ]' \
+    "  hostapd.conf on flash untouched; the session's every other line as it has it, the passphrase too"
+  mkf; printf 'ieee80211ac=1\nvht_oper_chwidth=1\nvht_oper_centr_freq_seg0_idx=42\n' >> "$F/etc/hostapd.conf"; r=$(bnd 2.4 36)
+  check '[ "$r" = "6 $SC" ] && ! grep -q -e "^ieee80211ac=" -e "^vht_" "$SC"' "  no VHT line carried to 2.4 GHz"
+  mkf; r=$(bnd 5 36)
+  check '[ "$r" = "36 $F/etc/hostapd.conf" ] && [ ! -e "$SC" ] && grep -q "mode ap: 5 GHz, channel 36 (its own)" "$F/tmp/box.log"' \
+    "5 GHz on the AP's own 36: hostapd.conf as today, nothing written"
+  mkf; r=$(bnd 5 149)
+  check '[ "$r" = "149 $F/etc/hostapd.conf" ] && [ ! -e "$SC" ]' "5 GHz on its own 149 (no radar channel): kept"
+  for own in 100 52 6; do
+    mkf; r=$(bnd 5 "$own")
+    check '[ "$r" = "36 $SC" ] && grep -qx "channel=36" "$SC" && grep -qx "hw_mode=a" "$SC" && grep -qxF "ht_capab=[SHORT-GI-20][SHORT-GI-40][HT40+]" "$SC"' \
+      "5 GHz with the AP's own on $own (a radar channel, or 2.4 GHz): 36, HT40+"
+  done
+  # The whole start in mode ap: hostapd from the band's configuration, the band's mark once it is up; none without one.
+  ended; rm -f "$S/refuse"; : > "$S/hostapd.confs"
+  BAND=2.4; start_ap "$sh"; unset BAND
+  check '[ "$(cat "$R.rc")" = 0 ] && grep -q "AP up: ssid=[^ ]* ip=192.168.43.1 ch=6 if=sta0 dhcp=yes" "$R.out" && [ "$(cat "$S/hostapd.confs")" = "$R/tmp/hostapd_session.conf" ] && [ "$(cat "$R/tmp/.radio_ap_link")" = "2.4 6" ]' \
+    "mode ap, 2.4 GHz: hostapd from the session's configuration on 6, and the mark \"2.4 6\" for ocbmd"
+  check 'cmp -s "$R/etc/hostapd.conf" "$R.flash"' "  hostapd.conf on flash as it was"
+  : > "$S/hostapd.confs"; BAND=5; start_ap "$sh"; unset BAND
+  check '[ "$(cat "$R.rc")" = 0 ] && [ ! -s "$S/hostapd.confs" ] && [ "$(cat "$R/tmp/.radio_ap_link")" = "2.4 6" ]' \
+    "  a start while that AP runs: nothing moves, the mark as it was (ocbmd restarts it for another band)"
+  ended; : > "$S/hostapd.confs"; echo 6 > "$S/refuse"
+  BAND=2.4; start_ap "$sh"; unset BAND
+  check '[ "$(cat "$R.rc")" = 0 ] && grep -q "mode ap: hostapd did not start on channel 6 - the AP takes its own channel 36" "$R.out" && [ "$(cat "$R/tmp/.radio_ap_link")" = "2.4 36" ]' \
+    "hostapd refuses 6: the AP's own channel, said; the mark the band asked and the channel taken (no restart loop)"
+  ended; rm -f "$S/refuse"; : > "$S/hostapd.confs"
+  start_ap "$sh"
+  check '[ "$(cat "$R.rc")" = 0 ] && [ ! -e "$R/tmp/.radio_ap_link" ] && [ "$(cat "$S/hostapd.confs")" = "$R/etc/hostapd.conf" ]' \
+    "no band (no mode ap): hostapd.conf as before, and no mark"
   ended; rm -f "$S/hostapd.confs"
 
   # do_wifi_ap_off itself, its commands stood in for (the second review, item 5): the AP's server seen gone before it
