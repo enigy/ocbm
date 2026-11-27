@@ -643,9 +643,9 @@ impl Watch {
     }
 
     /// ADDENDUM 13: an authentication that went unanswered (`true`), or one answered (`false`: the association tried,
-    /// a refusal, a join made). The IW416's moal driver counts the first kind the same way, and at its fifth in a row
-    /// resets the radio (`WiFi Reset due to auth timeout cnt 5`, its firmware loaded again: every link on it drops), so
-    /// the keeper holds the station back before then while a phone uses the AP.
+    /// a refusal, a join made); the keeper's guard holds the station back after a few in a row while a phone uses the
+    /// AP. ADDENDUM 15: moal's `WiFi Reset due to auth timeout cnt 5`, which the guard was for, counts its data path's
+    /// frames only, and this firmware sends authentications by command: these reset no radio here.
     fn missed(&mut self, yes: bool) {
         if let Some((f, n)) = &mut self.miss {
             let m = if yes { *n + 1 } else { 0 };
@@ -1201,8 +1201,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// ADDENDUM 13: the authentications in a row that went unanswered, the radio driver's own count (moal resets the
-    /// radio at its fifth), kept in the file the keeper reads: one more for each that ended unsaid or on the SME's 5 s
+    /// ADDENDUM 13: the authentications in a row that went unanswered (no radio reset from them on this firmware,
+    /// ADDENDUM 15), kept in the file the keeper reads: one more for each that ended unsaid or on the SME's 5 s
     /// timer, none again once one is answered (the association tried, a refusal, a join); none for a refusal by the
     /// driver (no frame went out) or a step after the authentication.
     #[test]

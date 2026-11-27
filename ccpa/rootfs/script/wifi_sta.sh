@@ -21,8 +21,8 @@
 # failed joins (TEMP-DISABLED) has it try again. Beside each supplicant a monitor, `ocbmd wpa ... events 0`, writes
 # its joins into the box log and counts unanswered authentications (MISSES, for the guard below). ADDENDUM 13: hostapd
 # starting (radio_ap_up.sh's AP_START), no scan and no join; after MISS_GUARD unanswered authentications in a row, none
-# while the AP runs (the IW416's driver resets the radio at its fifth). The AP follows the station's channel at its
-# start; nothing moves an AP under a host.
+# while the AP runs (ADDENDUM 15: they reset no radio on this firmware, so the guard only spares the AP's phone the
+# station's tries). The AP follows the station's channel at its start; nothing moves an AP under a host.
 #
 # /etc/ocbm/wifi_link (ocbmd's, 0600): key=, ssid_hex= (the name in hex), psk= (64 hex digits, the PBKDF2 hash; or the
 # passphrase; or empty: open). Beside it, written when they change (0600, never logged): the hotspot's last channel
@@ -423,10 +423,10 @@ while :; do
       # under way had ended): a pause, so the rules below put it back once the AP is up (or did not come).
       paused=1; plan "the AP is starting: no scans and no joins until it is up"
     elif [ "$up" = 1 ] && [ "$guard" != 0 ] && [ "$misses" -ge "$guard" ]; then
-      # ADDENDUM 13: the IW416's moal driver resets the radio at its fifth unanswered authentication in a row (its
-      # firmware loaded again, the AP's phone dropped): none tried while the AP runs, once the monitor counted $guard.
+      # ADDENDUM 13's guard: none tried while the AP runs, once the monitor counted $guard in a row. Its premise, a
+      # radio reset at the fifth, does not hold here (ADDENDUM 15: moal counts them on its data path only).
       [ "$paused" = 1 ] || in_join || { cli disconnect >/dev/null; paused=1; }
-      plan "$misses authentications in a row unanswered: no joins while the AP runs (the driver resets the radio at 5)"
+      plan "$misses authentications in a row unanswered: no joins while the AP runs"
     elif [ "$starting" = 1 ] && [ "$up" = 0 ] && [ "$parked" = 1 ] && [ "${seen_ch:-0}" != 0 ]; then
       on_channel "$seen_ch"
       plan "the adapter's own session starting, no AP yet: scans and joins on the hotspot's channel $seen_ch only"

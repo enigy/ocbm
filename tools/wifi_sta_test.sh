@@ -403,7 +403,7 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
   check '! grep -q "the AP is starting" "$R/tmp/box.log" && grep -q "^wpa sta0 find" "$R/calls" && grep -q "^wpa sta0 reconnect" "$R/calls" && [ ! -e "$R/tmp/.radio_ap_start" ]' \
     "  a mark whose start has ended, no AP: taken over (the mark gone), the first look, the station on again"
 
-  # ADDENDUM 13: the IW416's driver resets the radio at its fifth unanswered authentication in a row. The monitor counts
+  # ADDENDUM 13's guard (its radio reset disproven by ADDENDUM 15; the guard stays the owner's). The monitor counts
   # them (/tmp/wifi_sta_misses); at 3 (the bench's sta_miss_guard: another count, or off) no join is tried while the AP
   # runs; the AP gone, the station is on again.
   R="$T/mg"; unit "$R" "sta0 wlan0" "$HASH"; printf 'wpa_state=SCANNING\n' > "$R/wpa_status"
@@ -412,7 +412,7 @@ for sh in ${SHELLS:-$(distinct_shells sh dash)}; do
     "$sh" "$KEEPER" >/dev/null 2>&1 &
   BG=$!
   n=0; while [ "$n" -lt 100 ] && ! grep -q "3 authentications in a row unanswered" "$R/tmp/box.log" 2>/dev/null; do n=$((n + 1)); sleep 0.1; done
-  check 'grep -q "^wpa sta0 disconnect" "$R/calls" && grep -q "3 authentications in a row unanswered: no joins while the AP runs (the driver resets the radio at 5)" "$R/tmp/box.log"' \
+  check 'grep -q "^wpa sta0 disconnect" "$R/calls" && grep -q "3 authentications in a row unanswered: no joins while the AP runs$" "$R/tmp/box.log"' \
     "3 unanswered authentications in a row, the AP up: no joins while it runs, and why"
   echo 0 > "$R/tmp/wifi_sta_misses"
   n=0; while [ "$n" -lt 100 ] && ! grep -q "scans and joins on the AP.s channel 36 only" "$R/tmp/box.log"; do n=$((n + 1)); sleep 0.1; done
