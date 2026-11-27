@@ -490,9 +490,7 @@ restart_ocbmd_daemon() {
   # opens O_APPEND, which ocbmd's own box.log rotation relies on (see `log_rotate` there).
   setsid /usr/sbin/ocbmd >> /tmp/box.log 2>&1 &
   sleep 2
-  # The full path alone here: a bare `ocbmd` is the Wi-Fi link keeper's `ocbmd wpa` (its supplicant's monitor runs all
-  # along, ADDENDUM 11), never this daemon, so it would certify a restart that failed.
-  if pgrep -x /usr/sbin/ocbmd >/dev/null 2>&1; then
+  if pgrep -x ocbmd >/dev/null 2>&1 || pgrep -x /usr/sbin/ocbmd >/dev/null 2>&1; then
     echo "[sup] L2: ocbmd restarted — host must re-SUBSCRIBE"
   else
     echo "[sup] CRITICAL: ocbmd did not restart — reboot required (L3 = task #28)"

@@ -1,18 +1,19 @@
-//! The Wi-Fi link's discovery: a minimal mDNS / DNS-SD responder for `_ocbm._tcp`, on the station interface only.
+//! The Wi-Fi link's discovery: a minimal mDNS / DNS-SD responder for `_ocbm._tcp`, on the listener's interface only
+//! (the adapter's own AP, mode `ap`).
 //!
-//! On the phone's hotspot the box's address comes from DHCP, so a host finds it the standard way (Android's
-//! `NsdManager`, `dns-sd -B _ocbm._tcp` on a Mac). The record set, `<name>` being the box's name (CarLink-xxxx, the
-//! one its AP and Bluetooth carry):
+//! The head unit's first way to the box is the AP's DHCP server address; this is the second, the standard one
+//! (Android's `NsdManager`, `dns-sd -B _ocbm._tcp` on a Mac). The record set, `<name>` being the box's name
+//! (CarLink-xxxx, the one its AP and Bluetooth carry):
 //!
 //! ```text
 //!   _services._dns-sd._udp.local  PTR  _ocbm._tcp.local
 //!   _ocbm._tcp.local              PTR  <name>._ocbm._tcp.local
 //!   <name>._ocbm._tcp.local       SRV  0 0 7020 <name lower case>.local
 //!   <name>._ocbm._tcp.local       TXT  "v=1" "id=<ocbm_link::box_id>"
-//!   <name lower case>.local       A    <the station's address>
+//!   <name lower case>.local       A    <the listener's address>
 //! ```
 //!
-//! `id` lets a host pick ITS box among several on one hotspot; it is an HMAC of the link key, so it says nothing
+//! `id` lets a host pick ITS box among several on one network; it is an HMAC of the link key, so it says nothing
 //! about the key. The instance name is for people only: Carlink matches on `id`.
 //!
 //! WHY HAND-ROLLED. carplayd advertises `_airplay._tcp` with the `mdns-sd` crate; ocbmd taking that crate too would
@@ -25,15 +26,13 @@
 //! socket bound to the group address takes only datagrams sent to the group, so a unicast datagram to :5353 (a direct
 //! query, a unicast reply to carplayd's own) never lands here, where with 0.0.0.0 and SO_REUSEPORT the kernel would
 //! have spread unicast ones over every socket of the port, carplayd's and this one alike. Every multicast query still
-//! reaches both. It joins the group on the station's address only, sends there only (replies go from the address the
-//! route picks, the station's: a socket bound to a group address has no source address of its own), and on Linux sets
+//! reaches both. It joins the group on the listener's address only, sends there only (replies go from the address the
+//! route picks: a socket bound to a group address has no source address of its own), and on Linux sets
 //! IP_MULTICAST_ALL to 0 so it hears only the groups it joined itself (by default a Linux socket hears a group joined
-//! by ANY socket on ANY interface, the AP's included). A query from outside the station's subnet is not answered. So
-//! nothing of `_ocbm._tcp` reaches the phone on the box's own AP.
+//! by ANY socket on ANY interface). A query from outside the listener's subnet is not answered.
 //!
-//! MODE `ap` (ADDENDUM 24): the listener's address is the AP's own, so the same advert runs on the AP's interface and
-//! subnet, where the head unit is (its first way to the box is the DHCP server's address; this is the second). The
-//! phone on that AP hears it too: `id` says nothing about the key.
+//! The listener's address is the AP's own (ADDENDUM 24), so the advert runs on the AP's interface and subnet, where
+//! the head unit is. The phone on that AP hears it too: `id` says nothing about the key.
 
 use crate::wifi::Shared;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
@@ -263,7 +262,7 @@ fn run(shared: &Shared) {
     let mut last_answer = Instant::now() - Duration::from_secs(10);
     let mut last_announce = Instant::now();
     while !shared.stop.load(Ordering::Acquire) {
-        // Follow the listener: its address is the advert's (none until the station has one).
+        // Follow the listener: its address is the advert's (none until the AP serves).
         let want = match (shared.bound(), shared.key()) {
             (Some(a), Some(k)) => Some(Advert { name: box_name(), addr: *a.ip(), port: a.port(), id: ocbm_link::box_id(&k) }),
             _ => None,
@@ -295,14 +294,14 @@ fn run(shared: &Shared) {
             std::thread::sleep(Duration::from_secs(1));
             continue;
         };
-        // A gentle re-announce: a host that joined the hotspot later hears of the box unasked.
+        // A gentle re-announce: a host that joined the network later hears of the box unasked.
         if last_announce.elapsed() >= Duration::from_secs(120) {
             let _ = s.send_to(&response(a, false, None), dest);
             last_announce = Instant::now();
         }
         if let Ok((n, SocketAddr::V4(src))) = s.recv_from(&mut buf) {
             if !same_subnet(*src.ip(), a.addr, *mask) {
-                continue; // not from the hotspot: never answered
+                continue; // not from the listener's subnet: never answered
             }
             if let Some(q) = asks_for_us(&buf[..n], a) {
                 if src.port() != PORT {

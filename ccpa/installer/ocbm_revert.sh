@@ -115,8 +115,9 @@ rm -f "$S/radio_preload_off" "$S/.radio_preload_inflight" "$S/.radio_preload_unf
 rm -f "$S/radio_together_off" "$S/.radio_together_inflight" "$S/.radio_together_failed" "$S/radio_handover_on" \
   "$S/radio_handover_off"
 rm -f "$EO/boot_attempts"
-# The Wi-Fi link (24 Nov 2026): its link key and the hotspot's WPA key (the hash IS the key) must not stay on a stock
-# unit, whose rcS starts a passwordless telnetd on its AP; its session config, channel and addresses go with them.
+# The Wi-Fi link (24 Nov 2026): its link key must not stay on a stock unit, whose rcS starts a passwordless telnetd on
+# its AP (nor, on an adapter of the retired hotspot mode, the hotspot's WPA key); its session config goes with it, and
+# what the hotspot mode kept beside it (channel, addresses).
 rm -f "$EO/wifi_link" "$EO/wifi_link.tmp" "$EO/wifi_link_channel" "$EO/wifi_link_bssid" "$EO/wifi_link_sta" \
   "$EO/wifi_session.yaml" "$EO/wifi_selfstart_off" "$EO/wifi_setup_off" "$EO/wifi_setup_once"; sync
 log "on stock from the next start"

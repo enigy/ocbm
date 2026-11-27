@@ -11,8 +11,6 @@ export LC_ALL=C
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
 T="$(mktemp -d "${TMPDIR:-/tmp}/ocbm_installer_test.XXXXXX")"
-# Hermetic: a supplicant this host built (tools/build_wpa_supplicant.sh) stays out of the payloads built here.
-export WPA_INSTALL_DIR="$T/no_such_wpa_install"
 trap 'rm -rf "$T"' EXIT
 fails=0
 ok()   { echo "  ok   $*"; }
@@ -59,24 +57,21 @@ script/radio_hal.sh
 script/run_ocbmd.sh
 script/run_supervisor.sh
 script/session_supervisor.sh
-script/wifi_sta.sh
-script/wifi_sta_dhcp.sh
 usr/bin/iap_role_switch
 usr/sbin/btd
 usr/sbin/carplayd
 usr/sbin/iap2d
 usr/sbin/ocbmd"
-# The supplicant is in the payload only where tools/build_wpa_supplicant.sh built it: both cases pinned, not this host's.
-mkdir -p "$T/nowpa" "$T/wpa"
-have="$(WPA_INSTALL_DIR="$T/nowpa" bash "$HERE/make_ocbm_installer.sh" --list | grep -vE '^script/(ocbm_(dispatch|selftest|revert|finish|update|restore)|stock_restore_box)\.sh$' | LC_ALL=C sort -u)"
+have="$(bash "$HERE/make_ocbm_installer.sh" --list | grep -vE '^script/(ocbm_(dispatch|selftest|revert|finish|update|restore)|stock_restore_box)\.sh$' | LC_ALL=C sort -u)"
 check '[ "$want" = "$have" ]' "the payload is the pinned file set"
-# A wpa_cli beside it (an older build of the script made one): not shipped, `ocbmd wpa` speaks to the supplicant.
-printf 'x' > "$T/wpa/ocbm-wpa_supplicant"; printf 'x' > "$T/wpa/ocbm-wpa_cli"; chmod +x "$T/wpa/ocbm-wpa_supplicant" "$T/wpa/ocbm-wpa_cli"
-have_wpa="$(WPA_INSTALL_DIR="$T/wpa" bash "$HERE/make_ocbm_installer.sh" --list | grep -E 'wpa' | LC_ALL=C sort -u | tr '\n' ' ')"
-check '[ "$have_wpa" = "usr/sbin/ocbm-wpa_supplicant " ]' "a built supplicant joins the payload under OCBM's own name, and no wpa_cli does"
-check 'grep -qx "usr/sbin/ocbm-wpa_cli" "$REPO/ccpa/installer/retired.list"' "  one a bench package placed is retired"
-check '! bash "$HERE/make_ocbm_installer.sh" --list | grep -qx "usr/sbin/wpa_supplicant"' \
-  "never usr/sbin/wpa_supplicant: the vendor's dispatcher reads it as STA mode on every unit"
+# The Wi-Fi link's hotspot mode, retired 27 Nov 2026: no supplicant, station keeper or DHCP hook in the payload, and
+# the ones the branch's bench packages placed are retired (a commit and once.sh delete them).
+check '! bash "$HERE/make_ocbm_installer.sh" --list | grep -q -e wpa -e wifi_sta' "no supplicant, wpa_cli or station keeper in the payload"
+for t in usr/sbin/ocbm-wpa_cli usr/sbin/ocbm-wpa_supplicant script/wifi_sta.sh script/wifi_sta_dhcp.sh; do
+  check 'grep -qx "$t" "$REPO/ccpa/installer/retired.list"' "  /$t, placed by bench packages, is retired"
+done
+check '! bash "$HERE/make_ocbm_installer.sh" --list | grep -qx "usr/sbin/wpa_supplicant" && ! grep -qx "usr/sbin/wpa_supplicant" "$REPO/ccpa/installer/retired.list"' \
+  "never usr/sbin/wpa_supplicant either way: the vendor's dispatcher reads it as STA mode on every unit"
 mkdir -p "$T/noinst"; cp "$REPO/ccpa/installer/"* "$T/noinst/"; rm -f "$T/noinst/ocbm_dispatch.sh"
 check '! BIN_DIR="$T/bin" IRS_BIN="$T/irs" INSTALLER_DIR="$T/noinst" bash "$HERE/make_ocbm_installer.sh" "$T/out2" >/dev/null 2>&1' \
   "the builder refuses without the Stage B scripts"

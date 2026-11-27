@@ -80,9 +80,9 @@ run "supervisor" bash tools/session_supervisor_test.sh
 # come up in, its switches, fallback and guard, a host before, during and after the boot preload, the GPIO set-up's
 # mark, the boot line: radio_hal.sh's verbs as processes against stubbed hardware in a scratch root.
 run "radio-hal" bash tools/radio_hal_test.sh
-# The Wi-Fi link's station keeper and DHCP hook, and radio_hal.sh's STA mode (24 Nov 2026), against stubbed tools in a
+# radio_hal.sh's part of the Wi-Fi link (mode ap, 27 Nov 2026) and of M3's set-up network, its functions against a
 # scratch root.
-run "wifi-sta" bash tools/wifi_sta_test.sh
+run "wifi-link" bash tools/wifi_link_test.sh
 # The box scripts' suites again under BusyBox's sh and awk, the adapter's (v1.32.1); skipped without it.
 run "busybox (the adapter's sh and awk)" sh tools/busybox_suites.sh
 

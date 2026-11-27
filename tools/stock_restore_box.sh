@@ -99,8 +99,9 @@ etc/ocbm/wifi_setup_off etc/ocbm/wifi_setup_once"
 # OCBM's radio seam, payload, and its boot preload's state (radio_hal.sh do_preload): radio_* to is_radio(), so the
 # guard kept the off flag, and an install after the go-back started with the preload off (the Mac, 13 Nov). The radio
 # order's switch and its guard's state the same (20 Nov). The kept descriptor (/etc/ocbm/kept_radio_caps) goes with
-# /etc/ocbm, its name outside is_radio(). The Wi-Fi link's keeper, its DHCP hook and its state in /etc/ocbm (the link key
-# and the hotspot's WPA key: 24 Nov 2026) are OCBM's too, and *wifi* to the guard: named here, so they go with OCBM.
+# /etc/ocbm, its name outside is_radio(). The Wi-Fi link's state in /etc/ocbm (its link key since 24 Nov 2026) is OCBM's
+# too, and *wifi* to the guard: named here, so it goes with OCBM; so do what the retired hotspot mode left (its station
+# keeper and DHCP hook, which an update retires at its commit, and the hotspot's kept channel and addresses).
 OCBM_STATE="etc/carplay"                          # OCBM's Bluetooth bond store, written while it runs
 BT_FLAG="etc/.custom_bluetooth_name"              # the seam's Bluetooth name flag (ocbm_bt_flag)
 

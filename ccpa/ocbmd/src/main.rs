@@ -18,7 +18,6 @@ mod mdns;
 mod meta;
 mod setup;
 mod wifi;
-mod wpa;
 
 use wifi::Via;
 
@@ -335,21 +334,12 @@ struct SelfSession {
     attached: bool,
     /// When the last attached host left; the hold runs from there.
     left: Option<Instant>,
-    /// It started again once on the hotspot's channel (ADDENDUM 9, [`Daemon::self_session_tick`]); never twice.
-    moved: bool,
-    /// When the keeper's state was last read for that.
-    looked: Option<Instant>,
 }
-
-/// ADDENDUM 9: how often a self-started session with no host reads the keeper's state for the hotspot heard on a
-/// channel other than the AP's, and how old (s) the keeper's word may be.
-const SELF_MOVE_LOOK: Duration = Duration::from_secs(2);
-const SELF_MOVE_FRESH: u64 = 30;
 
 /// A self-started session ends when no host has attached this long after it started...
 const SELF_FIRST_WAIT: Duration = Duration::from_secs(180);
 /// ...or this long after its last host left. The phone is in CarPlay all the while, its audio going to nobody, so the
-/// holds bridge a Carlink restart, a hotspot blip or the head unit's own start, and no more.
+/// holds bridge a Carlink restart, a Wi-Fi blip or the head unit's own start, and no more.
 const SELF_HOLD: Duration = Duration::from_secs(60);
 /// Set when a self-started session ended for want of a host: none starts again this boot (tmpfs).
 #[cfg(not(test))]
@@ -3654,28 +3644,40 @@ impl Daemon {
 
     /// MGMT_WIFI_LINK's body stored, its apply pending for after the ACK (wifi_tick); the ACK to send, status 0 when
     /// stored. A v2's (mode `ap`) carries the AP the head unit joins, its name and passphrase, and is refused when the
-    /// box cannot say them yet (wifi::ap_network). The log names what changed, never a key, a name, a hash or a password.
+    /// box cannot say them yet (wifi::ap_network). A v1 (the retired hotspot mode) is refused with status 2
+    /// (wifi::STATUS_RETIRED), anything else malformed with 1: nothing stored, nothing changed. The log names what
+    /// changed, never a key, a name or a password.
     fn store_wifi_link(&mut self, body: &[u8], came: Option<Via>) -> Vec<u8> {
         let mut ack = vec![p::MGMT_ACK, p::MGMT_WIFI_LINK, 1];
         let net = wifi::parse_provision(body).and_then(|prov| match &prov {
-            wifi::Provision::Set(c) if c.ap.is_some() => wifi::ap_network(wifi::AP_ROOT).map(|n| (prov, Some(n))),
-            _ => Ok((prov, None)),
+            wifi::Provision::Set(_) => wifi::ap_network(wifi::AP_ROOT).map(|n| (prov, Some(n))).map_err(wifi::Refusal::Bad),
+            wifi::Provision::Clear => Ok((prov, None)),
         });
         let stored = net.and_then(|(prov, n)| {
-            wifi::store(&prov, wifi::LINK_FILE).map(|()| (prov, n)).map_err(|e| {
+            let c = match &prov {
+                wifi::Provision::Set(c) => Some(c),
+                wifi::Provision::Clear => None,
+            };
+            wifi::store(c, wifi::LINK_FILE).map(|()| (prov, n)).map_err(|e| {
                 eprintln!("[ocbmd] wifi: MGMT_WIFI_LINK could not be stored ({e})");
-                "not stored"
+                wifi::Refusal::Bad("not stored")
             })
         });
         let (what, net) = match stored {
             Err(why) => {
-                eprintln!("[ocbmd] wifi: refused a MGMT_WIFI_LINK ({why}); nothing changed");
+                ack[2] = why.status();
+                match why {
+                    wifi::Refusal::Retired => eprintln!(
+                        "[ocbmd] wifi: refused a MGMT_WIFI_LINK v1 (the hotspot mode is retired: the head unit joins the \
+                         adapter's own AP, v2); nothing changed (status {})",
+                        wifi::STATUS_RETIRED
+                    ),
+                    wifi::Refusal::Bad(why) => eprintln!("[ocbmd] wifi: refused a MGMT_WIFI_LINK ({why}); nothing changed"),
+                }
                 return ack;
             }
             Ok((wifi::Provision::Clear, _)) => ("the link removed", None),
-            Ok((wifi::Provision::Set(c), n)) if c.ap.is_some() => ("a link key, mode ap", n),
-            Ok((wifi::Provision::Set(c), _)) if c.ssid.is_empty() => ("a link key, no hotspot", None),
-            Ok((wifi::Provision::Set(_), _)) => ("a link key and a hotspot", None),
+            Ok((wifi::Provision::Set(_), n)) => ("a link key, mode ap", n),
         };
         eprintln!("[ocbmd] wifi: MGMT_WIFI_LINK stored ({what}, over {}); applied after the ACK", via_name(came));
         self.wifi.pending = Some((Instant::now() + WIFI_APPLY_AFTER, came, self.wifi.conf.clone()));
@@ -4049,7 +4051,6 @@ impl Daemon {
                         if let Some(ss) = self.selfs.as_mut() {
                             ss.attached = true;
                             ss.left = None;
-                            wifi::set_parked(false);
                             if differs {
                                 ss.cfg = pl[1..].to_vec();
                             }
@@ -4545,7 +4546,7 @@ impl Daemon {
             l.close();
         }
         // Mode `ap`: the AP is the head unit's network (wifi::ApKeep).
-        if let Some(band) = self.wifi.conf.as_ref().and_then(|c| c.ap).filter(|_| self.wifi.on) {
+        if let Some(band) = self.wifi.conf.as_ref().map(|c| c.band).filter(|_| self.wifi.on) {
             if let Some(verb) = self.wifi.apk.tick(now, band, setup::ap_up()) {
                 setup::hal(verb);
             }
@@ -4558,25 +4559,20 @@ impl Daemon {
         }
     }
 
-    /// Apply the link as stored: start or stop taking Wi-Fi hosts, hand the listener a new key, restart the station
-    /// keeper for a new hotspot; and when the request came over a Wi-Fi link that the change cuts (a new key, a new
-    /// hotspot, a new mode or band, the link removed), close that link: its host reconnects. Mode `ap` (v2): the
-    /// listener takes the AP's address, and a new mode or band restarts the AP on the band at once (wifi::ApKeep).
+    /// Apply the link as stored: start or stop taking Wi-Fi hosts, hand the listener a new key; and when the request
+    /// came over a Wi-Fi link that the change cuts (a new key, a new band or a link that came, the link removed), close
+    /// that link: its host reconnects. The listener takes the AP's address, and a link that came or a new band restarts
+    /// the AP on the band at once (wifi::ApKeep).
     fn wifi_apply(&mut self, came: Option<Via>, before: Option<wifi::LinkConf>, now: Instant, direct_io: bool) {
         let conf = wifi::read_link_conf(wifi::LINK_FILE);
         let key_changed = before.as_ref().map(|c| &c.key) != conf.as_ref().map(|c| &c.key);
-        let hotspot_changed = before.as_ref().map(|c| (&c.ssid, &c.psk)) != conf.as_ref().map(|c| (&c.ssid, &c.psk));
-        let (was_ap, ap) = (before.as_ref().and_then(|c| c.ap), conf.as_ref().and_then(|c| c.ap));
-        let mode_changed = was_ap != ap;
-        let had_hotspot = before.as_ref().is_some_and(|c| !c.ssid.is_empty());
+        let (was, band) = (before.as_ref().map(|c| c.band), conf.as_ref().map(|c| c.band));
+        let moved = was != band;
         self.wifi.conf = conf.clone();
-        if let Some(s) = self.wifi.shared.as_ref() {
-            s.ap.store(ap.is_some(), std::sync::atomic::Ordering::Release);
-        }
-        self.wifi.apk.restart = ap.is_some() && (self.wifi.apk.restart || mode_changed); // one still due stays due
-        // Out of mode `ap` with no host's session up: the AP goes as after a session (the seam no longer keeps it);
+        self.wifi.apk.restart = band.is_some() && (self.wifi.apk.restart || moved); // one still due stays due
+        // The link removed with no host's session up: the AP goes as after a session (the seam no longer keeps it);
         // with one up, at that session's end.
-        if was_ap.is_some() && ap.is_none() && !self.present {
+        if was.is_some() && band.is_none() && !self.present {
             setup::hal("wifi_ap_off");
         }
         match &conf {
@@ -4611,7 +4607,7 @@ impl Daemon {
                     // This driver serializes reads and writes, and this USB host's session runs on the loop's own
                     // reads of it: a Wi-Fi host would stall whenever the USB host is silent, the loop asleep in
                     // acc_read (the review of 24 Nov, G). The listener starts with ocbmd's next start instead, once
-                    // this host has gone quiet; the station joins the hotspot now.
+                    // this host has gone quiet.
                     self.wifi.restart_when_idle = true;
                     eprintln!("[ocbmd] wifi: set up over USB on a driver that serializes reads and writes: Wi-Fi hosts from the next start, once this USB host is quiet");
                 } else {
@@ -4634,21 +4630,14 @@ impl Daemon {
                         Err(e) => eprintln!("[ocbmd] wifi: the listener could not start ({e}); USB only"),
                     }
                 }
-                // A keeper for a hotspot that came, changed or went (mode `ap` has none: it stops one there was).
-                if hotspot_changed && (had_hotspot || !c.ssid.is_empty()) {
-                    wifi::keeper_restart(!c.ssid.is_empty());
-                }
             }
-        }
-        if conf.is_none() && had_hotspot {
-            wifi::keeper_restart(false);
         }
         // M3: one set-up a window: it ends now, its link with it.
         if std::mem::take(&mut self.setup.linked) {
             self.setup_end("done");
         }
         if let Some(Via::Wifi(id)) = came {
-            if conf.is_none() || key_changed || hotspot_changed || mode_changed {
+            if conf.is_none() || key_changed || moved {
                 if let Some(i) = self.wifi.link_index(id) {
                     eprintln!("[ocbmd] wifi: link {id} closed after its own set-up changed it; its host reconnects");
                     self.wifi.links[i].close();
@@ -4707,8 +4696,7 @@ impl Daemon {
             "[ocbmd] wifi: starting the CarPlay session with no host (Bluetooth up, the bonded phones paged, the video parked until a host attaches; {} B config kept)",
             cfg.len()
         );
-        self.selfs = Some(SelfSession { started: now, cfg, attached: false, left: None, moved: false, looked: None });
-        wifi::set_parked(true);
+        self.selfs = Some(SelfSession { started: now, cfg, attached: false, left: None });
         self.set_present(true);
     }
 
@@ -4732,7 +4720,6 @@ impl Daemon {
         if let Some(ss) = self.selfs.as_mut() {
             ss.attached = false;
             ss.left = Some(Instant::now());
-            wifi::set_parked(true);
         }
         eprintln!(
             "[ocbmd] wifi: the host left ({why}); the CarPlay session goes on, parked, {} s for a host to attach",
@@ -4742,34 +4729,11 @@ impl Daemon {
 
     /// End a self-started session no host came to in time: presence drops (the supervisor's complete teardown lets the
     /// phone go), and none starts again this boot; a host's arrival is then today's session start.
-    ///
-    /// ADDENDUM 9: one radio, so while the AP runs on one channel and the hotspot is on another the station never
-    /// joins and no Wi-Fi host can reach the adapter. When the keeper says two looks in a row heard the hotspot on a
-    /// channel an AP may use and the AP is elsewhere (`elsewhere=`), a session with no host attached starts again,
-    /// once: presence dips (the supervisor's re-arm, as for a host with another config), the AP goes down, and its next
-    /// start takes the hotspot's channel (radio_ap_up.sh). The phone leaves CarPlay and comes back, about a cold start;
-    /// nobody watches a parked session. A session a host is attached to is never moved (ADDENDUM 6).
     fn self_session_tick(&mut self, now: Instant) {
-        let Some(ss) = self.selfs.as_mut() else { return };
+        let Some(ss) = self.selfs.as_ref() else { return };
         if ss.attached {
             return;
         }
-        if !ss.moved && ss.looked.is_none_or(|t| now.duration_since(t) >= SELF_MOVE_LOOK) {
-            ss.looked = Some(now);
-            let now_s = box_common::timeline::now_ms().unwrap_or(0) / 1000;
-            let text = std::fs::read_to_string(wifi::STA_STATE).unwrap_or_default();
-            if let Some(ch) = wifi::elsewhere(&text, now_s, SELF_MOVE_FRESH) {
-                (ss.moved, ss.started, ss.left) = (true, now, None);
-                let ap = wifi::ap_channel(&wifi::ap_conf_text(wifi::AP_SESSION_CONF, wifi::HOSTAPD_CONF));
-                eprintln!(
-                    "[ocbmd] wifi: the hotspot is heard on channel {ch}, the AP runs on {ap}: no Wi-Fi host can \
-                     reach the adapter; the session with no host starts again on {ch} (once)"
-                );
-                self.rearm_presence_silently();
-                return;
-            }
-        }
-        let Some(ss) = self.selfs.as_ref() else { return };
         let (since, wait, why) = match ss.left {
             Some(t) => (t, SELF_HOLD, "no host came back"),
             None => (ss.started, SELF_FIRST_WAIT, "no host attached"),
@@ -4782,7 +4746,6 @@ impl Daemon {
             wait.as_secs()
         );
         self.selfs = None;
-        wifi::set_parked(false);
         let _ = std::fs::write(SELF_OVER_FILE, b"1\n");
         self.go_idle(false);
     }
@@ -5307,11 +5270,6 @@ fn main() {
     if let Some(code) = jffs2::cli(&args) {
         std::process::exit(code);
     }
-    // `ocbmd wpa [-p DIR] IFACE COMMAND...`: one request to the station's supplicant, for the keeper and the bench
-    // (wpa.rs). Also a tool run, before the lock.
-    if let Some(code) = wpa::cli(&args) {
-        std::process::exit(code);
-    }
     // Singleton guard BEFORE anything with a side effect — see [`PID_LOCK_FILE`]. The fd is held
     // (never closed) for the process lifetime; the kernel releases the lock when we exit.
     let _pid_lock = match acquire_pid_lock(PID_LOCK_FILE) {
@@ -5368,9 +5326,13 @@ fn main() {
         }
     );
     // The Wi-Fi link (wifi.rs): with a link key on flash this start takes Wi-Fi hosts too. Without one, or for the one
-    // USB-only start after a USB host took the box on a serializing driver, this is the USB daemon of 2.7.1.
+    // USB-only start after a USB host took the box on a serializing driver, this is the USB daemon of 2.7.1. A link
+    // file of the retired hotspot mode is removed here (its session config with it): no link.
     let usb_once = wifi::take_usb_once();
-    let link_conf = wifi::read_link_conf(wifi::LINK_FILE);
+    let (link_conf, retired) = wifi::start_link_conf(wifi::LINK_FILE);
+    if retired {
+        let _ = std::fs::remove_file(SESSION_CFG_FILE);
+    }
     let wifi_mode = link_conf.is_some() && !usb_once;
     if usb_once && link_conf.is_some() {
         eprintln!("[ocbmd] wifi: this start is USB only (a USB host took the box on a driver that serializes reads and writes)");
@@ -5545,9 +5507,7 @@ fn main() {
     if let Err(e) = File::create(ALIVE_FILE) {
         eprintln!("[ocbmd] cannot create {ALIVE_FILE} ({e}) — supervisor liveness unavailable");
     }
-    // M2: with the Wi-Fi link set up, the CarPlay session starts now, with no host (Daemon::self_session_start). A
-    // parked mark an earlier ocbmd left goes first (a USB-only start, say, has no session of its own).
-    wifi::set_parked(false);
+    // M2: with the Wi-Fi link set up, the CarPlay session starts now, with no host (Daemon::self_session_start).
     if d.wifi.on && self_start_wanted() {
         d.self_session_start(Instant::now());
     }
@@ -8051,7 +8011,13 @@ mod tests {
         L.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn provision(key: u8, ssid: &str, psk: &str) -> Vec<u8> {
+    /// MGMT_WIFI_LINK v2 (mode `ap`): `[0E][02][key 32][band]`.
+    fn v2(key: u8, band: u8) -> Vec<u8> {
+        [&[p::MGMT_WIFI_LINK, 2][..], &[key; 32], &[band]].concat()
+    }
+
+    /// MGMT_WIFI_LINK v1, the retired hotspot form: `[0E][01][key 32][ssid_len][ssid][psk_len][psk]`.
+    fn v1(key: u8, ssid: &str, psk: &str) -> Vec<u8> {
         let mut b = vec![p::MGMT_WIFI_LINK, 1];
         b.extend_from_slice(&[key; 32]);
         b.push(ssid.len() as u8);
@@ -8059,6 +8025,15 @@ mod tests {
         b.push(psk.len() as u8);
         b.extend_from_slice(psk.as_bytes());
         b
+    }
+
+    /// The AP a v2's ACK names, under wifi::AP_ROOT (held under wifi_file_lock): CarLink-0000, example-pass.
+    fn ap_named() {
+        let root = wifi::AP_ROOT;
+        let _ = std::fs::remove_dir_all(root);
+        std::fs::create_dir_all(format!("{root}/etc/ocbm")).unwrap();
+        std::fs::write(format!("{root}/etc/carplay_ident"), "CarLink-0000\n").unwrap();
+        std::fs::write(format!("{root}/etc/hostapd.conf"), "ssid=CarLink-0000\nwpa_passphrase=example-pass\nchannel=36\n").unwrap();
     }
 
     fn mgmt_acks(d: &mut Daemon) -> Vec<(u8, u8)> {
@@ -8069,16 +8044,17 @@ mod tests {
     fn mgmt_wifi_link_is_stored_acked_then_applied_and_a_bad_body_changes_nothing() {
         let _l = wifi_file_lock();
         let _ = std::fs::remove_file(wifi::LINK_FILE);
+        ap_named();
         let mut d = td();
         d.handle_mgmt(&[p::MGMT_WIFI_LINK, 2, 0]);
         assert_eq!(mgmt_acks(&mut d), vec![(p::MGMT_WIFI_LINK, 1)]);
         assert!(!std::path::Path::new(wifi::LINK_FILE).exists(), "a refused body writes nothing");
         assert!(d.wifi.pending.is_none());
 
-        d.handle_mgmt(&provision(0x21, "Example Hotspot", &"ab".repeat(32)));
+        d.handle_mgmt(&v2(0x21, 0x02));
         assert_eq!(mgmt_acks(&mut d), vec![(p::MGMT_WIFI_LINK, 0)]);
         let c = wifi::read_link_conf(wifi::LINK_FILE).expect("stored");
-        assert_eq!((c.key.0, c.ssid.as_str()), ([0x21; 32], "Example Hotspot"));
+        assert_eq!((c.key.0, c.band), ([0x21; 32], wifi::Band::G24));
         let (at, came, before) = d.wifi.pending.clone().expect("an apply pending");
         assert_eq!((came, before), (Some(Via::Usb), None), "set up over USB, nothing before");
         // Not before its time: the ACK goes first.
@@ -8089,30 +8065,54 @@ mod tests {
         assert_eq!(mgmt_acks(&mut d), vec![(p::MGMT_WIFI_LINK, 0)]);
         assert!(!std::path::Path::new(wifi::LINK_FILE).exists());
         let _ = std::fs::remove_file(wifi::LINK_FILE);
+        let _ = std::fs::remove_dir_all(wifi::AP_ROOT);
+    }
+
+    /// The hotspot mode is retired (27 Nov 2026): a v1, any of its forms, is refused with status 2 (not 1: Carlink may
+    /// try a refused v2 again; a v1 never), the link stored before it untouched, nothing pending.
+    #[test]
+    fn a_v1_is_refused_with_status_2_and_changes_nothing() {
+        let _l = wifi_file_lock();
+        ap_named();
+        let mut d = td();
+        let kept = wifi::LinkConf { key: ocbm_link::LinkKey([0x61; 32]), band: wifi::Band::G5 };
+        wifi::store(Some(&kept), wifi::LINK_FILE).unwrap();
+        let before = std::fs::read(wifi::LINK_FILE).unwrap();
+        for body in [v1(0x62, "Example Hotspot", &"ab".repeat(32)), v1(0x62, "", ""), vec![p::MGMT_WIFI_LINK, 1]] {
+            d.handle_mgmt(&body);
+            assert_eq!(mgmt_acks(&mut d), vec![(p::MGMT_WIFI_LINK, wifi::STATUS_RETIRED)], "{} B", body.len());
+            assert!(d.wifi.pending.is_none());
+        }
+        assert_eq!(std::fs::read(wifi::LINK_FILE).unwrap(), before, "the mode-ap link as it was");
+        let _ = std::fs::remove_file(wifi::LINK_FILE);
+        let _ = std::fs::remove_dir_all(wifi::AP_ROOT);
     }
 
     #[test]
     fn a_wifi_hosts_own_new_key_closes_its_link_after_the_ack() {
         let _l = wifi_file_lock();
+        ap_named();
         let mut d = td_wifi();
-        let first = wifi::LinkConf { key: ocbm_link::LinkKey([0x31; 32]), ssid: "net".into(), psk: "cd".repeat(32), ap: None };
-        wifi::store(&wifi::Provision::Set(first.clone()), wifi::LINK_FILE).unwrap();
+        let first = wifi::LinkConf { key: ocbm_link::LinkKey([0x31; 32]), band: wifi::Band::G24 };
+        wifi::store(Some(&first), wifi::LINK_FILE).unwrap();
         d.wifi.conf = Some(first);
         let (l, _o, mut host) = wifi::test_link(9);
         d.wifi.links.push(l);
         let t = Instant::now();
         assert_eq!(d.admit(Via::Wifi(9), p::CH_CTRL, &hello(0x0900_0009, b""), t), Admit::Take);
-        // The same hotspot, a new key: stored, ACKed over the link, then the link closes.
-        d.handle_mgmt(&provision(0x32, "net", &"cd".repeat(32)));
+        // The same band, a new key: stored, ACKed over the link, then the link closes.
+        d.handle_mgmt(&v2(0x32, 0x02));
         let (at, came, _) = d.wifi.pending.clone().unwrap();
         assert_eq!(came, Some(Via::Wifi(9)));
         d.wifi_tick(at, false);
         assert!(d.wifi.pending.is_none());
         assert_eq!(d.wifi.conf.as_ref().map(|c| c.key.0), Some([0x32; 32]));
+        assert!(!d.wifi.apk.restart, "the same band: the AP stays as it is");
         host.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         let mut b = [0u8; 16];
         assert!(matches!(host.read(&mut b), Ok(0) | Err(_)), "the host's link was closed");
         let _ = std::fs::remove_file(wifi::LINK_FILE);
+        let _ = std::fs::remove_dir_all(wifi::AP_ROOT);
     }
 
     /// ADDENDUM 24 (agent B's proposal as adopted): a v2 is mode `ap`, ACKed with the AP the head unit joins, B's ACK
@@ -8139,12 +8139,11 @@ mod tests {
         d.handle_mgmt(&v2(0x02));
         let want = "820e000c4361724c696e6b2d303030300c6578616d706c652d70617373";
         assert_eq!(acks(&mut d).iter().map(|a| ocbm_link::hex(a)).collect::<Vec<_>>(), vec![want.to_string()], "B's vector");
-        assert_eq!(wifi::read_link_conf(wifi::LINK_FILE).and_then(|c| c.ap), Some(wifi::Band::G24));
+        assert_eq!(wifi::read_link_conf(wifi::LINK_FILE).map(|c| c.band), Some(wifi::Band::G24));
         let (at, came, before) = d.wifi.pending.take().unwrap();
         assert_eq!((came, before.is_none()), (Some(Via::Usb), true));
         d.wifi_apply(came, before, at, false);
-        let ap_mode = |d: &Daemon| d.wifi.shared.as_ref().is_some_and(|s| s.ap.load(std::sync::atomic::Ordering::Acquire));
-        assert!(d.wifi.on && ap_mode(&d) && d.wifi.apk.restart, "listening on the AP; the AP to move to the band");
+        assert!(d.wifi.on && d.wifi.shared.is_some() && d.wifi.apk.restart, "listening on the AP; the AP to move to the band");
         assert!(d.wifi.info().starts_with("{\"mode\":\"ap\",\"state\":\"off\",\"ap_band\":\"2.4\""), "{}", d.wifi.info());
         // The same v2 again (over the USB session that holds the box): the AP named again, nothing moved.
         d.wifi.apk.restart = false;
@@ -8157,7 +8156,7 @@ mod tests {
         d.handle_mgmt(&v2(0x05));
         let (at, came, before) = d.wifi.pending.take().unwrap();
         d.wifi_apply(came, before, at, false);
-        assert!(d.wifi.apk.restart && d.wifi.conf.as_ref().and_then(|c| c.ap) == Some(wifi::Band::G5));
+        assert!(d.wifi.apk.restart && d.wifi.conf.as_ref().map(|c| c.band) == Some(wifi::Band::G5));
         d.wifi.stop();
         let _ = std::fs::remove_file(wifi::LINK_FILE);
         let _ = std::fs::remove_dir_all(root);
@@ -8373,83 +8372,6 @@ mod tests {
         let _ = std::fs::remove_file(SELF_OVER_FILE);
     }
 
-    /// ADDENDUM 9: the hotspot heard on another channel than the AP's and no host attached: the session starts again,
-    /// once (the supervisor's re-arm), so the AP's next start takes the hotspot's channel; never on a stale word, never
-    /// twice, and its first wait runs again from there. The parked mark is there while no host is attached.
-    #[test]
-    fn a_self_started_session_with_no_host_starts_again_once_when_the_hotspot_is_heard_elsewhere() {
-        let _flag = presence_flag_lock();
-        let _ = std::fs::remove_file(SELF_OVER_FILE);
-        let parked = || std::path::Path::new(wifi::PARKED_FLAG).exists();
-        let state = |at: u64| format!("iface=sta0\nstate=joining\nchannel=0\nseen=6 {at}\nelsewhere=6 {at}\n");
-        let now_s = box_common::timeline::now_ms().unwrap() / 1000;
-        let mut d = td();
-        let t0 = Instant::now();
-        d.self_session_start(t0);
-        assert!(parked(), "the adapter's own session, no host: parked");
-        std::fs::write(wifi::STA_STATE, state(now_s.saturating_sub(SELF_MOVE_FRESH + 5))).unwrap();
-        d.presence_tick(t0 + Duration::from_secs(1));
-        assert!(d.rearm_deadline.is_none() && !d.selfs.as_ref().unwrap().moved, "the keeper's word too old: nothing");
-        std::fs::write(wifi::STA_STATE, state(now_s)).unwrap();
-        d.presence_tick(t0 + Duration::from_secs(2));
-        assert!(d.rearm_deadline.is_none(), "read again only every SELF_MOVE_LOOK");
-        let moved = t0 + Duration::from_secs(4);
-        d.presence_tick(moved);
-        assert!(d.rearm_deadline.is_some() && d.present, "the re-arm: the flag dips, the host-facing presence stays");
-        assert_eq!(std::fs::read_to_string(HOST_PRESENT_FLAG).unwrap().trim(), "0");
-        assert!(d.selfs.as_ref().is_some_and(|s| s.moved && s.started == moved) && parked());
-        d.presence_tick(moved + REARM_HOLD + Duration::from_secs(1));
-        let flag = || std::fs::read_to_string(HOST_PRESENT_FLAG).unwrap().trim().to_string();
-        assert_eq!(flag(), "1", "back up: the session starts again");
-        d.presence_tick(moved + Duration::from_secs(10));
-        assert!(d.rearm_deadline.is_none(), "never twice");
-        d.presence_tick(moved + SELF_FIRST_WAIT - Duration::from_secs(1));
-        assert!(d.selfs.is_some(), "its first wait runs from the move");
-        d.presence_tick(moved + SELF_FIRST_WAIT);
-        assert!(d.selfs.is_none() && !parked(), "then it ends, and the mark goes");
-        let _ = std::fs::remove_file(SELF_OVER_FILE);
-        let _ = std::fs::remove_file(wifi::STA_STATE);
-    }
-
-    #[test]
-    fn a_self_started_session_a_host_is_attached_to_is_never_moved() {
-        let _flag = presence_flag_lock();
-        let _ = std::fs::remove_file(SELF_OVER_FILE);
-        std::fs::write(SESSION_CFG_FILE, b"cfg: kept\n").unwrap();
-        let now_s = box_common::timeline::now_ms().unwrap() / 1000;
-        let mut d = td();
-        let t0 = Instant::now();
-        d.self_session_start(t0);
-        d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &hello(0x2200_0009, b""));
-        subscribe(&mut d, b"cfg: kept\n");
-        assert!(!std::path::Path::new(wifi::PARKED_FLAG).exists(), "a host attached: not parked");
-        let word = format!("iface=sta0\nstate=joining\nchannel=0\nelsewhere=6 {now_s}\n");
-        std::fs::write(wifi::STA_STATE, word).unwrap();
-        d.presence_tick(t0 + Duration::from_secs(3));
-        assert!(d.rearm_deadline.is_none() && !d.selfs.as_ref().unwrap().moved, "nothing moves under a host");
-        d.handle(p::CH_CTRL, p::F_SOM | p::F_EOM, &[p::CT_STOP]);
-        assert!(std::path::Path::new(wifi::PARKED_FLAG).exists(), "the host left: parked again");
-        d.go_idle(false);
-        d.selfs = None;
-        wifi::set_parked(false);
-        let _ = std::fs::remove_file(SESSION_CFG_FILE);
-        let _ = std::fs::remove_file(wifi::STA_STATE);
-    }
-
-    #[test]
-    fn the_keepers_elsewhere_word_is_read_with_its_age() {
-        let full = "iface=sta0\nstate=joining\nchannel=0\nseen=6 100\nelsewhere=6 100\n";
-        assert_eq!(wifi::elsewhere(full, 120, 30), Some(6));
-        assert_eq!(wifi::elsewhere("elsewhere=11 100\n", 131, 30), None, "older than 30 s");
-        assert_eq!(wifi::elsewhere("elsewhere=11 100\n", 101, 30), Some(11));
-        assert_eq!(wifi::elsewhere("elsewhere=11 200\n", 101, 30), None, "said after now: not this boot's");
-        assert_eq!(wifi::elsewhere("seen=6 100\n", 100, 30), None);
-        assert_eq!(wifi::elsewhere("elsewhere=0 100\n", 100, 30), None);
-        assert_eq!(wifi::elsewhere("elsewhere=x 100\n", 100, 30), None);
-        let s = wifi::parse_sta_state(full);
-        assert!(!s.joined && s.channel == 0 && s.iface == "sta0", "the lines after channel= change nothing else");
-    }
-
     #[test]
     fn the_session_config_is_kept_only_while_the_link_is_set_up() {
         let _flag = presence_flag_lock();
@@ -8457,7 +8379,7 @@ mod tests {
         let mut d = td();
         subscribe(&mut d, b"cfg: a\n");
         assert!(!std::path::Path::new(SESSION_CFG_FILE).exists(), "no link: the config stays ephemeral, as in 2.7.1");
-        d.wifi.conf = Some(wifi::LinkConf { key: ocbm_link::LinkKey([1; 32]), ssid: String::new(), psk: String::new(), ap: None });
+        d.wifi.conf = Some(wifi::LinkConf { key: ocbm_link::LinkKey([1; 32]), band: wifi::Band::G24 });
         subscribe(&mut d, b"cfg: b\n");
         assert_eq!(std::fs::read(SESSION_CFG_FILE).unwrap(), b"cfg: b\n");
         let _ = std::fs::remove_file(SESSION_CFG_FILE);
@@ -8488,6 +8410,7 @@ mod tests {
         let _l = wifi_file_lock();
         let _flag = presence_flag_lock();
         let _ = std::fs::remove_file(wifi::LINK_FILE);
+        ap_named();
         let mut d = td(); // no Wi-Fi mode: the loop's output is USB's
         d.setup.phase = setup::Phase::Offered(Instant::now() + setup::WINDOW);
         (d.heard, d.answered) = (false, false); // a fresh boot's: no host heard yet
@@ -8497,12 +8420,16 @@ mod tests {
         let t = Instant::now();
         assert!(d.link_frame(0, p::CH_CTRL, p::F_SOM | p::F_EOM, &hello(0x5e70_0001, b"head unit"), t));
         assert!(d.link_frame(0, p::CH_CTRL, p::F_SOM | p::F_EOM, &hello(0x5e70_0001, b"head unit"), t), "a HELLO again (Carlink's 500 ms)");
-        assert!(d.link_frame(0, p::CH_MGMT, p::F_SOM | p::F_EOM, &provision(0x41, "Example Hotspot", &"ef".repeat(32)), t));
+        // A v1 first (an older Carlink's hotspot set-up): refused with status 2, the session goes on, nothing set up.
+        assert!(d.link_frame(0, p::CH_MGMT, p::F_SOM | p::F_EOM, &v1(0x41, "Example Hotspot", &"ef".repeat(32)), t));
+        assert!(!d.setup.linked && d.wifi.pending.is_none() && !std::path::Path::new(wifi::LINK_FILE).exists());
+        assert!(d.link_frame(0, p::CH_MGMT, p::F_SOM | p::F_EOM, &v2(0x41, 0x02), t));
         let got = frames_out(&mut out);
         let acks: Vec<_> = got.iter().filter(|(_, _, pl)| pl.first() == Some(&p::CT_HELLO_ACK)).collect();
         assert_eq!(acks.len(), 2, "{got:?}");
         assert_eq!(u32::from_le_bytes([acks[0].2[2], acks[0].2[3], acks[0].2[4], acks[0].2[5]]), p::CAP_WIFI_LINK, "no other capability");
-        assert!(got.iter().any(|(ch, _, pl)| *ch == p::CH_MGMT && pl[..] == [p::MGMT_ACK, p::MGMT_WIFI_LINK, 0]), "{got:?}");
+        let mgmt: Vec<_> = got.iter().filter(|(ch, _, _)| *ch == p::CH_MGMT).map(|(_, _, pl)| pl[..3].to_vec()).collect();
+        assert_eq!(mgmt, vec![vec![p::MGMT_ACK, p::MGMT_WIFI_LINK, wifi::STATUS_RETIRED], vec![p::MGMT_ACK, p::MGMT_WIFI_LINK, 0]], "{got:?}");
         assert_eq!((d.seq, d.out_hi.len()), (seq, queued), "the session's sequence and queues untouched");
         assert!(d.host_instance.is_none() && d.host_name.is_none() && !d.heard && !d.answered, "no host for the install's trials");
         assert!(d.wifi.via.is_none() && d.wifi.usb_out.is_none(), "it never held the box");
@@ -8515,6 +8442,7 @@ mod tests {
         assert!(closed(&mut host), "the set-up link closed after its ACK");
         d.wifi.stop();
         let _ = std::fs::remove_file(wifi::LINK_FILE);
+        let _ = std::fs::remove_dir_all(wifi::AP_ROOT);
     }
 
     /// ADDENDUM 24 over the set-up network: its two messages as before, the v2 answered on the set-up link with the AP
@@ -8541,7 +8469,7 @@ mod tests {
         assert!(got.iter().any(|(ch, _, pl)| *ch == p::CH_MGMT && ocbm_link::hex(pl) == want), "{got:?}");
         let (at, came, _) = d.wifi.pending.clone().unwrap();
         d.wifi_apply(came, None, at, false);
-        assert!(d.wifi.on && d.wifi.apk.restart && d.wifi.shared.as_ref().is_some_and(|s| s.ap.load(std::sync::atomic::Ordering::Acquire)));
+        assert!(d.wifi.on && d.wifi.apk.restart && d.wifi.shared.is_some());
         assert_eq!(d.setup.phase, setup::Phase::Over, "one set-up a window");
         assert!(closed(&mut host), "the set-up link closed after its ACK");
         d.wifi.stop();
@@ -8610,8 +8538,8 @@ mod tests {
     #[test]
     fn on_a_serializing_driver_no_listener_runs_beside_the_loops_own_reads_of_the_device() {
         let _l = wifi_file_lock();
-        let c = wifi::LinkConf { key: ocbm_link::LinkKey([0x51; 32]), ssid: String::new(), psk: String::new(), ap: None };
-        wifi::store(&wifi::Provision::Set(c), wifi::LINK_FILE).unwrap();
+        let c = wifi::LinkConf { key: ocbm_link::LinkKey([0x51; 32]), band: wifi::Band::G24 };
+        wifi::store(Some(&c), wifi::LINK_FILE).unwrap();
         let mut d = td();
         d.wifi_apply(Some(Via::Usb), None, Instant::now(), true);
         assert!(!d.wifi.on && d.wifi.listener.is_none() && d.wifi.restart_when_idle, "the listener waits for the next start");
@@ -8820,13 +8748,14 @@ mod tests {
         let _l = wifi_file_lock();
         let _c = setup::code_file_lock();
         let _ = std::fs::remove_file(wifi::LINK_FILE);
+        ap_named();
         let mut d = td();
         d.setup.phase = setup::Phase::Offered(Instant::now() + setup::WINDOW);
         let (_out, _host) = setup_session(&mut d, 1 << 43);
         wifi::test_opened(&d.wifi.links[0]);
         d.wifi_tick(Instant::now(), false);
         assert_eq!(code_up().as_deref(), Some("2092"));
-        assert!(d.link_frame(0, p::CH_MGMT, p::F_SOM | p::F_EOM, &provision(0x43, "Example Hotspot", &"ab".repeat(32)), Instant::now()));
+        assert!(d.link_frame(0, p::CH_MGMT, p::F_SOM | p::F_EOM, &v2(0x43, 0x02), Instant::now()));
         let (at, _, _) = d.wifi.pending.clone().unwrap();
         d.wifi_tick(at, false);
         assert_eq!((d.setup.code_for, code_up(), &d.setup.phase), (None, None, &setup::Phase::Over), "done: off with the window");
@@ -8834,6 +8763,7 @@ mod tests {
         assert_eq!(d.setup.failed, 0);
         d.wifi.stop();
         let _ = std::fs::remove_file(wifi::LINK_FILE);
+        let _ = std::fs::remove_dir_all(wifi::AP_ROOT);
     }
 
     /// A set-up link whose first record has not opened 3 s after its exchange is closed (bytes but no record: no

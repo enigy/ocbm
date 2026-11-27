@@ -244,10 +244,12 @@ onefile_tests() {  # $1 shell
   rm -rf "$T/own" "$T/own.tgz" "$T/owntree" "$T/owntree.owners"
   # A trial from an older image, or updated since: the programs that version placed and this one retired go too.
   rm -rf "$T/old"; cp -pR "$T/trial" "$T/old"
-  for p in usr/sbin/aa-bridge usr/sbin/ocbm-wpa_cli; do blob "$T/old/$p" 3000; chmod 755 "$T/old/$p"; done
+  for p in usr/sbin/aa-bridge usr/sbin/ocbm-wpa_cli usr/sbin/ocbm-wpa_supplicant script/wifi_sta.sh script/wifi_sta_dhcp.sh; do
+    blob "$T/old/$p" 3000; chmod 755 "$T/old/$p"
+  done
   archive_of "$T/old" "$T/old.tgz"; rm -rf "$T/oldtree" "$T/oldtree.owners"
   "$SH1" "$TREE" "$T/old.tgz" "$T/oldtree" > "$T/out" 2>&1; rc=$?
-  check '[ $rc -eq 0 ] && [ ! -e "$T/oldtree/usr/sbin/aa-bridge" ] && [ ! -e "$T/oldtree/usr/sbin/ocbm-wpa_cli" ] && [ -x "$T/oldtree/usr/sbin/ARMadb-driver" ]' \
+  check '[ $rc -eq 0 ] && [ ! -e "$T/oldtree/usr/sbin/aa-bridge" ] && [ ! -e "$T/oldtree/usr/sbin/ocbm-wpa_cli" ] && [ ! -e "$T/oldtree/usr/sbin/ocbm-wpa_supplicant" ] && [ ! -e "$T/oldtree/script/wifi_sta.sh" ] && [ ! -e "$T/oldtree/script/wifi_sta_dhcp.sh" ] && [ -x "$T/oldtree/usr/sbin/ARMadb-driver" ]' \
     "tree: what an earlier OCBM placed and this one retired (retired.list) is dropped too, stock kept"
   rm -rf "$T/old" "$T/old.tgz" "$T/oldtree" "$T/oldtree.owners"
   check '[ ! -e "$T/tree/proc/version" ] && [ -x "$T/tree/usr/sbin/ARMadb-driver" ]' "tree: stock programs kept"

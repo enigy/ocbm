@@ -151,14 +151,6 @@ touch /tmp/UDiskPassThroughMode
     [ -e /script/radio_preload_late ] && echo "[ocbm-boot] radio preload starts after ocbmd and the supervisor (/script/radio_preload_late)" >> /tmp/box.log
     radio_preload
   fi
-  # The Wi-Fi link's station keeper (wifi_sta.sh, 24 Nov 2026): with a hotspot set up in /etc/ocbm/wifi_link, the adapter
-  # looks for the phone's hotspot from power-up and keeps the station joined (its header says what it scans, and when).
-  # After the preload's start, so the driver load goes through the preload's locks first. Backgrounded; with no such
-  # line nothing starts and this boot is 2.7.1's (the test is the shell's own: no fork without the file).
-  if [ -e /etc/ocbm/wifi_link ] && grep -q '^ssid_hex=' /etc/ocbm/wifi_link 2>/dev/null && [ -r /script/wifi_sta.sh ]; then
-    echo "[ocbm-boot] wifi link: station keeper starting" >> /tmp/box.log
-    setsid sh /script/wifi_sta.sh >> /tmp/box.log 2>&1 </dev/null &
-  fi
   # The radio order's off switch, every boot, as the preload's (radio_hal.sh, "The order Bluetooth and the Wi-Fi
   # driver come up in"): the owner's or its guard's /script/radio_together_off brings back the Wi-Fi-first order.
   if [ -e /script/radio_together_off ]; then
@@ -243,16 +235,14 @@ touch /tmp/UDiskPassThroughMode
     i=0; while [ ! -e /dev/usb_accessory ] && [ "$i" -lt 60 ]; do i=$((i+1)); sleep 1; done
     [ -e /dev/usb_accessory ] || fail "/dev/usb_accessory never appeared in ${i}s"
     misses=0; t=0
-    # The daemon by its full path, as the respawn wrapper (run_ocbmd.sh) finds it: `pidof ocbmd` also counts the Wi-Fi
-    # link keeper's `ocbmd wpa` runs (its supplicant's monitor lives as long as the supplicant, ADDENDUM 11).
     while [ "$t" -lt 120 ]; do
-      if pgrep -f /usr/sbin/ocbmd >/dev/null 2>&1; then misses=0; else
+      if pidof ocbmd >/dev/null 2>&1; then misses=0; else
         misses=$((misses+1))
         [ "$misses" -ge 4 ] && fail "ocbmd not running on $misses consecutive checks by ${t}s"
       fi
       sleep 5; t=$((t+5))
     done
-    echo "$(date) OCBM healthy at ${t}s (ocbmd pid=$(pgrep -f /usr/sbin/ocbmd))" >> "$W"
+    echo "$(date) OCBM healthy at ${t}s (ocbmd pid=$(pidof ocbmd))" >> "$W"
   ) &
   fi
 ) &

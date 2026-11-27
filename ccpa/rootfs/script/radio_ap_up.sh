@@ -31,7 +31,7 @@
 # USAGE  RADIO_WLAN_IF=<iface> sh radio_ap_up.sh [AP|PREP]
 #        AP (the default) brings the AP up. PREP writes its configuration only, raising nothing, and the stamp a
 #        later AP start trusts (radio_hal.sh wifi_ap_prep, the armed state between host sessions).
-#        RADIO_AP_CHANNEL: STA mode's station channel, for the AP to follow (ap_follow). RADIO_AP_BAND: mode ap's.
+#        RADIO_AP_BAND: mode ap's band (2.4 or 5; ap_band_conf), empty with no Wi-Fi link.
 # EXIT   0 AP converged (PREP: configured)   1 failed to converge
 ########################
 set -u
@@ -332,91 +332,16 @@ ap_enabled_seen() {
   case "$_ae_out" in *AP-ENABLED*) return 0 ;; esac
   return 1
 }
-# ---- STA mode: the AP on the hotspot's channel (ADDENDUM 6 and 9, 24 Nov 2026) ---------------------------------------
-# One radio: the AP, the station and the head unit on one channel, the hotspot's. RADIO_AP_CHANNEL is the seam's: the
-# station's channel, 0 not on the hotspot, "" no link. ap_may_use: the US domain hostapd.conf asks for
-# (country_code=US), no DFS: 1-11, 36-48, 149-165. ht40_side: its pair's side (_hs); none on 165 and 14.
+# ---- mode ap: the AP on the Wi-Fi link's band (ADDENDUM 24, 27 Nov 2026; docs/wireless/01_BT_AND_RADIO.md) -----------
+# ap_may_use: the channels of the US domain hostapd.conf asks for (country_code=US) an AP may start on, no DFS: 1-11,
+# 36-48, 149-165. ht40_side: its pair's side (_hs); none on 165 and 14.
 ap_may_use() { case "$1" in [1-9]|1[01]|36|40|44|48|149|153|157|161|165) return 0 ;; esac; return 1; }
 ht40_side() { _hs=""; case "$1" in [1-7]|36|44|149|157) _hs=+ ;; [89]|1[0-3]|40|48|153|161) _hs=- ;; esac; }
 say() { echo "$L $*"; echo "$L $*" 2>/dev/null >>"$AP_BOXLOG"; }   # the box log too
-# The adapter's own session with no host (M2: ocbmd's mark AP_PARKED), the station not on the hotspot: the AP waits up
-# to HEAD_START tenths of a second for the keeper's first look (its state's 4th line, seen=<ch> <up s>) while the
-# keeper lives, then takes the channel the look heard the hotspot on, else the hotspot's last (wifi_link_channel), else
-# its own. No other start waits (a USB host's never). Sets _fc.
-AP_PARKED=/tmp/wifi_self_parked; STA_ST=/tmp/wifi_link_state; STA_KEPT=/etc/ocbm/wifi_link_channel
-STA_LOCK=/tmp/.wifi_sta_lock/pid; HEAD_START=${HEAD_START:-40}
-ap_head() {
-  _hn=0; _hw=""; _jn=0; _jh=""
-  while :; do
-    _a=""; _b=""; _c=""; _d=""; _k=""
-    { read -r _a; read -r _b; read -r _c; read -r _d; } 2>/dev/null <"$1$STA_ST"
-    [ "$_b" = state=joined ] && { _fc=${_c#channel=}; _hw="the station joined the hotspot there"; break; }
-    case $_d in seen=*) break ;; esac
-    read -r _k 2>/dev/null <"$1$STA_LOCK"
-    [ "$_hn" -lt "$HEAD_START" ] && [ -e "$1$AP_PARKED" ] && [ -n "$_k" ] && kill -0 "$_k" 2>/dev/null || break
-    _hn=$((_hn + 1)); sleep 0.1
-  done
-  if [ -z "$_hw" ]; then
-    _d=${_d#seen=}; _d=${_d%% *}
-    case $_d in [1-9]*) ap_join "$1" "${_a#iface=}" ;; esac
-  fi
-  if [ -z "$_hw" ]; then
-    case $_d in
-      [1-9]*) _fc=$_d; _hw="heard there by the station's look" ;;
-      *) _k=""; read -r _k 2>/dev/null <"$1$STA_KEPT"
-         ap_may_use "$_k" && { _fc=$_k; _hw="the hotspot's last (not heard now)"; } ;;
-    esac
-  fi
-  say "STA mode, the adapter's own session: ${_hw:+channel $_fc, }${_hw:-the hotspot not heard and no last channel}" \
-      "(waited $((_hn * 100)) ms for the station${_jn#0}${_jh})"
-}
-# ADDENDUM 13 (the 25 Nov bench, case a: an authentication answered as hostapd started on its channel, then the
-# association refused). The look heard the hotspot: a join under way is waited for, from the supplicant's STATUS every
-# 0.2 s: JOIN_WAIT s at most (the bench's sta_join_wait; off: none), the authentication alone taking the IW416's
-# driver 2.4 s; with the bench's sta_join_first (s, 10 when it names none), until the station is on the hotspot, its
-# retries too. Joined: its channel. Not: before hostapd starts the station is held still (DISCONNECT, never over a join
-# under way; the bench's sta_ap_hold off: not), and AP_START (this start's pid) says so to the keeper, which holds it
-# while this start runs and then takes it as its own pause (and the file) whatever this start's end, so no join begins
-# in hostapd's start and the keeper's own rules put the station back. Sets _fc, _hw; _jn and _jh for the line.
-AP_START=/tmp/.radio_ap_start; JOIN_WAIT=6; STA_CTRL=/var/run/wpa_supplicant
-bench() {  # $1 name, $2 root: as the keeper's (wifi_sta.sh): 0 set (_bv), 1 off, 2 no file
-  for _bvf in "$2/tmp/bench_$1" "$2/etc/ocbm/bench_$1"; do
-    [ -e "$_bvf" ] || continue
-    _bv=""; read -r _bv 2>/dev/null <"$_bvf"; [ "$_bv" = on ] && _bv=""
-    [ "$_bv" != off ]; return
-  done
-  return 2
-}
-ap_join() {  # $1 root, $2 the station's interface
-  _jw=$JOIN_WAIT; bench sta_join_wait "$1"; case $? in 0) _jw=${_bv:-$JOIN_WAIT} ;; 1) _jw=0 ;; esac
-  _jf=0; bench sta_join_first "$1" && _jf=${_bv:-10}
-  case $_jw in ''|*[!0-9]*) _jw=$JOIN_WAIT ;; esac; case $_jf in ''|*[!0-9]*) _jf=10 ;; esac
-  [ "$_jf" -gt "$_jw" ] && _jw=$_jf
-  _jj=0
-  while :; do
-    _js=$(timeout 1 ocbmd wpa -p "$1$STA_CTRL" "$2" status 2>/dev/null)
-    case $_js in
-      *wpa_state=COMPLETED*) _jq=${_js#*freq=}; _jq=${_jq%%[!0-9]*}; _fc=0
-        case $_jq in 24[0-9][0-9]) _fc=$(( (_jq - 2407) / 5 )) ;; 5[0-9][0-9][0-9]) _fc=$(( (_jq - 5000) / 5 )) ;; esac
-        _hw="the station joined the hotspot there"; break ;;
-      *wpa_state=AUTHENTICATING*|*wpa_state=ASSOCIAT*|*wpa_state=*HANDSHAKE*) _jj=1 ;;
-      '') _jj=0; break ;;
-      *) _jj=0 ;;
-    esac
-    [ "$_jn" -lt $((_jw * 5)) ] && { [ "$_jj" = 1 ] || [ "$_jn" -lt $((_jf * 5)) ]; } || break
-    _jn=$((_jn + 1)); sleep 0.2
-  done
-  [ "$_jn" = 0 ] || _jn=", then $((_jn * 200)) ms for its join"
-  [ -z "$_hw" ] && [ -n "$_js" ] || return 0
-  if [ "$_jj" = 1 ]; then _jh=", a join still under way: the AP starts beside it"; return 0; fi
-  bench sta_ap_hold "$1"; [ $? = 1 ] && return 0
-  echo $$ 2>/dev/null >"$1$AP_START" && timeout 1 ocbmd wpa -p "$1$STA_CTRL" "$2" disconnect >/dev/null 2>&1 \
-    && _jh=", held still while hostapd starts"
-}
-# hostapd's configuration (_hrun) under root $1: AP_SESSION (tmpfs, 0600: hostapd.conf with the station's channel, band
-# and HT40 side; 20 MHz and no VHT at 2.4 GHz, as the factory file's own 2.4 GHz line) when it follows, else
-# hostapd.conf, never written for it. Sets ch; _own: the AP's own. ap_session writes it for channel $2: 0 written (ch,
-# _hrun then name it; _hm, _bw what it is).
+# hostapd's configuration (_hrun) under root $1: AP_SESSION (tmpfs, 0600: hostapd.conf with the band's channel,
+# hw_mode and HT40 side; 20 MHz and no VHT at 2.4 GHz, as the factory file's own 2.4 GHz line) where the band needs
+# another channel than the AP's own, else hostapd.conf, never written for it. ap_session writes it for channel $2: 0
+# written (ch, _hrun then name it; _hm, _bw what it is).
 AP_SESSION=/tmp/hostapd_session.conf
 ap_session() {
   _hm=a; _vd='/^vht_oper_c/d'; _sg='[SHORT-GI-40]'; ht40_side "$2"
@@ -429,27 +354,12 @@ ap_session() {
   fi
   rm -f "$1$AP_SESSION.new"; return 1
 }
-ap_follow() {
-  _hrun="$1/etc/hostapd.conf"; _own=$ch; _fc=${RADIO_AP_CHANNEL:-}
-  rm -f "$1$AP_SESSION"
-  [ "$_fc" = 0 ] && [ -e "$1$AP_PARKED" ] && ap_head "$1"
-  case "$_fc" in
-    ''|"$ch") return 0 ;;
-    0) say "STA mode: the station is not on the hotspot - the AP keeps its own channel $ch"; return 0 ;;
-  esac
-  if ! ap_may_use "$_fc"; then
-    _w="not one an AP may use"
-    case "$_fc" in 5[2-9]|6[0-4]|1[0-3][0-9]|14[0-4]) _w="a radar (DFS) channel" ;; esac
-    say "STA mode: the station is on channel $_fc, $_w - the AP keeps its own channel $ch"; return 0
-  fi
-  if ap_session "$1" "$_fc"; then say "STA mode: the AP follows the station to channel $_fc (hw_mode=$_hm, $_bw)"
-  else say "STA mode: channel $_fc not written - the AP keeps its own channel $ch"; fi
-}
-# Mode ap (ADDENDUM 24, docs/wireless/01_BT_AND_RADIO.md): RADIO_AP_BAND 2.4 = channel 6, 20 MHz; 5 = the AP's own
-# non-DFS 5 GHz channel, else 36. AP_LINK: the band the running AP was started for, and its channel (ocbmd's).
+# RADIO_AP_BAND 2.4 = channel 6, 20 MHz; 5 = the AP's own non-DFS 5 GHz channel, else 36. Sets ch, _hrun; _own: the
+# AP's own channel, for a refusal's fallback. AP_LINK: the band the running AP was started for, and its channel
+# (ocbmd's).
 AP_LINK=/tmp/.radio_ap_link
 ap_band_conf() {
-  _hrun="$1/etc/hostapd.conf"; _own=$ch; _mw="mode ap"; _fc=6; rm -f "$1$AP_SESSION"
+  _hrun="$1/etc/hostapd.conf"; _own=$ch; _fc=6; rm -f "$1$AP_SESSION"
   [ "$RADIO_AP_BAND" = 5 ] && { _fc=36; [ "$ch" -gt 14 ] && ap_may_use "$ch" && _fc=$ch; }
   if [ "$_fc" -gt 14 ] && [ "$_fc" = "$ch" ]; then _bw="its own"
   elif ap_session "$1" "$_fc"; then _bw="hw_mode=$_hm, $_bw"
@@ -544,16 +454,19 @@ test -e "$AP_ROOT/tmp/bin/hostapd" || cp "$AP_ROOT/usr/sbin/hostapd" "$AP_ROOT/t
 # This start's own line, before the launch: the converge step waits for an AP-ENABLED after it (ap_enabled_seen).
 _ae_mark="[radio] hostapd starting on $IF"
 echo "$_ae_mark" 2>/dev/null >> "$AP_BOXLOG" || _ae_mark=""
-_launched=0; _hapd=""; _dhcpd=""; _hrun="$AP_ROOT/etc/hostapd.conf"; _mw="STA mode"
+_launched=0; _hapd=""; _dhcpd=""; _hrun="$AP_ROOT/etc/hostapd.conf"; _own=""
 if ! pidof hostapd >/dev/null 2>&1; then
-  [ -e "$AP_ROOT$AP_LINK" ] && rm -f "$AP_ROOT$AP_LINK"   # the shell's test first: no fork with no link
-  if [ -n "${RADIO_AP_BAND:-}" ]; then ap_band_conf "$AP_ROOT"; else ap_follow "$AP_ROOT"; fi
+  # Mode ap's band (ap_band_conf), or hostapd.conf as in 2.7.1; a mark or a session configuration an earlier mode-ap AP
+  # left goes (the shell's own tests first: no fork with no link).
+  [ -e "$AP_ROOT$AP_LINK" ] && rm -f "$AP_ROOT$AP_LINK"
+  if [ -n "${RADIO_AP_BAND:-}" ]; then ap_band_conf "$AP_ROOT"
+  elif [ -e "$AP_ROOT$AP_SESSION" ]; then rm -f "$AP_ROOT$AP_SESSION"; fi
   setsid hostapd "$_hrun" </dev/null >>"$AP_BOXLOG" 2>&1 &
   _hapd=$!
   tl_stamp ap_start
   _launched=1
 elif [ -f "$AP_ROOT$AP_SESSION" ]; then
-  ch=$(sed -n 's/^channel=//p' "$AP_ROOT$AP_SESSION")   # up already, where it followed
+  ch=$(sed -n 's/^channel=//p' "$AP_ROOT$AP_SESSION")   # up already, on mode ap's band
 fi
 
 # The AP's DHCP server, explicitly scoped. The stock script masked this behind a global udhcpd
@@ -610,7 +523,8 @@ hapd_exited() {
   read -r _hx_pid _hx_name _hx_state _hx_rest 2>/dev/null <"$AP_PROC/$_hapd/stat"
   [ "$_hx_name" = "(hostapd)" ] && [ "$_hx_state" = Z ]
 }
-# ap_follow's AP refused: its hostapd gone in its start-up (a zombie, or reaped). Never so for another AP.
+# Mode ap's AP from its session configuration refused: its hostapd gone in its start-up (a zombie, or reaped). Never so
+# for another AP.
 hapd_refused() { [ "$_hrun" = "$AP_ROOT$AP_SESSION" ] && { hapd_exited || ! kill -0 "$_hapd" 2>/dev/null; }; }
 ap_converge() {
   n=0
@@ -639,7 +553,7 @@ ap_converge() {
 ap_converge
 # Refused there (a domain with no AP on it, say): the AP's own channel, as before.
 if hapd_refused; then
-  say "$_mw: hostapd did not start on channel $ch - the AP takes its own channel $_own"
+  say "mode ap: hostapd did not start on channel $ch - the AP takes its own channel $_own"
   rm -f "$_hrun"; ch=$_own; _hrun="$AP_ROOT/etc/hostapd.conf"
   [ -n "$_ae_mark" ] && echo "$_ae_mark" 2>/dev/null >> "$AP_BOXLOG"
   setsid hostapd "$_hrun" </dev/null >>"$AP_BOXLOG" 2>&1 &

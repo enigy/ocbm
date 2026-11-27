@@ -364,21 +364,20 @@ pub const MGMT_UPDATE: u8 = 0x0C;
 /// MGMT_CONNECT_DEVICE. Never ends a wired session: btd has none live then. MGMT_ACK status 1 = not a
 /// MAC, not bonded, or btd unreachable. Only on a box with CAP_PHONE_SWITCH.
 pub const MGMT_SWITCH_DEVICE: u8 = 0x0D;
-/// [MGMT_WIFI_LINK][ver 1][link key 32 B][ssid_len u8][ssid][psk_len u8][psk] -> set up the Wi-Fi link (OCBW v1,
-/// crate `ocbm-link`; ocbmd `src/wifi.rs`): the box keeps the key and the phone hotspot's name and WPA key in
-/// `/etc/ocbm/wifi_link` (0600), joins that hotspot on its station interface, and listens on it. `psk` = the
-/// hotspot's WPA key as 64 hex digits (PBKDF2-SHA1(passphrase, ssid, 4096, 32), worked out on the head unit so the
-/// passphrase never reaches the box), or the passphrase itself (8..=63 printable ASCII, no `"`), or empty for an
-/// open network. An empty ssid (with an empty psk) keeps the key only: the listener runs on a station interface
-/// that already has an address, no hotspot is joined. [MGMT_WIFI_LINK] with no body removes the link. MGMT_ACK
-/// status 0 = stored; the box then applies it about half a second later, beside the session that asked: a USB
-/// session carries on, a Wi-Fi session's link is closed when the key or the hotspot changed (or the link was
-/// removed), and its host reconnects. Status 1 = malformed, not storable, or the file could not be written: nothing
-/// changed. Only on a box with CAP_WIFI_LINK.
-/// Version 2 (Wi-Fi link plan, ADDENDUM 24: mode `ap`, the head unit joins the adapter's own AP; no hotspot, no
-/// station): [MGMT_WIFI_LINK][ver 2][link key 32 B][band u8], 35 B exactly, band 0x02 = 2.4 GHz, 0x05 = 5 GHz. Its
+/// [MGMT_WIFI_LINK][ver 2][link key 32 B][band u8] -> set up the Wi-Fi link (OCBW v1, crate `ocbm-link`; ocbmd
+/// `src/wifi.rs`) in mode `ap` (the Wi-Fi link plan's ADDENDUM 24): the head unit joins the adapter's own AP, the one
+/// the phone's CarPlay uses, and reaches the box at the AP's own address. 35 B exactly; band 0x02 = 2.4 GHz, 0x05 =
+/// 5 GHz. The box keeps the key, the mode and the band in `/etc/ocbm/wifi_link` (0600) and listens on its AP. Its
 /// MGMT_ACK status 0 carries the AP the head unit joins: [MGMT_ACK][0x0E][0][ssid_len u8][ssid][pass_len u8][pass]
-/// (the AP's name and WPA2 passphrase; never in MGMT_INFO). A changed key, band or mode restarts the AP on the band.
+/// (the AP's name and WPA2 passphrase; never in MGMT_INFO). The box applies it about half a second after the ACK,
+/// beside the session that asked: a USB session carries on; a changed key or band (or a first set-up) restarts the AP
+/// on the band and closes a Wi-Fi session's link, whose host reconnects. [MGMT_WIFI_LINK] with no body removes the
+/// link (MGMT_ACK status 0).
+/// Status 1 = malformed (a version 2 that is not 35 B or names another band, an unknown version), the AP not nameable
+/// yet (try again in a moment), or the file could not be written: nothing changed. Status 2 = version 1, the RETIRED
+/// hotspot mode (`[ver 1][key 32][ssid_len][ssid][psk_len][psk]`, the adapter as a client of the phone's hotspot,
+/// retired 27 Nov 2026: the IW416 joins no 2.4 GHz network as a client): never taken, nothing stored or changed.
+/// Only on a box with CAP_WIFI_LINK.
 pub const MGMT_WIFI_LINK: u8 = 0x0E;
                                             //   Box->host:
 pub const MGMT_INFO: u8 = 0x81; // [MGMT_INFO][utf8 JSON] — identity + health + bonded-device snapshot

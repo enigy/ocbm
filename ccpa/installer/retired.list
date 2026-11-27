@@ -8,3 +8,8 @@
 usr/sbin/aa-bridge
 # The Wi-Fi link's wpa_cli, placed by the branch's bench packages until 24 Nov 2026; `ocbmd wpa` replaces it.
 usr/sbin/ocbm-wpa_cli
+# The Wi-Fi link's hotspot mode, retired 27 Nov 2026 (the head unit joins the adapter's own AP): its supplicant, its
+# station keeper and the keeper's DHCP hook, placed by the branch's bench packages of 24-27 Nov.
+usr/sbin/ocbm-wpa_supplicant
+script/wifi_sta.sh
+script/wifi_sta_dhcp.sh

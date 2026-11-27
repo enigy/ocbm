@@ -1,10 +1,10 @@
 //! OCBW v1: the OCBM byte stream over TCP (the Wi-Fi link), behind a pre-shared-key handshake and inside
 //! ChaCha20-Poly1305 records.
 //!
-//! WHY. Over USB the OCBM stream rides a cable that only the head unit holds. Over Wi-Fi it rides the phone's
-//! hotspot, which passengers share, and the stream carries a root console (`CH_CONSOLE`), file push and
-//! CarPlay's per-session A/V keys. So no byte gets through without the link key, and nobody on the hotspot reads
-//! one.
+//! WHY. Over USB the OCBM stream rides a cable that only the head unit holds. Over Wi-Fi it rides the adapter's own
+//! access point, which the phone shares and anyone with its password may join, and the stream carries a root console
+//! (`CH_CONSOLE`), file push and CarPlay's per-session A/V keys. So no byte gets through without the link key, and
+//! nobody else on that network reads one.
 //!
 //! THE LINK KEY is 32 random bytes the host makes and hands the box once, in `MGMT_WIFI_LINK` over an OCBM
 //! session it already has. It never crosses the network itself: each side only proves that it holds it.
@@ -50,7 +50,7 @@ type HmacSha256 = Hmac<Sha256>;
 
 pub const MAGIC: [u8; 4] = *b"OCBW";
 pub const VERSION: u8 = 1;
-/// The TCP port the box listens on, on its station interface only.
+/// The TCP port the box listens on, on its access point's own address only.
 pub const PORT: u16 = 7020;
 /// The largest record plaintext. OCBM frames are at most 16 B + 64 KiB; a writer cuts larger chunks.
 pub const MAX_RECORD: usize = 64 * 1024;
@@ -180,7 +180,7 @@ pub fn box_proof(key: &LinkKey, hn: &[u8; 32], bn: &[u8; 32]) -> [u8; 32] {
 }
 
 /// The box's public id for discovery: the first 8 bytes of HMAC(K, "OCBW id"), as 16 hex digits. The mDNS advert
-/// carries it (TXT `id=`), so a host picks ITS box among several on one hotspot, and the advert says nothing about
+/// carries it (TXT `id=`), so a host picks ITS box among several on one network, and the advert says nothing about
 /// the key.
 pub fn box_id(key: &LinkKey) -> String {
     let full: [u8; 32] = mac(key, ID_LABEL, &[], &[]).finalize().into_bytes().into();
@@ -365,8 +365,9 @@ pub fn host_handshake<S: Read + Write>(s: &mut S, key: &LinkKey, host_nonce: [u8
 //
 // An adapter with no link key offers a time-limited set-up network from its own AP (SSID [`SETUP_SSID_PREFIX`] + its
 // four hex digits, WPA2 passphrase [`SETUP_PASSPHRASE`], public on purpose). A host on it agrees keys with the box by an
-// unauthenticated P-256 ECDH, so nothing it then sends (the link key, the hotspot's WPA key) is readable from the air;
-// trust is first-come within the window (the adapter has no screen for a code). After the 70-byte exchange the session
+// unauthenticated P-256 ECDH, so nothing it then sends (the link key, the AP's name and passphrase in the answer) is
+// readable from the air; trust is first-come within the window (the adapter has no screen for a code). After the 70-byte
+// exchange the session
 // is OCBW v1's record layer, the plain OCBM stream inside:
 //
 // ```text

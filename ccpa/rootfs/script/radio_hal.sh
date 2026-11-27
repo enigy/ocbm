@@ -4,8 +4,8 @@
 # the Rust daemons) asks for "wifi up" / "bt up" and never names a chip, a module, a firmware
 # path or an attach helper.
 #
-# VERBS   probe | status | wifi_ap_on | wifi_ap_off | wifi_ap_prep | wifi_ap_restart | wifi_sta_up | setup_ap_on |
-#         setup_ap_off | bt_on | bt_off | preload
+# VERBS   probe | status | wifi_ap_on | wifi_ap_off | wifi_ap_prep | wifi_ap_restart | setup_ap_on | setup_ap_off |
+#         bt_on | bt_off | preload
 # EXIT    0 converged now   1 ran and failed   2 already converged   3 unsupported on this unit
 #
 # wifi_ap_prep (16 Nov 2026) writes the AP's configuration ahead, with no host here and nothing raised: the files
@@ -372,20 +372,13 @@ wlan_iface() {
   return 1
 }
 
-# ---- the Wi-Fi link's station (24 Nov 2026; /script/wifi_sta.sh, ocbmd src/wifi.rs) ----------------------------------
-# With a hotspot in /etc/ocbm/wifi_link (an ssid_hex= line) the adapter also joins the phone's hotspot as a station. One
-# radio, and two interfaces from one driver load: on the IW416 its stock wifi_mod_para.conf (drv_mode=3) names the STA
-# BSS sta0 (sta_name=sta) and the uAP BSS wlan0 (uap_name=wlan), and stock's own STA mode (when a supplicant exists)
-# runs its station on sta0. So in STA mode the station keeps the interface named sta* and the AP takes the OTHER
-# wireless interface: each BSS in its own role. Without the line nothing here changes: the AP takes the first
-# interface, as before (sta0 on the IW416, by name order). A unit whose driver makes one interface only has no station
-# beside the AP: the AP keeps it, and the keeper says so. RADIO_STA_IF names the station's interface outright.
+# ---- the Wi-Fi link, mode ap (ADDENDUM 24 of the Wi-Fi link plan, 27 Nov 2026; ocbmd src/wifi.rs) --------------------
+# With a link set up (/etc/ocbm/wifi_link: its key and mode=ap, MGMT_WIFI_LINK v2) the head unit joins this adapter's
+# own AP, which then stays up between sessions, on the link's band (2.4 unless band=5). The file's lines are read with
+# the shell's own read, after its own test of the file: an adapter with no link forks nothing more than 2.7.1 on any
+# path that asks. A file of the retired hotspot mode (no mode=ap; ocbmd removes it at its start) is no link. 0 in mode
+# ap, _lband then 2.4 or 5 (else empty).
 WIFI_LINK_FILE=/etc/ocbm/wifi_link
-# The shell's own test first: an adapter with no link forks nothing more than 2.7.1 on any path that asks.
-sta_mode() { [ -f "$WIFI_LINK_FILE" ] && grep -q '^ssid_hex=' "$WIFI_LINK_FILE" 2>/dev/null; }
-# Mode ap (ADDENDUM 24, MGMT_WIFI_LINK v2): the head unit joins this adapter's own AP, which then stays up between
-# sessions, on the link's band (2.4 unless band=5); no station. The link file's mode=ap with its key, read with the
-# shell's own read: no fork. 0 in mode ap, _lband then 2.4 or 5 (else empty).
 link_ap() {
   _lband=""; _lap_m=""; _lap_b=""; _lap_k=""
   [ -f "$WIFI_LINK_FILE" ] || return 1
@@ -398,8 +391,13 @@ link_ap() {
   _lband=2.4; [ "$_lap_b" = 5 ] && _lband=5
   return 0
 }
-sta_iface() {
-  if [ -n "${RADIO_STA_IF:-}" ]; then [ -e "/sys/class/net/$RADIO_STA_IF" ] && { echo "$RADIO_STA_IF"; return 0; }; return 1; fi
+# The AP's interface in mode ap. One driver load may make two wireless interfaces: on the IW416 its stock
+# wifi_mod_para.conf (drv_mode=3) names the STA BSS sta0 (sta_name=sta) and the uAP BSS wlan0 (uap_name=wlan). The AP
+# of 2.7.1 takes the first by name, sta0, which hostapd switches to the AP role, and leaves wlan0 idle; with no link it
+# still does. In mode ap the AP takes the uAP: the wireless interface not named sta* while one named sta* is beside it
+# (sta_bss_iface; the 2.4 GHz CarPlay AP of the 24-25 Nov benches ran there), and sta0 stays idle; with one interface,
+# that one. No station runs on either (the hotspot mode is retired).
+sta_bss_iface() {   # the driver's STA BSS interface (sta*), only while another wireless interface is beside it
   _sti_s=""; _sti_o=""
   for _sti_d in /sys/class/net/*/; do
     [ -e "$_sti_d/wireless" ] || [ -e "$_sti_d/phy80211" ] || continue
@@ -409,21 +407,19 @@ sta_iface() {
   [ -n "$_sti_s" ] && [ -n "$_sti_o" ] && { echo "$_sti_s"; return 0; }
   return 1
 }
-# STA mode, the driver's first interface there: is a station's beside it? A driver's interfaces come from one probe, so a
+# Mode ap, the driver's first interface there: is its pair beside it? A driver's interfaces come from one probe, so a
 # second is there within 1 s of the first; none by then is a one-interface driver, marked for the boot (ONE_IF), so no
-# path waits for a station again and the keeper stops asking. 1: none.
+# AP start waits for one again. 1: none.
 ONE_IF=/tmp/.radio_one_iface
-sta_settle() {
+pair_settle() {
   [ -e "$ONE_IF" ] && return 1
-  _ss=0; while [ "$_ss" -lt 10 ]; do sta_iface >/dev/null 2>&1 && return 0; _ss=$((_ss+1)); sleep 0.1; done
-  echo 1 > "$ONE_IF"; log "one wireless interface on this driver: no station beside the AP, so no hotspot link here"
+  _ss=0; while [ "$_ss" -lt 10 ]; do sta_bss_iface >/dev/null 2>&1 && return 0; _ss=$((_ss+1)); sleep 0.1; done
+  echo 1 > "$ONE_IF"; log "one wireless interface on this driver: mode ap's AP takes it"
   return 1
 }
-# The AP's interface: in STA mode and in mode ap (the uAP, wlan0 on the IW416: the 2.4 GHz CarPlay AP of the 24-25 Nov
-# benches) the wireless interface that is not the station's (when there is one), else wlan_iface.
 ap_iface() {
-  sta_mode || link_ap || { wlan_iface; return; }
-  _apf_s=$(sta_iface) || { wlan_iface; return; }
+  link_ap || { wlan_iface; return; }
+  _apf_s=$(sta_bss_iface) || { wlan_iface; return; }
   for _apf_d in /sys/class/net/*/; do
     [ -e "$_apf_d/wireless" ] || [ -e "$_apf_d/phy80211" ] || continue
     _apf_n=$(basename "$_apf_d")
@@ -431,17 +427,6 @@ ap_iface() {
     echo "$_apf_n"; return 0
   done
   wlan_iface
-}
-# The station's channel for the AP (ADDENDUM 6; radio_ap_up.sh's RADIO_AP_CHANNEL), from the keeper's state (iface=,
-# state=, channel=, in that order): joined, its channel; not yet, or no state yet, 0; no station, or no link, "". No
-# fork. Sets _fch.
-WIFI_LINK_STATE=/tmp/wifi_link_state
-sta_channel() {
-  _fch=""; _sts=""; _stc=""
-  [ -f "$WIFI_LINK_FILE" ] || return 0
-  link_ap && return 0   # mode ap: no station to follow
-  { read -r _sti; read -r _sts; read -r _stc; } 2>/dev/null <"$WIFI_LINK_STATE"
-  case $_sts in state=joined) _fch=${_stc#channel=} ;; state=unsupported) ;; *) _fch=0 ;; esac
 }
 
 hci_dev() {
@@ -584,72 +569,6 @@ wlan_driver_up() {
   return $_wdr
 }
 
-# Bench only (the Wi-Fi link plan's ADDENDUM 13 and 15), at a module's load (a power-up: the preload loads the driver):
-# /tmp/bench_<name>, else /etc/ocbm/bench_<name>; "off" in /tmp over the flash file. Each file names its module, so this
-# script names none. sta_modparam: `<module> NAME=VALUE...`, plain words. A module whose insmod names a parameter file
-# (mod_para=) reads them from a copy of it at /tmp/fw, the kernel firmware loader's first path, inside its first
-# block after the file's own lines: a driver that takes its command line first and then the block (the IW416's moal)
-# keeps the block's word. Without that path, or for any other module: on its insmod line. sta_drvpatch: `<module>
-# <sha256> OFFSET:OLD:NEW...` (decimal offset, hex bytes): the module loads from a copy with those bytes changed, only
-# when its file has that sha256 and `cmp -l` then lists those bytes and no other; else as it is, said. Sets _blc.
-BENCH_FW=/tmp/fw
-bench_load() {  # $1 the module, $2 its insmod line
-  _blc=$2; _blw=""
-  for _blf in /tmp/bench_sta_modparam /etc/ocbm/bench_sta_modparam; do
-    [ -e "$_blf" ] || continue
-    _blm=""; _blx=""; read -r _blm _blx 2>/dev/null <"$_blf"
-    [ "$_blm" = "$1" ] && case "$_blx" in ''|*[!A-Za-z0-9_=.,\ -]*)
-      log "[bench] sta_modparam ($_blf): refused, not plain NAME=VALUE words" ;; *) _blw=$_blx ;; esac
-    break
-  done
-  _blp=""; case " $2 " in *" mod_para="*) _blp=${2##*mod_para=}; _blp=${_blp%% *} ;; esac
-  case "$_blp" in /*|*..*) _blp="" ;; esac
-  if [ -n "$_blp" ]; then
-    rm -f "$BENCH_FW/$_blp"
-    case "$_blp" in */*) _bld=$BENCH_FW/${_blp%/*} ;; *) _bld=$BENCH_FW ;; esac
-    if [ -n "$_blw" ] && [ -e /sys/module/firmware_class/parameters/path ] && mkdir -p "$_bld" 2>/dev/null &&
-       awk -v w="$_blw" 'index($0, "{") { b = 1 } b && !d && index($0, "}") { n = split(w, a, " ")
-         for (i = 1; i <= n; i++) print "\t" a[i]; d = 1 } { print } END { exit !d }' \
-         "/lib/firmware/$_blp" > "$BENCH_FW/$_blp" 2>/dev/null &&
-       printf %s "$BENCH_FW" 2>/dev/null > /sys/module/firmware_class/parameters/path; then
-      log "[bench] sta_modparam ($_blf): $1 reads $_blw from $BENCH_FW/$_blp, in its block"
-      _blw=""
-    else rm -f "$BENCH_FW/$_blp"; fi
-  fi
-  [ -n "$_blw" ] && { _blc="$_blc $_blw"; log "[bench] sta_modparam ($_blf): $1 loads with $_blw"; }
-  for _blf in /tmp/bench_sta_drvpatch /etc/ocbm/bench_sta_drvpatch; do
-    [ -e "$_blf" ] || continue
-    _blm=""; _bls=""; _blx=""; read -r _blm _bls _blx 2>/dev/null <"$_blf"
-    [ "$_blm" = "$1" ] && drv_patch "$1"
-    break
-  done
-  return 0
-}
-drv_patch() {  # $1 the module; bench_load's _blf, _bls (sha256), _blx (the bytes) and _blc
-  _dpk=""; for _dpw in $_blc; do case "$_dpw" in *.ko) _dpk=$_dpw ;; esac; done
-  _dpo=${_dpk%.ko}.bench.ko; rm -f "$_dpo"
-  _dps=""; [ -n "$_dpk" ] && _dps=$(sha256sum "$_dpk" 2>/dev/null); _dps=${_dps%% *}
-  [ -n "$_dps" ] && [ "$_dps" = "$_bls" ] && [ -n "$_blx" ] || {
-    log "[bench] sta_drvpatch ($_blf): refused, ${_dpk:-no file} is not that $1 (sha256 ${_dps:-none})"; return 0; }
-  cp "$_dpk" "$_dpo" 2>/dev/null || { log "[bench] sta_drvpatch ($_blf): refused, no copy"; return 0; }
-  _dpe=""
-  for _dpw in $_blx; do
-    _dpf=${_dpw%%:*}; _dpv=${_dpw#*:}; _dpa=${_dpv%%:*}; _dpb=${_dpv#*:}
-    case "$_dpf" in ''|*[!0-9]*) _dpe=x; break ;; esac
-    case "$_dpa:$_dpb" in [0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]) ;; *) _dpe=x; break ;; esac
-    printf "\\$(printf %03o "0x$_dpb")" | dd of="$_dpo" bs=1 seek="$_dpf" count=1 conv=notrunc 2>/dev/null ||
-      { _dpe=x; break; }
-    _dpe="$_dpe$((_dpf + 1)) $(printf %o "0x$_dpa") $(printf %o "0x$_dpb")
-"
-  done
-  _dpe=$(printf %s "$_dpe" | sort -n); _dpc=$(cmp -l "$_dpk" "$_dpo" 2>/dev/null | sed 's/^ *//; s/  */ /g')
-  if [ "$_dpc" = "$_dpe" ]; then
-    _dpn=""; for _dpw in $_blc; do [ "$_dpw" = "$_dpk" ] && _dpw=$_dpo; _dpn="${_dpn:+$_dpn }$_dpw"; done; _blc=$_dpn
-    log "[bench] sta_drvpatch ($_blf): $1 loads from $_dpo, these bytes changed: $_blx"
-  else
-    rm -f "$_dpo"; log "[bench] sta_drvpatch ($_blf): refused, the bytes named are not the ones that changed in a copy"
-  fi
-}
 wlan_driver_load() {
   ko_unpack || log "driver tarball ${RADIO_KO_TARBALL:-<none>} did not unpack"
   log "wlan driver: $RADIO_WLAN_INSMOD"
@@ -667,9 +586,7 @@ wlan_driver_load() {
     else
       boot_mark wlan_start   # the boot line: the first module this boot loads (the first stamp stands)
       _wdl_loaded=1
-      bench_load "$_mod" "$_cmd"
-      [ "$_blc" = "$_cmd" ] || log "[bench] $_mod: $_blc"
-      $_blc 2>&1 | sed "s|^|$LOGP   |"
+      $_cmd 2>&1 | sed "s|^|$LOGP   |"
     fi
     IFS=';'
   done
@@ -765,11 +682,9 @@ do_wifi_ap_on() {
   # interface is there): straight to the owned AP layer, whose first launch is then hostapd. No descriptor read, no
   # driver step, no configuration writes: about 0.9 s of every connect went there before hostapd started.
   if ap_prepared_iface && [ -x /script/radio_ap_up.sh ] \
-     && { ! sta_mode && [ -z "$_lband" ] || [ "$_api" = "$(ap_iface 2>/dev/null)" ]; }; then
+     && { [ -z "$_lband" ] || [ "$_api" = "$(ap_iface 2>/dev/null)" ]; }; then
     log "AP configured ahead on $_api - launching it"
-    sta_channel
-    ONDEMAND_WIFI=1 RADIO_WLAN_IF="$_api" RADIO_AP_CHANNEL="$_fch" RADIO_AP_BAND="$_lband" \
-      sh /script/radio_ap_up.sh AP 2>&1 | sed "s/^/$LOGP   /"
+    ONDEMAND_WIFI=1 RADIO_WLAN_IF="$_api" RADIO_AP_BAND="$_lband" sh /script/radio_ap_up.sh AP 2>&1 | sed "s/^/$LOGP   /"
     _n=0; while [ "$_n" -lt 50 ]; do ap_running && break; _n=$((_n+1)); sleep 0.2; done
     if ap_running; then
       # The address the AP layer configured, from its stamp (rewritten if it configured afresh), and the MAC, both
@@ -820,10 +735,10 @@ do_wifi_ap_on() {
       wlan_driver_up || {
         publish "$WLAN_STATE" "result=fail" "backend=mapped" "chipset=$RADIO_SDIO_DEVICE" "detail=driver-load"
         return 1; }
-      # Converge on the interface appearing, discovered by enumeration; in STA mode a station's beside it, 1 s at most
-      # (in mode ap too: the AP takes the other one).
+      # Converge on the interface appearing, discovered by enumeration; in mode ap its pair beside it too, 1 s at most
+      # (the AP takes the uAP, ap_iface).
       _n=0; while [ "$_n" -lt 100 ]; do wlan_iface >/dev/null 2>&1 && break; _n=$((_n+1)); sleep 0.1; done
-      { sta_mode || [ -n "$_lband" ]; } && sta_settle
+      [ -n "$_lband" ] && pair_settle
       _i=$(ap_iface 2>/dev/null) || {
         log "driver loaded but no wireless interface appeared"
         publish "$WLAN_STATE" "result=fail" "backend=mapped" "chipset=$RADIO_SDIO_DEVICE" "detail=no-iface"
@@ -850,9 +765,8 @@ do_wifi_ap_on() {
         return 1; }
       # RADIO_BOX_NAME is resolved HERE, not inside the AP layer, so the SSID and the Bluetooth
       # name provably come from one decision rather than two derivations that can disagree.
-      sta_channel
-      ONDEMAND_WIFI=1 RADIO_WLAN_IF="$_i" RADIO_BOX_NAME="$(box_name)" RADIO_AP_CHANNEL="$_fch" \
-        RADIO_AP_BAND="$_lband" sh /script/radio_ap_up.sh AP 2>&1 | sed "s/^/$LOGP   /"
+      ONDEMAND_WIFI=1 RADIO_WLAN_IF="$_i" RADIO_BOX_NAME="$(box_name)" RADIO_AP_BAND="$_lband" \
+        sh /script/radio_ap_up.sh AP 2>&1 | sed "s/^/$LOGP   /"
       _n=0; while [ "$_n" -lt 50 ]; do ap_running && break; _n=$((_n+1)); sleep 0.2; done
       if ap_running; then
         publish "$WLAN_STATE" "result=ok" "backend=mapped" "chipset=$RADIO_SDIO_DEVICE" \
@@ -955,24 +869,6 @@ do_setup_ap_off() {
   return 0
 }
 
-# The Wi-Fi link's station (wifi_sta.sh): this unit's WLAN driver loaded, and the station's interface (sta_iface: one
-# beside the AP's) up. Never an AP, an address or a scan. 2: already there; 3: no station on this unit (no mapped
-# backend, no STA mode, one interface: sta_settle), which the keeper takes as final for the boot.
-do_wifi_sta_up() {
-  sta_mode || { log "wifi_sta_up: no hotspot in $WIFI_LINK_FILE"; return 3; }
-  [ -e "$ONE_IF" ] && return 3
-  _wsu=$(sta_iface 2>/dev/null) && { ifconfig "$_wsu" up 2>/dev/null; return 2; }
-  caps || return 3
-  [ "$RADIO_BACKEND" = mapped ] || { log "wifi_sta_up: backend ${RADIO_BACKEND:-none} has no station path"; return 3; }
-  wlan_driver_up || return 1
-  _n=0; while [ "$_n" -lt 100 ] && ! wlan_iface >/dev/null 2>&1; do _n=$((_n+1)); sleep 0.1; done
-  sta_settle || return 3
-  _wsu=$(sta_iface 2>/dev/null) || return 1
-  ifconfig "$_wsu" up 2>/dev/null
-  log "wifi_sta_up: station interface $_wsu up"
-  return 0
-}
-
 do_wifi_ap_off() {
   # Mode ap (ADDENDUM 24): the AP is the head unit's network, so a session's teardown leaves it up (the phone's session
   # and Bluetooth go as before); only wifi_ap_restart (_ap_force) takes it down.
@@ -999,18 +895,19 @@ do_wifi_ap_off() {
   # that never was. Its pidfile's pid is no longer killed blind: the server is found by its config path
   # as above, and a stale pidfile can name any process.
   ap_dhcp_stop
-  if sta_mode || [ "$_lap" = 0 ]; then
-    # The interface the AP ran on; the station's (an AP raised there before the link was set up) only loses the AP's
-    # address: the station keeper brings it up for the hotspot.
+  if [ "$_lap" = 0 ] || [ -e "$AP_LINK_MARK" ]; then
+    # Mode ap's AP (forced down by wifi_ap_restart, or the link removed: its band's mark says so; the shell's test, no
+    # fork without one): down on the interface it ran on, which hostapd.conf names (radio_ap_up.sh writes it): the uAP,
+    # or the first interface for an AP raised before the link was set up. Not the first interface by name blindly, which
+    # left the uAP up with the AP's address once the link was removed.
     _i=$(sed -n 's/^interface=//p' /etc/hostapd.conf 2>/dev/null | head -1); [ -n "$_i" ] || _i=$(ap_iface 2>/dev/null)
-    if [ -n "$_i" ] && [ "$_i" = "$(sta_iface 2>/dev/null)" ]; then ifconfig "$_i" 0.0.0.0 2>/dev/null
-    elif [ -n "$_i" ]; then ifconfig "$_i" down 2>/dev/null; fi
+    [ -n "$_i" ] && ifconfig "$_i" down 2>/dev/null
   else
     _i=$(wlan_iface 2>/dev/null) && ifconfig "$_i" down 2>/dev/null
   fi
   _n=0; while [ "$_n" -lt 25 ] && ap_running; do _n=$((_n+1)); sleep 0.2; done
   ap_running && { log "hostapd still running after teardown"; publish "$WLAN_STATE" "result=fail" "detail=ap-survived"; return 1; }
-  # With the AP: its configuration where it followed the station or took mode ap's band, and its band's mark.
+  # With the AP: its configuration where it took mode ap's band, and its band's mark.
   rm -f "$WLAN_STATE" "$AP_SESSION" "$AP_LINK_MARK"
   log "wifi AP down"
   return 0
@@ -2063,9 +1960,6 @@ case "$VERB" in
                [ "${_bt_attached:-0}" = 1 ] && boot_line bt_on "$_r"   # a bt_on that attached (no preload did)
                exit $_r ;;
   bt_off)      lock_take bt   || exit 1; do_bt_off;      _r=$?; lock_drop bt;   exit $_r ;;
-  # The Wi-Fi link's station (wifi_sta.sh): the WLAN driver loaded and the station's interface up, nothing else (no AP,
-  # no address). Under the wlan lock, so it never meets a session's wifi_ap_on or the boot preload.
-  wifi_sta_up) lock_take wlan || exit 1; do_wifi_sta_up; _r=$?; lock_drop wlan; exit $_r ;;
   # M3's set-up network (ocbmd src/setup.rs), under the wlan lock like the CarPlay AP.
   setup_ap_on)  lock_take wlan || exit 1; do_setup_ap_on;  _r=$?; lock_drop wlan; exit $_r ;;
   setup_ap_off) lock_take wlan || exit 1; do_setup_ap_off; _r=$?; lock_drop wlan; exit $_r ;;
@@ -2074,5 +1968,5 @@ case "$VERB" in
   # earlier (do_preload, and the Wi-Fi side of a together attach), so each goes here only while it is still this one's.
   preload)     lock_take wlan || exit 1; lock_take bt || { lock_drop wlan; exit 1; }
                do_preload; _r=$?; trap - EXIT INT TERM HUP; lock_drop_own bt; lock_drop_own wlan; exit $_r ;;
-  *) echo "$LOGP usage: radio_hal.sh probe|status|wifi_ap_on|wifi_ap_off|wifi_ap_prep|wifi_ap_restart|wifi_sta_up|setup_ap_on|setup_ap_off|bt_on|bt_off|preload" >&2; exit 64 ;;
+  *) echo "$LOGP usage: radio_hal.sh probe|status|wifi_ap_on|wifi_ap_off|wifi_ap_prep|wifi_ap_restart|setup_ap_on|setup_ap_off|bt_on|bt_off|preload" >&2; exit 64 ;;
 esac
